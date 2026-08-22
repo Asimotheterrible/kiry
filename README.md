@@ -36,11 +36,10 @@ That is why one maintainer is enough.
 Early. It reads the package format (`version`, `sources`, `checksums`, `depends`,
 `targets`) and prints back what it parsed. Nothing gets installed yet.
 
-Extraction, the installed database and `l` `i` `r` come next. The soname engine, which
-is the part that is actually novel, has not been written.
+Extraction, the installed database and `l` `i` `r` come next. **The soname engine, which
+is the part that is actually novel, has not been written, but it WILL BE written.**
 
-Do not point this at your system. It is being built for one machine in particular, and
-that machine does not exist yet either.
+Do not point this at your system **yet**.
 
 ## Building
 
@@ -125,7 +124,7 @@ kiry is not a distribution. It is written for one, but that system's design live
 outside this repository.
 
 Nor is it a binary package manager, though it will install a prebuilt artifact where
-building one makes no sense.
+building one makes no sense. 
 
 Portability stops at x86_64 Linux.
 

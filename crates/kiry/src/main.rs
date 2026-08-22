@@ -11,7 +11,13 @@ fn main() {
         }
     };
 
-    let p = pkg::load(&dir);
+    let p = match pkg::load(&dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kiry: {e}");
+            std::process::exit(1);
+        }
+    };
 
     println!("{} {}", p.name, p.version);
     println!("targets {}", p.targets.join(" "));
@@ -26,10 +32,12 @@ fn main() {
 
     for (i, src) in p.sources.iter().enumerate() {
         // dbg!(&p.checksums);
-        let sum = match p.checksums.get(i) {
-            Some(s) => &s[..8],
-            None => "--------",
-        };
+        // get(..8) rather than a slice: nothing has checked these are sha256 yet
+        let sum = p
+            .checksums
+            .get(i)
+            .and_then(|s| s.get(..8))
+            .unwrap_or("--------");
         println!("src {sum} {src}");
     }
 }

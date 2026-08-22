@@ -1,10 +1,11 @@
-// a package is a directory of plain text files, one fact per file. the .meta/
-// sidecar beside a cached artifact reuses these names on purpose, so this reads
-// both and there is no second format to keep in sync
+// a .meta/ sidecar reuses these file names, so one parser reads both
 
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+
+use crate::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
@@ -13,11 +14,19 @@ pub struct Version {
 }
 
 impl Version {
-    pub fn parse(s: &str) -> Version {
+    pub fn parse(s: &str) -> Result<Version, Error> {
         let mut f = s.split_whitespace();
-        let upstream = f.next().unwrap().to_string();
-        let rev = f.next().unwrap().parse().unwrap();
-        Version { upstream, rev }
+        let (Some(upstream), Some(rev)) = (f.next(), f.next()) else {
+            return Err(Error::Version(s.trim().to_string()));
+        };
+        let rev = rev
+            .parse()
+            .map_err(|_| Error::Version(s.trim().to_string()))?;
+
+        Ok(Version {
+            upstream: upstream.to_string(),
+            rev,
+        })
     }
 }
 
@@ -44,32 +53,48 @@ pub struct Package {
     pub targets: Vec<String>,
 }
 
-pub fn load(dir: &Path) -> Package {
-    let name = dir.file_name().unwrap().to_str().unwrap().to_string();
-    let version = Version::parse(&fs::read_to_string(dir.join("version")).unwrap());
+pub fn load(dir: &Path) -> Result<Package, Error> {
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::Name(dir.to_path_buf()))?
+        .to_string();
 
-    let sources = lines(&dir.join("sources"));
-    let checksums = lines(&dir.join("checksums"));
-    // TODO: these two have to line up
+    // TODO: a dir that isn't there at all blames version, should say so instead
+    let version = Version::parse(&required(&dir.join("version"))?)?;
+
+    let sources = lines(&dir.join("sources"))?;
+    let checksums = lines(&dir.join("checksums"))?;
+    // a hand written recipe can have sources and no checksums yet
+    if !checksums.is_empty() && sources.len() != checksums.len() {
+        return Err(Error::Counts {
+            sources: sources.len(),
+            checksums: checksums.len(),
+        });
+    }
 
     let mut depends = Vec::new();
-    for l in lines(&dir.join("depends")) {
+    for l in lines(&dir.join("depends"))? {
         // " make" on the end means build-only. splitting and looking at field two
         // beats matching the suffix, since the name can't contain a space anyway
         let mut f = l.split_whitespace();
-        let name = f.next().unwrap().to_string();
-        let make = f.next() == Some("make");
-        depends.push(Dep { name, make });
+        let Some(name) = f.next() else { continue };
+        depends.push(Dep {
+            name: name.to_string(),
+            make: f.next() == Some("make"),
+        });
     }
 
-    // normally one line, space separated. nothing stops one per line though and
-    // it would be annoying to care
+    // one line or one per line, either way
     let mut targets = Vec::new();
-    for l in lines(&dir.join("targets")) {
+    for l in lines(&dir.join("targets"))? {
         targets.extend(l.split_whitespace().map(String::from));
     }
+    if targets.is_empty() {
+        return Err(Error::Empty(dir.join("targets")));
+    }
 
-    Package {
+    Ok(Package {
         name,
         dir: dir.to_path_buf(),
         version,
@@ -77,33 +102,41 @@ pub fn load(dir: &Path) -> Package {
         checksums,
         depends,
         targets,
-    }
+    })
 }
 
 // version and targets are the only two files every package has. the rest are
-// optional and a missing one is just an empty list
-fn lines(p: &Path) -> Vec<String> {
-    // FIXME: an unreadable file looks identical to a missing one here
+// optional, so absent means empty list - but a file that is there and will not
+// read is a real problem and says so
+fn lines(p: &Path) -> Result<Vec<String>, Error> {
     let text = match fs::read_to_string(p) {
         Ok(t) => t,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(p.to_path_buf(), e)),
     };
 
-    text.lines()
+    Ok(text
+        .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(String::from)
-        .collect()
+        .collect())
+}
+
+fn required(p: &Path) -> Result<String, Error> {
+    fs::read_to_string(p).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => Error::Required(p.to_path_buf()),
+        _ => Error::Io(p.to_path_buf(), e),
+    })
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
-    // no tempfile crate, and CARGO_TARGET_TMPDIR is integration-tests only, so
-    // this is what's left. i hate it but it works
+    // no tempfile, and CARGO_TARGET_TMPDIR is integration-tests only
     fn scratch(name: &str) -> PathBuf {
-        // the leaf has to be the package name, load() takes it from the directory
         let d = std::env::temp_dir()
             .join(format!("kiry-t-{}", std::process::id()))
             .join(name);
@@ -118,7 +151,7 @@ mod tests {
 
     #[test]
     fn version_round_trips() {
-        let v = Version::parse("7.1.1 1");
+        let v = Version::parse("7.1.1 1").unwrap();
         assert_eq!(v.upstream, "7.1.1");
         assert_eq!(v.rev, 1);
         assert_eq!(v.to_string(), "7.1.1 1");
@@ -130,10 +163,10 @@ mod tests {
         write(&d, "version", "25.2.0 1\n");
         write(&d, "targets", "x86_64-musl x86_64-gnu\n");
         write(&d, "sources", "https://example.invalid/mesa-25.2.0.tar.xz\n");
-        write(&d, "checksums", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n");
+        write(&d, "checksums", &format!("{}\n", "e3b0c442".repeat(8)));
         write(&d, "depends", "libdrm\nwayland\nmuon make\n");
 
-        let p = load(&d);
+        let p = load(&d).unwrap();
         assert_eq!(p.name, "mesa");
         assert_eq!(p.version.to_string(), "25.2.0 1");
         assert_eq!(p.targets, ["x86_64-musl", "x86_64-gnu"]);
@@ -152,7 +185,7 @@ mod tests {
         write(&d, "version", "1.0 1");
         write(&d, "targets", "x86_64-musl");
 
-        let p = load(&d);
+        let p = load(&d).unwrap();
         assert!(p.depends.is_empty());
         assert!(p.sources.is_empty());
         assert_eq!(p.targets, ["x86_64-musl"]);
@@ -164,6 +197,59 @@ mod tests {
         write(&d, "version", "2 3");
         write(&d, "targets", "x86_64-musl\nx86_64-gnu\n");
 
-        assert_eq!(load(&d).targets, ["x86_64-musl", "x86_64-gnu"]);
+        assert_eq!(load(&d).unwrap().targets, ["x86_64-musl", "x86_64-gnu"]);
+    }
+
+    #[test]
+    fn version_has_to_have_both_fields() {
+        assert!(matches!(Version::parse("7.1.1"), Err(Error::Version(_))));
+        assert!(matches!(Version::parse(""), Err(Error::Version(_))));
+        assert!(matches!(Version::parse("7.1.1 x"), Err(Error::Version(_))));
+    }
+
+    #[test]
+    fn a_missing_version_names_the_file() {
+        let d = scratch("noversion");
+        write(&d, "targets", "x86_64-musl");
+
+        match load(&d) {
+            Err(Error::Required(p)) => assert!(p.ends_with("version")),
+            other => panic!("wanted Required, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn targets_cannot_be_blank() {
+        let d = scratch("notargets");
+        write(&d, "version", "1 1");
+        write(&d, "targets", "\n\n# only a comment\n");
+
+        assert!(matches!(load(&d), Err(Error::Empty(_))));
+    }
+
+    #[test]
+    fn checksums_have_to_pair_up_with_sources() {
+        let d = scratch("shortsums");
+        write(&d, "version", "1 1");
+        write(&d, "targets", "x86_64-musl");
+        write(&d, "sources", "a\nb\n");
+        write(&d, "checksums", "aa\n");
+
+        match load(&d) {
+            Err(Error::Counts { sources, checksums }) => {
+                assert_eq!((sources, checksums), (2, 1));
+            }
+            other => panic!("wanted Counts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_that_will_not_read_is_not_an_empty_file() {
+        let d = scratch("weird");
+        write(&d, "version", "1 1");
+        write(&d, "targets", "x86_64-musl");
+        fs::create_dir(d.join("sources")).unwrap();
+
+        assert!(matches!(load(&d), Err(Error::Io(_, _))));
     }
 }

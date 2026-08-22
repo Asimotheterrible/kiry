@@ -1,0 +1,7 @@
+[package]
+name = "kiry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kiry-core = { path = "../kiry-core" }

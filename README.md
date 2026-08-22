@@ -48,12 +48,13 @@ rustup target add x86_64-unknown-linux-musl     # not installed by default
 cargo build --release
 ```
 
-`cargo test` needs nothing beyond the toolchain today. Once extraction lands it also
-wants `zstd`, `libarchive-tools` (bsdtar), `busybox-static` and a `sha256sum`, because
-the suite builds one tree with GNU tar, bsdtar and busybox tar and then demands all three
-extract identically. The target system runs a busybox userland, and tar implementations
-disagree about long names, sparse files and pax records in ways that reach the installed
-root.
+`cargo test` shells out to `tar` and `zstd`. One test builds a real archive with them
+rather than a synthetic fixture, because a synthetic fixture is exactly what was happy
+with code that could not read a normal tarball. Extraction adds `libarchive-tools`
+(bsdtar), `busybox-static` and a `sha256sum`, since the suite then builds one tree with
+GNU tar, bsdtar and busybox tar and demands all three extract identically. The target
+system runs a busybox userland, and tar implementations disagree about long names,
+sparse files and pax records in ways that reach the installed root.
 
 A missing tool fails the suite rather than skipping it. `KIRY_TEST_ALLOW_SKIP=1` is the
 override. A suite that reports success while testing a third of what it claims is worse

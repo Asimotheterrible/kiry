@@ -5,6 +5,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+pub mod archive;
 pub mod db;
 pub mod pkg;
 
@@ -23,6 +24,8 @@ pub enum Error {
     Manifest { line: usize, why: &'static str },
     // a path the manifest format cannot represent, so it never gets written
     BadPath(String),
+    // an archive, or one member of it, that kiry refuses to touch
+    Archive { path: String, why: &'static str },
 }
 
 impl fmt::Display for Error {
@@ -39,6 +42,7 @@ impl fmt::Display for Error {
             Error::NoPackage(p) => write!(f, "no package at {}", p.display()),
             Error::Manifest { line, why } => write!(f, "manifest line {line}: {why}"),
             Error::BadPath(p) => write!(f, "cannot record this path: {p:?}"),
+            Error::Archive { path, why } => write!(f, "{path}: {why}"),
         }
     }
 }

@@ -5,6 +5,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+pub mod db;
 pub mod pkg;
 
 #[derive(Debug)]
@@ -18,6 +19,10 @@ pub enum Error {
     Version(String),
     Counts { sources: usize, checksums: usize },
     Name(PathBuf),
+    NoPackage(PathBuf),
+    Manifest { line: usize, why: &'static str },
+    // a path the manifest format cannot represent, so it never gets written
+    BadPath(String),
 }
 
 impl fmt::Display for Error {
@@ -31,6 +36,9 @@ impl fmt::Display for Error {
                 write!(f, "{sources} sources but {checksums} checksums")
             }
             Error::Name(p) => write!(f, "cannot tell the package name from {}", p.display()),
+            Error::NoPackage(p) => write!(f, "no package at {}", p.display()),
+            Error::Manifest { line, why } => write!(f, "manifest line {line}: {why}"),
+            Error::BadPath(p) => write!(f, "cannot record this path: {p:?}"),
         }
     }
 }

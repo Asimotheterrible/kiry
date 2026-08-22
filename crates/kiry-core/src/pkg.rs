@@ -54,13 +54,16 @@ pub struct Package {
 }
 
 pub fn load(dir: &Path) -> Result<Package, Error> {
+    if !dir.is_dir() {
+        return Err(Error::NoPackage(dir.to_path_buf()));
+    }
+
     let name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| Error::Name(dir.to_path_buf()))?
         .to_string();
 
-    // TODO: a dir that isn't there at all blames version, should say so instead
     let version = Version::parse(&required(&dir.join("version"))?)?;
 
     let sources = lines(&dir.join("sources"))?;
@@ -73,17 +76,7 @@ pub fn load(dir: &Path) -> Result<Package, Error> {
         });
     }
 
-    let mut depends = Vec::new();
-    for l in lines(&dir.join("depends"))? {
-        // " make" on the end means build-only. splitting and looking at field two
-        // beats matching the suffix, since the name can't contain a space anyway
-        let mut f = l.split_whitespace();
-        let Some(name) = f.next() else { continue };
-        depends.push(Dep {
-            name: name.to_string(),
-            make: f.next() == Some("make"),
-        });
-    }
+    let depends = depends_from(lines(&dir.join("depends"))?);
 
     // one line or one per line, either way
     let mut targets = Vec::new();
@@ -105,10 +98,8 @@ pub fn load(dir: &Path) -> Result<Package, Error> {
     })
 }
 
-// version and targets are the only two files every package has. the rest are
-// optional, so absent means empty list - but a file that is there and will not
-// read is a real problem and says so
-fn lines(p: &Path) -> Result<Vec<String>, Error> {
+// only version and targets are required. absent means empty, unreadable is an error
+pub(crate) fn lines(p: &Path) -> Result<Vec<String>, Error> {
     let text = match fs::read_to_string(p) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -123,7 +114,21 @@ fn lines(p: &Path) -> Result<Vec<String>, Error> {
         .collect())
 }
 
-fn required(p: &Path) -> Result<String, Error> {
+// " make" suffix means build-only
+pub(crate) fn depends_from(ls: Vec<String>) -> Vec<Dep> {
+    let mut out = Vec::new();
+    for l in ls {
+        let mut f = l.split_whitespace();
+        let Some(name) = f.next() else { continue };
+        out.push(Dep {
+            name: name.to_string(),
+            make: f.next() == Some("make"),
+        });
+    }
+    out
+}
+
+pub(crate) fn required(p: &Path) -> Result<String, Error> {
     fs::read_to_string(p).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => Error::Required(p.to_path_buf()),
         _ => Error::Io(p.to_path_buf(), e),
@@ -198,6 +203,13 @@ mod tests {
         write(&d, "targets", "x86_64-musl\nx86_64-gnu\n");
 
         assert_eq!(load(&d).unwrap().targets, ["x86_64-musl", "x86_64-gnu"]);
+    }
+
+    #[test]
+    fn a_directory_that_isnt_there_says_so() {
+        let d = scratch("gone");
+        fs::remove_dir_all(&d).unwrap();
+        assert!(matches!(load(&d), Err(Error::NoPackage(_))));
     }
 
     #[test]

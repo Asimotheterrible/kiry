@@ -1,13 +1,17 @@
-// resolving here is TOCTOU-able. RESOLVE_BENEATH is what actually keeps a member
-// inside the root
+// resolving here is TOCTOU-able. RESOLVE_BENEATH in extract() is what actually
+// keeps a member inside the root
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 
+use rustix::fs::{Mode, OFlags, ResolveFlags};
+use sha2::{Digest, Sha256};
 use tar::EntryType;
 
+use crate::db;
 use crate::Error;
 
 // the kernel gives up at 40 as well
@@ -44,6 +48,15 @@ pub fn plan(root: &Path, archive: &Path) -> Result<Vec<Member>, Error> {
 }
 
 pub fn plan_reader<R: Read>(root: &Path, reader: R) -> Result<Vec<Member>, Error> {
+    walk(root, reader, |_, _| Ok(()))
+}
+
+// one walk, two callers: plan collects, extract applies
+fn walk<R: Read>(
+    root: &Path,
+    reader: R,
+    mut each: impl FnMut(&mut tar::Entry<'_, R>, &Member) -> Result<(), Error>,
+) -> Result<Vec<Member>, Error> {
     let mut tar = tar::Archive::new(reader);
     let mut out = Vec::new();
     // symlinks this archive makes, before they exist on disk
@@ -129,14 +142,194 @@ pub fn plan_reader<R: Read>(root: &Path, reader: R) -> Result<Vec<Member>, Error
             made.insert(landed.clone(), t.clone());
         }
 
-        out.push(Member {
+        let m = Member {
             what,
             mode,
             path: landed,
-        });
+        };
+        each(&mut e, &m)?;
+        out.push(m);
     }
 
     Ok(out)
+}
+
+// mkdirat, symlinkat and linkat take no resolve flags, so the parent is opened with
+// openat2 first and the last component created relative to that fd
+pub fn extract(root: &Path, archive: &Path) -> Result<Vec<db::Entry>, Error> {
+    let f = fs::File::open(archive).map_err(|e| Error::Io(archive.to_path_buf(), e))?;
+    let z = ruzstd::decoding::StreamingDecoder::new(io::BufReader::new(f)).map_err(|_| {
+        Error::Archive {
+            path: archive.display().to_string(),
+            why: "not a zstd stream",
+        }
+    })?;
+
+    let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
+
+    let mut manifest: Vec<db::Entry> = Vec::new();
+    walk(root, z, |entry, m| {
+        apply(&rootfd, entry, m, &mut manifest)
+    })
+    .map_err(|e| match e {
+        Error::Io(p, inner) if p.as_os_str().is_empty() => Error::Io(archive.to_path_buf(), inner),
+        other => other,
+    })?;
+
+    Ok(manifest)
+}
+
+fn apply<R: Read>(
+    rootfd: &OwnedFd,
+    entry: &mut tar::Entry<'_, R>,
+    m: &Member,
+    manifest: &mut Vec<db::Entry>,
+) -> Result<(), Error> {
+    let (parent, name) = split(&m.path);
+    let pfd = parent_fd(rootfd, parent, manifest)?;
+
+    // /etc/kiry/setuid does not exist yet
+    let mode = m.mode & 0o1777;
+
+    let kind = match &m.what {
+        What::Dir => {
+            mkdir(&pfd, name, mode, &m.path)?;
+            db::Kind::Dir
+        }
+        What::File => {
+            clear(&pfd, name);
+            let fd = rustix::fs::openat(
+                &pfd,
+                name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+                Mode::from_bits_truncate(mode),
+            )
+            .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
+
+            let mut out = fs::File::from(fd);
+            let mut h = Sha256::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = entry.read(&mut buf).map_err(anon)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+                out.write_all(&buf[..n])
+                    .map_err(|e| Error::Io(m.path.clone().into(), e))?;
+            }
+            db::Kind::File(hex(&h.finalize()))
+        }
+        What::Link(target) => {
+            clear(&pfd, name);
+            rustix::fs::symlinkat(target.as_str(), &pfd, name)
+                .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
+            db::Kind::Link(target.clone())
+        }
+        What::Hard(target) => {
+            clear(&pfd, name);
+            rustix::fs::linkat(
+                rootfd,
+                target.as_str(),
+                &pfd,
+                name,
+                rustix::fs::AtFlags::empty(),
+            )
+            .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
+            db::Kind::Hard(target.clone())
+        }
+    };
+
+    manifest.push(db::Entry {
+        mode,
+        kind,
+        path: m.path.clone(),
+    });
+    Ok(())
+}
+
+fn split(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+fn clear(pfd: &OwnedFd, name: &str) {
+    let _ = rustix::fs::unlinkat(pfd, name, rustix::fs::AtFlags::empty());
+}
+
+fn mkdir(pfd: &OwnedFd, name: &str, mode: u32, blame: &str) -> Result<(), Error> {
+    match rustix::fs::mkdirat(pfd, name, Mode::from_bits_truncate(mode)) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::EXIST) => Ok(()),
+        Err(e) => Err(Error::Io(blame.into(), e.into())),
+    }
+}
+
+fn parent_fd(
+    rootfd: &OwnedFd,
+    parent: &str,
+    manifest: &mut Vec<db::Entry>,
+) -> Result<OwnedFd, Error> {
+    if parent.is_empty() {
+        return rootfd
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| Error::Io(std::path::PathBuf::new(), e));
+    }
+
+    let open = |p: &str| {
+        rustix::fs::openat2(
+            rootfd,
+            p,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
+        )
+    };
+
+    if let Ok(fd) = open(parent) {
+        return Ok(fd);
+    }
+
+    // archive named a file without its directory
+    let mut walked = String::new();
+    for c in parent.split('/') {
+        if !walked.is_empty() {
+            walked.push('/');
+        }
+        walked.push_str(c);
+        if open(&walked).is_ok() {
+            continue;
+        }
+        let (up, name) = split(&walked);
+        let upfd = if up.is_empty() {
+            rootfd
+                .as_fd()
+                .try_clone_to_owned()
+                .map_err(|e| Error::Io(std::path::PathBuf::new(), e))?
+        } else {
+            open(up).map_err(|e| Error::Io(up.into(), e.into()))?
+        };
+        mkdir(&upfd, name, 0o755, &walked)?;
+        manifest.push(db::Entry {
+            mode: 0o755,
+            kind: db::Kind::Dir,
+            path: walked.clone(),
+        });
+    }
+
+    open(parent).map_err(|e| Error::Io(parent.into(), e.into()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn anon(e: io::Error) -> Error {
@@ -458,6 +651,117 @@ mod tests {
             why(plan_reader(&r, &b.into_inner().unwrap()[..])),
             "carries an xattr record"
         );
+    }
+
+    fn build(dir: &Path, arc: &Path) {
+        let sh = format!("cd {} && tar cf - . | zstd -q -o {}", dir.display(), arc.display());
+        let ok = std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap();
+        assert!(ok.success(), "the suite needs tar and zstd on PATH");
+    }
+
+    #[test]
+    fn it_extracts_a_real_tarball() {
+        let r = root("ex");
+        let src = r.join("src");
+        fs::create_dir_all(src.join("usr/bin")).unwrap();
+        fs::write(src.join("usr/bin/foo"), b"hello there").unwrap();
+        fs::set_permissions(
+            src.join("usr/bin/foo"),
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("foo", src.join("usr/bin/bar")).unwrap();
+
+        let arc = r.join("p.tar.zst");
+        build(&src, &arc);
+
+        let dest = r.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let man = extract(&dest, &arc).unwrap();
+
+        assert_eq!(fs::read_to_string(dest.join("usr/bin/foo")).unwrap(), "hello there");
+        assert_eq!(
+            fs::read_link(dest.join("usr/bin/bar")).unwrap().display().to_string(),
+            "foo"
+        );
+
+        let foo = man.iter().find(|e| e.path == "usr/bin/foo").unwrap();
+        assert_eq!(foo.mode, 0o755);
+        let db::Kind::File(sha) = &foo.kind else {
+            panic!("usr/bin/foo is not a file in the manifest")
+        };
+
+        let out = std::process::Command::new("sha256sum")
+            .arg(dest.join("usr/bin/foo"))
+            .output()
+            .unwrap();
+        let want = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(sha, want.split_whitespace().next().unwrap());
+    }
+
+    #[test]
+    fn layer_two_refuses_to_leave_the_root() {
+        let r = root("beneath");
+        fs::create_dir_all(r.join("usr")).unwrap();
+        let rootfd =
+            rustix::fs::open(&r, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+        let mut junk = Vec::new();
+
+        assert!(parent_fd(&rootfd, "usr", &mut junk).is_ok(), "a real dir should open");
+        for bad in ["..", "../..", "/etc", "usr/../.."] {
+            assert!(
+                parent_fd(&rootfd, bad, &mut junk).is_err(),
+                "openat2 let {bad:?} through, RESOLVE_BENEATH is not doing its job"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_replaces_a_symlink_already_on_disk() {
+        let r = root("clobber");
+        let src = r.join("src");
+        fs::create_dir_all(src.join("usr/bin")).unwrap();
+        fs::write(src.join("usr/bin/foo"), b"new").unwrap();
+        let arc = r.join("p.tar.zst");
+        build(&src, &arc);
+
+        let dest = r.join("dest");
+        fs::create_dir_all(dest.join("usr/bin")).unwrap();
+        fs::write(dest.join("canary"), b"do not touch").unwrap();
+        std::os::unix::fs::symlink("/canary", dest.join("usr/bin/foo")).unwrap();
+
+        extract(&dest, &arc).unwrap();
+
+        assert_eq!(fs::read_to_string(dest.join("canary")).unwrap(), "do not touch");
+        assert_eq!(fs::read_to_string(dest.join("usr/bin/foo")).unwrap(), "new");
+        assert!(!dest.join("usr/bin/foo").symlink_metadata().unwrap().is_symlink());
+    }
+
+    #[test]
+    fn setuid_bits_do_not_survive() {
+        let r = root("suid");
+        let src = r.join("src");
+        fs::create_dir_all(src.join("usr/bin")).unwrap();
+        let p = src.join("usr/bin/ping");
+        fs::write(&p, b"x").unwrap();
+        fs::set_permissions(
+            &p,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o4755),
+        )
+        .unwrap();
+        let arc = r.join("p.tar.zst");
+        build(&src, &arc);
+
+        let dest = r.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let man = extract(&dest, &arc).unwrap();
+
+        let e = man.iter().find(|e| e.path == "usr/bin/ping").unwrap();
+        assert_eq!(e.mode, 0o755, "setuid survived into the manifest");
+        let on_disk = <fs::Metadata as std::os::unix::fs::MetadataExt>::mode(
+            &fs::metadata(dest.join("usr/bin/ping")).unwrap(),
+        );
+        assert_eq!(on_disk & 0o7000, 0, "setuid survived onto disk");
     }
 
     #[test]

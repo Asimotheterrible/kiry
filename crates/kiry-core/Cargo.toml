@@ -4,5 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
 ruzstd = "0.9.0"
+sha2 = "0.11.0"
 tar = { version = "0.4.46", default-features = false }

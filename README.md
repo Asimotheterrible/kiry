@@ -74,6 +74,23 @@ extra/foo/
 └── …             optional: flags, filter, group, tracker, pin, policy
 ```
 
+An archive carries the same fields again in a `.meta` directory beside it. The name is
+appended to the whole file name rather than derived from it, because an archive's name
+is a display name and nothing parses it:
+
+```
+foo-1.2.3-1.x86_64-musl.tar.zst
+foo-1.2.3-1.x86_64-musl.tar.zst.meta/
+├── name        required
+├── version     required, same "1.2.3 1" as the recipe
+├── targets     required, and exactly one line, unlike the recipe's
+├── depends     optional, copied from the recipe
+└── hash        the source hash, for the provenance check; i does not read it yet
+```
+
+Whatever builds the archive writes this directory too. Building one by hand means
+writing it by hand, or `i` has nothing to go on.
+
 Nothing generated lives in the repo. The manifest, `provides`, `status` and the soname
 index all live under `/usr/lib/kiry/db/`, inside the root subvolume, so they roll back
 atomically with the files they describe. `/var/kiry/` holds caches, staging and the

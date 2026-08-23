@@ -52,12 +52,18 @@ rustup target add x86_64-unknown-linux-musl     # not installed by default
 cargo build --release
 ```
 
-`cargo test` shells out to `tar`, `libarchive-tools` (bsdtar), `busybox-static`, `zstd`
-and a `sha256sum`. The suite builds one tree with all three tars and demands they extract
-identically, because the target system runs a busybox userland and tar implementations
-disagree about long names, spaces and pax records in ways that reach the installed root.
-A synthetic fixture is exactly what was happy with code that could not read a normal
-tarball.
+`cargo test` shells out to `tar`, `libarchive-tools` (bsdtar), `busybox-static`, `zstd`,
+a `sha256sum`, `readelf` and a C compiler. The suite builds one tree with all three tars
+and demands they extract identically, because the target system runs a busybox userland
+and tar implementations disagree about long names, spaces and pax records in ways that
+reach the installed root. A synthetic fixture is exactly what was happy with code that
+could not read a normal tarball.
+
+The ELF reader gets the same treatment against `readelf`, over every shared library and
+executable installed on the machine running the suite. The compiler is there to build one
+`-no-pie` binary: `DT_STRTAB` is an address rather than a file offset, the two are equal
+in position-independent code, and a reader that never maps one to the other agrees with
+`readelf` on everything else installed.
 
 A missing tool fails the suite rather than skipping it. `KIRY_TEST_ALLOW_SKIP=1` is the
 override. A suite that reports success while testing a third of what it claims is worse

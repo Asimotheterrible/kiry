@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 pub mod archive;
 pub mod db;
+pub mod elf;
 pub mod install;
 pub mod pkg;
 
@@ -50,6 +51,8 @@ pub enum Error {
     BadPath(String),
     // an archive, or one member of it, that kiry refuses to touch
     Archive { path: String, why: &'static str },
+    // an elf kiry could not make sense of
+    Elf { path: String, why: &'static str },
     Conflict { path: String, owner: String },
     Targets(PathBuf),
     MissingDep { pkg: String, dep: String },
@@ -71,6 +74,7 @@ impl fmt::Display for Error {
             Error::Manifest { line, why } => write!(f, "manifest line {line}: {why}"),
             Error::BadPath(p) => write!(f, "cannot record this path: {p:?}"),
             Error::Archive { path, why } => write!(f, "{path}: {why}"),
+            Error::Elf { path, why } => write!(f, "{path}: {why}"),
             Error::Conflict { path, owner } => write!(f, "{path} is owned by {owner}"),
             Error::Targets(p) => write!(f, "{} must hold exactly one target", p.display()),
             Error::MissingDep { pkg, dep } => write!(f, "{pkg} needs {dep}"),

@@ -33,11 +33,12 @@ That is why one maintainer is enough.
 
 ## Status
 
-Early. It reads the package format (`version`, `sources`, `checksums`, `depends`,
-`targets`) and prints back what it parsed. Nothing gets installed yet.
+`l`, `i` and `r` work against a real root, along with the archive extraction and the
+installed database underneath them. `b` does not exist yet, so packages have to arrive
+as an archive built somewhere else.
 
-Extraction, the installed database and `l` `i` `r` come next. **The soname engine, which
-is the part that is actually novel, has not been written, but it WILL BE written.**
+**The soname engine, which is the part that is actually novel, has not been written,
+but it WILL BE written.**
 
 Do not point this at your system **yet**.
 
@@ -48,13 +49,12 @@ rustup target add x86_64-unknown-linux-musl     # not installed by default
 cargo build --release
 ```
 
-`cargo test` shells out to `tar` and `zstd`. One test builds a real archive with them
-rather than a synthetic fixture, because a synthetic fixture is exactly what was happy
-with code that could not read a normal tarball. Extraction adds `libarchive-tools`
-(bsdtar), `busybox-static` and a `sha256sum`, since the suite then builds one tree with
-GNU tar, bsdtar and busybox tar and demands all three extract identically. The target
-system runs a busybox userland, and tar implementations disagree about long names,
-sparse files and pax records in ways that reach the installed root.
+`cargo test` shells out to `tar`, `libarchive-tools` (bsdtar), `busybox-static`, `zstd`
+and a `sha256sum`. The suite builds one tree with all three tars and demands they extract
+identically, because the target system runs a busybox userland and tar implementations
+disagree about long names, spaces and pax records in ways that reach the installed root.
+A synthetic fixture is exactly what was happy with code that could not read a normal
+tarball.
 
 A missing tool fails the suite rather than skipping it. `KIRY_TEST_ALLOW_SKIP=1` is the
 override. A suite that reports success while testing a third of what it claims is worse
@@ -100,15 +100,17 @@ nothing.
 ## Commands
 
 ```
-kiry <dir>          print a parsed package
+kiry l [--root DIR]                        list installed
+kiry i [--root DIR] [--force] <archive>... install
+kiry r [--root DIR] [--force] <pkg>...     remove
+kiry <dir>                                 print a parsed package
 ```
+
+`--root` defaults to `/`, or whatever `KIRY_ROOT` says.
 
 Planned, and none of them written yet:
 
 ```
-kiry l              list installed
-kiry i <pkg>        install
-kiry r <pkg>        remove
 kiry b <pkg>        build into a staging root
 kiry doctor         verify every installed ELF's linkage resolves
 kiry why <pkg>      reverse-dependency path

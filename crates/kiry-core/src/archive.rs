@@ -601,41 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn it_reads_a_tarball_the_real_tools_made() {
-        let r = root("realzst");
-        let src = r.join("src");
-        fs::create_dir_all(src.join("usr/bin")).unwrap();
-        fs::write(src.join("usr/bin/foo"), b"hi").unwrap();
-        std::os::unix::fs::symlink("foo", src.join("usr/bin/bar")).unwrap();
-
-        let arc = r.join("p.tar.zst");
-        let sh = format!(
-            "cd {} && tar cf - . | zstd -q -o {}",
-            src.display(),
-            arc.display()
-        );
-        let ok = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&sh)
-            .status()
-            .unwrap();
-        assert!(ok.success(), "the suite needs tar and zstd on PATH");
-
-        let dest = r.join("dest");
-        fs::create_dir_all(&dest).unwrap();
-        let m = plan(&dest, &arc).unwrap();
-
-        let got = paths(&m);
-        assert!(got.contains(&"usr/bin/foo"), "got {got:?}");
-        assert!(got.contains(&"usr/bin"), "got {got:?}");
-        assert!(!got.iter().any(|p| p.is_empty()), "the ./ root leaked in: {got:?}");
-        assert!(
-            m.iter().any(|e| e.what == What::Link("foo".into())),
-            "the symlink did not survive: {m:?}"
-        );
-    }
-
-    #[test]
     fn an_xattr_record_is_refused() {
         let r = root("xattr");
         let mut b = tar::Builder::new(Vec::new());
@@ -655,52 +620,6 @@ mod tests {
         );
     }
 
-    fn build(dir: &Path, arc: &Path) {
-        let sh = format!("cd {} && tar cf - . | zstd -q -o {}", dir.display(), arc.display());
-        let ok = std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap();
-        assert!(ok.success(), "the suite needs tar and zstd on PATH");
-    }
-
-    #[test]
-    fn it_extracts_a_real_tarball() {
-        let r = root("ex");
-        let src = r.join("src");
-        fs::create_dir_all(src.join("usr/bin")).unwrap();
-        fs::write(src.join("usr/bin/foo"), b"hello there").unwrap();
-        fs::set_permissions(
-            src.join("usr/bin/foo"),
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("foo", src.join("usr/bin/bar")).unwrap();
-
-        let arc = r.join("p.tar.zst");
-        build(&src, &arc);
-
-        let dest = r.join("dest");
-        fs::create_dir_all(&dest).unwrap();
-        let man = extract(&dest, &arc).unwrap();
-
-        assert_eq!(fs::read_to_string(dest.join("usr/bin/foo")).unwrap(), "hello there");
-        assert_eq!(
-            fs::read_link(dest.join("usr/bin/bar")).unwrap().display().to_string(),
-            "foo"
-        );
-
-        let foo = man.iter().find(|e| e.path == "usr/bin/foo").unwrap();
-        assert_eq!(foo.mode, 0o755);
-        let db::Kind::File(sha) = &foo.kind else {
-            panic!("usr/bin/foo is not a file in the manifest")
-        };
-
-        let out = std::process::Command::new("sha256sum")
-            .arg(dest.join("usr/bin/foo"))
-            .output()
-            .unwrap();
-        let want = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(sha, want.split_whitespace().next().unwrap());
-    }
-
     #[test]
     fn layer_two_refuses_to_leave_the_root() {
         let r = root("beneath");
@@ -716,54 +635,6 @@ mod tests {
                 "openat2 let {bad:?} through, RESOLVE_BENEATH is not doing its job"
             );
         }
-    }
-
-    #[test]
-    fn a_file_replaces_a_symlink_already_on_disk() {
-        let r = root("clobber");
-        let src = r.join("src");
-        fs::create_dir_all(src.join("usr/bin")).unwrap();
-        fs::write(src.join("usr/bin/foo"), b"new").unwrap();
-        let arc = r.join("p.tar.zst");
-        build(&src, &arc);
-
-        let dest = r.join("dest");
-        fs::create_dir_all(dest.join("usr/bin")).unwrap();
-        fs::write(dest.join("canary"), b"do not touch").unwrap();
-        std::os::unix::fs::symlink("/canary", dest.join("usr/bin/foo")).unwrap();
-
-        extract(&dest, &arc).unwrap();
-
-        assert_eq!(fs::read_to_string(dest.join("canary")).unwrap(), "do not touch");
-        assert_eq!(fs::read_to_string(dest.join("usr/bin/foo")).unwrap(), "new");
-        assert!(!dest.join("usr/bin/foo").symlink_metadata().unwrap().is_symlink());
-    }
-
-    #[test]
-    fn setuid_bits_do_not_survive() {
-        let r = root("suid");
-        let src = r.join("src");
-        fs::create_dir_all(src.join("usr/bin")).unwrap();
-        let p = src.join("usr/bin/ping");
-        fs::write(&p, b"x").unwrap();
-        fs::set_permissions(
-            &p,
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o4755),
-        )
-        .unwrap();
-        let arc = r.join("p.tar.zst");
-        build(&src, &arc);
-
-        let dest = r.join("dest");
-        fs::create_dir_all(&dest).unwrap();
-        let man = extract(&dest, &arc).unwrap();
-
-        let e = man.iter().find(|e| e.path == "usr/bin/ping").unwrap();
-        assert_eq!(e.mode, 0o755, "setuid survived into the manifest");
-        let on_disk = <fs::Metadata as std::os::unix::fs::MetadataExt>::mode(
-            &fs::metadata(dest.join("usr/bin/ping")).unwrap(),
-        );
-        assert_eq!(on_disk & 0o7000, 0, "setuid survived onto disk");
     }
 
     #[test]

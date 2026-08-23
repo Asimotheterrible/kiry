@@ -21,10 +21,7 @@ fn kiry_core_fits_in_its_budget() {
     let mut rows = String::new();
     for f in &files {
         let text = fs::read_to_string(f).unwrap();
-        let n = text
-            .lines()
-            .take_while(|l| *l != "#[cfg(test)]")
-            .count();
+        let n = text.lines().take_while(|l| *l != "#[cfg(test)]").count();
         total += n;
         rows.push_str(&format!(
             "\n  {n:>5}  {}",

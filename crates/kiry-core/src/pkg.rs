@@ -167,7 +167,11 @@ mod tests {
         let d = scratch("mesa");
         write(&d, "version", "25.2.0 1\n");
         write(&d, "targets", "x86_64-musl x86_64-gnu\n");
-        write(&d, "sources", "https://example.invalid/mesa-25.2.0.tar.xz\n");
+        write(
+            &d,
+            "sources",
+            "https://example.invalid/mesa-25.2.0.tar.xz\n",
+        );
         write(&d, "checksums", &format!("{}\n", "e3b0c442".repeat(8)));
         write(&d, "depends", "libdrm\nwayland\nmuon make\n");
 

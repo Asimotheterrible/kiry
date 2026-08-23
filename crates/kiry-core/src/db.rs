@@ -260,8 +260,14 @@ mod tests {
             ("x 0644 {SHA} usr/bin/foo", "kind is not one of f d l h"),
             ("f 08x9 {SHA} usr/bin/foo", "mode is not octal"),
             ("f 0644 deadbeef usr/bin/foo", "not a sha256"),
-            ("d 0755 nope usr/share/foo", "a directory takes - in field three"),
-            ("f 0644 {SHA} /usr/bin/foo", "path must be relative to the root"),
+            (
+                "d 0755 nope usr/share/foo",
+                "a directory takes - in field three",
+            ),
+            (
+                "f 0644 {SHA} /usr/bin/foo",
+                "path must be relative to the root",
+            ),
         ];
         for (raw, want) in cases {
             let line = raw.replace("{SHA}", SHA);
@@ -283,10 +289,16 @@ mod tests {
             kind: Kind::File(SHA.to_string()),
             path: "usr/bin/with\nnewline".to_string(),
         };
-        assert!(matches!(format_manifest(&[e.clone()]), Err(Error::BadPath(_))));
+        assert!(matches!(
+            format_manifest(&[e.clone()]),
+            Err(Error::BadPath(_))
+        ));
 
         e.path = "/absolute".to_string();
-        assert!(matches!(format_manifest(&[e.clone()]), Err(Error::BadPath(_))));
+        assert!(matches!(
+            format_manifest(&[e.clone()]),
+            Err(Error::BadPath(_))
+        ));
 
         e.path = "usr/bin/baz".to_string();
         e.kind = Kind::Link("../some dir/bar".to_string());
@@ -300,10 +312,7 @@ mod tests {
             name: "mesa".to_string(),
             target: "x86_64-musl".to_string(),
             version: Version::parse("25.2.0 1").unwrap(),
-            depends: pkg::depends_from(vec![
-                "libdrm".to_string(),
-                "muon make".to_string(),
-            ]),
+            depends: pkg::depends_from(vec!["libdrm".to_string(), "muon make".to_string()]),
             manifest: parse_manifest(&sample()).unwrap(),
         };
 

@@ -15,7 +15,10 @@ const TARS: &[(&str, &str)] = &[
 ];
 
 fn have(cmd: &str) -> bool {
-    let probe = format!("command -v {} >/dev/null", cmd.split(' ').next().unwrap_or(cmd));
+    let probe = format!(
+        "command -v {} >/dev/null",
+        cmd.split(' ').next().unwrap_or(cmd)
+    );
     Command::new("sh")
         .arg("-c")
         .arg(probe)
@@ -42,7 +45,11 @@ fn build_tree(at: &Path) {
     fs::write(at.join("usr/bin/tool"), b"#!/bin/sh\necho hi\n").unwrap();
     fs::set_permissions(at.join("usr/bin/tool"), perms(0o755)).unwrap();
 
-    fs::write(at.join("usr/share/with space/file with spaces.txt"), b"spaces\n").unwrap();
+    fs::write(
+        at.join("usr/share/with space/file with spaces.txt"),
+        b"spaces\n",
+    )
+    .unwrap();
     fs::write(at.join(format!("usr/share/doc/{long}/readme")), b"long\n").unwrap();
     fs::write(at.join("usr/share/empty"), b"").unwrap();
 

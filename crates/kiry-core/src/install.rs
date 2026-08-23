@@ -271,8 +271,20 @@ mod tests {
 // repair path has to work with no config present, and a config file that can
 // delete /usr is not worth having
 const PROTECTED: &[&str] = &[
-    "", "usr", "etc", "var", "bin", "sbin", "lib", "lib64", "usr/bin", "usr/sbin",
-    "usr/lib", "usr/lib64", "usr/local", "usr/share",
+    "",
+    "usr",
+    "etc",
+    "var",
+    "bin",
+    "sbin",
+    "lib",
+    "lib64",
+    "usr/bin",
+    "usr/sbin",
+    "usr/lib",
+    "usr/lib64",
+    "usr/local",
+    "usr/share",
 ];
 
 #[derive(Debug, Default, PartialEq, Eq)]

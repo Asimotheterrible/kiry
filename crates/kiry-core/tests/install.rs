@@ -4,9 +4,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use kiry_core::{archive, db, install, Error};
-use kiry_core::install::Job;
 use kiry_core::archive::{Member, What};
+use kiry_core::install::Job;
+use kiry_core::{archive, db, install, Error};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir()
@@ -90,7 +90,12 @@ fn a_batch_installs_and_records_itself() {
 #[test]
 fn removing_takes_the_files_and_the_record() {
     let (d, root) = rooted("rm");
-    run(&root, &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])], false).unwrap();
+    run(
+        &root,
+        &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])],
+        false,
+    )
+    .unwrap();
 
     let r = install::remove(&root, "x86_64-musl", "foo", false).unwrap();
     assert_eq!(r.gone, 1);
@@ -102,7 +107,12 @@ fn removing_takes_the_files_and_the_record() {
 #[test]
 fn a_modified_file_is_left_where_it_is() {
     let (d, root) = rooted("modified");
-    run(&root, &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])], false).unwrap();
+    run(
+        &root,
+        &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])],
+        false,
+    )
+    .unwrap();
     fs::write(root.join("usr/share/doc/foo/x"), b"edited by hand").unwrap();
 
     let r = install::remove(&root, "x86_64-musl", "foo", false).unwrap();
@@ -117,12 +127,22 @@ fn a_modified_file_is_left_where_it_is() {
 #[test]
 fn a_symlink_where_the_file_belongs_counts_as_modified() {
     let (d, root) = rooted("swapped");
-    run(&root, &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])], false).unwrap();
+    run(
+        &root,
+        &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])],
+        false,
+    )
+    .unwrap();
     let p = root.join("usr/share/doc/foo/x");
     fs::remove_file(&p).unwrap();
     std::os::unix::fs::symlink("/etc/passwd", &p).unwrap();
 
-    assert_eq!(install::remove(&root, "x86_64-musl", "foo", false).unwrap().kept, 1);
+    assert_eq!(
+        install::remove(&root, "x86_64-musl", "foo", false)
+            .unwrap()
+            .kept,
+        1
+    );
     assert!(p.symlink_metadata().unwrap().is_symlink());
 }
 
@@ -193,20 +213,29 @@ fn it_reads_a_tarball_the_real_tools_made() {
     let got = paths(&m);
     assert!(got.contains(&"usr/bin/foo"), "got {got:?}");
     assert!(got.contains(&"usr/bin"), "got {got:?}");
-    assert!(!got.iter().any(|p| p.is_empty()), "the ./ root leaked in: {got:?}");
+    assert!(
+        !got.iter().any(|p| p.is_empty()),
+        "the ./ root leaked in: {got:?}"
+    );
     assert!(
         m.iter().any(|e| e.what == What::Link("foo".into())),
         "the symlink did not survive: {m:?}"
     );
 }
 
-
 fn build(dir: &Path, arc: &Path) {
-    let sh = format!("cd {} && tar cf - . | zstd -q -o {}", dir.display(), arc.display());
-    let ok = std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap();
+    let sh = format!(
+        "cd {} && tar cf - . | zstd -q -o {}",
+        dir.display(),
+        arc.display()
+    );
+    let ok = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&sh)
+        .status()
+        .unwrap();
     assert!(ok.success(), "the suite needs tar and zstd on PATH");
 }
-
 
 #[test]
 fn it_extracts_a_real_tarball() {
@@ -228,9 +257,15 @@ fn it_extracts_a_real_tarball() {
     fs::create_dir_all(&dest).unwrap();
     let man = archive::extract(&dest, &arc).unwrap();
 
-    assert_eq!(fs::read_to_string(dest.join("usr/bin/foo")).unwrap(), "hello there");
     assert_eq!(
-        fs::read_link(dest.join("usr/bin/bar")).unwrap().display().to_string(),
+        fs::read_to_string(dest.join("usr/bin/foo")).unwrap(),
+        "hello there"
+    );
+    assert_eq!(
+        fs::read_link(dest.join("usr/bin/bar"))
+            .unwrap()
+            .display()
+            .to_string(),
         "foo"
     );
 
@@ -248,7 +283,6 @@ fn it_extracts_a_real_tarball() {
     assert_eq!(sha, want.split_whitespace().next().unwrap());
 }
 
-
 #[test]
 fn a_file_replaces_a_symlink_already_on_disk() {
     let r = root("clobber");
@@ -265,11 +299,17 @@ fn a_file_replaces_a_symlink_already_on_disk() {
 
     archive::extract(&dest, &arc).unwrap();
 
-    assert_eq!(fs::read_to_string(dest.join("canary")).unwrap(), "do not touch");
+    assert_eq!(
+        fs::read_to_string(dest.join("canary")).unwrap(),
+        "do not touch"
+    );
     assert_eq!(fs::read_to_string(dest.join("usr/bin/foo")).unwrap(), "new");
-    assert!(!dest.join("usr/bin/foo").symlink_metadata().unwrap().is_symlink());
+    assert!(!dest
+        .join("usr/bin/foo")
+        .symlink_metadata()
+        .unwrap()
+        .is_symlink());
 }
-
 
 #[test]
 fn setuid_bits_do_not_survive() {
@@ -297,4 +337,3 @@ fn setuid_bits_do_not_survive() {
     );
     assert_eq!(on_disk & 0o7000, 0, "setuid survived onto disk");
 }
-

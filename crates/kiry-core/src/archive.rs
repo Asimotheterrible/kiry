@@ -169,10 +169,7 @@ pub fn extract(root: &Path, archive: &Path) -> Result<Vec<db::Entry>, Error> {
         .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
 
     let mut manifest: Vec<db::Entry> = Vec::new();
-    walk(root, z, |entry, m| {
-        apply(&rootfd, entry, m, &mut manifest)
-    })
-    .map_err(|e| match e {
+    walk(root, z, |entry, m| apply(&rootfd, entry, m, &mut manifest)).map_err(|e| match e {
         Error::Io(p, inner) if p.as_os_str().is_empty() => Error::Io(archive.to_path_buf(), inner),
         other => other,
     })?;
@@ -450,7 +447,11 @@ mod tests {
         fn verbatim(mut self, p: &str, kind: EntryType) -> Self {
             let mut h = tar::Header::new_gnu();
             h.set_size(0);
-            h.set_mode(if kind == EntryType::Directory { 0o755 } else { 0o644 });
+            h.set_mode(if kind == EntryType::Directory {
+                0o755
+            } else {
+                0o644
+            });
             h.set_entry_type(kind);
             h.set_path("placeholder").unwrap();
             let b = h.as_mut_bytes();
@@ -539,11 +540,17 @@ mod tests {
     fn climbing_out_with_dot_dot_is_refused() {
         let r = root("climb");
         assert_eq!(
-            why(plan_reader(&r, &Tar::new().evil("../etc/passwd").done()[..])),
+            why(plan_reader(
+                &r,
+                &Tar::new().evil("../etc/passwd").done()[..]
+            )),
             "would climb out of the root"
         );
         assert_eq!(
-            why(plan_reader(&r, &Tar::new().evil("usr/../../etc/passwd").done()[..])),
+            why(plan_reader(
+                &r,
+                &Tar::new().evil("usr/../../etc/passwd").done()[..]
+            )),
             "would climb out of the root"
         );
     }
@@ -560,7 +567,10 @@ mod tests {
     #[test]
     fn a_symlink_the_archive_makes_cannot_be_used_to_escape() {
         let r = root("selfmade");
-        let t = Tar::new().link("evil", "../..").file("evil/etc/passwd").done();
+        let t = Tar::new()
+            .link("evil", "../..")
+            .file("evil/etc/passwd")
+            .done();
         assert_eq!(why(plan_reader(&r, &t[..])), "would climb out of the root");
     }
 
@@ -587,7 +597,10 @@ mod tests {
     fn a_newline_in_a_path_is_refused() {
         let r = root("newline");
         assert_eq!(
-            why(plan_reader(&r, &Tar::new().evil("usr/bin/two\nlines").done()[..])),
+            why(plan_reader(
+                &r,
+                &Tar::new().evil("usr/bin/two\nlines").done()[..]
+            )),
             "newline in the path"
         );
     }
@@ -620,7 +633,10 @@ mod tests {
             rustix::fs::open(&r, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
         let mut junk = Vec::new();
 
-        assert!(parent_fd(&rootfd, "usr", &mut junk).is_ok(), "a real dir should open");
+        assert!(
+            parent_fd(&rootfd, "usr", &mut junk).is_ok(),
+            "a real dir should open"
+        );
         for bad in ["..", "../..", "/etc", "usr/../.."] {
             assert!(
                 parent_fd(&rootfd, bad, &mut junk).is_err(),

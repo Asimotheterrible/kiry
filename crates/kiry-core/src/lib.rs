@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 pub mod archive;
 pub mod db;
+pub mod install;
 pub mod pkg;
 
 #[derive(Debug)]
@@ -26,6 +27,10 @@ pub enum Error {
     BadPath(String),
     // an archive, or one member of it, that kiry refuses to touch
     Archive { path: String, why: &'static str },
+    Conflict { path: String, owner: String },
+    Targets(PathBuf),
+    MissingDep { pkg: String, dep: String },
+    Needed { pkg: String, by: String },
 }
 
 impl fmt::Display for Error {
@@ -43,6 +48,10 @@ impl fmt::Display for Error {
             Error::Manifest { line, why } => write!(f, "manifest line {line}: {why}"),
             Error::BadPath(p) => write!(f, "cannot record this path: {p:?}"),
             Error::Archive { path, why } => write!(f, "{path}: {why}"),
+            Error::Conflict { path, owner } => write!(f, "{path} is owned by {owner}"),
+            Error::Targets(p) => write!(f, "{} must hold exactly one target", p.display()),
+            Error::MissingDep { pkg, dep } => write!(f, "{pkg} needs {dep}"),
+            Error::Needed { pkg, by } => write!(f, "{by} still needs {pkg}"),
         }
     }
 }

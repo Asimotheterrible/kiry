@@ -1,0 +1,53 @@
+# the dependency tree is fixed. a new crate fails `cargo deny check` until it is
+# added here, which is the doc's "ask before adding a dependency" made mechanical
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+]
+
+[bans]
+multiple-versions = "deny"
+
+[[bans.allow]]
+name = "kiry"
+[[bans.allow]]
+name = "kiry-core"
+[[bans.allow]]
+name = "bitflags"
+[[bans.allow]]
+name = "block-buffer"
+[[bans.allow]]
+name = "cfg-if"
+[[bans.allow]]
+name = "const-oid"
+[[bans.allow]]
+name = "cpufeatures"
+[[bans.allow]]
+name = "crypto-common"
+[[bans.allow]]
+name = "digest"
+[[bans.allow]]
+name = "filetime"
+[[bans.allow]]
+name = "hybrid-array"
+[[bans.allow]]
+name = "libc"
+[[bans.allow]]
+name = "linux-raw-sys"
+[[bans.allow]]
+name = "rustix"
+[[bans.allow]]
+name = "ruzstd"
+[[bans.allow]]
+name = "sha2"
+[[bans.allow]]
+name = "tar"
+[[bans.allow]]
+name = "twox-hash"
+[[bans.allow]]
+name = "typenum"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]

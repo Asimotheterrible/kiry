@@ -128,17 +128,29 @@ pub fn dir(root: &Path, target: &str, name: &str) -> PathBuf {
     root.join(DB).join("installed").join(target).join(name)
 }
 
+pub fn targets(root: &Path) -> Result<Vec<String>, Error> {
+    names(&root.join(DB).join("installed"))
+}
+
+pub fn forget(root: &Path, target: &str, name: &str) -> Result<(), Error> {
+    let d = dir(root, target, name);
+    fs::remove_dir_all(&d).map_err(|e| Error::Io(d, e))
+}
+
 pub fn installed(root: &Path, target: &str) -> Result<Vec<String>, Error> {
-    let d = root.join(DB).join("installed").join(target);
-    let rd = match fs::read_dir(&d) {
+    names(&root.join(DB).join("installed").join(target))
+}
+
+fn names(d: &Path) -> Result<Vec<String>, Error> {
+    let rd = match fs::read_dir(d) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(Error::Io(d, e)),
+        Err(e) => return Err(Error::Io(d.to_path_buf(), e)),
     };
 
     let mut out = Vec::new();
     for e in rd {
-        let e = e.map_err(|e| Error::Io(d.clone(), e))?;
+        let e = e.map_err(|e| Error::Io(d.to_path_buf(), e))?;
         if let Some(n) = e.file_name().to_str() {
             out.push(n.to_string());
         }

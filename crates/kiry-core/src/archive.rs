@@ -268,6 +268,16 @@ fn mkdir(pfd: &OwnedFd, name: &str, mode: u32, blame: &str) -> Result<(), Error>
     }
 }
 
+pub(crate) fn beneath(rootfd: &OwnedFd, path: &str) -> rustix::io::Result<OwnedFd> {
+    rustix::fs::openat2(
+        rootfd,
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
+    )
+}
+
 fn parent_fd(
     rootfd: &OwnedFd,
     parent: &str,
@@ -280,15 +290,7 @@ fn parent_fd(
             .map_err(|e| Error::Io(std::path::PathBuf::new(), e));
     }
 
-    let open = |p: &str| {
-        rustix::fs::openat2(
-            rootfd,
-            p,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS,
-        )
-    };
+    let open = |p: &str| beneath(rootfd, p);
 
     if let Ok(fd) = open(parent) {
         return Ok(fd);
@@ -324,7 +326,7 @@ fn parent_fd(
     open(parent).map_err(|e| Error::Io(parent.into(), e.into()))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));

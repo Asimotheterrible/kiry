@@ -1,5 +1,11 @@
 use std::collections::HashMap;
+use std::io::Read;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::io::Errno;
+use sha2::{Digest, Sha256};
 
 use crate::pkg::{self, Dep, Version};
 use crate::{archive, db, Error};
@@ -263,3 +269,101 @@ mod tests {
     }
 }
 
+// compiled in rather than configured: a package legitimately owns usr/lib, the
+// repair path has to work with no config present, and a config file that can
+// delete /usr is not worth having
+const PROTECTED: &[&str] = &[
+    "", "usr", "etc", "var", "bin", "sbin", "lib", "lib64", "usr/bin", "usr/sbin",
+    "usr/lib", "usr/lib64", "usr/local", "usr/share",
+];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Removed {
+    pub gone: usize,
+    pub missing: usize,
+    pub kept: usize,
+}
+
+pub fn remove(root: &Path, target: &str, name: &str, force: bool) -> Result<Removed, Error> {
+    let rec = db::read(root, target, name)?;
+
+    if !force {
+        for other in db::installed(root, target)? {
+            if other == name {
+                continue;
+            }
+            let o = db::read(root, target, &other)?;
+            if o.depends.iter().any(|d| !d.make && d.name == name) {
+                return Err(Error::Needed {
+                    pkg: name.to_string(),
+                    by: other,
+                });
+            }
+        }
+    }
+
+    let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
+
+    let mut out = Removed::default();
+    for e in rec.manifest.iter().rev() {
+        let (parent, leaf) = match e.path.rfind('/') {
+            Some(i) => (&e.path[..i], &e.path[i + 1..]),
+            None => ("", e.path.as_str()),
+        };
+        let pfd = match archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent }) {
+            Ok(fd) => fd,
+            Err(_) => {
+                out.missing += 1;
+                continue;
+            }
+        };
+
+        match &e.kind {
+            db::Kind::Dir => {
+                if !PROTECTED.contains(&e.path.as_str()) {
+                    let _ = rustix::fs::unlinkat(&pfd, leaf, AtFlags::REMOVEDIR);
+                }
+            }
+            db::Kind::Link(target) => match rustix::fs::readlinkat(&pfd, leaf, Vec::new()) {
+                Ok(got) if got.to_bytes() == target.as_bytes() => {
+                    let _ = rustix::fs::unlinkat(&pfd, leaf, AtFlags::empty());
+                    out.gone += 1;
+                }
+                Ok(_) => out.kept += 1,
+                Err(Errno::NOENT) => out.missing += 1,
+                Err(_) => out.kept += 1,
+            },
+            // only ENOENT is gone. NOFOLLOW turns a symlink standing where the file
+            // belongs into ELOOP, and that is modified, not missing
+            db::Kind::File(want) | db::Kind::Hard(want) => match hash(&pfd, leaf) {
+                Ok(got) if &got == want => {
+                    let _ = rustix::fs::unlinkat(&pfd, leaf, AtFlags::empty());
+                    out.gone += 1;
+                }
+                Ok(_) => out.kept += 1,
+                Err(Errno::NOENT) => out.missing += 1,
+                Err(_) => out.kept += 1,
+            },
+        }
+    }
+
+    db::forget(root, target, name)?;
+    Ok(out)
+}
+
+fn hash(pfd: &OwnedFd, name: &str) -> Result<String, Errno> {
+    let fd = rustix::fs::openat(pfd, name, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())?;
+
+    let mut f = std::fs::File::from(fd);
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|_| Errno::IO)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(archive::hex(&h.finalize()))
+}

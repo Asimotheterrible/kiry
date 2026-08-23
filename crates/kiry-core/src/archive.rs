@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tar::EntryType;
 
 use crate::db;
-use crate::Error;
+use crate::{hex, Error};
 
 // the kernel gives up at 40 as well
 const MAX_HOPS: u32 = 40;
@@ -324,14 +324,6 @@ fn parent_fd(
     }
 
     open(parent).map_err(|e| Error::Io(parent.into(), e.into()))
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 fn anon(e: io::Error) -> Error {

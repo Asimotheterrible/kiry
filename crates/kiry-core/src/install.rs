@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
-use sha2::{Digest, Sha256};
 
 use crate::pkg::{self, Dep, Version};
 use crate::{archive, db, Error};
@@ -354,16 +352,5 @@ pub fn remove(root: &Path, target: &str, name: &str, force: bool) -> Result<Remo
 
 fn hash(pfd: &OwnedFd, name: &str) -> Result<String, Errno> {
     let fd = rustix::fs::openat(pfd, name, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())?;
-
-    let mut f = std::fs::File::from(fd);
-    let mut h = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = f.read(&mut buf).map_err(|_| Errno::IO)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(archive::hex(&h.finalize()))
+    crate::sha256(std::fs::File::from(fd)).map_err(|_| Errno::IO)
 }

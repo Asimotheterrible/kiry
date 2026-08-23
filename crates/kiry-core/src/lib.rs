@@ -2,13 +2,36 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
+
+use sha2::{Digest, Sha256};
 
 pub mod archive;
 pub mod db;
 pub mod install;
 pub mod pkg;
+
+pub fn sha256<R: Read>(mut r: R) -> Result<String, io::Error> {
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex(&h.finalize()))
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
 
 #[derive(Debug)]
 pub enum Error {

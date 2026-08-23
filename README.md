@@ -33,9 +33,12 @@ That is why one maintainer is enough.
 
 ## Status
 
-`l`, `i` and `r` work against a real root, along with the archive extraction and the
-installed database underneath them. `b` does not exist yet, so packages have to arrive
-as an archive built somewhere else.
+`b`, `l`, `i` and `r` work against a real root, along with the archive extraction and
+the installed database underneath them. A recipe goes from `sources` to an installed
+package without leaving the tree.
+
+There is no sandbox yet, so a build sees the host environment and its declared
+dependencies are not enforced against what it actually links.
 
 **The soname engine, which is the part that is actually novel, has not been written,
 but it WILL BE written.**
@@ -100,18 +103,32 @@ nothing.
 ## Commands
 
 ```
-kiry l [--root DIR]                        list installed
-kiry i [--root DIR] [--force] <archive>... install
-kiry r [--root DIR] [--force] <pkg>...     remove
-kiry <dir>                                 print a parsed package
+kiry b [--root DIR] [--target T] [-v] <dir>...  build a recipe
+kiry l [--root DIR]                             list installed
+kiry i [--root DIR] [--force] <archive>...      install
+kiry r [--root DIR] [--force] <pkg>...          remove
+kiry <dir>                                      print a parsed package
 ```
 
 `--root` defaults to `/`, or whatever `KIRY_ROOT` says.
 
+`b` fetches every source, checks it against `checksums`, unpacks into `/var/kiry/stage`,
+runs `build` with `DESTDIR` set, and writes `<pkg>-<version>-<rev>.<target>.tar.zst` with
+its sidecar into `/var/kiry/cache`. Every target in `targets` is built and packed before
+any of them is renamed into place, so a package cannot leave half its targets in the
+cache. Build output goes to `/var/kiry/log`; `-v` streams it as well.
+
+The build script starts in the unpacked source directory with `DESTDIR`, `KIRY_SRCDIR`,
+`KIRY_TARGET`, `KIRY_NAME`, `KIRY_VERSION` and `KIRY_REV` set. A source with no matching
+line in `checksums` is built anyway and its sha256 printed, which is how you fill that
+file in the first place.
+
+Fetching runs `$KIRY_FETCH`, `curl -fL --retry 3 -o %o %u` by default. `%u` and `%o` are
+substituted and the words are executed directly, so a URL never reaches a shell.
+
 Planned, and none of them written yet:
 
 ```
-kiry b <pkg>        build into a staging root
 kiry doctor         verify every installed ELF's linkage resolves
 kiry why <pkg>      reverse-dependency path
 kiry owns <path>    which package owns a file

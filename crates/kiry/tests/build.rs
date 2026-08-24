@@ -55,18 +55,25 @@ fn kiry(args: &[&str]) -> Output {
     Command::new(KIRY).args(args).output().unwrap()
 }
 
-fn artifacts(root: &Path) -> Vec<String> {
-    let cache = root.join("var/kiry/cache");
-    let Ok(rd) = fs::read_dir(cache) else {
+fn cache(root: &Path, suffix: &str) -> Vec<String> {
+    let Ok(rd) = fs::read_dir(root.join("var/kiry/cache")) else {
         return Vec::new();
     };
     let mut out: Vec<String> = rd
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(String::from))
-        .filter(|n| n.ends_with(".tar.zst"))
+        .filter(|n| n.ends_with(suffix))
         .collect();
     out.sort();
     out
+}
+
+fn artifacts(root: &Path) -> Vec<String> {
+    cache(root, ".tar.zst")
+}
+
+fn sidecars(root: &Path) -> Vec<String> {
+    cache(root, ".meta")
 }
 
 #[test]
@@ -107,6 +114,21 @@ fn round_trip_through_install() {
         String::from_utf8_lossy(&o.stdout).trim(),
         "hello 1.0 x86_64-musl"
     );
+}
+
+// the one above dies before anything is packed. this one dies inside tar
+#[test]
+fn a_target_dying_while_it_packs_leaves_no_sidecar() {
+    let at = scratch("sidecar");
+    let script = format!("{GOOD}[ \"$KIRY_TARGET\" = x86_64-musl ] || rm -rf \"$DESTDIR\"\n");
+    let d = recipe(&at, "x86_64-musl x86_64-gnu", &script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    assert!(artifacts(&root).is_empty(), "{:?}", artifacts(&root));
+    assert!(sidecars(&root).is_empty(), "{:?}", sidecars(&root));
 }
 
 #[test]

@@ -1,10 +1,29 @@
 // the 2500 line budget, counted rather than estimated. tests do not ship and are
-// not what has to be readable at 3am, so a file counts up to its test module
+// not what has to be readable at 3am, so a file counts all but its test module
 
 use std::fs;
 use std::path::Path;
 
 const BUDGET: usize = 2500;
+
+// install.rs keeps remove() below mod tests, so stopping at #[cfg(test)] misses it
+fn shipping(text: &str) -> usize {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(start) = lines.iter().position(|l| *l == "#[cfg(test)]") else {
+        return lines.len();
+    };
+    let end = lines[start..]
+        .iter()
+        .position(|l| *l == "}")
+        .map_or(lines.len(), |i| start + i + 1);
+    start + lines.len() - end
+}
+
+#[test]
+fn code_below_a_test_module_is_still_code() {
+    let f = "one\ntwo\n#[cfg(test)]\nmod tests {\n    nope\n}\nthree\nfour\n";
+    assert_eq!(shipping(f), 4);
+}
 
 #[test]
 fn kiry_core_fits_in_its_budget() {
@@ -20,8 +39,7 @@ fn kiry_core_fits_in_its_budget() {
     let mut total = 0;
     let mut rows = String::new();
     for f in &files {
-        let text = fs::read_to_string(f).unwrap();
-        let n = text.lines().take_while(|l| *l != "#[cfg(test)]").count();
+        let n = shipping(&fs::read_to_string(f).unwrap());
         total += n;
         rows.push_str(&format!(
             "\n  {n:>5}  {}",

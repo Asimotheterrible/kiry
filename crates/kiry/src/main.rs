@@ -109,13 +109,14 @@ fn build(root: &Path, p: &Package, targets: &[String], verbose: bool) -> Result<
 
     let mut ready = Vec::new();
     for (t, work) in &built {
-        let (art, part) = pack(root, p, t, work)?;
-        meta(p, t, &hash, &art)?;
-        ready.push((art, part));
+        ready.push((t.clone(), pack(root, p, t, work)?));
     }
 
-    for (art, part) in &ready {
+    // sidecar lands after the rename. ahead of it, a target failing to tar leaves a
+    // .meta for an artifact that never arrives
+    for (t, (art, part)) in &ready {
         fs::rename(part, art).map_err(|e| format!("{}: {e}", art.display()))?;
+        meta(p, t, &hash, art)?;
     }
     for (_, work) in &built {
         let _ = fs::remove_dir_all(work);

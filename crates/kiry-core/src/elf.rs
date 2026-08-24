@@ -14,11 +14,28 @@ const PT_DYNAMIC: u32 = 2;
 
 const DT_NULL: i64 = 0;
 const DT_NEEDED: i64 = 1;
+const DT_HASH: i64 = 4;
 const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
 const DT_STRSZ: i64 = 10;
+const DT_SYMENT: i64 = 11;
 const DT_SONAME: i64 = 14;
 const DT_RPATH: i64 = 15;
 const DT_RUNPATH: i64 = 29;
+const DT_GNU_HASH: i64 = 0x6fff_fef5;
+
+const STB_WEAK: u8 = 2;
+const STT_OBJECT: u8 = 1;
+const SHN_UNDEF: u16 = 0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sym {
+    pub name: String,
+    pub weak: bool,
+    // st_size is the object's size here, and code size on a function, too noisy to diff
+    pub object: bool,
+    pub size: u64,
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Elf {
@@ -27,6 +44,8 @@ pub struct Elf {
     // rpath applies to transitive loads, runpath does not
     pub rpath: Option<String>,
     pub runpath: Option<String>,
+    pub exports: Vec<Sym>,
+    pub undefined: Vec<Sym>,
 }
 
 pub fn read(p: &Path) -> Result<Elf, Error> {
@@ -101,6 +120,8 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
     let mut needed = Vec::new();
     let (mut soname, mut rpath, mut runpath) = (None, None, None);
     let (mut strtab, mut strsz) = (None, None);
+    let (mut symtab, mut syment) = (None, None);
+    let (mut hash, mut gnu_hash) = (None, None);
 
     for e in entries.chunks_exact(16) {
         let (tag, val) = match (e.get(..8), e.get(8..16)) {
@@ -118,11 +139,20 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
             DT_RUNPATH => runpath = Some(val),
             DT_STRTAB => strtab = Some(val),
             DT_STRSZ => strsz = Some(val),
+            DT_SYMTAB => symtab = Some(val),
+            DT_SYMENT => syment = Some(val),
+            DT_HASH => hash = Some(val),
+            DT_GNU_HASH => gnu_hash = Some(val),
             _ => {}
         }
     }
 
-    if needed.is_empty() && soname.is_none() && rpath.is_none() && runpath.is_none() {
+    if needed.is_empty()
+        && soname.is_none()
+        && rpath.is_none()
+        && runpath.is_none()
+        && symtab.is_none()
+    {
         return Ok(Elf::default());
     }
 
@@ -138,6 +168,8 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
         .and_then(|s| s.get(..strsz))
         .ok_or("string table runs past the end of the file")?;
 
+    let (exports, undefined) = symbols(b, &loads, strs, symtab, syment, hash, gnu_hash)?;
+
     Ok(Elf {
         soname: soname.map(|v| string(strs, v)).transpose()?,
         needed: needed
@@ -146,7 +178,61 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
             .collect::<Result<_, _>>()?,
         rpath: rpath.map(|v| string(strs, v)).transpose()?,
         runpath: runpath.map(|v| string(strs, v)).transpose()?,
+        exports,
+        undefined,
     })
+}
+
+// there is no DT_SYMSZ. the count comes out of whichever hash table the linker
+// emitted, and modern ones emit only the gnu flavour
+fn count(
+    b: &[u8],
+    loads: &[(u64, u64, u64)],
+    hash: Option<u64>,
+    gnu: Option<u64>,
+) -> Result<usize, &'static str> {
+    if let Some(addr) = gnu {
+        let t = b
+            .get(at(offset_of(loads, addr)?)?..)
+            .ok_or("gnu hash past the file")?;
+        let nbuckets = at(u32at(t, 0).ok_or("short gnu hash")?.into())?;
+        let symoffset = at(u32at(t, 4).ok_or("short gnu hash")?.into())?;
+        let bloom = at(u32at(t, 8).ok_or("short gnu hash")?.into())?;
+
+        let buckets_at = 16 + bloom * 8;
+        let mut last = 0usize;
+        for i in 0..nbuckets {
+            let v = at(u32at(t, buckets_at + i * 4)
+                .ok_or("short gnu hash buckets")?
+                .into())?;
+            last = last.max(v);
+        }
+        // every bucket empty means nothing is in the table past symoffset
+        if last < symoffset {
+            return Ok(symoffset);
+        }
+
+        let chain_at = buckets_at + nbuckets * 4;
+        let mut i = last - symoffset;
+        loop {
+            let v = u32at(t, chain_at + i * 4).ok_or("gnu hash chain runs off the end")?;
+            // the low bit terminates the chain
+            if v & 1 == 1 {
+                return Ok(symoffset + i + 1);
+            }
+            i += 1;
+        }
+    }
+
+    if let Some(addr) = hash {
+        let t = b
+            .get(at(offset_of(loads, addr)?)?..)
+            .ok_or("hash past the file")?;
+        // nchain is the symbol count, by definition
+        return at(u32at(t, 4).ok_or("short hash table")?.into());
+    }
+
+    Err("a symbol table with no hash table to size it")
 }
 
 fn offset_of(loads: &[(u64, u64, u64)], addr: u64) -> Result<u64, &'static str> {
@@ -194,6 +280,57 @@ fn u64at(b: &[u8], from: usize) -> Option<u64> {
     Some(u64::from_le_bytes(
         b.get(from..)?.get(..8)?.try_into().ok()?,
     ))
+}
+
+fn symbols(
+    b: &[u8],
+    loads: &[(u64, u64, u64)],
+    strs: &[u8],
+    symtab: Option<u64>,
+    syment: Option<u64>,
+    hash: Option<u64>,
+    gnu: Option<u64>,
+) -> Result<(Vec<Sym>, Vec<Sym>), &'static str> {
+    // TODO: everyone gets the whole table, even a caller that only wants linkage
+    let Some(addr) = symtab else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let entsize = at(syment.unwrap_or(24))?;
+    if entsize < 24 {
+        return Err("symbol entries too small to be ones");
+    }
+
+    let n = count(b, loads, hash, gnu)?;
+    let start = at(offset_of(loads, addr)?)?;
+    let table = b
+        .get(start..)
+        .and_then(|s| s.get(..n.checked_mul(entsize)?))
+        .ok_or("symbol table runs past the end of the file")?;
+
+    let (mut exports, mut undefined) = (Vec::new(), Vec::new());
+    for e in table.chunks_exact(entsize) {
+        let name = u32at(e, 0).ok_or("short symbol")?;
+        if name == 0 {
+            continue; // the null symbol, and anything else unnamed
+        }
+        let info = *e.get(4).ok_or("short symbol")?;
+        let shndx = u16at(e, 6).ok_or("short symbol")?;
+        let size = u64at(e, 16).ok_or("short symbol")?;
+
+        let sym = Sym {
+            name: string(strs, name.into())?,
+            weak: info >> 4 == STB_WEAK,
+            object: info & 0xf == STT_OBJECT,
+            size,
+        };
+        if shndx == SHN_UNDEF {
+            undefined.push(sym);
+        } else {
+            exports.push(sym);
+        }
+    }
+
+    Ok((exports, undefined))
 }
 
 #[cfg(test)]

@@ -219,3 +219,184 @@ fn maps_a_string_table_that_is_not_where_its_address_says() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct RSym {
+    name: String,
+    weak: bool,
+    object: bool,
+    size: u64,
+    undefined: bool,
+}
+
+// Num: Value Size Type Bind Vis Ndx Name[@ver|@@ver][ (n)]
+fn dyn_syms(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
+    let out = Command::new("readelf")
+        .args(["--dyn-syms", "-W"])
+        .args(paths)
+        .output()
+        .expect("readelf failed to run");
+    let text = &String::from_utf8_lossy(&out.stdout);
+
+    let mut map: BTreeMap<PathBuf, Vec<RSym>> = BTreeMap::new();
+    // no File: header comes back when readelf was handed exactly one file
+    let mut cur: Option<PathBuf> = match paths {
+        [only] => {
+            map.insert((*only).clone(), Vec::new());
+            Some((*only).clone())
+        }
+        _ => None,
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("File: ") {
+            cur = Some(PathBuf::from(rest.trim()));
+            map.entry(cur.clone().unwrap()).or_default();
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 8 || !f[0].ends_with(':') {
+            continue;
+        }
+        let Ok(size) = f[2].parse::<u64>() else {
+            continue;
+        };
+        let (kind, bind, ndx) = (f[3], f[4], f[6]);
+        // readelf glues the version onto the name. versions get their own commit,
+        // so cut it off here
+        let name = f[7].split('@').next().unwrap_or(f[7]).to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let s = RSym {
+            name,
+            weak: bind == "WEAK",
+            object: kind == "OBJECT",
+            size,
+            undefined: ndx == "UND",
+        };
+        if let Some(p) = &cur {
+            map.entry(p.clone()).or_default().push(s);
+        }
+    }
+    map
+}
+
+fn mine(e: &elf::Elf) -> Vec<RSym> {
+    let f = |s: &elf::Sym, undefined: bool| RSym {
+        name: s.name.clone(),
+        weak: s.weak,
+        object: s.object,
+        size: s.size,
+        undefined,
+    };
+    let mut v: Vec<RSym> = e.exports.iter().map(|s| f(s, false)).collect();
+    v.extend(e.undefined.iter().map(|s| f(s, true)));
+    v
+}
+
+#[test]
+fn agrees_with_readelf_on_dynamic_symbols() {
+    let corpus = corpus();
+    if corpus.len() < 100 {
+        assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "no corpus");
+        return;
+    }
+    // every Nth, so it stays a spread across the tree without running readelf
+    // over a million symbols
+    let sample: Vec<&(PathBuf, Vec<u8>)> = corpus.iter().step_by(corpus.len() / 120).collect();
+    let paths: Vec<&PathBuf> = sample.iter().map(|(p, _)| p).collect();
+
+    let theirs = dyn_syms(&paths);
+
+    let mut compared = 0;
+    let mut objects = 0;
+    let mut undef = 0;
+    for (p, bytes) in &sample {
+        let got = elf::parse(bytes).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let want = theirs
+            .get(p)
+            .unwrap_or_else(|| panic!("readelf skipped {}", p.display()));
+
+        let mut a = mine(&got);
+        let mut b: Vec<&RSym> = want.iter().collect();
+        a.sort_by(|x, y| (&x.name, x.size).cmp(&(&y.name, y.size)));
+        b.sort_by(|x, y| (&x.name, x.size).cmp(&(&y.name, y.size)));
+
+        assert_eq!(a.len(), b.len(), "symbol count for {}", p.display());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(&x, y, "symbol mismatch in {}", p.display());
+        }
+
+        compared += a.len();
+        objects += a.iter().filter(|s| s.object).count();
+        undef += a.iter().filter(|s| s.undefined).count();
+    }
+
+    assert!(compared > 5000, "only compared {compared} symbols");
+    assert!(objects > 100, "only {objects} data symbols");
+    assert!(undef > 100, "only {undef} undefined symbols");
+}
+
+// nothing installed here carries DT_HASH any more, the linker has defaulted to the
+// gnu table for years. --hash-style=sysv is the only way to reach that path
+#[test]
+fn counts_symbols_out_of_the_old_hash_table_too() {
+    let dir = std::env::temp_dir().join(format!("kiry-sysv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("s.c");
+    std::fs::write(
+        &src,
+        "int alpha(int x){return x+1;}\nint beta(int x){return x+2;}\ndouble gamma_data = 3.0;\n",
+    )
+    .unwrap();
+    let lib = dir.join("libsysv.so");
+
+    let built = Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wl,--hash-style=sysv", "-o"])
+        .arg(&lib)
+        .arg(&src)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            assert!(
+                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+                "cc cannot build a sysv-hash library"
+            );
+            return;
+        }
+    }
+
+    let b = std::fs::read(&lib).unwrap();
+    // prove the fixture reaches the branch it exists for
+    let tags = Command::new("readelf")
+        .arg("-d")
+        .arg(&lib)
+        .output()
+        .unwrap();
+    let tags = String::from_utf8_lossy(&tags.stdout);
+    assert!(tags.contains("(HASH)"), "no DT_HASH, fixture is pointless");
+    assert!(
+        !tags.contains("GNU_HASH"),
+        "GNU_HASH present too, so the gnu branch wins and this proves nothing"
+    );
+
+    let got = elf::parse(&b).unwrap();
+    let want = dyn_syms(&[&lib]);
+    let want = &want[&lib];
+
+    assert_eq!(got.exports.len() + got.undefined.len(), want.len());
+    for n in ["alpha", "beta", "gamma_data"] {
+        assert!(
+            got.exports.iter().any(|s| s.name == n),
+            "{n} missing from {:?}",
+            got.exports.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+    assert!(got
+        .exports
+        .iter()
+        .any(|s| s.name == "gamma_data" && s.object && s.size == 8));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

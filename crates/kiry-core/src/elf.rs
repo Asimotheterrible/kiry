@@ -23,7 +23,16 @@ const DT_SONAME: i64 = 14;
 const DT_RPATH: i64 = 15;
 const DT_RUNPATH: i64 = 29;
 const DT_GNU_HASH: i64 = 0x6fff_fef5;
+const DT_VERSYM: i64 = 0x6fff_fff0;
+const DT_VERDEF: i64 = 0x6fff_fffc;
+const DT_VERDEFNUM: i64 = 0x6fff_fffd;
+const DT_VERNEED: i64 = 0x6fff_fffe;
+const DT_VERNEEDNUM: i64 = 0x6fff_ffff;
 
+// the version index's high bit doubles as the not-default flag
+const VERSYM_HIDDEN: u16 = 0x8000;
+// a verdef entry describing the file itself rather than a version it exports
+const VER_FLG_BASE: u16 = 1;
 const STB_WEAK: u8 = 2;
 const STT_OBJECT: u8 = 1;
 const SHN_UNDEF: u16 = 0;
@@ -31,6 +40,10 @@ const SHN_UNDEF: u16 = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sym {
     pub name: String,
+    pub version: Option<String>,
+    // foo@@v2 rather than foo@v1. new links bind to the default, so moving which
+    // version is default is an abi change even with both symbols still present
+    pub default: bool,
     pub weak: bool,
     // st_size is the object's size here, and code size on a function, too noisy to diff
     pub object: bool,
@@ -46,6 +59,8 @@ pub struct Elf {
     pub runpath: Option<String>,
     pub exports: Vec<Sym>,
     pub undefined: Vec<Sym>,
+    // carries .gnu.version_d, which decides whether versions mean anything here
+    pub versioned: bool,
 }
 
 pub fn read(p: &Path) -> Result<Elf, Error> {
@@ -121,7 +136,9 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
     let (mut soname, mut rpath, mut runpath) = (None, None, None);
     let (mut strtab, mut strsz) = (None, None);
     let (mut symtab, mut syment) = (None, None);
-    let (mut hash, mut gnu_hash) = (None, None);
+    let (mut hash, mut gnu_hash, mut versym) = (None, None, None);
+    let (mut verdef, mut verdefnum) = (None, 0);
+    let (mut verneed, mut verneednum) = (None, 0);
 
     for e in entries.chunks_exact(16) {
         let (tag, val) = match (e.get(..8), e.get(8..16)) {
@@ -143,6 +160,11 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
             DT_SYMENT => syment = Some(val),
             DT_HASH => hash = Some(val),
             DT_GNU_HASH => gnu_hash = Some(val),
+            DT_VERSYM => versym = Some(val),
+            DT_VERDEF => verdef = Some(val),
+            DT_VERDEFNUM => verdefnum = val,
+            DT_VERNEED => verneed = Some(val),
+            DT_VERNEEDNUM => verneednum = val,
             _ => {}
         }
     }
@@ -168,7 +190,10 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
         .and_then(|s| s.get(..strsz))
         .ok_or("string table runs past the end of the file")?;
 
-    let (exports, undefined) = symbols(b, &loads, strs, symtab, syment, hash, gnu_hash)?;
+    let names = versions(b, &loads, strs, verdef, verdefnum, verneed, verneednum)?;
+    let (exports, undefined) = symbols(
+        b, &loads, strs, &names, symtab, syment, hash, gnu_hash, versym,
+    )?;
 
     Ok(Elf {
         soname: soname.map(|v| string(strs, v)).transpose()?,
@@ -180,6 +205,7 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
         runpath: runpath.map(|v| string(strs, v)).transpose()?,
         exports,
         undefined,
+        versioned: verdef.is_some(),
     })
 }
 
@@ -282,14 +308,84 @@ fn u64at(b: &[u8], from: usize) -> Option<u64> {
     ))
 }
 
+// verdef is what this file exports, verneed what it asks of others. vn_file is
+// ignored: glibc stopped using it for symbol search in 2.30
+#[allow(clippy::too_many_arguments)]
+fn versions(
+    b: &[u8],
+    loads: &[(u64, u64, u64)],
+    strs: &[u8],
+    verdef: Option<u64>,
+    verdefnum: u64,
+    verneed: Option<u64>,
+    verneednum: u64,
+) -> Result<Vec<(u16, String)>, &'static str> {
+    let mut out = Vec::new();
+
+    if let Some(addr) = verdef {
+        let t = b
+            .get(at(offset_of(loads, addr)?)?..)
+            .ok_or("verdef past the end of the file")?;
+        let mut at_ = 0usize;
+        for _ in 0..verdefnum {
+            let flags = u16at(t, at_ + 2).ok_or("short verdef")?;
+            let ndx = u16at(t, at_ + 4).ok_or("short verdef")?;
+            let aux = at(u32at(t, at_ + 12).ok_or("short verdef")?.into())?;
+            let next = at(u32at(t, at_ + 16).ok_or("short verdef")?.into())?;
+
+            if flags & VER_FLG_BASE == 0 {
+                let name = u32at(t, at_ + aux).ok_or("short verdaux")?;
+                out.push((ndx, string(strs, name.into())?));
+            }
+            if next == 0 {
+                break;
+            }
+            at_ += next;
+        }
+    }
+
+    if let Some(addr) = verneed {
+        let t = b
+            .get(at(offset_of(loads, addr)?)?..)
+            .ok_or("verneed past the end of the file")?;
+        let mut at_ = 0usize;
+        for _ in 0..verneednum {
+            let cnt = u16at(t, at_ + 2).ok_or("short verneed")?;
+            let aux = at(u32at(t, at_ + 8).ok_or("short verneed")?.into())?;
+            let next = at(u32at(t, at_ + 12).ok_or("short verneed")?.into())?;
+
+            let mut a = at_ + aux;
+            for _ in 0..cnt {
+                let other = u16at(t, a + 6).ok_or("short vernaux")?;
+                let name = u32at(t, a + 8).ok_or("short vernaux")?;
+                let anext = at(u32at(t, a + 12).ok_or("short vernaux")?.into())?;
+                out.push((other, string(strs, name.into())?));
+                if anext == 0 {
+                    break;
+                }
+                a += anext;
+            }
+            if next == 0 {
+                break;
+            }
+            at_ += next;
+        }
+    }
+
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn symbols(
     b: &[u8],
     loads: &[(u64, u64, u64)],
     strs: &[u8],
+    names: &[(u16, String)],
     symtab: Option<u64>,
     syment: Option<u64>,
     hash: Option<u64>,
     gnu: Option<u64>,
+    versym: Option<u64>,
 ) -> Result<(Vec<Sym>, Vec<Sym>), &'static str> {
     // TODO: everyone gets the whole table, even a caller that only wants linkage
     let Some(addr) = symtab else {
@@ -307,8 +403,16 @@ fn symbols(
         .and_then(|s| s.get(..n.checked_mul(entsize)?))
         .ok_or("symbol table runs past the end of the file")?;
 
+    let vers = match versym {
+        Some(a) => Some(
+            b.get(at(offset_of(loads, a)?)?..)
+                .ok_or("versym past the end of the file")?,
+        ),
+        None => None,
+    };
+
     let (mut exports, mut undefined) = (Vec::new(), Vec::new());
-    for e in table.chunks_exact(entsize) {
+    for (i, e) in table.chunks_exact(entsize).enumerate() {
         let name = u32at(e, 0).ok_or("short symbol")?;
         if name == 0 {
             continue; // the null symbol, and anything else unnamed
@@ -317,8 +421,30 @@ fn symbols(
         let shndx = u16at(e, 6).ok_or("short symbol")?;
         let size = u64at(e, 16).ok_or("short symbol")?;
 
+        let (version, default) = match vers {
+            Some(v) => {
+                let raw = u16at(v, i * 2).ok_or("versym is shorter than the symbol table")?;
+                let ndx = raw & !VERSYM_HIDDEN;
+                // 0 is local, 1 is global, and some linkers write 1 where the spec
+                // says 0. this and the VER_FLG_BASE skip hide each other: drop one
+                // and nothing changes, drop both and index 1 picks up the soname
+                if ndx <= 1 {
+                    (None, true)
+                } else {
+                    let found = names
+                        .iter()
+                        .find(|(k, _)| *k == ndx)
+                        .map(|(_, s)| s.clone());
+                    (found, raw & VERSYM_HIDDEN == 0)
+                }
+            }
+            None => (None, true),
+        };
+
         let sym = Sym {
             name: string(strs, name.into())?,
+            version,
+            default,
             weak: info >> 4 == STB_WEAK,
             object: info & 0xf == STT_OBJECT,
             size,

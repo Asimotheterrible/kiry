@@ -23,6 +23,7 @@ const DIRS: &[&str] = &[
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Dyn {
+    verdef: bool,
     soname: Option<String>,
     needed: Vec<String>,
     rpath: Option<String>,
@@ -100,6 +101,8 @@ fn readelf(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Dyn> {
             d.runpath = bracketed(line);
         } else if line.contains("(RPATH)") {
             d.rpath = bracketed(line);
+        } else if line.contains("(VERDEF)") {
+            d.verdef = true;
         }
     }
     if let Some(p) = cur {
@@ -135,6 +138,7 @@ fn agrees_with_readelf_on_every_library_here() {
 
     let mut sonames = 0;
     let mut rpaths = 0;
+    let mut verdefs = 0;
     for (p, bytes) in &corpus {
         let got = elf::parse(bytes).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         let want = &theirs[p];
@@ -143,14 +147,17 @@ fn agrees_with_readelf_on_every_library_here() {
         assert_eq!(got.needed, want.needed, "needed of {}", p.display());
         assert_eq!(got.rpath, want.rpath, "rpath of {}", p.display());
         assert_eq!(got.runpath, want.runpath, "runpath of {}", p.display());
+        assert_eq!(got.versioned, want.verdef, "verdef of {}", p.display());
 
         sonames += usize::from(got.soname.is_some());
         rpaths += usize::from(got.rpath.is_some() || got.runpath.is_some());
+        verdefs += usize::from(got.versioned);
     }
 
     // if the corpus somehow held nothing interesting the comparison above is empty
     assert!(sonames > 10, "only {sonames} sonames in {}", corpus.len());
     assert!(rpaths > 0, "no library carried an rpath or runpath");
+    assert!(verdefs > 10, "only {verdefs} libraries defined versions");
 }
 
 fn strtab_addr(p: &PathBuf) -> u64 {
@@ -223,6 +230,8 @@ fn maps_a_string_table_that_is_not_where_its_address_says() {
 #[derive(Debug, PartialEq, Eq)]
 struct RSym {
     name: String,
+    version: Option<String>,
+    default: bool,
     weak: bool,
     object: bool,
     size: u64,
@@ -261,14 +270,25 @@ fn dyn_syms(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
             continue;
         };
         let (kind, bind, ndx) = (f[3], f[4], f[6]);
-        // readelf glues the version onto the name. versions get their own commit,
-        // so cut it off here
-        let name = f[7].split('@').next().unwrap_or(f[7]).to_string();
+        let raw = f[7];
+        // a trailing "(3)" means readelf took the version from verneed rather than
+        // verdef, and it prints those with one @ regardless of the hidden bit, so
+        // the punctuation says nothing about default there
+        let from_verneed = f.get(8).is_some_and(|t| t.starts_with('('));
+        let (name, version, default) = match raw.split_once("@@") {
+            Some((n, v)) => (n.to_string(), Some(v.to_string()), true),
+            None => match raw.split_once('@') {
+                Some((n, v)) => (n.to_string(), Some(v.to_string()), from_verneed),
+                None => (raw.to_string(), None, true),
+            },
+        };
         if name.is_empty() {
             continue;
         }
         let s = RSym {
             name,
+            version,
+            default,
             weak: bind == "WEAK",
             object: kind == "OBJECT",
             size,
@@ -284,6 +304,8 @@ fn dyn_syms(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
 fn mine(e: &elf::Elf) -> Vec<RSym> {
     let f = |s: &elf::Sym, undefined: bool| RSym {
         name: s.name.clone(),
+        version: s.version.clone(),
+        default: s.default,
         weak: s.weak,
         object: s.object,
         size: s.size,
@@ -309,8 +331,8 @@ fn agrees_with_readelf_on_dynamic_symbols() {
     let theirs = dyn_syms(&paths);
 
     let mut compared = 0;
-    let mut objects = 0;
-    let mut undef = 0;
+    let mut versioned = 0;
+    let mut nondefault = 0;
     for (p, bytes) in &sample {
         let got = elf::parse(bytes).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         let want = theirs
@@ -319,8 +341,8 @@ fn agrees_with_readelf_on_dynamic_symbols() {
 
         let mut a = mine(&got);
         let mut b: Vec<&RSym> = want.iter().collect();
-        a.sort_by(|x, y| (&x.name, x.size).cmp(&(&y.name, y.size)));
-        b.sort_by(|x, y| (&x.name, x.size).cmp(&(&y.name, y.size)));
+        a.sort_by(|x, y| (&x.name, &x.version).cmp(&(&y.name, &y.version)));
+        b.sort_by(|x, y| (&x.name, &x.version).cmp(&(&y.name, &y.version)));
 
         assert_eq!(a.len(), b.len(), "symbol count for {}", p.display());
         for (x, y) in a.iter().zip(b.iter()) {
@@ -328,13 +350,19 @@ fn agrees_with_readelf_on_dynamic_symbols() {
         }
 
         compared += a.len();
-        objects += a.iter().filter(|s| s.object).count();
-        undef += a.iter().filter(|s| s.undefined).count();
+        versioned += a.iter().filter(|s| s.version.is_some()).count();
+        nondefault += a
+            .iter()
+            .filter(|s| s.version.is_some() && !s.default)
+            .count();
     }
 
     assert!(compared > 5000, "only compared {compared} symbols");
-    assert!(objects > 100, "only {objects} data symbols");
-    assert!(undef > 100, "only {undef} undefined symbols");
+    assert!(versioned > 100, "only {versioned} versioned symbols");
+    assert!(
+        nondefault > 0,
+        "no non-default versioned symbol in the sample"
+    );
 }
 
 // nothing installed here carries DT_HASH any more, the linker has defaulted to the

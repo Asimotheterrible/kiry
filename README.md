@@ -40,8 +40,11 @@ package without leaving the tree.
 There is no sandbox yet, so a build sees the host environment and its declared
 dependencies are not enforced against what it actually links.
 
-**The soname engine, which is the part that is actually novel, has not been written,
-but it WILL BE written.**
+**The soname engine reads, but does not yet decide.** Everything it needs out of an
+ELF is parsed: `DT_SONAME`, `DT_NEEDED`, rpath and runpath, and the dynamic symbol
+table with versions, default flags, bindings and sizes. Nothing yet turns that into an
+answer. The target-aware ABI comparison, `sonames.db`, the rebuild graph and `doctor`
+are all still to come, and they WILL BE written.
 
 Do not point this at your system **yet**.
 
@@ -149,9 +152,10 @@ kiry stats          build times and cache hit rates
 
 The install path never shells out. kiry is what you reach for when a libc upgrade has
 gone wrong and nothing dynamically linked will start, so it cannot itself need `sh`,
-`tar` or `sha256sum`. Extraction, hashing and the installed database are pure Rust in
-`kiry-core`. Fetching, running builds and converting recipes may shell out freely, and
-they live in the `kiry` crate. That boundary is the only reason there are two crates.
+`tar` or `sha256sum`. Extraction, hashing, ELF reading and the installed database are
+pure Rust in `kiry-core`. Fetching, running builds and converting recipes may shell
+out freely, and they live in the `kiry` crate. That boundary is the only reason there
+are two crates.
 
 Recipes stay POSIX sh. The package manager is Rust; packages are shell. No DSL.
 

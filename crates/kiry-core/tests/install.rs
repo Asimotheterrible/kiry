@@ -337,3 +337,96 @@ fn setuid_bits_do_not_survive() {
     );
     assert_eq!(on_disk & 0o7000, 0, "setuid survived onto disk");
 }
+
+// a real .so, because a file with elf magic and nothing behind it would let a
+// scanner that never actually parses anything pass
+#[test]
+fn installing_a_library_records_what_it_provides() {
+    let (root, at) = rooted("provides");
+    let src = at.join("g.c");
+    fs::write(&src, "int greet(int x){return x+1;}\n").unwrap();
+    let so = at.join("libgreet.so.1");
+
+    let built = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wl,-soname,libgreet.so.1", "-o"])
+        .arg(&so)
+        .arg(&src)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            assert!(
+                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+                "cc cannot build a shared library"
+            );
+            return;
+        }
+    }
+
+    // a second one with a version script, so .gnu.version_d is actually present
+    let vs = at.join("v.map");
+    fs::write(&vs, "GREET_1 { global: greet; local: *; };\n").unwrap();
+    let vso = at.join("libver.so.1");
+    assert!(std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wl,-soname,libver.so.1"])
+        .arg(format!("-Wl,--version-script={}", vs.display()))
+        .arg("-o")
+        .arg(&vso)
+        .arg(&src)
+        .status()
+        .unwrap()
+        .success());
+
+    let stage = at.join("stage");
+    fs::create_dir_all(stage.join("usr/lib")).unwrap();
+    fs::create_dir_all(stage.join("usr/bin")).unwrap();
+    fs::copy(&so, stage.join("usr/lib/libgreet.so.1")).unwrap();
+    fs::copy(&vso, stage.join("usr/lib/libver.so.1")).unwrap();
+    fs::write(stage.join("usr/bin/greet-hi"), "#!/bin/sh\necho hi\n").unwrap();
+    // the same library under a second name is one soname, not two
+    fs::hard_link(
+        stage.join("usr/lib/libgreet.so.1"),
+        stage.join("usr/lib/libgreet.so"),
+    )
+    .unwrap();
+
+    let arc = at.join("libgreet.tar.zst");
+    let sh = format!(
+        "cd {} && tar cf - . | zstd -q -o {}",
+        stage.display(),
+        arc.display()
+    );
+    assert!(std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&sh)
+        .status()
+        .unwrap()
+        .success());
+    let meta = at.join("libgreet.tar.zst.meta");
+    fs::create_dir_all(&meta).unwrap();
+    fs::write(meta.join("name"), "libgreet\n").unwrap();
+    fs::write(meta.join("version"), "1.0 1\n").unwrap();
+    fs::write(meta.join("targets"), "x86_64-musl\n").unwrap();
+
+    run(&root, &[arc], false).unwrap();
+
+    let got = db::read_provides(&root, "x86_64-musl", "libgreet").unwrap();
+    let names: Vec<&str> = got.iter().map(|p| p.soname.as_str()).collect();
+    assert_eq!(names, ["libgreet.so.1", "libver.so.1"], "{got:?}");
+
+    let plain = got.iter().find(|p| p.soname == "libgreet.so.1").unwrap();
+    assert_eq!(plain.path, "usr/lib/libgreet.so.1");
+    assert!(
+        !plain.versioned,
+        "a plain -shared build defines no versions"
+    );
+
+    let ver = got.iter().find(|p| p.soname == "libver.so.1").unwrap();
+    assert!(
+        ver.versioned,
+        "a --version-script build carries .gnu.version_d"
+    );
+
+    // the shell script sits in the same package and is not an elf
+    assert!(!got.iter().any(|p| p.path.contains("greet-hi")));
+}

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
@@ -6,7 +7,7 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::pkg::{self, Dep, Version};
-use crate::{archive, db, Error};
+use crate::{archive, db, elf, Error};
 
 #[derive(Debug, Clone)]
 pub struct Job {
@@ -99,6 +100,7 @@ fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
 pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
     for j in jobs {
         let manifest = archive::extract(root, &j.archive)?;
+        let provides = scan(root, &manifest)?;
         db::write(
             root,
             &db::Installed {
@@ -109,8 +111,56 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
                 manifest,
             },
         )?;
+        db::write_provides(root, &j.target, &j.name, &provides)?;
     }
     Ok(())
+}
+
+// a library announces itself with DT_SONAME, and something without one is not
+// anything another package could have linked against
+fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<db::Provide>, Error> {
+    let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
+
+    let mut out = Vec::new();
+    for e in manifest {
+        if !matches!(e.kind, db::Kind::File(_)) {
+            continue;
+        }
+        let (parent, leaf) = match e.path.rfind('/') {
+            Some(i) => (&e.path[..i], &e.path[i + 1..]),
+            None => ("", e.path.as_str()),
+        };
+        let Ok(pfd) = archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent })
+        else {
+            continue;
+        };
+        let Ok(fd) =
+            rustix::fs::openat(&pfd, leaf, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())
+        else {
+            continue;
+        };
+
+        // most of a package is not an elf, so stop after four bytes
+        let mut f = std::fs::File::from(fd);
+        let mut magic = [0u8; 4];
+        if f.read_exact(&mut magic).is_err() || magic != elf::MAGIC {
+            continue;
+        }
+        let mut bytes = magic.to_vec();
+        if f.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        let Ok(o) = elf::parse(&bytes) else { continue };
+        if let Some(soname) = o.soname {
+            out.push(db::Provide {
+                soname,
+                versioned: o.versioned,
+                path: e.path.clone(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 // sidecar is <archive>.meta, appended rather than derived, since the archive name

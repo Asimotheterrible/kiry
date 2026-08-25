@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::pkg::{self, Dep, Version};
@@ -124,6 +125,86 @@ pub struct Installed {
     pub manifest: Vec<Entry>,
 }
 
+// one soname a package hands to everything that links against it. versioned says
+// the library carries .gnu.version_d, which decides which comparison rule applies
+// to it later
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provide {
+    pub soname: String,
+    pub versioned: bool,
+    pub path: String,
+}
+
+pub fn provides(root: &Path, target: &str, name: &str) -> PathBuf {
+    root.join(DB).join("provides").join(target).join(name)
+}
+
+// same shape as a manifest line, path last so a path with a space in it needs no
+// quoting and there is no escape syntax to get wrong by hand
+pub fn format_provides(ps: &[Provide]) -> Result<String, Error> {
+    let mut out = String::new();
+    for p in ps {
+        if p.soname.contains(|c: char| c.is_whitespace()) {
+            return Err(Error::BadPath(p.soname.clone()));
+        }
+        if p.path.contains('\n') || p.path.starts_with('/') {
+            return Err(Error::BadPath(p.path.clone()));
+        }
+        let v = if p.versioned { 'v' } else { '-' };
+        out.push_str(&format!("{} {} {}\n", p.soname, v, p.path));
+    }
+    Ok(out)
+}
+
+pub fn parse_provides(text: &str) -> Result<Vec<Provide>, Error> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut f = line.splitn(3, ' ');
+        let (Some(soname), Some(v), Some(path)) = (f.next(), f.next(), f.next()) else {
+            return Err(Error::Manifest {
+                line: n + 1,
+                why: "wants soname, flag, path",
+            });
+        };
+        let versioned = match v {
+            "v" => true,
+            "-" => false,
+            _ => {
+                return Err(Error::Manifest {
+                    line: n + 1,
+                    why: "flag is v or -",
+                })
+            }
+        };
+        out.push(Provide {
+            soname: soname.to_string(),
+            versioned,
+            path: path.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+pub fn write_provides(root: &Path, target: &str, name: &str, ps: &[Provide]) -> Result<(), Error> {
+    let text = format_provides(ps)?;
+    let d = provides(root, target, name);
+    let parent = d.parent().unwrap_or(&d);
+    fs::create_dir_all(parent).map_err(|e| Error::Io(parent.to_path_buf(), e))?;
+    put(&d, &text)
+}
+
+pub fn read_provides(root: &Path, target: &str, name: &str) -> Result<Vec<Provide>, Error> {
+    let p = provides(root, target, name);
+    match fs::read_to_string(&p) {
+        Ok(t) => parse_provides(&t),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(Error::Io(p, e)),
+    }
+}
+
 pub fn dir(root: &Path, target: &str, name: &str) -> PathBuf {
     root.join(DB).join("installed").join(target).join(name)
 }
@@ -223,6 +304,54 @@ mod tests {
              l 0777 ../bar usr/bin/baz\n\
              h 0644 usr/bin/foo usr/bin/foo-alias\n"
         )
+    }
+
+    #[test]
+    fn a_provides_line_round_trips() {
+        let ps = vec![
+            Provide {
+                soname: "libz.so.1".into(),
+                versioned: true,
+                path: "usr/lib/libz.so.1".into(),
+            },
+            Provide {
+                soname: "libfoo.so.2".into(),
+                versioned: false,
+                path: "usr/lib/some dir/libfoo.so.2".into(),
+            },
+        ];
+        let text = format_provides(&ps).unwrap();
+        assert_eq!(
+            text,
+            "libz.so.1 v usr/lib/libz.so.1\nlibfoo.so.2 - usr/lib/some dir/libfoo.so.2\n"
+        );
+        assert_eq!(parse_provides(&text).unwrap(), ps);
+    }
+
+    #[test]
+    fn a_provides_line_that_makes_no_sense_names_its_line() {
+        for (raw, why) in [
+            ("libz.so.1 x usr/lib/libz.so.1", "flag is v or -"),
+            ("libz.so.1", "wants soname, flag, path"),
+        ] {
+            match parse_provides(raw) {
+                Err(Error::Manifest { line, why: got }) => {
+                    assert_eq!(line, 1);
+                    assert_eq!(got, why);
+                }
+                other => panic!("{raw:?} gave {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_absolute_provides_path_is_refused_before_writing() {
+        let p = Provide {
+            soname: "libz.so.1".into(),
+            versioned: false,
+            path: "/usr/lib/libz.so.1".into(),
+        };
+        assert!(matches!(format_provides(&[p]), Err(Error::BadPath(_))));
     }
 
     #[test]

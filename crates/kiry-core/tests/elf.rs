@@ -4,7 +4,7 @@
 // construction and proves nothing
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use kiry_core::elf;
@@ -266,9 +266,13 @@ fn dyn_syms(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
         if f.len() < 8 || !f[0].ends_with(':') {
             continue;
         }
-        let Ok(size) = f[2].parse::<u64>() else {
-            continue;
+        // readelf prints st_size in decimal up to 99999 and hex past it, so parsing
+        // only decimal silently drops every symbol over that line
+        let size = match f[2].strip_prefix("0x") {
+            Some(h) => u64::from_str_radix(h, 16),
+            None => f[2].parse(),
         };
+        let Ok(size) = size else { continue };
         let (kind, bind, ndx) = (f[3], f[4], f[6]);
         let raw = f[7];
         // a trailing "(3)" means readelf took the version from verneed rather than
@@ -304,7 +308,10 @@ fn dyn_syms(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
 fn mine(e: &elf::Elf) -> Vec<RSym> {
     let f = |s: &elf::Sym, undefined: bool| RSym {
         name: s.name.clone(),
-        version: s.version.clone(),
+        // glibc exports every version name as an ABS symbol pointed at its own verdef
+        // entry, and get_symbol_version_string guards the print on st_name != vda_name,
+        // so readelf never writes GLIBC_2.10@GLIBC_2.10
+        version: s.version.clone().filter(|v| *v != s.name),
         default: s.default,
         weak: s.weak,
         object: s.object,
@@ -316,6 +323,25 @@ fn mine(e: &elf::Elf) -> Vec<RSym> {
     v
 }
 
+// libc alone carries forty-odd version definitions and most of the non-default
+// symbols on the machine, so the sample never gets to skip it
+const ALWAYS: &[&str] = &["libc.so.6", "libm.so.6"];
+
+// hashing the path keeps a file in or out for good. an index into a directory
+// listing would re-roll the whole sample every time a package lands
+fn sampled(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if ALWAYS.contains(&name) {
+        return true;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in p.to_string_lossy().bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h.is_multiple_of(21)
+}
+
 #[test]
 fn agrees_with_readelf_on_dynamic_symbols() {
     let corpus = corpus();
@@ -323,9 +349,7 @@ fn agrees_with_readelf_on_dynamic_symbols() {
         assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "no corpus");
         return;
     }
-    // every Nth, so it stays a spread across the tree without running readelf
-    // over a million symbols
-    let sample: Vec<&(PathBuf, Vec<u8>)> = corpus.iter().step_by(corpus.len() / 120).collect();
+    let sample: Vec<&(PathBuf, Vec<u8>)> = corpus.iter().filter(|(p, _)| sampled(p)).collect();
     let paths: Vec<&PathBuf> = sample.iter().map(|(p, _)| p).collect();
 
     let theirs = dyn_syms(&paths);
@@ -333,6 +357,7 @@ fn agrees_with_readelf_on_dynamic_symbols() {
     let mut compared = 0;
     let mut versioned = 0;
     let mut nondefault = 0;
+    let mut selfnamed = 0;
     for (p, bytes) in &sample {
         let got = elf::parse(bytes).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         let want = theirs
@@ -355,6 +380,13 @@ fn agrees_with_readelf_on_dynamic_symbols() {
             .iter()
             .filter(|s| s.version.is_some() && !s.default)
             .count();
+        // mine() drops these to match readelf, so count them before it does or
+        // the reader could stop resolving them and nothing here would notice
+        selfnamed += got
+            .exports
+            .iter()
+            .filter(|s| s.version.as_deref() == Some(s.name.as_str()))
+            .count();
     }
 
     assert!(compared > 5000, "only compared {compared} symbols");
@@ -363,6 +395,63 @@ fn agrees_with_readelf_on_dynamic_symbols() {
         nondefault > 0,
         "no non-default versioned symbol in the sample"
     );
+    assert!(selfnamed > 0, "no version-definition symbol in the sample");
+}
+
+// nothing sampled here has an object big enough to cross readelf's decimal cutoff,
+// so a fixture is the only way to reach that branch on purpose
+#[test]
+fn reads_a_symbol_too_big_for_readelf_to_print_in_decimal() {
+    let dir = std::env::temp_dir().join(format!("kiry-big-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("t.c");
+    std::fs::write(&src, "char big[200000];\n").unwrap();
+    let so = dir.join("libt.so");
+
+    let built = Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(&src)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => {
+            assert!(
+                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+                "cc cannot build a shared library"
+            );
+            return;
+        }
+    }
+
+    let raw = Command::new("readelf")
+        .args(["--dyn-syms", "-W"])
+        .arg(&so)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&raw.stdout);
+    let hex = text.lines().any(|l| {
+        l.split_whitespace().last() == Some("big")
+            && l.split_whitespace()
+                .nth(2)
+                .is_some_and(|s| s.starts_with("0x"))
+    });
+    assert!(
+        hex,
+        "readelf printed the size in decimal, so the fixture no longer reaches the \
+         hex branch and this test proves nothing"
+    );
+
+    let got = mine(&elf::parse(&std::fs::read(&so).unwrap()).unwrap());
+    let want = &dyn_syms(&[&so])[&so];
+    assert_eq!(got.len(), want.len(), "symbol count for the fixture");
+    let big = got
+        .iter()
+        .find(|s| s.name == "big")
+        .unwrap_or_else(|| panic!("lost the symbol readelf prints in hex"));
+    assert_eq!(big.size, 200_000);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // nothing installed here carries DT_HASH any more, the linker has defaulted to the

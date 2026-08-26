@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use kiry_core::pkg::Package;
-use kiry_core::{db, install, pkg};
+use kiry_core::{db, elf, install, pkg};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -14,6 +15,7 @@ fn main() {
         Some("i") => install_cmd(&args[1..]),
         Some("r") => remove_cmd(&args[1..]),
         Some("l") => list_cmd(&args[1..]),
+        Some("doctor") => doctor_cmd(&args[1..]),
         Some(dir) => show(dir),
         None => {
             usage();
@@ -27,6 +29,7 @@ fn usage() {
     println!("       kiry i [--root DIR] [--force] <archive>...");
     println!("       kiry r [--root DIR] [--force] <pkg>...");
     println!("       kiry l [--root DIR]");
+    println!("       kiry doctor [--root DIR]");
     println!("       kiry <package dir>");
 }
 
@@ -491,6 +494,152 @@ fn list_cmd(args: &[String]) {
             }
         }
     }
+}
+
+// the stale check goes when provides stops being a stored file, the linkage check
+// when nothing outside kiry can write to the root, so never
+fn doctor_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    if let Some(a) = rest.first() {
+        die(format!("doctor takes no arguments, got {a}"));
+    }
+
+    let targets = match db::targets(&root) {
+        Ok(t) => t,
+        Err(e) => die(e.to_string()),
+    };
+
+    let mut found = 0;
+    for t in &targets {
+        found += check(&root, t);
+    }
+    if found > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn check(root: &Path, target: &str) -> usize {
+    let Some(dirs) = defaults(target) else {
+        println!("{target} - unknown-target");
+        return 1;
+    };
+
+    let names = match db::installed(root, target) {
+        Ok(n) => n,
+        Err(e) => die(e.to_string()),
+    };
+
+    let mut elves = Vec::new();
+    let mut here: HashMap<String, Vec<String>> = HashMap::new();
+    let mut found = 0;
+
+    for name in &names {
+        let rec = match db::read(root, target, name) {
+            Ok(r) => r,
+            Err(e) => die(e.to_string()),
+        };
+        let seen = match install::scan(root, &rec.manifest) {
+            Ok(s) => s,
+            Err(e) => die(e.to_string()),
+        };
+
+        let mut mine = Vec::new();
+        for (path, o) in seen {
+            let Some(o) = o else {
+                println!("{path} {target} unreadable");
+                found += 1;
+                continue;
+            };
+            if let Some(soname) = &o.soname {
+                here.entry(soname.clone())
+                    .or_default()
+                    .push(fold(dirname(&path)));
+                mine.push(db::Provide {
+                    soname: soname.clone(),
+                    versioned: o.versioned,
+                    path: path.clone(),
+                });
+            }
+            elves.push((path, o));
+        }
+
+        // the only thing that ever reads the recorded file, and a moved soname is
+        // what it notices
+        match db::read_provides(root, target, name) {
+            Ok(mut was) => {
+                let mut is = mine;
+                was.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
+                is.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
+                if was != is {
+                    println!("{name} {target} stale-provides");
+                    found += 1;
+                }
+            }
+            Err(e) => die(e.to_string()),
+        }
+    }
+
+    for (path, o) in &elves {
+        let where_ = search(o, path, dirs);
+        for want in &o.needed {
+            let ok = here
+                .get(want)
+                .is_some_and(|at| at.iter().any(|d| where_.iter().any(|w| w == d)));
+            if !ok {
+                println!("{path} {target} unresolved {want}");
+                found += 1;
+            }
+        }
+    }
+    found
+}
+
+// no ld.so.conf and no cache exist anywhere in this system: musl uses the search path
+// compiled into it, and the gnu tree is built with libdir=/usr/lib64
+fn defaults(target: &str) -> Option<&'static [&'static str]> {
+    match target.rsplit('-').next() {
+        Some("musl") => Some(&["usr/lib", "usr/local/lib"]),
+        Some("gnu") => Some(&["usr/lib64"]),
+        _ => None,
+    }
+}
+
+// the loader's remaining precedence reorders the search without changing what it finds
+fn search(o: &elf::Elf, path: &str, dirs: &[&str]) -> Vec<String> {
+    let own = dirname(path);
+    let listed = o.runpath.as_deref().or(o.rpath.as_deref()).unwrap_or("");
+    let mut out: Vec<String> = listed
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| fold(&d.replace("${ORIGIN}", own).replace("$ORIGIN", own)))
+        .collect();
+    out.extend(dirs.iter().map(|d| (*d).to_string()));
+    out
+}
+
+fn dirname(p: &str) -> &str {
+    match p.rfind('/') {
+        Some(i) => &p[..i],
+        None => "",
+    }
+}
+
+// /lib, /usr/lib and usr/bin/../lib all name one directory here
+fn fold(p: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    if matches!(parts.first(), Some(&"lib" | &"lib64" | &"bin" | &"sbin")) {
+        parts.insert(0, "usr");
+    }
+    parts.join("/")
 }
 
 fn show(dir: &str) {

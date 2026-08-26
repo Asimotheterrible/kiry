@@ -100,7 +100,17 @@ fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
 pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
     for j in jobs {
         let manifest = archive::extract(root, &j.archive)?;
-        let provides = scan(root, &manifest)?;
+        let provides = scan(root, &manifest)?
+            .into_iter()
+            .filter_map(|(path, o)| {
+                let o = o?;
+                Some(db::Provide {
+                    soname: o.soname?,
+                    versioned: o.versioned,
+                    path,
+                })
+            })
+            .collect::<Vec<_>>();
         db::write(
             root,
             &db::Installed {
@@ -116,9 +126,9 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
     Ok(())
 }
 
-// a library announces itself with DT_SONAME, and something without one is not
-// anything another package could have linked against
-fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<db::Provide>, Error> {
+// every elf the manifest lists, paired with its path. None is a file that would not
+// open or would not parse, which doctor reports rather than skips
+pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Option<elf::Elf>)>, Error> {
     let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
 
@@ -133,11 +143,13 @@ fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<db::Provide>, Error> 
         };
         let Ok(pfd) = archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent })
         else {
+            out.push((e.path.clone(), None));
             continue;
         };
         let Ok(fd) =
             rustix::fs::openat(&pfd, leaf, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())
         else {
+            out.push((e.path.clone(), None));
             continue;
         };
 
@@ -149,16 +161,10 @@ fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<db::Provide>, Error> 
         }
         let mut bytes = magic.to_vec();
         if f.read_to_end(&mut bytes).is_err() {
+            out.push((e.path.clone(), None));
             continue;
         }
-        let Ok(o) = elf::parse(&bytes) else { continue };
-        if let Some(soname) = o.soname {
-            out.push(db::Provide {
-                soname,
-                versioned: o.versioned,
-                path: e.path.clone(),
-            });
-        }
+        out.push((e.path.clone(), elf::parse(&bytes).ok()));
     }
     Ok(out)
 }

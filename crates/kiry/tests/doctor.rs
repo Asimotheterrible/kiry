@@ -41,8 +41,13 @@ fn skip(why: &str) -> bool {
 // -nostdlib keeps libc out of DT_NEEDED, so the only unresolved thing in a fixture root
 // is the one the test put there
 fn lib(at: &Path, soname: &str) -> PathBuf {
-    let src = at.join("p.c");
-    fs::write(&src, "void p(void){}\n").unwrap();
+    libsrc(at, soname, "void p(void){}\n")
+}
+
+fn libsrc(at: &Path, soname: &str, body: &str) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{soname}.c"));
+    fs::write(&src, body).unwrap();
     let out = at.join(soname);
     let ok = Command::new("cc")
         .args([
@@ -61,8 +66,19 @@ fn lib(at: &Path, soname: &str) -> PathBuf {
 }
 
 fn bin(at: &Path, name: &str, against: &Path, rpath: Option<&str>) -> PathBuf {
-    let src = at.join("m.c");
-    fs::write(&src, "void p(void);\nvoid _start(void){p();}\n").unwrap();
+    binsrc(
+        at,
+        name,
+        "void p(void);\nvoid _start(void){p();}\n",
+        against,
+        rpath,
+    )
+}
+
+fn binsrc(at: &Path, name: &str, body: &str, against: &Path, rpath: Option<&str>) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{name}.c"));
+    fs::write(&src, body).unwrap();
     let out = at.join(name);
     let mut c = Command::new("cc");
     c.arg("-nostdlib");
@@ -82,6 +98,10 @@ fn bin(at: &Path, name: &str, against: &Path, rpath: Option<&str>) -> PathBuf {
 
 // exactly what apply() records, so a test root and a real one agree
 fn install(root: &Path, name: &str, files: &[(&str, &Path)]) {
+    installed(root, name, files, &[])
+}
+
+fn installed(root: &Path, name: &str, files: &[(&str, &Path)], links: &[(&str, &str)]) {
     let mut manifest = Vec::new();
     for (path, from) in files {
         let dst = root.join(path);
@@ -93,6 +113,7 @@ fn install(root: &Path, name: &str, files: &[(&str, &Path)]) {
             path: (*path).to_string(),
         });
     }
+    add_links(root, &mut manifest, links);
     db::write(
         root,
         &db::Installed {
@@ -120,6 +141,20 @@ fn install(root: &Path, name: &str, files: &[(&str, &Path)]) {
     db::write_provides(root, TARGET, name, &provides).unwrap();
 }
 
+fn add_links(root: &Path, manifest: &mut Vec<db::Entry>, links: &[(&str, &str)]) {
+    for (at, to) in links {
+        let dst = root.join(at);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let _ = fs::remove_file(&dst);
+        std::os::unix::fs::symlink(to, &dst).unwrap();
+        manifest.push(db::Entry {
+            kind: db::Kind::Link((*to).to_string()),
+            mode: 0o777,
+            path: (*at).to_string(),
+        });
+    }
+}
+
 fn doctor(root: &Path) -> (bool, String) {
     let o: Output = Command::new(KIRY)
         .args(["doctor", "--root", root.to_str().unwrap()])
@@ -141,6 +176,22 @@ fn ldd_finds(bin: &Path, soname: &str) -> bool {
     String::from_utf8_lossy(&o.stdout)
         .lines()
         .any(|l| l.contains(soname) && !l.contains("not found"))
+}
+
+// -r makes ldd resolve every relocation instead of stopping at the libraries, which is
+// the question doctor is asking. it reports on stderr
+fn ldd_relocs(bin: &Path) -> String {
+    let o = Command::new("ldd")
+        .args(["-r"])
+        .arg(bin)
+        .env_remove("LD_LIBRARY_PATH")
+        .output()
+        .unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
 }
 
 #[test]
@@ -336,4 +387,203 @@ fn origin_names_the_directory_the_binary_is_in() {
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "{out}");
     assert!(ldd_finds(&root.join("usr/bin/app"), "libp.so.1"));
+}
+
+// the case a soname check gets wrong from the other side: the library is installed,
+// under the name it always had, in the directory the binary looks in, and the function
+// the binary calls is not in it any more
+#[test]
+fn a_symbol_the_library_dropped_is_reported() {
+    if skip("dropped symbol") {
+        return;
+    }
+    let at = scratch("dropped");
+    let root = at.join("root");
+    let full = libsrc(
+        &at.join("was"),
+        "libt.so.1",
+        "void p(void){}\nvoid q(void){}\n",
+    );
+    let thin = libsrc(&at.join("now"), "libt.so.1", "void p(void){}\n");
+    let app = binsrc(
+        &at.join("was"),
+        "app",
+        "void q(void);\nvoid _start(void){q();}\n",
+        &full,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "libt", &[("usr/lib64/libt.so.1", &thin)]);
+    install(&root, "app", &[("usr/bin/app", &app)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!ok, "doctor passed a binary whose symbol is gone");
+    assert!(
+        out.contains(&format!("usr/bin/app {TARGET} missing-symbol q")),
+        "{out}"
+    );
+    assert!(
+        !out.contains("unresolved"),
+        "the library itself resolves, only the symbol is gone: {out}"
+    );
+
+    let ldd = ldd_relocs(&root.join("usr/bin/app"));
+    assert!(ldd.contains("undefined symbol: q"), "ldd disagrees: {ldd}");
+}
+
+// a weak undefined is allowed to stay undefined. reporting those would bury every real
+// finding under the __gmon_start__ in front of it
+#[test]
+fn a_weak_undefined_symbol_is_not_a_finding() {
+    if skip("weak undefined") {
+        return;
+    }
+    let at = scratch("weak");
+    let root = at.join("root");
+    let l = lib(&at, "libt.so.1");
+    let app = binsrc(
+        &at,
+        "app",
+        "void p(void);\n__attribute__((weak)) void q(void);\nvoid _start(void){p();if(q)q();}\n",
+        &l,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "libt", &[("usr/lib64/libt.so.1", &l)]);
+    install(&root, "app", &[("usr/bin/app", &app)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(ok && out.is_empty(), "expected silence, got {out:?}");
+}
+
+// same name, same library, different version node. the symbol is right there and the
+// binary still will not start
+#[test]
+fn a_symbol_that_kept_its_name_and_changed_version_does_not_satisfy() {
+    if skip("version moved") {
+        return;
+    }
+    let at = scratch("vers");
+    let root = at.join("root");
+    let was = versioned_lib(&at.join("was"), "V1");
+    let now = versioned_lib(&at.join("now"), "V2");
+    let app = binsrc(
+        &at.join("was"),
+        "app",
+        "void p(void);\nvoid _start(void){p();}\n",
+        &was,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "libt", &[("usr/lib64/libt.so.1", &now)]);
+    install(&root, "app", &[("usr/bin/app", &app)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!ok, "doctor passed a binary asking for a version that left");
+    assert!(
+        out.contains(&format!("usr/bin/app {TARGET} missing-symbol p@V1")),
+        "{out}"
+    );
+
+    let ldd = ldd_relocs(&root.join("usr/bin/app"));
+    assert!(ldd.contains("V1"), "ldd disagrees: {ldd}");
+}
+
+fn versioned_lib(at: &Path, node: &str) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let map = at.join("v.map");
+    fs::write(&map, format!("{node} {{ global: p; local: *; }};\n")).unwrap();
+    let src = at.join("v.c");
+    fs::write(&src, "void p(void){}\n").unwrap();
+    let out = at.join("libt.so.1");
+    let ok = Command::new("cc")
+        .args(["-shared", "-fPIC", "-nostdlib", "-Wl,-soname,libt.so.1"])
+        .arg(format!("-Wl,--version-script,{}", map.display()))
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    out
+}
+
+// alpine ships libscudo.so with no DT_SONAME at all and lld asks for it by that name.
+// DT_NEEDED names a file, and the loader opens it without ever asking what the library
+// calls itself
+#[test]
+fn a_library_with_no_soname_resolves_by_the_name_asked_for() {
+    if skip("no soname") {
+        return;
+    }
+    let at = scratch("nosoname");
+    let root = at.join("root");
+    let l = nameless(&at, "libt.so.1");
+    let app = against_name(&at, "app", &l, "libt.so.1", Some("$ORIGIN/../lib64"));
+    install(&root, "libt", &[("usr/lib64/libt.so.1", &l)]);
+    install(&root, "app", &[("usr/bin/app", &app)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(ok && out.is_empty(), "expected silence, got {out:?}");
+    assert!(ldd_finds(&root.join("usr/bin/app"), "libt.so.1"));
+}
+
+// musl reaches its libc through usr/lib/libc.musl-x86_64.so.1, which is a symlink to the
+// loader. resolution that stops at regular files calls that root broken
+#[test]
+fn a_library_reached_through_a_symlink_resolves() {
+    if skip("symlinked library") {
+        return;
+    }
+    let at = scratch("symlinked");
+    let root = at.join("root");
+    let l = nameless(&at, "libt.so.1");
+    let app = against_name(&at, "app", &l, "libt.so.1", Some("$ORIGIN/../lib64"));
+    install(&root, "libt", &[("usr/lib64/libreal.so.1", &l)]);
+    installed(
+        &root,
+        "app",
+        &[("usr/bin/app", &app)],
+        &[("usr/lib64/libt.so.1", "libreal.so.1")],
+    );
+
+    let (ok, out) = doctor(&root);
+    assert!(ok && out.is_empty(), "expected silence, got {out:?}");
+}
+
+// no -Wl,-soname, so the library says nothing about what it is called
+fn nameless(at: &Path, name: &str) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{name}.c"));
+    fs::write(&src, "void p(void){}\n").unwrap();
+    let out = at.join(name);
+    let ok = Command::new("cc")
+        .args(["-shared", "-fPIC", "-nostdlib"])
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    out
+}
+
+// -l: takes the file name verbatim, which is what lands in DT_NEEDED when the library
+// carries no soname of its own
+fn against_name(at: &Path, name: &str, lib: &Path, asks: &str, rpath: Option<&str>) -> PathBuf {
+    let src = at.join(format!("{name}.c"));
+    fs::write(&src, "void p(void);\nvoid _start(void){p();}\n").unwrap();
+    let out = at.join(name);
+    let mut c = Command::new("cc");
+    c.arg("-nostdlib");
+    if let Some(r) = rpath {
+        c.arg(format!("-Wl,-rpath,{r}"));
+    }
+    let ok = c
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .arg(format!("-L{}", lib.parent().unwrap().display()))
+        .arg(format!("-l:{asks}"))
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    out
 }

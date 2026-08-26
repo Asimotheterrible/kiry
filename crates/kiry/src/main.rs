@@ -1,6 +1,6 @@
 mod sandbox;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -545,7 +545,8 @@ fn check(root: &Path, target: &str) -> usize {
     };
 
     let mut elves = Vec::new();
-    let mut here: HashMap<String, Vec<String>> = HashMap::new();
+    let mut here: HashMap<String, usize> = HashMap::new();
+    let mut links: HashMap<String, String> = HashMap::new();
     let mut found = 0;
 
     for name in &names {
@@ -553,6 +554,20 @@ fn check(root: &Path, target: &str) -> usize {
             Ok(r) => r,
             Err(e) => die(e.to_string()),
         };
+        // the loader opens a path, so a symlink on the way to a library is part of
+        // resolution. musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1
+        // points at the loader itself
+        for e in &rec.manifest {
+            if let db::Kind::Link(t) = &e.kind {
+                let to = if let Some(abs) = t.strip_prefix('/') {
+                    abs.to_string()
+                } else {
+                    format!("{}/{t}", dirname(&e.path))
+                };
+                links.insert(fold(&e.path), fold(&to));
+            }
+        }
+
         let seen = match install::scan(root, &rec.manifest) {
             Ok(s) => s,
             Err(e) => die(e.to_string()),
@@ -565,10 +580,8 @@ fn check(root: &Path, target: &str) -> usize {
                 found += 1;
                 continue;
             };
+            here.insert(fold(&path), elves.len());
             if let Some(soname) = &o.soname {
-                here.entry(soname.clone())
-                    .or_default()
-                    .push(fold(dirname(&path)));
                 mine.push(db::Provide {
                     soname: soname.clone(),
                     versioned: o.versioned,
@@ -594,19 +607,124 @@ fn check(root: &Path, target: &str) -> usize {
         }
     }
 
-    for (path, o) in &elves {
+    let sets = exported(&elves);
+    for (i, (path, o)) in elves.iter().enumerate() {
         let where_ = search(o, path, dirs);
         for want in &o.needed {
-            let ok = here
-                .get(want)
-                .is_some_and(|at| at.iter().any(|d| where_.iter().any(|w| w == d)));
-            if !ok {
+            if provider(&here, &links, want, &where_).is_none() {
                 println!("{path} {target} unresolved {want}");
                 found += 1;
             }
         }
+        for want in missing(&elves, &sets, &here, &links, dirs, i) {
+            println!("{path} {target} missing-symbol {want}");
+            found += 1;
+        }
     }
     found
+}
+
+// DT_NEEDED names a file, not a soname. the loader opens the first directory on the
+// search path holding a file by that name and never looks at what the library calls
+// itself, so a library with no DT_SONAME at all still loads. matching sonames instead
+// declared alpine's libscudo.so missing while it sat in usr/lib
+fn provider(
+    here: &HashMap<String, usize>,
+    links: &HashMap<String, String>,
+    want: &str,
+    where_: &[String],
+) -> Option<usize> {
+    for d in where_ {
+        let mut at = fold(&format!("{d}/{want}"));
+        // a chain of eight is past anything real and short of looping forever
+        for _ in 0..8 {
+            if let Some(i) = here.get(&at) {
+                return Some(*i);
+            }
+            match links.get(&at) {
+                Some(to) => at = to.clone(),
+                None => break,
+            }
+        }
+    }
+    None
+}
+
+// a soname check passes a library that kept its name and dropped half its symbols, and
+// the binary linked against it dies at the first call that is not there. lazy binding
+// means launching it proves nothing either, so the definitions get counted here
+//
+// rpath inheritance down the closure is not modelled: a transitive library reachable
+// only through its parent's rpath reports as unresolved on its own walk instead, which
+// is a second finding rather than a missed one
+// one pair of sets per file, built once for the whole walk. unioning a closure per
+// consumer instead is tens of millions of inserts on a real root, to answer a question
+// that only ever needed a lookup
+type Exports<'a> = (HashSet<&'a str>, HashSet<(&'a str, Option<&'a str>)>);
+
+fn exported(elves: &[(String, elf::Elf)]) -> Vec<Exports<'_>> {
+    elves
+        .iter()
+        .map(|(_, o)| {
+            let mut names = HashSet::new();
+            let mut versioned = HashSet::new();
+            for s in &o.exports {
+                names.insert(s.name.as_str());
+                versioned.insert((s.name.as_str(), s.version.as_deref()));
+            }
+            (names, versioned)
+        })
+        .collect()
+}
+
+fn missing(
+    elves: &[(String, elf::Elf)],
+    sets: &[Exports<'_>],
+    here: &HashMap<String, usize>,
+    links: &HashMap<String, String>,
+    dirs: &[&str],
+    root: usize,
+) -> Vec<String> {
+    let mut seen = HashSet::from([root]);
+    let mut queue = vec![root];
+    let mut closure = vec![root];
+
+    while let Some(i) = queue.pop() {
+        let (path, o) = &elves[i];
+        let where_ = search(o, path, dirs);
+        for want in &o.needed {
+            if let Some(j) = provider(here, links, want, &where_) {
+                if seen.insert(j) {
+                    queue.push(j);
+                    closure.push(j);
+                }
+            }
+        }
+    }
+
+    elves[root]
+        .1
+        .undefined
+        .iter()
+        // a weak undefined is allowed to stay undefined, which is the whole point of
+        // it. __gmon_start__ sits in nearly every binary on the system
+        .filter(|s| !s.weak)
+        .filter(|s| {
+            !closure.iter().any(|&i| match s.version.as_deref() {
+                None => sets[i].0.contains(s.name.as_str()),
+                // an unversioned definition still satisfies a versioned request, which
+                // is the case where the loader binds it and only warns
+                Some(v) => {
+                    sets[i].1.contains(&(s.name.as_str(), Some(v)))
+                        || sets[i].1.contains(&(s.name.as_str(), None))
+                }
+            })
+        })
+        .map(|s| match &s.version {
+            Some(v) => format!("{}@{v}", s.name),
+            None => s.name.clone(),
+        })
+        .collect()
 }
 
 // no ld.so.conf and no cache exist anywhere in this system: musl uses the search path

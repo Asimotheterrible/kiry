@@ -180,10 +180,21 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
 
     // dt_strtab is an address, not a file offset. map it through pt_load the way
     // the loader does
-    let strtab = at(offset_of(
-        &loads,
-        strtab.ok_or("names to look up but no string table")?,
-    )?)?;
+    let strtab_at = strtab.ok_or("names to look up but no string table")?;
+    let strtab = at(offset_of(&loads, strtab_at)?)?;
+
+    // there is no DT_SYMSZ, so the symbol table ends where the next structure the
+    // dynamic section points at begins. anything between that and the count the hash
+    // gives is padding, whose name index is zero and gets skipped below
+    let end = [Some(strtab_at), versym, verdef, verneed, hash, gnu_hash]
+        .into_iter()
+        .flatten()
+        .filter(|a| symtab.is_some_and(|s| *a > s))
+        .min()
+        .map(|a| offset_of(&loads, a))
+        .transpose()?
+        .map(at)
+        .transpose()?;
     let strsz = at(strsz.ok_or("a string table of no stated size")?)?;
     let strs = b
         .get(strtab..)
@@ -192,7 +203,7 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
 
     let names = versions(b, &loads, strs, verdef, verdefnum, verneed, verneednum)?;
     let (exports, undefined) = symbols(
-        b, &loads, strs, &names, symtab, syment, hash, gnu_hash, versym,
+        b, &loads, strs, &names, symtab, syment, hash, gnu_hash, versym, end,
     )?;
 
     Ok(Elf {
@@ -386,6 +397,7 @@ fn symbols(
     hash: Option<u64>,
     gnu: Option<u64>,
     versym: Option<u64>,
+    end: Option<usize>,
 ) -> Result<(Vec<Sym>, Vec<Sym>), &'static str> {
     // TODO: everyone gets the whole table, even a caller that only wants linkage
     let Some(addr) = symtab else {
@@ -396,8 +408,11 @@ fn symbols(
         return Err("symbol entries too small to be ones");
     }
 
-    let n = count(b, loads, hash, gnu)?;
     let start = at(offset_of(loads, addr)?)?;
+    // the gnu hash sizes only the symbols it hashes, and a file that exports nothing
+    // hashes nothing: its symndx is then whatever the linker felt like writing, which
+    // is how a binary with one undefined symbol reads as having none
+    let n = count(b, loads, hash, gnu)?.max(end.map_or(0, |e| e.saturating_sub(start) / entsize));
     let table = b
         .get(start..)
         .and_then(|s| s.get(..n.checked_mul(entsize)?))

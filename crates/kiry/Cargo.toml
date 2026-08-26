@@ -6,3 +6,4 @@ edition.workspace = true
 
 [dependencies]
 kiry-core = { path = "../kiry-core" }
+rustix = { version = "1.1.4", features = ["fs", "mount", "process", "thread"] }

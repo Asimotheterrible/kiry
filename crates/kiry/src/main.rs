@@ -1,3 +1,5 @@
+mod sandbox;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,11 @@ fn main() {
         Some("r") => remove_cmd(&args[1..]),
         Some("l") => list_cmd(&args[1..]),
         Some("doctor") => doctor_cmd(&args[1..]),
+        Some("sandbox") => {
+            if let Err(e) = sandbox::init() {
+                die(e);
+            }
+        }
         Some(dir) => show(dir),
         None => {
             usage();
@@ -30,6 +37,7 @@ fn usage() {
     println!("       kiry r [--root DIR] [--force] <pkg>...");
     println!("       kiry l [--root DIR]");
     println!("       kiry doctor [--root DIR]");
+    println!("       kiry sandbox                    internal: build inside its closure");
     println!("       kiry <package dir>");
 }
 
@@ -223,12 +231,19 @@ fn compile(
         return Err(format!("{}: no build script", p.dir.display()));
     }
 
-    let mut c = Command::new("sh");
-    c.arg("-e")
-        .arg(abs(&script)?)
-        .current_dir(unpacked(&src))
-        .env("DESTDIR", abs(&dest)?)
-        .env("KIRY_SRCDIR", abs(&src)?)
+    let sysroot = work.join("sysroot");
+    let members = sandbox::closure(root, t, &p.depends)?;
+    sandbox::assemble(root, t, &members, &sysroot)?;
+
+    fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
+
+    let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut c = Command::new(me);
+    c.arg("sandbox")
+        .env("KIRY_SANDBOX", abs(&work)?)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("DESTDIR", "/dest")
+        .env("KIRY_SRCDIR", "/src")
         .env("KIRY_TARGET", t)
         .env("KIRY_NAME", &p.name)
         .env("KIRY_VERSION", &p.version.upstream)

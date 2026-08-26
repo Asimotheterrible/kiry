@@ -1,9 +1,13 @@
 // doctor answers the same question ldd does, so ldd is what it gets checked against.
-// every fixture is built with cc and installed through the real binary
+// the fixtures are placed and recorded the way install records them rather than built
+// through b: what is under test is linkage, not the build path
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use kiry_core::pkg::Version;
+use kiry_core::{db, install};
 
 const KIRY: &str = env!("CARGO_BIN_EXE_kiry");
 const TARGET: &str = "x86_64-gnu";
@@ -17,34 +21,14 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-fn kiry(args: &[&str]) -> Output {
-    Command::new(KIRY).args(args).output().unwrap()
-}
-
-fn recipe(at: &Path, name: &str, script: &str) -> PathBuf {
-    let d = at.join(name);
-    fs::create_dir_all(&d).unwrap();
-    fs::write(d.join("version"), "1.0 1\n").unwrap();
-    fs::write(d.join("targets"), format!("{TARGET}\n")).unwrap();
-    fs::write(d.join("build"), script).unwrap();
-    d
-}
-
-// -nostdlib keeps libc out of DT_NEEDED, so the only unresolved thing in a fixture root
-// is the one the test put there
-const LIB: &str = "echo 'void p(void){}' > p.c\n\
-     cc -shared -fPIC -nostdlib -Wl,-soname,libp.so.1 -o libp.so.1 p.c\n";
-const MAIN: &str = "printf 'void p(void);\\nvoid _start(void){p();}\\n' > m.c\n";
-
-fn have_cc() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
 fn skip(why: &str) -> bool {
-    if have_cc() && Command::new("ldd").arg("--version").output().is_ok() {
+    let have = |p: &str| {
+        Command::new(p)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if have("cc") && have("ldd") {
         return false;
     }
     assert!(
@@ -54,24 +38,93 @@ fn skip(why: &str) -> bool {
     true
 }
 
-fn build_and_install(at: &Path, root: &Path, pkgs: &[&Path]) {
-    let mut args: Vec<String> = vec!["b".into(), "--root".into(), root.display().to_string()];
-    args.extend(pkgs.iter().map(|p| p.display().to_string()));
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let o = kiry(&refs);
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+// -nostdlib keeps libc out of DT_NEEDED, so the only unresolved thing in a fixture root
+// is the one the test put there
+fn lib(at: &Path, soname: &str) -> PathBuf {
+    let src = at.join("p.c");
+    fs::write(&src, "void p(void){}\n").unwrap();
+    let out = at.join(soname);
+    let ok = Command::new("cc")
+        .args([
+            "-shared",
+            "-fPIC",
+            "-nostdlib",
+            &format!("-Wl,-soname,{soname}"),
+        ])
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    out
+}
 
-    for p in pkgs {
-        let name = p.file_name().unwrap().to_str().unwrap();
-        let art = root.join(format!("var/kiry/cache/{name}-1.0-1.{TARGET}.tar.zst"));
-        let o = kiry(&["i", "--root", root.to_str().unwrap(), art.to_str().unwrap()]);
-        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+fn bin(at: &Path, name: &str, against: &Path, rpath: Option<&str>) -> PathBuf {
+    let src = at.join("m.c");
+    fs::write(&src, "void p(void);\nvoid _start(void){p();}\n").unwrap();
+    let out = at.join(name);
+    let mut c = Command::new("cc");
+    c.arg("-nostdlib");
+    if let Some(r) = rpath {
+        c.arg(format!("-Wl,-rpath,{r}"));
     }
-    let _ = at;
+    let ok = c
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .arg(against)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    out
+}
+
+// exactly what apply() records, so a test root and a real one agree
+fn install(root: &Path, name: &str, files: &[(&str, &Path)]) {
+    let mut manifest = Vec::new();
+    for (path, from) in files {
+        let dst = root.join(path);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::copy(from, &dst).unwrap();
+        manifest.push(db::Entry {
+            mode: 0o755,
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(&dst).unwrap()).unwrap()),
+            path: (*path).to_string(),
+        });
+    }
+    db::write(
+        root,
+        &db::Installed {
+            name: name.to_string(),
+            target: TARGET.to_string(),
+            version: Version::parse("1.0 1").unwrap(),
+            depends: Vec::new(),
+            manifest: manifest.clone(),
+        },
+    )
+    .unwrap();
+
+    let provides: Vec<db::Provide> = install::scan(root, &manifest)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(path, o)| {
+            let o = o?;
+            Some(db::Provide {
+                soname: o.soname?,
+                versioned: o.versioned,
+                path,
+            })
+        })
+        .collect();
+    db::write_provides(root, TARGET, name, &provides).unwrap();
 }
 
 fn doctor(root: &Path) -> (bool, String) {
-    let o = kiry(&["doctor", "--root", root.to_str().unwrap()]);
+    let o: Output = Command::new(KIRY)
+        .args(["doctor", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
     (
         o.status.success(),
         String::from_utf8_lossy(&o.stdout).into(),
@@ -97,19 +150,10 @@ fn a_root_whose_linkage_resolves_says_nothing() {
     }
     let at = scratch("clean");
     let root = at.join("root");
-    fs::create_dir_all(&root).unwrap();
-
-    let lib = recipe(
-        &at,
-        "libp",
-        &format!("{LIB}mkdir -p \"$DESTDIR/usr/lib64\"\ncp libp.so.1 \"$DESTDIR/usr/lib64/\"\n"),
-    );
-    let bin = recipe(
-        &at,
-        "app",
-        &format!("{LIB}{MAIN}cc -nostdlib -o app m.c libp.so.1\nmkdir -p \"$DESTDIR/usr/bin\"\ncp app \"$DESTDIR/usr/bin/\"\n"),
-    );
-    build_and_install(&at, &root, &[&lib, &bin]);
+    let l = lib(&at, "libp.so.1");
+    let b = bin(&at, "app", &l, None);
+    install(&root, "libp", &[("usr/lib64/libp.so.1", &l)]);
+    install(&root, "app", &[("usr/bin/app", &b)]);
 
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "expected silence, got {out:?}");
@@ -122,14 +166,9 @@ fn a_library_nothing_installs_is_unresolved() {
     }
     let at = scratch("missing");
     let root = at.join("root");
-    fs::create_dir_all(&root).unwrap();
-
-    let bin = recipe(
-        &at,
-        "app",
-        &format!("{LIB}{MAIN}cc -nostdlib -o app m.c libp.so.1\nmkdir -p \"$DESTDIR/usr/bin\"\ncp app \"$DESTDIR/usr/bin/\"\n"),
-    );
-    build_and_install(&at, &root, &[&bin]);
+    let l = lib(&at, "libp.so.1");
+    let b = bin(&at, "app", &l, None);
+    install(&root, "app", &[("usr/bin/app", &b)]);
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "doctor passed a root with nothing providing libp.so.1");
@@ -149,24 +188,12 @@ fn a_library_off_the_search_path_does_not_count_as_provided() {
     }
     let at = scratch("offpath");
     let root = at.join("root");
-    fs::create_dir_all(&root).unwrap();
-
-    let lib = recipe(
-        &at,
-        "libp",
-        &format!("{LIB}mkdir -p \"$DESTDIR/usr/lib64/priv\"\ncp libp.so.1 \"$DESTDIR/usr/lib64/priv/\"\n"),
-    );
-    let bare = recipe(
-        &at,
-        "bare",
-        &format!("{LIB}{MAIN}cc -nostdlib -o bare m.c libp.so.1\nmkdir -p \"$DESTDIR/usr/bin\"\ncp bare \"$DESTDIR/usr/bin/\"\n"),
-    );
-    let rp = recipe(
-        &at,
-        "rp",
-        &format!("{LIB}{MAIN}cc -nostdlib -Wl,-rpath,'$ORIGIN/../lib64/priv' -o rp m.c libp.so.1\nmkdir -p \"$DESTDIR/usr/bin\"\ncp rp \"$DESTDIR/usr/bin/\"\n"),
-    );
-    build_and_install(&at, &root, &[&lib, &bare, &rp]);
+    let l = lib(&at, "libp.so.1");
+    let bare = bin(&at, "bare", &l, None);
+    let rp = bin(&at, "rp", &l, Some("$ORIGIN/../lib64/priv"));
+    install(&root, "libp", &[("usr/lib64/priv/libp.so.1", &l)]);
+    install(&root, "bare", &[("usr/bin/bare", &bare)]);
+    install(&root, "rp", &[("usr/bin/rp", &rp)]);
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "{out}");
@@ -191,14 +218,8 @@ fn a_manifest_file_that_vanished_is_reported_rather_than_skipped() {
     }
     let at = scratch("vanished");
     let root = at.join("root");
-    fs::create_dir_all(&root).unwrap();
-
-    let lib = recipe(
-        &at,
-        "libp",
-        &format!("{LIB}mkdir -p \"$DESTDIR/usr/lib64\"\ncp libp.so.1 \"$DESTDIR/usr/lib64/\"\n"),
-    );
-    build_and_install(&at, &root, &[&lib]);
+    let l = lib(&at, "libp.so.1");
+    install(&root, "libp", &[("usr/lib64/libp.so.1", &l)]);
     fs::remove_file(root.join("usr/lib64/libp.so.1")).unwrap();
 
     let (ok, out) = doctor(&root);
@@ -216,31 +237,12 @@ fn a_soname_that_moved_out_from_under_the_db_shows_as_stale() {
     }
     let at = scratch("stale");
     let root = at.join("root");
-    fs::create_dir_all(&root).unwrap();
-
-    let lib = recipe(
-        &at,
-        "libp",
-        &format!("{LIB}mkdir -p \"$DESTDIR/usr/lib64\"\ncp libp.so.1 \"$DESTDIR/usr/lib64/\"\n"),
-    );
-    build_and_install(&at, &root, &[&lib]);
+    let one = lib(&at, "libp.so.1");
+    install(&root, "libp", &[("usr/lib64/libp.so.1", &one)]);
 
     // same path, different soname, which is what a hand swapped library looks like
-    let src = at.join("swap.c");
-    fs::write(&src, "void p(void){}\n").unwrap();
-    let built = Command::new("cc")
-        .args([
-            "-shared",
-            "-fPIC",
-            "-nostdlib",
-            "-Wl,-soname,libp.so.2",
-            "-o",
-        ])
-        .arg(root.join("usr/lib64/libp.so.1"))
-        .arg(&src)
-        .status()
-        .unwrap();
-    assert!(built.success());
+    let two = lib(&at, "libp.so.2");
+    fs::copy(&two, root.join("usr/lib64/libp.so.1")).unwrap();
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "{out}");
@@ -262,17 +264,10 @@ fn the_usrmerge_spelling_of_a_directory_is_the_same_directory() {
     fs::create_dir_all(root.join("usr/lib64")).unwrap();
     std::os::unix::fs::symlink("usr/lib64", root.join("lib64")).unwrap();
 
-    let lib = recipe(
-        &at,
-        "libp",
-        &format!("{LIB}mkdir -p \"$DESTDIR/usr/lib64/priv\"\ncp libp.so.1 \"$DESTDIR/usr/lib64/priv/\"\n"),
-    );
-    let app = recipe(
-        &at,
-        "app",
-        &format!("{LIB}{MAIN}cc -nostdlib -Wl,-rpath,'$ORIGIN/../../lib64/priv' -o app m.c libp.so.1\nmkdir -p \"$DESTDIR/usr/bin\"\ncp app \"$DESTDIR/usr/bin/\"\n"),
-    );
-    build_and_install(&at, &root, &[&lib, &app]);
+    let l = lib(&at, "libp.so.1");
+    let b = bin(&at, "app", &l, Some("$ORIGIN/../../lib64/priv"));
+    install(&root, "libp", &[("usr/lib64/priv/libp.so.1", &l)]);
+    install(&root, "app", &[("usr/bin/app", &b)]);
 
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "{out}");
@@ -287,19 +282,27 @@ fn dt_rpath_resolves_when_there_is_no_runpath() {
     }
     let at = scratch("rpath");
     let root = at.join("root");
-    fs::create_dir_all(&root).unwrap();
+    let l = lib(&at, "libp.so.1");
 
-    let lib = recipe(
-        &at,
-        "libp",
-        &format!("{LIB}mkdir -p \"$DESTDIR/usr/lib64/priv\"\ncp libp.so.1 \"$DESTDIR/usr/lib64/priv/\"\n"),
-    );
-    let app = recipe(
-        &at,
-        "app",
-        &format!("{LIB}{MAIN}cc -nostdlib -Wl,--disable-new-dtags -Wl,-rpath,'$ORIGIN/../lib64/priv' -o app m.c libp.so.1\nmkdir -p \"$DESTDIR/usr/bin\"\ncp app \"$DESTDIR/usr/bin/\"\n"),
-    );
-    build_and_install(&at, &root, &[&lib, &app]);
+    let src = at.join("m.c");
+    fs::write(&src, "void p(void);\nvoid _start(void){p();}\n").unwrap();
+    let b = at.join("app");
+    let ok = Command::new("cc")
+        .args([
+            "-nostdlib",
+            "-Wl,--disable-new-dtags",
+            "-Wl,-rpath,$ORIGIN/../lib64/priv",
+            "-o",
+        ])
+        .arg(&b)
+        .arg(&src)
+        .arg(&l)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+
+    install(&root, "libp", &[("usr/lib64/priv/libp.so.1", &l)]);
+    install(&root, "app", &[("usr/bin/app", &b)]);
 
     let raw = Command::new("readelf")
         .args(["-dW"])
@@ -316,9 +319,8 @@ fn dt_rpath_resolves_when_there_is_no_runpath() {
     assert!(ldd_finds(&root.join("usr/bin/app"), "libp.so.1"));
 }
 
-// every other fixture spells the runpath $ORIGIN/.., where the .. cancels the token
-// even unexpanded. a library sitting beside its binary is what actually needs $ORIGIN
-// to mean something, and it is the commonest shape a bundled app ships
+// every other fixture spells the runpath $ORIGIN/.., where the .. cancels the token even
+// unexpanded. a library beside its binary is what actually needs $ORIGIN to mean something
 #[test]
 fn origin_names_the_directory_the_binary_is_in() {
     if skip("origin") {
@@ -326,19 +328,10 @@ fn origin_names_the_directory_the_binary_is_in() {
     }
     let at = scratch("origin");
     let root = at.join("root");
-    fs::create_dir_all(&root).unwrap();
-
-    let lib = recipe(
-        &at,
-        "libp",
-        &format!("{LIB}mkdir -p \"$DESTDIR/usr/bin\"\ncp libp.so.1 \"$DESTDIR/usr/bin/\"\n"),
-    );
-    let app = recipe(
-        &at,
-        "app",
-        &format!("{LIB}{MAIN}cc -nostdlib -Wl,-rpath,'$ORIGIN' -o app m.c libp.so.1\nmkdir -p \"$DESTDIR/usr/bin\"\ncp app \"$DESTDIR/usr/bin/\"\n"),
-    );
-    build_and_install(&at, &root, &[&lib, &app]);
+    let l = lib(&at, "libp.so.1");
+    let b = bin(&at, "app", &l, Some("$ORIGIN"));
+    install(&root, "libp", &[("usr/bin/libp.so.1", &l)]);
+    install(&root, "app", &[("usr/bin/app", &b)]);
 
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "{out}");

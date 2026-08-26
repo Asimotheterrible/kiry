@@ -92,6 +92,7 @@ name = "kiry"
 version = "0.1.0"
 dependencies = [
  "kiry-core",
+ "rustix",
 ]
 
 [[package]]

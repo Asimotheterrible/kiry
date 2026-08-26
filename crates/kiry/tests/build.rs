@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use kiry_core::pkg::Version;
+use kiry_core::{db, install};
+
 const KIRY: &str = env!("CARGO_BIN_EXE_kiry");
 
 fn scratch(name: &str) -> PathBuf {
@@ -76,12 +79,94 @@ fn sidecars(root: &Path) -> Vec<String> {
     cache(root, ".meta")
 }
 
+// phase 1 starts from a rootfs nobody built either, and the installed database is plain
+// text precisely so a package can be written by hand. one busybox is the whole toolchain
+// these recipes need: their scripts run echo, mkdir and cp, never a compiler
+fn bootstrap(root: &Path) -> bool {
+    let bb = PathBuf::from("/usr/bin/busybox");
+    if !bb.is_file() {
+        assert!(
+            std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+            "no busybox to seed the sandbox toolchain with"
+        );
+        return false;
+    }
+
+    // ldd names the loader too, which walking DT_NEEDED by hand does not
+    let out = Command::new("ldd").arg(&bb).output().unwrap();
+    let mut files: Vec<(String, PathBuf)> = vec![("usr/bin/busybox".into(), bb.clone())];
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let path = match line.split_whitespace().collect::<Vec<_>>()[..] {
+            [p, ..] if p.starts_with('/') => p.to_string(),
+            [_, "=>", p, ..] if p.starts_with('/') => p.to_string(),
+            _ => continue,
+        };
+        files.push((
+            path.trim_start_matches('/').to_string(),
+            PathBuf::from(path),
+        ));
+    }
+
+    let mut manifest = Vec::new();
+    for (at, from) in &files {
+        let dst = root.join(at);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::copy(from, &dst).unwrap();
+        manifest.push(db::Entry {
+            mode: 0o755,
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(&dst).unwrap()).unwrap()),
+            path: at.clone(),
+        });
+    }
+    // busybox picks its applet out of argv[0], so this is the shell
+    std::os::unix::fs::symlink("busybox", root.join("usr/bin/sh")).unwrap();
+    manifest.push(db::Entry {
+        mode: 0o777,
+        kind: db::Kind::Link("busybox".into()),
+        path: "usr/bin/sh".into(),
+    });
+
+    let provides: Vec<db::Provide> = install::scan(root, &manifest)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(path, o)| {
+            let o = o?;
+            Some(db::Provide {
+                soname: o.soname?,
+                versioned: o.versioned,
+                path,
+            })
+        })
+        .collect();
+    for target in ["x86_64-musl", "x86_64-gnu"] {
+        db::write(
+            root,
+            &db::Installed {
+                name: "busybox".into(),
+                target: target.into(),
+                version: Version::parse("1.0 1").unwrap(),
+                depends: Vec::new(),
+                manifest: manifest.clone(),
+            },
+        )
+        .unwrap();
+        db::write_provides(root, target, "busybox", &provides).unwrap();
+    }
+
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("etc/kiry/toolchain"), "busybox\n").unwrap();
+    true
+}
+
 #[test]
 fn round_trip_through_install() {
     let at = scratch("round-trip");
     let d = recipe(&at, "x86_64-musl", GOOD);
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
 
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -110,9 +195,10 @@ fn round_trip_through_install() {
     );
 
     let o = kiry(&["l", "--root", root.to_str().unwrap()]);
-    assert_eq!(
-        String::from_utf8_lossy(&o.stdout).trim(),
-        "hello 1.0 x86_64-musl"
+    let listed = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        listed.lines().any(|l| l == "hello 1.0 x86_64-musl"),
+        "{listed}"
     );
 }
 
@@ -124,6 +210,9 @@ fn a_target_dying_while_it_packs_leaves_no_sidecar() {
     let d = recipe(&at, "x86_64-musl x86_64-gnu", &script);
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
 
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(!o.status.success());
@@ -138,6 +227,9 @@ fn one_target_failing_cancels_the_other() {
     let d = recipe(&at, "x86_64-musl x86_64-gnu", &script);
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
 
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(!o.status.success());
@@ -150,6 +242,9 @@ fn targets_agree_on_the_hash() {
     let d = recipe(&at, "x86_64-musl x86_64-gnu", GOOD);
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
 
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -167,6 +262,9 @@ fn a_wrong_checksum_stops_the_build() {
     fs::write(d.join("checksums"), format!("{}\n", "0".repeat(64))).unwrap();
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
 
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(!o.status.success());
@@ -205,6 +303,9 @@ fn fetches_once_and_keeps_it() {
 
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
     let args = ["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()];
 
     for _ in 0..2 {
@@ -226,6 +327,9 @@ fn a_failed_build_points_at_its_log() {
     let d = recipe(&at, "x86_64-musl", "echo wrecked >&2\nexit 3\n");
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
 
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(!o.status.success());
@@ -242,6 +346,9 @@ fn dash_v_streams_it_instead() {
     let d = recipe(&at, "x86_64-musl", GOOD);
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
 
     let o = kiry(&[
         "b",

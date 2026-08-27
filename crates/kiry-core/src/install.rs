@@ -148,6 +148,13 @@ fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
                 .retain(|e| matches!(e.kind, db::Kind::Dir) || !taken.contains(e.path.as_str()));
             if rec.manifest.len() != before {
                 db::write(root, &rec)?;
+                // provides names paths as well, and a record pointing at a file the
+                // package no longer owns is the exact thing the stale check reports
+                let kept: Vec<db::Provide> = db::read_provides(root, &j.target, &name)?
+                    .into_iter()
+                    .filter(|p| !taken.contains(p.path.as_str()))
+                    .collect();
+                db::write_provides(root, &j.target, &name, &kept)?;
             }
         }
     }

@@ -11,6 +11,7 @@ pub const MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
+const PT_INTERP: u32 = 3;
 
 const DT_NULL: i64 = 0;
 const DT_NEEDED: i64 = 1;
@@ -61,6 +62,8 @@ pub struct Elf {
     pub undefined: Vec<Sym>,
     // carries .gnu.version_d, which decides whether versions mean anything here
     pub versioned: bool,
+    // names a program interpreter, so it is a thing to run rather than a thing to load
+    pub interp: bool,
 }
 
 pub fn read(p: &Path) -> Result<Elf, Error> {
@@ -102,6 +105,8 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
 
     let mut loads = Vec::new();
     let mut dynamic = None;
+    // a loader is named only by something meant to be run
+    let mut interp = false;
     for i in 0..phnum {
         let start = phoff
             .checked_add(i * phentsize)
@@ -117,6 +122,7 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
         match u32at(ph, 0).ok_or("short program header")? {
             PT_LOAD => loads.push((vaddr, filesz, offset)),
             PT_DYNAMIC => dynamic = Some((offset, filesz)),
+            PT_INTERP => interp = true,
             _ => {}
         }
     }
@@ -217,6 +223,7 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
         exports,
         undefined,
         versioned: verdef.is_some(),
+        interp,
     })
 }
 

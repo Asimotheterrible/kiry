@@ -608,13 +608,27 @@ fn check(root: &Path, target: &str) -> usize {
     }
 
     let sets = exported(&elves);
-    for (i, (path, o)) in elves.iter().enumerate() {
+    let mut linked: HashSet<usize> = HashSet::new();
+    for (path, o) in &elves {
         let where_ = search(o, path, dirs);
         for want in &o.needed {
-            if provider(&here, &links, want, &where_).is_none() {
-                println!("{path} {target} unresolved {want}");
-                found += 1;
+            match provider(&here, &links, want, &where_) {
+                Some(j) => {
+                    linked.insert(j);
+                }
+                None => {
+                    println!("{path} {target} unresolved {want}");
+                    found += 1;
+                }
             }
+        }
+    }
+
+    for (i, (path, o)) in elves.iter().enumerate() {
+        // a library nothing links can only arrive through dlopen, and then its symbols
+        // come from whichever process opened it. python ships 4825 of those
+        if !o.interp && !linked.contains(&i) {
+            continue;
         }
         for want in missing(&elves, &sets, &here, &links, dirs, i) {
             println!("{path} {target} missing-symbol {want}");

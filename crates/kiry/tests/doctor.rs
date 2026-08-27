@@ -81,7 +81,9 @@ fn binsrc(at: &Path, name: &str, body: &str, against: &Path, rpath: Option<&str>
     fs::write(&src, body).unwrap();
     let out = at.join(name);
     let mut c = Command::new("cc");
-    c.arg("-nostdlib");
+    // a library is allowed to leave symbols to whatever loads it, which is the case
+    // under test. the linker refusing that would make the fixture unbuildable
+    c.args(["-nostdlib", "-Wl,--allow-shlib-undefined"]);
     if let Some(r) = rpath {
         c.arg(format!("-Wl,-rpath,{r}"));
     }
@@ -586,4 +588,32 @@ fn against_name(at: &Path, name: &str, lib: &Path, asks: &str, rpath: Option<&st
         .unwrap();
     assert!(ok.success());
     out
+}
+
+// a library nothing links can only be reached through dlopen, and then its symbols come
+// from whichever process opened it. python ships thousands of such modules and every one
+// of them leans on the interpreter for its CPython symbols
+#[test]
+fn a_library_nothing_links_is_not_asked_about_its_symbols() {
+    if skip("plugin") {
+        return;
+    }
+    let at = scratch("plugin");
+    let root = at.join("root");
+    let plug = libsrc(&at, "libplug.so.1", "void q(void);\nvoid p(void){q();}\n");
+    install(&root, "plug", &[("usr/lib64/libplug.so.1", &plug)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(ok && out.is_empty(), "expected silence, got {out:?}");
+
+    // link something against it and the same symbol becomes a real finding
+    let app = bin(&at, "app", &plug, Some("$ORIGIN/../lib64"));
+    install(&root, "app", &[("usr/bin/app", &app)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!ok, "a linked library still owes its undefined symbols");
+    assert!(
+        out.contains(&format!("usr/lib64/libplug.so.1 {TARGET} missing-symbol q")),
+        "{out}"
+    );
 }

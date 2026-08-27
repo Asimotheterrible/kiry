@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -122,6 +122,34 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
             },
         )?;
         db::write_provides(root, &j.target, &j.name, &provides)?;
+    }
+    dispossess(root, jobs)
+}
+
+// --force lets a package take a path from whoever had it. the database has to stop
+// claiming the loser owns it, or two records disagree about what lives there and
+// whoever reads the older one rebuilds a shape that is no longer on disk
+fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
+    for j in jobs {
+        let taken: HashSet<&str> = j
+            .members
+            .iter()
+            .filter(|m| m.what != archive::What::Dir)
+            .map(|m| m.path.as_str())
+            .collect();
+
+        for name in db::installed(root, &j.target)? {
+            if name == j.name {
+                continue;
+            }
+            let mut rec = db::read(root, &j.target, &name)?;
+            let before = rec.manifest.len();
+            rec.manifest
+                .retain(|e| matches!(e.kind, db::Kind::Dir) || !taken.contains(e.path.as_str()));
+            if rec.manifest.len() != before {
+                db::write(root, &rec)?;
+            }
+        }
     }
     Ok(())
 }

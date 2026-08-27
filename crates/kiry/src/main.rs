@@ -2,12 +2,24 @@ mod sandbox;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use kiry_core::pkg::Package;
 use kiry_core::{db, elf, install, pkg};
+
+// a closed pipe is the readers business, not a failure of ours. rust ignores SIGPIPE
+// and turns the write error into a panic, which is how `kiry l | head` printed a
+// backtrace where every other unix tool goes quiet
+macro_rules! say {
+    ($($a:tt)*) => {
+        if writeln!(std::io::stdout(), $($a)*).is_err() {
+            std::process::exit(0);
+        }
+    };
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,13 +44,13 @@ fn main() {
 }
 
 fn usage() {
-    println!("usage: kiry b [--root DIR] [--target T] [-v] <package dir>...");
-    println!("       kiry i [--root DIR] [--force] <archive>...");
-    println!("       kiry r [--root DIR] [--force] <pkg>...");
-    println!("       kiry l [--root DIR]");
-    println!("       kiry doctor [--root DIR]");
-    println!("       kiry sandbox                    internal: build inside its closure");
-    println!("       kiry <package dir>");
+    say!("usage: kiry b [--root DIR] [--target T] [-v] <package dir>...");
+    say!("       kiry i [--root DIR] [--force] <archive>...");
+    say!("       kiry r [--root DIR] [--force] <pkg>...");
+    say!("       kiry l [--root DIR]");
+    say!("       kiry doctor [--root DIR]");
+    say!("       kiry sandbox                    internal: build inside its closure");
+    say!("       kiry <package dir>");
 }
 
 fn die(msg: String) -> ! {
@@ -101,7 +113,7 @@ fn build_cmd(args: &[String]) {
         }
     }
 
-    println!("cached {}", root.join("var/kiry/cache").display());
+    say!("cached {}", root.join("var/kiry/cache").display());
 }
 
 // every target compiles and packs before any of them is renamed into place, so a
@@ -114,7 +126,7 @@ fn build(root: &Path, p: &Package, targets: &[String], verbose: bool) -> Result<
     for t in targets {
         let start = Instant::now();
         let work = compile(root, p, t, &srcs, verbose)?;
-        println!("{} {} {t} ok {}", p.name, p.version.upstream, took(start));
+        say!("{} {} {t} ok {}", p.name, p.version.upstream, took(start));
         built.push((t.clone(), work));
     }
 
@@ -440,7 +452,7 @@ fn install_cmd(args: &[String]) {
     }
 
     for j in &jobs {
-        println!("{} {} {} ok", j.name, j.version.upstream, j.target);
+        say!("{} {} {} ok", j.name, j.version.upstream, j.target);
     }
 }
 
@@ -479,7 +491,7 @@ fn remove_cmd(args: &[String]) {
                         format!("  {}", notes.join(", "))
                     };
                     let s = if r.gone == 1 { "" } else { "s" };
-                    println!("{name} {t} removed {} file{s}{note}", r.gone);
+                    say!("{name} {t} removed {} file{s}{note}", r.gone);
                 }
                 Err(e) => die(e.to_string()),
             }
@@ -504,7 +516,7 @@ fn list_cmd(args: &[String]) {
         };
         for n in names {
             match db::read(&root, t, &n) {
-                Ok(r) => println!("{} {} {}", r.name, r.version.upstream, t),
+                Ok(r) => say!("{} {} {}", r.name, r.version.upstream, t),
                 Err(e) => die(e.to_string()),
             }
         }
@@ -535,7 +547,7 @@ fn doctor_cmd(args: &[String]) {
 
 fn check(root: &Path, target: &str) -> usize {
     let Some(dirs) = defaults(target) else {
-        println!("{target} - unknown-target");
+        say!("{target} - unknown-target");
         return 1;
     };
 
@@ -576,7 +588,7 @@ fn check(root: &Path, target: &str) -> usize {
         let mut mine = Vec::new();
         for (path, o) in seen {
             let Some(o) = o else {
-                println!("{path} {target} unreadable");
+                say!("{path} {target} unreadable");
                 found += 1;
                 continue;
             };
@@ -599,7 +611,7 @@ fn check(root: &Path, target: &str) -> usize {
                 was.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
                 is.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
                 if was != is {
-                    println!("{name} {target} stale-provides");
+                    say!("{name} {target} stale-provides");
                     found += 1;
                 }
             }
@@ -617,7 +629,7 @@ fn check(root: &Path, target: &str) -> usize {
                     linked.insert(j);
                 }
                 None => {
-                    println!("{path} {target} unresolved {want}");
+                    say!("{path} {target} unresolved {want}");
                     found += 1;
                 }
             }
@@ -631,7 +643,7 @@ fn check(root: &Path, target: &str) -> usize {
             continue;
         }
         for want in missing(&elves, &sets, &here, &links, dirs, i) {
-            println!("{path} {target} missing-symbol {want}");
+            say!("{path} {target} missing-symbol {want}");
             found += 1;
         }
     }
@@ -648,18 +660,23 @@ fn provider(
     want: &str,
     where_: &[String],
 ) -> Option<usize> {
-    for d in where_ {
-        let mut at = fold(&format!("{d}/{want}"));
-        // a chain of eight is past anything real and short of looping forever
-        for _ in 0..8 {
-            if let Some(i) = here.get(&at) {
-                return Some(*i);
-            }
-            match links.get(&at) {
-                Some(to) => at = to.clone(),
-                None => break,
-            }
+    where_
+        .iter()
+        .find_map(|d| at_path(here, links, &format!("{d}/{want}")))
+}
+
+fn at_path(
+    here: &HashMap<String, usize>,
+    links: &HashMap<String, String>,
+    path: &str,
+) -> Option<usize> {
+    let mut at = fold(path);
+    // a chain of eight is past anything real and short of looping forever
+    for _ in 0..8 {
+        if let Some(i) = here.get(&at) {
+            return Some(*i);
         }
+        at = links.get(&at)?.clone();
     }
     None
 }
@@ -796,14 +813,14 @@ fn show(dir: &str) {
         Err(e) => die(e.to_string()),
     };
 
-    println!("{} {}", p.name, p.version);
-    println!("targets {}", p.targets.join(" "));
+    say!("{} {}", p.name, p.version);
+    say!("targets {}", p.targets.join(" "));
 
     for d in &p.depends {
         if d.make {
-            println!("dep {} make", d.name);
+            say!("dep {} make", d.name);
         } else {
-            println!("dep {}", d.name);
+            say!("dep {}", d.name);
         }
     }
 
@@ -813,6 +830,6 @@ fn show(dir: &str) {
             .get(i)
             .and_then(|s| s.get(..8))
             .unwrap_or("--------");
-        println!("src {sum} {src}");
+        say!("src {sum} {src}");
     }
 }

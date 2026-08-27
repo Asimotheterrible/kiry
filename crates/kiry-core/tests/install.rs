@@ -430,3 +430,31 @@ fn installing_a_library_records_what_it_provides() {
     // the shell script sits in the same package and is not an elf
     assert!(!got.iter().any(|p| p.path.contains("greet-hi")));
 }
+
+// --force hands a path to the newcomer, and the database has to stop claiming the old
+// owner still has it. two records disagreeing about one path is how the sandbox came to
+// rebuild a symlink over a regular file and produce a loop the loader could not walk
+#[test]
+fn forcing_a_path_takes_it_off_the_previous_owner() {
+    let (at, root) = rooted("dispossess");
+    let first = pack(&at, "first", &[], &["usr/bin/tool", "usr/share/first/note"]);
+    let second = pack(&at, "second", &[], &["usr/bin/tool"]);
+
+    install::apply(&root, &run(&root, &[first], false).unwrap()).unwrap();
+    let jobs = run(&root, &[second], true).unwrap();
+    install::apply(&root, &jobs).unwrap();
+
+    let old = db::read(&root, "x86_64-musl", "first").unwrap();
+    let kept: Vec<&str> = old.manifest.iter().map(|e| e.path.as_str()).collect();
+    assert!(
+        !kept.contains(&"usr/bin/tool"),
+        "first still claims the path second took: {kept:?}"
+    );
+    assert!(
+        kept.contains(&"usr/share/first/note"),
+        "the rest of first went with it: {kept:?}"
+    );
+
+    let new = db::read(&root, "x86_64-musl", "second").unwrap();
+    assert!(new.manifest.iter().any(|e| e.path == "usr/bin/tool"));
+}

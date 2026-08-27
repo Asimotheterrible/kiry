@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use kiry_core::pkg::Version;
 use kiry_core::{db, install};
@@ -485,4 +485,45 @@ fn record(root: &Path, name: &str, deps: &[&str], manifest: Vec<db::Entry>) {
         },
     )
     .unwrap();
+}
+
+// rust ignores SIGPIPE and turns the write error into a panic, so `kiry l | head` used
+// to print a backtrace where every other unix tool goes quiet
+#[test]
+fn a_closed_pipe_is_not_a_panic() {
+    let at = scratch("pipe");
+    let root = at.join("root");
+    if !bootstrap(&root) {
+        return;
+    }
+
+    // more output than a pipe buffer holds, so the writer is still going when the
+    // reader leaves. two lines would race and prove nothing
+    for i in 0..2500 {
+        db::write(
+            &root,
+            &db::Installed {
+                name: format!("filler{i:04}"),
+                target: "x86_64-musl".into(),
+                version: Version::parse("1.0 1").unwrap(),
+                depends: Vec::new(),
+                manifest: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    let mut c = Command::new(KIRY)
+        .args(["l", "--root", root.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // the reader walks away before the first line is written
+    drop(c.stdout.take());
+    let out = c.wait_with_output().unwrap();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(out.status.success(), "{:?}", out.status);
 }

@@ -458,3 +458,44 @@ fn forcing_a_path_takes_it_off_the_previous_owner() {
     let new = db::read(&root, "x86_64-musl", "second").unwrap();
     assert!(new.manifest.iter().any(|e| e.path == "usr/bin/tool"));
 }
+
+// provides carries paths too, and it is read by the sandbox to decide which files a
+// dependency contributes. leaving the old owner pointing at a file it lost is what made
+// doctor report llvm20-libs as stale the moment our own llvm went in over it
+#[test]
+fn forcing_a_path_takes_it_out_of_provides_as_well() {
+    let (at, root) = rooted("dispossess-provides");
+    let first = pack(
+        &at,
+        "first",
+        &[],
+        &["usr/lib/libthing.so.1", "usr/lib/libkept.so.1"],
+    );
+    let second = pack(&at, "second", &[], &["usr/lib/libthing.so.1"]);
+
+    install::apply(&root, &run(&root, &[first], false).unwrap()).unwrap();
+    db::write_provides(
+        &root,
+        "x86_64-musl",
+        "first",
+        &[
+            db::Provide {
+                soname: "libthing.so.1".into(),
+                versioned: false,
+                path: "usr/lib/libthing.so.1".into(),
+            },
+            db::Provide {
+                soname: "libkept.so.1".into(),
+                versioned: false,
+                path: "usr/lib/libkept.so.1".into(),
+            },
+        ],
+    )
+    .unwrap();
+
+    install::apply(&root, &run(&root, &[second], true).unwrap()).unwrap();
+
+    let left = db::read_provides(&root, "x86_64-musl", "first").unwrap();
+    let paths: Vec<&str> = left.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(paths, vec!["usr/lib/libkept.so.1"], "{paths:?}");
+}

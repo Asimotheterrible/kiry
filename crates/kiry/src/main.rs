@@ -559,6 +559,9 @@ fn check(root: &Path, target: &str) -> usize {
     let mut elves = Vec::new();
     let mut here: HashMap<String, usize> = HashMap::new();
     let mut links: HashMap<String, String> = HashMap::new();
+    let mut shebangs: Vec<(String, Vec<String>)> = Vec::new();
+    // every regular file, not only the ones that parse as elf: an interpreter is a file
+    let mut present: HashSet<String> = HashSet::new();
     let mut found = 0;
 
     for name in &names {
@@ -570,6 +573,9 @@ fn check(root: &Path, target: &str) -> usize {
         // resolution. musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1
         // points at the loader itself
         for e in &rec.manifest {
+            if matches!(e.kind, db::Kind::File(_)) {
+                present.insert(fold(&e.path));
+            }
             if let db::Kind::Link(t) = &e.kind {
                 let to = if let Some(abs) = t.strip_prefix('/') {
                     abs.to_string()
@@ -586,11 +592,19 @@ fn check(root: &Path, target: &str) -> usize {
         };
 
         let mut mine = Vec::new();
-        for (path, o) in seen {
-            let Some(o) = o else {
-                say!("{path} {target} unreadable");
-                found += 1;
-                continue;
+        for (path, what) in seen {
+            let o = match what {
+                install::Seen::Elf(o) => o,
+                install::Seen::Script(words) => {
+                    shebangs.push((path, words));
+                    continue;
+                }
+                install::Seen::Other => continue,
+                install::Seen::Bad => {
+                    say!("{path} {target} unreadable");
+                    found += 1;
+                    continue;
+                }
             };
             here.insert(fold(&path), elves.len());
             if let Some(soname) = &o.soname {
@@ -636,6 +650,35 @@ fn check(root: &Path, target: &str) -> usize {
         }
     }
 
+    // the kernel will not start a script whose interpreter is not there, which is the
+    // same failure DT_NEEDED describes and nothing was checking it
+    for (path, words) in &shebangs {
+        let mut want = words[0].trim_start_matches('/').to_string();
+        // env looks the real one up on PATH, so that is the name that has to exist
+        if want.ends_with("/env") || want == "env" {
+            // env takes its own options and VAR=value pairs first. -S is the common one
+            match words
+                .iter()
+                .skip(1)
+                .find(|w| !w.starts_with('-') && !w.contains('='))
+            {
+                Some(w) => want.clone_from(w),
+                None => continue,
+            }
+        }
+        let there = if want.contains('/') {
+            exists(&present, &links, &want)
+        } else {
+            ["usr/bin", "usr/sbin"]
+                .iter()
+                .any(|d| exists(&present, &links, &format!("{d}/{want}")))
+        };
+        if !there {
+            say!("{path} {target} no-interpreter {}", words.join(" "));
+            found += 1;
+        }
+    }
+
     for (i, (path, o)) in elves.iter().enumerate() {
         // a library nothing links can only arrive through dlopen, and then its symbols
         // come from whichever process opened it. python ships 4825 of those
@@ -663,6 +706,20 @@ fn provider(
     where_
         .iter()
         .find_map(|d| at_path(here, links, &format!("{d}/{want}")))
+}
+
+fn exists(present: &HashSet<String>, links: &HashMap<String, String>, path: &str) -> bool {
+    let mut at = fold(path);
+    for _ in 0..8 {
+        if present.contains(&at) {
+            return true;
+        }
+        match links.get(&at) {
+            Some(to) => at = to.clone(),
+            None => return false,
+        }
+    }
+    false
 }
 
 fn at_path(

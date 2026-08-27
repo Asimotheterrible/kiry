@@ -129,8 +129,10 @@ fn bootstrap(root: &Path) -> bool {
     let provides: Vec<db::Provide> = install::scan(root, &manifest)
         .unwrap()
         .into_iter()
-        .filter_map(|(path, o)| {
-            let o = o?;
+        .filter_map(|(path, s)| {
+            let install::Seen::Elf(o) = s else {
+                return None;
+            };
             Some(db::Provide {
                 soname: o.soname?,
                 versioned: o.versioned,
@@ -449,8 +451,10 @@ fn shared(at: &Path, root: &Path, name: &str) {
     let provides: Vec<db::Provide> = install::scan(root, &manifest)
         .unwrap()
         .into_iter()
-        .filter_map(|(path, o)| {
-            let o = o?;
+        .filter_map(|(path, s)| {
+            let install::Seen::Elf(o) = s else {
+                return None;
+            };
             Some(db::Provide {
                 soname: o.soname?,
                 versioned: o.versioned,

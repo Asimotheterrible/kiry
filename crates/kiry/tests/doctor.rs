@@ -131,8 +131,10 @@ fn installed(root: &Path, name: &str, files: &[(&str, &Path)], links: &[(&str, &
     let provides: Vec<db::Provide> = install::scan(root, &manifest)
         .unwrap()
         .into_iter()
-        .filter_map(|(path, o)| {
-            let o = o?;
+        .filter_map(|(path, s)| {
+            let install::Seen::Elf(o) = s else {
+                return None;
+            };
             Some(db::Provide {
                 soname: o.soname?,
                 versioned: o.versioned,
@@ -616,4 +618,46 @@ fn a_library_nothing_links_is_not_asked_about_its_symbols() {
         out.contains(&format!("usr/lib64/libplug.so.1 {TARGET} missing-symbol q")),
         "{out}"
     );
+}
+
+// the kernel refuses to start a script whose interpreter is not installed, which is the
+// same shape of failure as a missing library and nothing was looking for it
+#[test]
+fn a_script_whose_interpreter_is_missing_is_reported() {
+    if skip("shebang") {
+        return;
+    }
+    let at = scratch("shebang");
+    let root = at.join("root");
+    let script = at.join("thing");
+    fs::write(&script, "#!/usr/bin/env fictionsh\necho hi\n").unwrap();
+    install(&root, "thing", &[("usr/bin/thing", &script)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!ok, "doctor passed a script with no interpreter");
+    assert!(
+        out.contains(&format!(
+            "usr/bin/thing {TARGET} no-interpreter /usr/bin/env fictionsh"
+        )),
+        "{out}"
+    );
+
+    // env takes options of its own before the program name, and -S is common enough
+    // that reading the word after env finds a flag rather than an interpreter
+    let dashs = at.join("dashs");
+    fs::write(&dashs, "#!/usr/bin/env -S fictionsh -u\necho hi\n").unwrap();
+    install(&root, "dashs", &[("usr/bin/dashs", &dashs)]);
+    let (_, out) = doctor(&root);
+    assert!(
+        out.contains(&format!("usr/bin/dashs {TARGET} no-interpreter")),
+        "{out}"
+    );
+    assert!(!out.contains("no-interpreter /usr/bin/env -S\n"), "{out}");
+
+    // install the interpreter and the findings go away
+    let sh = at.join("fictionsh");
+    fs::write(&sh, "an interpreter with no interpreter of its own\n").unwrap();
+    install(&root, "fictionsh", &[("usr/bin/fictionsh", &sh)]);
+    let (ok, out) = doctor(&root);
+    assert!(ok && out.is_empty(), "expected silence, got {out:?}");
 }

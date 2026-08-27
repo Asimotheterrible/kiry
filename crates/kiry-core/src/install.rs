@@ -102,8 +102,8 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
         let manifest = archive::extract(root, &j.archive)?;
         let provides = scan(root, &manifest)?
             .into_iter()
-            .filter_map(|(path, o)| {
-                let o = o?;
+            .filter_map(|(path, s)| {
+                let Seen::Elf(o) = s else { return None };
                 Some(db::Provide {
                     soname: o.soname?,
                     versioned: o.versioned,
@@ -154,9 +154,20 @@ fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
     Ok(())
 }
 
-// every elf the manifest lists, paired with its path. None is a file that would not
-// open or would not parse, which doctor reports rather than skips
-pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Option<elf::Elf>)>, Error> {
+// what a manifest entry turned out to be, once opened. one pass, one open per file:
+// an elf answers for its linkage, a shebang for its interpreter, and both are refusals
+// the kernel makes before a single instruction runs
+pub enum Seen {
+    Elf(elf::Elf),
+    Script(Vec<String>),
+    Other,
+    // listed by the manifest and will not open, or will not parse. doctor reports it
+    // rather than skipping it, which is how a root missing half its binaries used to
+    // come back clean
+    Bad,
+}
+
+pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Seen)>, Error> {
     let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
 
@@ -171,28 +182,50 @@ pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Option<e
         };
         let Ok(pfd) = archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent })
         else {
-            out.push((e.path.clone(), None));
+            out.push((e.path.clone(), Seen::Bad));
             continue;
         };
         let Ok(fd) =
             rustix::fs::openat(&pfd, leaf, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())
         else {
-            out.push((e.path.clone(), None));
+            out.push((e.path.clone(), Seen::Bad));
             continue;
         };
 
-        // most of a package is not an elf, so stop after four bytes
+        // the kernel reads 256 bytes of a shebang line and no more, so neither does this
+        let mut head = [0u8; 256];
         let mut f = std::fs::File::from(fd);
-        let mut magic = [0u8; 4];
-        if f.read_exact(&mut magic).is_err() || magic != elf::MAGIC {
+        let n = f.read(&mut head).unwrap_or(0);
+        let head = &head[..n];
+
+        if head.starts_with(&elf::MAGIC) {
+            let mut bytes = head.to_vec();
+            if f.read_to_end(&mut bytes).is_err() {
+                out.push((e.path.clone(), Seen::Bad));
+                continue;
+            }
+            out.push((
+                e.path.clone(),
+                match elf::parse(&bytes) {
+                    Ok(o) => Seen::Elf(o),
+                    Err(_) => Seen::Bad,
+                },
+            ));
             continue;
         }
-        let mut bytes = magic.to_vec();
-        if f.read_to_end(&mut bytes).is_err() {
-            out.push((e.path.clone(), None));
-            continue;
+
+        if e.mode & 0o111 != 0 && head.starts_with(b"#!") {
+            let line = head[2..].split(|c| *c == b'\n').next().unwrap_or_default();
+            let words: Vec<String> = String::from_utf8_lossy(line)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            if !words.is_empty() {
+                out.push((e.path.clone(), Seen::Script(words)));
+                continue;
+            }
         }
-        out.push((e.path.clone(), elf::parse(&bytes).ok()));
+        out.push((e.path.clone(), Seen::Other));
     }
     Ok(out)
 }

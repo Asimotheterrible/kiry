@@ -360,3 +360,129 @@ fn dash_v_streams_it_instead() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(String::from_utf8_lossy(&o.stdout).contains("chatter"));
 }
+
+// a library the loader reaches through a symlink has to land in the sysroot with the
+// link, not only the file the link points at. provides records the file carrying the
+// soname, and DT_NEEDED almost never names that file
+#[test]
+fn a_transitive_library_arrives_with_the_link_that_names_it() {
+    let at = scratch("linked-dep");
+    let root = at.join("root");
+    if !bootstrap(&root) {
+        return;
+    }
+    if !have_cc() {
+        return;
+    }
+
+    // mid is declared by the recipe, so deep is reached one hop further out and is not
+    // a direct member of anything
+    shared(&at, &root, "deep");
+    bare(&root, "mid", &["deep"]);
+
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "test -L /usr/lib/libdeep.so.1\ntest -f /usr/lib/libdeep.so.1.2.3\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    fs::write(d.join("depends"), "mid\n").unwrap();
+
+    let out = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "the sysroot is missing the name the loader would open: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn have_cc() -> bool {
+    if Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return true;
+    }
+    assert!(
+        std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+        "no cc to build a library with a soname"
+    );
+    false
+}
+
+// the real file plus the name that would sit in DT_NEEDED
+fn shared(at: &Path, root: &Path, name: &str) {
+    let src = at.join(format!("{name}.c"));
+    fs::write(&src, "void p(void){}\n").unwrap();
+    let real = format!("usr/lib/lib{name}.so.1.2.3");
+    let dst = root.join(&real);
+    fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-nostdlib"])
+        .arg(format!("-Wl,-soname,lib{name}.so.1"))
+        .arg("-o")
+        .arg(&dst)
+        .arg(&src)
+        .status()
+        .unwrap()
+        .success());
+
+    let link = format!("usr/lib/lib{name}.so.1");
+    let _ = fs::remove_file(root.join(&link));
+    std::os::unix::fs::symlink(format!("lib{name}.so.1.2.3"), root.join(&link)).unwrap();
+
+    let manifest = vec![
+        db::Entry {
+            mode: 0o755,
+            kind: db::Kind::File(
+                kiry_core::sha256(fs::File::open(root.join(&real)).unwrap()).unwrap(),
+            ),
+            path: real,
+        },
+        db::Entry {
+            mode: 0o777,
+            kind: db::Kind::Link(format!("lib{name}.so.1.2.3")),
+            path: link,
+        },
+    ];
+    let provides: Vec<db::Provide> = install::scan(root, &manifest)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(path, o)| {
+            let o = o?;
+            Some(db::Provide {
+                soname: o.soname?,
+                versioned: o.versioned,
+                path,
+            })
+        })
+        .collect();
+    record(root, name, &[], manifest);
+    db::write_provides(root, "x86_64-musl", name, &provides).unwrap();
+}
+
+fn bare(root: &Path, name: &str, deps: &[&str]) {
+    record(root, name, deps, Vec::new());
+    db::write_provides(root, "x86_64-musl", name, &[]).unwrap();
+}
+
+fn record(root: &Path, name: &str, deps: &[&str], manifest: Vec<db::Entry>) {
+    db::write(
+        root,
+        &db::Installed {
+            name: name.to_string(),
+            target: "x86_64-musl".into(),
+            version: Version::parse("1.0 1").unwrap(),
+            depends: deps
+                .iter()
+                .map(|d| kiry_core::pkg::Dep {
+                    name: (*d).to_string(),
+                    make: false,
+                })
+                .collect(),
+            manifest,
+        },
+    )
+    .unwrap();
+}

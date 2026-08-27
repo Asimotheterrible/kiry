@@ -82,13 +82,17 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
         let keep: Option<BTreeSet<String>> = if m.direct {
             None
         } else {
-            Some(
-                db::read_provides(root, target, &m.name)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .map(|p| p.path)
-                    .collect(),
-            )
+            let mut k: BTreeSet<String> = db::read_provides(root, target, &m.name)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|p| p.path)
+                .collect();
+            // provides records the file carrying the soname, and DT_NEEDED almost never
+            // names that file. libstdc++.so.6 is a link to libstdc++.so.6.0.34, so a
+            // sysroot holding only the second one has a loader that cannot find the
+            // first. links chain, so this runs until nothing new lands
+            while add_links(&rec.manifest, &mut k) {}
+            Some(k)
         };
 
         for e in &rec.manifest {
@@ -105,6 +109,40 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
         fs::create_dir_all(into.join(d)).map_err(|e| format!("{d}: {e}"))?;
     }
     Ok(())
+}
+
+fn add_links(manifest: &[db::Entry], keep: &mut BTreeSet<String>) -> bool {
+    let mut grew = false;
+    for e in manifest {
+        let db::Kind::Link(t) = &e.kind else { continue };
+        if keep.contains(&e.path) {
+            continue;
+        }
+        if keep.contains(&points_at(&e.path, t)) {
+            keep.insert(e.path.clone());
+            grew = true;
+        }
+    }
+    grew
+}
+
+// manifest paths are relative to the root and carry no leading slash, so an absolute
+// link target just loses its slash and a relative one resolves against its own directory
+fn points_at(from: &str, to: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    if !to.starts_with('/') {
+        out.extend(crate::dirname(from).split('/').filter(|s| !s.is_empty()));
+    }
+    for part in to.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            p => out.push(p),
+        }
+    }
+    out.join("/")
 }
 
 fn place(root: &Path, into: &Path, e: &db::Entry) -> Result<(), String> {

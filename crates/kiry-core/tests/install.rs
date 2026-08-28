@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use kiry_core::archive::{Member, What};
-use kiry_core::install::Job;
+use kiry_core::install::{Job, Removed};
 use kiry_core::{archive, db, install, Error};
 
 fn scratch(name: &str) -> PathBuf {
@@ -87,6 +87,18 @@ fn a_batch_installs_and_records_itself() {
     assert!(rec.manifest.iter().any(|e| e.path == "usr/bin/foo"));
 }
 
+fn rm(root: &Path, names: &[&str], force: bool) -> Result<Vec<(String, Removed)>, Error> {
+    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    install::remove(root, "x86_64-musl", &names, force)
+}
+
+// most of these remove one package and want to talk about the counts
+fn one(root: &Path, name: &str, force: bool) -> Removed {
+    let mut done = rm(root, &[name], force).unwrap();
+    assert_eq!(done.len(), 1);
+    done.remove(0).1
+}
+
 #[test]
 fn removing_takes_the_files_and_the_record() {
     let (d, root) = rooted("rm");
@@ -97,7 +109,7 @@ fn removing_takes_the_files_and_the_record() {
     )
     .unwrap();
 
-    let r = install::remove(&root, "x86_64-musl", "foo", false).unwrap();
+    let r = one(&root, "foo", false);
     assert_eq!(r.gone, 1);
     assert_eq!(r.kept, 0);
     assert!(!root.join("usr/share/doc/foo").exists());
@@ -115,7 +127,7 @@ fn a_modified_file_is_left_where_it_is() {
     .unwrap();
     fs::write(root.join("usr/share/doc/foo/x"), b"edited by hand").unwrap();
 
-    let r = install::remove(&root, "x86_64-musl", "foo", false).unwrap();
+    let r = one(&root, "foo", false);
     assert_eq!(r.kept, 1);
     assert_eq!(r.gone, 0);
     assert_eq!(
@@ -137,12 +149,7 @@ fn a_symlink_where_the_file_belongs_counts_as_modified() {
     fs::remove_file(&p).unwrap();
     std::os::unix::fs::symlink("/etc/passwd", &p).unwrap();
 
-    assert_eq!(
-        install::remove(&root, "x86_64-musl", "foo", false)
-            .unwrap()
-            .kept,
-        1
-    );
+    assert_eq!(one(&root, "foo", false).kept, 1);
     assert!(p.symlink_metadata().unwrap().is_symlink());
 }
 
@@ -153,13 +160,40 @@ fn a_dependent_blocks_removal() {
     let app = pack(&d, "foo", &["libbar"], &["usr/share/doc/foo/x"]);
     run(&root, &[lib, app], false).unwrap();
 
-    match install::remove(&root, "x86_64-musl", "libbar", false) {
+    match rm(&root, &["libbar"], false) {
         Err(Error::Needed { pkg, by }) => {
             assert_eq!((pkg.as_str(), by.as_str()), ("libbar", "foo"));
         }
         other => panic!("wanted Needed, got {other:?}"),
     }
-    assert!(install::remove(&root, "x86_64-musl", "libbar", true).is_ok());
+    assert!(rm(&root, &["libbar"], true).is_ok());
+}
+
+#[test]
+fn a_dependent_leaving_in_the_same_breath_does_not_block() {
+    let (d, root) = rooted("together");
+    let lib = pack(&d, "libbar", &[], &["usr/share/doc/bar/x"]);
+    let app = pack(&d, "foo", &["libbar"], &["usr/share/doc/foo/x"]);
+    run(&root, &[lib, app], false).unwrap();
+
+    // the depended-on name is typed first, so what is under test is the order rather
+    // than the dependency
+    assert_eq!(rm(&root, &["libbar", "foo"], false).unwrap().len(), 2);
+    assert!(db::read(&root, "x86_64-musl", "libbar").is_err());
+    assert!(db::read(&root, "x86_64-musl", "foo").is_err());
+}
+
+#[test]
+fn one_blocked_member_leaves_the_whole_batch_alone() {
+    let (d, root) = rooted("blocked");
+    let lib = pack(&d, "libbar", &[], &["usr/share/doc/bar/x"]);
+    let app = pack(&d, "foo", &["libbar"], &["usr/share/doc/foo/x"]);
+    let odd = pack(&d, "qux", &[], &["usr/share/doc/qux/x"]);
+    run(&root, &[lib, app, odd], false).unwrap();
+
+    assert!(rm(&root, &["qux", "libbar"], false).is_err());
+    assert!(root.join("usr/share/doc/qux/x").exists());
+    assert!(db::read(&root, "x86_64-musl", "qux").is_ok());
 }
 
 #[test]
@@ -167,7 +201,7 @@ fn protected_directories_survive() {
     let (d, root) = rooted("protected");
     run(&root, &[pack(&d, "foo", &[], &["usr/bin/foo"])], false).unwrap();
 
-    install::remove(&root, "x86_64-musl", "foo", false).unwrap();
+    rm(&root, &["foo"], false).unwrap();
     assert!(!root.join("usr/bin/foo").exists());
     assert!(root.join("usr/bin").is_dir());
     assert!(root.join("usr").is_dir());
@@ -180,7 +214,7 @@ fn a_directory_another_package_still_uses_survives() {
     let b = pack(&d, "bar", &[], &["usr/share/doc/b"]);
     run(&root, &[a, b], false).unwrap();
 
-    install::remove(&root, "x86_64-musl", "foo", false).unwrap();
+    rm(&root, &["foo"], false).unwrap();
     assert!(root.join("usr/share/doc/b").exists());
     assert!(root.join("usr/share/doc").is_dir());
 }

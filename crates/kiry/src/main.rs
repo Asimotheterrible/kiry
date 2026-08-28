@@ -538,17 +538,34 @@ fn doctor_cmd(args: &[String]) {
 
     let mut found = 0;
     for t in &targets {
-        found += check(&root, t);
+        for f in check(&root, t) {
+            say!("{} {t} {}", f.path, f.what);
+            found += 1;
+        }
     }
     if found > 0 {
         std::process::exit(1);
     }
 }
 
-fn check(root: &Path, target: &str) -> usize {
+// the linker gives every object these for itself, and the loader reaches DT_INIT and
+// DT_FINI by address rather than by name. counting them makes every pair of libraries in
+// the tree a duplicate, which is how a check that finds a rare real bug becomes noise
+const HOUSEKEEPING: &[&str] = &["_init", "_fini", "_edata", "_end", "__bss_start", "_etext"];
+
+// a finding is a value rather than a line on stdout, so a caller can group or count
+// them without parsing what doctor printed
+struct Finding {
+    path: String,
+    what: String,
+}
+
+fn check(root: &Path, target: &str) -> Vec<Finding> {
     let Some(dirs) = defaults(target) else {
-        say!("{target} - unknown-target");
-        return 1;
+        return vec![Finding {
+            path: target.to_string(),
+            what: "- unknown-target".into(),
+        }];
     };
 
     let names = match db::installed(root, target) {
@@ -562,7 +579,7 @@ fn check(root: &Path, target: &str) -> usize {
     let mut shebangs: Vec<(String, Vec<String>)> = Vec::new();
     // every regular file, not only the ones that parse as elf: an interpreter is a file
     let mut present: HashSet<String> = HashSet::new();
-    let mut found = 0;
+    let mut out: Vec<Finding> = Vec::new();
 
     for name in &names {
         let rec = match db::read(root, target, name) {
@@ -601,8 +618,10 @@ fn check(root: &Path, target: &str) -> usize {
                 }
                 install::Seen::Other => continue,
                 install::Seen::Bad => {
-                    say!("{path} {target} unreadable");
-                    found += 1;
+                    out.push(Finding {
+                        path,
+                        what: "unreadable".into(),
+                    });
                     continue;
                 }
             };
@@ -625,8 +644,10 @@ fn check(root: &Path, target: &str) -> usize {
                 was.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
                 is.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
                 if was != is {
-                    say!("{name} {target} stale-provides");
-                    found += 1;
+                    out.push(Finding {
+                        path: name.clone(),
+                        what: "stale-provides".into(),
+                    });
                 }
             }
             Err(e) => die(e.to_string()),
@@ -641,11 +662,20 @@ fn check(root: &Path, target: &str) -> usize {
             match provider(&here, &links, want, &where_) {
                 Some(j) => {
                     linked.insert(j);
+                    // musl ignores symbol versions, so a gnu binary that reaches into
+                    // the musl tree binds to whatever has the right name and nothing
+                    // errors. loader paths keep them apart until an rpath crosses over
+                    if target.ends_with("gnu") && elves[j].0.starts_with("usr/lib/") {
+                        out.push(Finding {
+                            path: path.clone(),
+                            what: format!("cross-tier {}", elves[j].0),
+                        });
+                    }
                 }
-                None => {
-                    say!("{path} {target} unresolved {want}");
-                    found += 1;
-                }
+                None => out.push(Finding {
+                    path: path.clone(),
+                    what: format!("unresolved {want}"),
+                }),
             }
         }
     }
@@ -674,8 +704,10 @@ fn check(root: &Path, target: &str) -> usize {
                 .any(|d| exists(&present, &links, &format!("{d}/{want}")))
         };
         if !there {
-            say!("{path} {target} no-interpreter {}", words.join(" "));
-            found += 1;
+            out.push(Finding {
+                path: path.clone(),
+                what: format!("no-interpreter {}", words.join(" ")),
+            });
         }
     }
 
@@ -686,11 +718,58 @@ fn check(root: &Path, target: &str) -> usize {
             continue;
         }
         for want in missing(&elves, &sets, &here, &links, dirs, i) {
-            say!("{path} {target} missing-symbol {want}");
-            found += 1;
+            out.push(Finding {
+                path: path.clone(),
+                what: format!("missing-symbol {want}"),
+            });
         }
     }
-    found
+
+    // two libraries exporting one name means load order decides which implementation a
+    // caller gets, silently. the index holds every export already, so this is a group-by
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (_, o)) in elves.iter().enumerate() {
+        if o.soname.is_none() || !linked.contains(&i) {
+            continue;
+        }
+        for sym in &o.exports {
+            // a weak export is c++ vague linkage: an inline function or a template
+            // instantiation lands in every object that used it, and the linker means for
+            // them to collapse. a version label names its own version node and every
+            // library that shares a version name carries one
+            if sym.weak
+                || sym.version.as_deref() == Some(sym.name.as_str())
+                || HOUSEKEEPING.contains(&sym.name.as_str())
+            {
+                continue;
+            }
+            let who = by_name.entry(&sym.name).or_default();
+            // one library exporting a name at two versions is one library, and exports
+            // arrive here in file order, so the last entry is the only one to look at
+            if who.last() != Some(&i) {
+                who.push(i);
+            }
+        }
+    }
+    let mut pairs: HashMap<(usize, usize), usize> = HashMap::new();
+    for (_, who) in by_name {
+        for a in 0..who.len() {
+            for b in a + 1..who.len() {
+                *pairs
+                    .entry((who[a].min(who[b]), who[a].max(who[b])))
+                    .or_default() += 1;
+            }
+        }
+    }
+    let mut dupes: Vec<((usize, usize), usize)> = pairs.into_iter().collect();
+    dupes.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+    for ((a, b), n) in dupes {
+        out.push(Finding {
+            path: elves[a].0.clone(),
+            what: format!("duplicate-symbols {n} {}", elves[b].0),
+        });
+    }
+    out
 }
 
 // DT_NEEDED names a file, not a soname. the loader opens the first directory on the

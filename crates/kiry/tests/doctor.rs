@@ -45,22 +45,27 @@ fn lib(at: &Path, soname: &str) -> PathBuf {
 }
 
 fn libsrc(at: &Path, soname: &str, body: &str) -> PathBuf {
+    versioned(at, soname, body, None)
+}
+
+fn versioned(at: &Path, soname: &str, body: &str, script: Option<&str>) -> PathBuf {
     fs::create_dir_all(at).unwrap();
     let src = at.join(format!("{soname}.c"));
     fs::write(&src, body).unwrap();
     let out = at.join(soname);
-    let ok = Command::new("cc")
-        .args([
-            "-shared",
-            "-fPIC",
-            "-nostdlib",
-            &format!("-Wl,-soname,{soname}"),
-        ])
-        .arg("-o")
-        .arg(&out)
-        .arg(&src)
-        .status()
-        .unwrap();
+    let mut c = Command::new("cc");
+    c.args([
+        "-shared",
+        "-fPIC",
+        "-nostdlib",
+        &format!("-Wl,-soname,{soname}"),
+    ]);
+    if let Some(v) = script {
+        let map = at.join("v.map");
+        fs::write(&map, v).unwrap();
+        c.arg(format!("-Wl,--version-script,{}", map.display()));
+    }
+    let ok = c.arg("-o").arg(&out).arg(&src).status().unwrap();
     assert!(ok.success());
     out
 }
@@ -660,4 +665,241 @@ fn a_script_whose_interpreter_is_missing_is_reported() {
     install(&root, "fictionsh", &[("usr/bin/fictionsh", &sh)]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "expected silence, got {out:?}");
+}
+
+// two libraries exporting one name means whichever loads first wins and the loser's
+// callers quietly get the wrong implementation. nothing else on the system says so
+#[test]
+fn two_libraries_exporting_one_name_are_reported() {
+    if skip("duplicate symbols") {
+        return;
+    }
+    let at = scratch("dupes");
+    let root = at.join("root");
+    let one = libsrc(
+        &at.join("one"),
+        "libone.so.1",
+        "void p(void){}\nvoid q(void){}\n",
+    );
+    let two = libsrc(&at.join("two"), "libtwo.so.1", "void p(void){}\n");
+    // the binary links both, so both are in the namespace where the clash happens
+    let app = binsrc(
+        &at,
+        "app",
+        "void p(void);\nvoid q(void);\nvoid _start(void){p();q();}\n",
+        &one,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "one", &[("usr/lib64/libone.so.1", &one)]);
+    install(&root, "two", &[("usr/lib64/libtwo.so.1", &two)]);
+    install(&root, "app", &[("usr/bin/app", &app)]);
+
+    // app names libone, so make libtwo reachable the same way anything else would be
+    let (ok, out) = doctor(&root);
+    if ok {
+        // nothing links libtwo yet, so there is no clash to report
+        assert!(out.is_empty(), "{out}");
+    }
+
+    let both = binsrc(
+        &at.join("both"),
+        "both",
+        "void p(void);\nvoid _start(void){p();}\n",
+        &two,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "both", &[("usr/bin/both", &both)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!ok, "doctor passed a root where two libraries export p");
+    assert!(
+        out.contains(&format!(
+            "usr/lib64/libone.so.1 {TARGET} duplicate-symbols 1 usr/lib64/libtwo.so.1"
+        )),
+        "{out}"
+    );
+}
+
+// alpine's toolchain leaves _init and _fini in the dynamic symbol table of every object
+// it links, so a plain group-by over exports pairs off every library on the system. the
+// fixtures here are -nostdlib and carry nothing, which is why the storm only showed up
+// against a real root
+#[test]
+fn the_names_every_object_carries_are_not_a_clash() {
+    if skip("duplicate symbols") {
+        return;
+    }
+    let at = scratch("housekeeping");
+    let root = at.join("root");
+    let body =
+        |own: &str| format!("void _init(void){{}}\nvoid _fini(void){{}}\nvoid {own}(void){{}}\n");
+    let one = libsrc(&at.join("one"), "libone.so.1", &body("a"));
+    let two = libsrc(&at.join("two"), "libtwo.so.1", &body("b"));
+    let ua = binsrc(
+        &at.join("ua"),
+        "ua",
+        "void a(void);\nvoid _start(void){a();}\n",
+        &one,
+        Some("$ORIGIN/../lib64"),
+    );
+    let ub = binsrc(
+        &at.join("ub"),
+        "ub",
+        "void b(void);\nvoid _start(void){b();}\n",
+        &two,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "one", &[("usr/lib64/libone.so.1", &one)]);
+    install(&root, "two", &[("usr/lib64/libtwo.so.1", &two)]);
+    install(&root, "ua", &[("usr/bin/ua", &ua)]);
+    install(&root, "ub", &[("usr/bin/ub", &ub)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!out.contains("duplicate-symbols"), "{out}");
+    assert!(ok, "{out}");
+}
+
+// libgcc_s exports six names at two versions each. grouping by name alone puts one
+// library in its own bucket twice and pairs it with itself, which reads as a clash and
+// is one library doing exactly what versioning is for
+#[test]
+fn one_library_exporting_a_name_at_two_versions_is_not_a_clash() {
+    if skip("duplicate symbols") {
+        return;
+    }
+    let at = scratch("twoversions");
+    let root = at.join("root");
+    let lib = versioned(
+        &at.join("v"),
+        "libv.so.1",
+        "void p_old(void){}\n__asm__(\".symver p_old,p@V1\");\n\
+         void p_new(void){}\n__asm__(\".symver p_new,p@@V2\");\n",
+        Some("V1 { global: p; local: *; };\nV2 { global: p; local: *; } V1;\n"),
+    );
+    let app = binsrc(
+        &at.join("app"),
+        "app",
+        "void p(void);\nvoid _start(void){p();}\n",
+        &lib,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "v", &[("usr/lib64/libv.so.1", &lib)]);
+    install(&root, "app", &[("usr/bin/app", &app)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!out.contains("duplicate-symbols"), "{out}");
+    assert!(ok, "{out}");
+}
+
+// an inline function or a template instantiation is emitted into every object that used
+// it and marked weak so the linker can collapse them. libclang-cpp and libLLVM share 299
+// of those, which is c++ working rather than two libraries fighting over a name
+#[test]
+fn a_weak_export_in_two_libraries_is_not_a_clash() {
+    if skip("duplicate symbols") {
+        return;
+    }
+    let at = scratch("vague");
+    let root = at.join("root");
+    let body =
+        |own: &str| format!("__attribute__((weak)) void shared(void){{}}\nvoid {own}(void){{}}\n");
+    let one = libsrc(&at.join("one"), "libone.so.1", &body("a"));
+    let two = libsrc(&at.join("two"), "libtwo.so.1", &body("b"));
+    let ua = binsrc(
+        &at.join("ua"),
+        "ua",
+        "void a(void);\nvoid _start(void){a();}\n",
+        &one,
+        Some("$ORIGIN/../lib64"),
+    );
+    let ub = binsrc(
+        &at.join("ub"),
+        "ub",
+        "void b(void);\nvoid _start(void){b();}\n",
+        &two,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "one", &[("usr/lib64/libone.so.1", &one)]);
+    install(&root, "two", &[("usr/lib64/libtwo.so.1", &two)]);
+    install(&root, "ua", &[("usr/bin/ua", &ua)]);
+    install(&root, "ub", &[("usr/bin/ub", &ub)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!out.contains("duplicate-symbols"), "{out}");
+    assert!(ok, "{out}");
+}
+
+// libssl and libcrypto both define OPENSSL_3.0.0 through OPENSSL_3.5.0, and a library
+// carries one symbol per version node it defines, named after the node. those label the
+// version rather than exporting anything
+#[test]
+fn a_version_label_in_two_libraries_is_not_a_clash() {
+    if skip("duplicate symbols") {
+        return;
+    }
+    let at = scratch("labels");
+    let root = at.join("root");
+    let script = "V1 { global: a; b; local: *; };\n";
+    let one = versioned(
+        &at.join("one"),
+        "libone.so.1",
+        "void a(void){}\n",
+        Some(script),
+    );
+    let two = versioned(
+        &at.join("two"),
+        "libtwo.so.1",
+        "void b(void){}\n",
+        Some(script),
+    );
+    let ua = binsrc(
+        &at.join("ua"),
+        "ua",
+        "void a(void);\nvoid _start(void){a();}\n",
+        &one,
+        Some("$ORIGIN/../lib64"),
+    );
+    let ub = binsrc(
+        &at.join("ub"),
+        "ub",
+        "void b(void);\nvoid _start(void){b();}\n",
+        &two,
+        Some("$ORIGIN/../lib64"),
+    );
+    install(&root, "one", &[("usr/lib64/libone.so.1", &one)]);
+    install(&root, "two", &[("usr/lib64/libtwo.so.1", &two)]);
+    install(&root, "ua", &[("usr/bin/ua", &ua)]);
+    install(&root, "ub", &[("usr/bin/ub", &ub)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!out.contains("duplicate-symbols"), "{out}");
+    assert!(ok, "{out}");
+}
+
+// the gnu tree is usr/lib64 and the musl one is usr/lib. musl's loader ignores symbol
+// versions entirely, so a gnu binary that reaches across binds to whatever carries the
+// right name and nothing errors until it behaves oddly
+#[test]
+fn a_gnu_binary_reaching_into_the_musl_tree_is_flagged() {
+    if skip("cross tier") {
+        return;
+    }
+    let at = scratch("crosstier");
+    let root = at.join("root");
+    let l = lib(&at, "libp.so.1");
+    let app = bin(&at, "app", &l, Some("$ORIGIN/../lib"));
+    install(&root, "libp", &[("usr/lib/libp.so.1", &l)]);
+    install(&root, "app", &[("usr/bin/app", &app)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(
+        !ok,
+        "a gnu binary resolved into the musl tree and doctor was happy"
+    );
+    assert!(
+        out.contains(&format!(
+            "usr/bin/app {TARGET} cross-tier usr/lib/libp.so.1"
+        )),
+        "{out}"
+    );
 }

@@ -227,6 +227,55 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
     })
 }
 
+// what changed between two builds of one library that resolving symbols cannot see.
+// a symbol that left is caught by the loader and by doctor; these are the ones that are
+// still there and no longer mean what they meant
+#[derive(Debug, PartialEq, Eq)]
+pub enum Change {
+    Gone(String),
+    // global to weak still resolves, and the consumer that used to link gets NULL
+    // instead of a load error
+    Weakened(String),
+    // an exported object's size is the object's size. a class gaining a virtual method
+    // grows its vtable, which is the classic c++ break where every name stays identical
+    Grew(String),
+    // gnu only: new links bind to the default version, so moving which one is default
+    // changes what everything built afterwards gets
+    Undefaulted(String),
+}
+
+// versions decide identity on the gnu target and are decoration on musl, whose loader
+// ignores them entirely. one comparison for both is wrong in both directions
+pub fn compare(old: &[Sym], new: &[Sym], versions: bool) -> Vec<Change> {
+    let key = |s: &Sym| match (versions, &s.version) {
+        (true, Some(v)) => format!("{}@{v}", s.name),
+        _ => s.name.clone(),
+    };
+
+    let mut now: Vec<(String, &Sym)> = new.iter().map(|s| (key(s), s)).collect();
+    now.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = Vec::new();
+    for was in old {
+        let k = key(was);
+        let Ok(i) = now.binary_search_by(|p| p.0.cmp(&k)) else {
+            out.push(Change::Gone(k));
+            continue;
+        };
+        let is = now[i].1;
+        if !was.weak && is.weak {
+            out.push(Change::Weakened(k.clone()));
+        }
+        if was.object && is.object && was.size != is.size {
+            out.push(Change::Grew(k.clone()));
+        }
+        if versions && was.default && !is.default {
+            out.push(Change::Undefaulted(k));
+        }
+    }
+    out
+}
+
 // there is no DT_SYMSZ. the count comes out of whichever hash table the linker
 // emitted, and modern ones emit only the gnu flavour
 fn count(

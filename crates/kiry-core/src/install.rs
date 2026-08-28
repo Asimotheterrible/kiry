@@ -149,10 +149,13 @@ fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
             if rec.manifest.len() != before {
                 db::write(root, &rec)?;
                 // provides names paths as well, and a record pointing at a file the
-                // package no longer owns is the exact thing the stale check reports
+                // package no longer owns is the exact thing the stale check reports.
+                // keeping what the manifest still holds rather than dropping what was
+                // taken also heals an entry an older kiry left behind
+                let own: HashSet<&str> = rec.manifest.iter().map(|e| e.path.as_str()).collect();
                 let kept: Vec<db::Provide> = db::read_provides(root, &j.target, &name)?
                     .into_iter()
-                    .filter(|p| !taken.contains(p.path.as_str()))
+                    .filter(|p| own.contains(p.path.as_str()))
                     .collect();
                 db::write_provides(root, &j.target, &name, &kept)?;
             }
@@ -418,18 +421,33 @@ pub struct Removed {
     pub kept: usize,
 }
 
-pub fn remove(root: &Path, target: &str, name: &str, force: bool) -> Result<Removed, Error> {
-    let rec = db::read(root, target, name)?;
+// the whole batch is read and checked before anything is unlinked, so a package that is
+// only needed by something else going away in the same breath is not needed at all, and
+// the order the names were typed in decides nothing
+pub fn remove(
+    root: &Path,
+    target: &str,
+    names: &[String],
+    force: bool,
+) -> Result<Vec<(String, Removed)>, Error> {
+    let mut recs = Vec::new();
+    for name in names {
+        recs.push((name.clone(), db::read(root, target, name)?));
+    }
 
     if !force {
         for other in db::installed(root, target)? {
-            if other == name {
+            if names.contains(&other) {
                 continue;
             }
             let o = db::read(root, target, &other)?;
-            if o.depends.iter().any(|d| !d.make && d.name == name) {
+            if let Some(d) = o
+                .depends
+                .iter()
+                .find(|d| !d.make && names.contains(&d.name))
+            {
                 return Err(Error::Needed {
-                    pkg: name.to_string(),
+                    pkg: d.name.clone(),
                     by: other,
                 });
             }
@@ -439,13 +457,22 @@ pub fn remove(root: &Path, target: &str, name: &str, force: bool) -> Result<Remo
     let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
 
+    let mut done = Vec::new();
+    for (name, rec) in recs {
+        done.push((name.clone(), unlink(&rootfd, &rec)?));
+        db::forget(root, target, &name)?;
+    }
+    Ok(done)
+}
+
+fn unlink(rootfd: &OwnedFd, rec: &db::Installed) -> Result<Removed, Error> {
     let mut out = Removed::default();
     for e in rec.manifest.iter().rev() {
         let (parent, leaf) = match e.path.rfind('/') {
             Some(i) => (&e.path[..i], &e.path[i + 1..]),
             None => ("", e.path.as_str()),
         };
-        let pfd = match archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent }) {
+        let pfd = match archive::beneath(rootfd, if parent.is_empty() { "." } else { parent }) {
             Ok(fd) => fd,
             Err(_) => {
                 out.missing += 1;
@@ -471,7 +498,7 @@ pub fn remove(root: &Path, target: &str, name: &str, force: bool) -> Result<Remo
             // only ENOENT is gone. NOFOLLOW turns a symlink standing where the file
             // belongs into ELOOP, and that is modified, not missing
             db::Kind::File(want) | db::Kind::Hard(want) => match hash(&pfd, leaf) {
-                Ok(got) if &got == want => {
+                Ok(got) if got == *want => {
                     let _ = rustix::fs::unlinkat(&pfd, leaf, AtFlags::empty());
                     out.gone += 1;
                 }
@@ -482,7 +509,6 @@ pub fn remove(root: &Path, target: &str, name: &str, force: bool) -> Result<Remo
         }
     }
 
-    db::forget(root, target, name)?;
     Ok(out)
 }
 

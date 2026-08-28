@@ -467,37 +467,43 @@ fn remove_cmd(args: &[String]) {
         Err(e) => die(e.to_string()),
     };
 
-    for name in &names {
-        let mut found = false;
-        for t in &targets {
-            match db::installed(&root, t) {
-                Ok(have) if have.contains(name) => {}
-                Ok(_) => continue,
-                Err(e) => die(e.to_string()),
-            }
-            found = true;
-            match install::remove(&root, t, name, force) {
-                Ok(r) => {
-                    let mut notes = Vec::new();
-                    if r.kept > 0 {
-                        notes.push(format!("{} modified, left alone", r.kept));
-                    }
-                    if r.missing > 0 {
-                        notes.push(format!("{} already gone", r.missing));
-                    }
-                    let note = if notes.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  {}", notes.join(", "))
-                    };
-                    let s = if r.gone == 1 { "" } else { "s" };
-                    say!("{name} {t} removed {} file{s}{note}", r.gone);
-                }
-                Err(e) => die(e.to_string()),
-            }
+    let mut plan: Vec<(&String, Vec<String>)> = Vec::new();
+    for t in &targets {
+        let have = match db::installed(&root, t) {
+            Ok(h) => h,
+            Err(e) => die(e.to_string()),
+        };
+        let mine: Vec<String> = names.iter().filter(|n| have.contains(n)).cloned().collect();
+        if !mine.is_empty() {
+            plan.push((t, mine));
         }
-        if !found {
+    }
+    for name in &names {
+        if !plan.iter().any(|(_, mine)| mine.contains(name)) {
             die(format!("{name} is not installed"));
+        }
+    }
+
+    for (t, mine) in &plan {
+        let done = match install::remove(&root, t, mine, force) {
+            Ok(d) => d,
+            Err(e) => die(e.to_string()),
+        };
+        for (name, r) in done {
+            let mut notes = Vec::new();
+            if r.kept > 0 {
+                notes.push(format!("{} modified, left alone", r.kept));
+            }
+            if r.missing > 0 {
+                notes.push(format!("{} already gone", r.missing));
+            }
+            let note = if notes.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", notes.join(", "))
+            };
+            let s = if r.gone == 1 { "" } else { "s" };
+            say!("{name} {t} removed {} file{s}{note}", r.gone);
         }
     }
 }

@@ -6,8 +6,13 @@ WIP, dont use it in your system yet, or use it idc
 
 no runtime dependencies, packages are plain text, recipes are POSIX `sh`.
 
-## The idea
+## The main idea
+**Basically kiry reads the dependencies of a package from the build binary instead of trusting the 
+Maintainers list of dependencies**, it scans the compiled programs and shared libraries, checks which
+other libraries actually link to it and then uses that information to decide what needs to be installed
+and later what needs rebuilding. There will be also more features to kiry.
 
+Long Version:
 Source-based package managers run on facts a maintainer declares: what a library provides,
 which ABI it has, what it depends on, which compiler flags are safe, what needs rebuilding
 when it changes. Those declarations work, and thousands of people maintain them. They are

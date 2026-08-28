@@ -517,3 +517,114 @@ fn counts_symbols_out_of_the_old_hash_table_too() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// the comparison has no oracle: no tool on the system will say whether two builds of one
+// library broke their consumers. so the compiler makes each change real and the test
+// asserts the verdict
+fn pair(
+    name: &str,
+    before: &str,
+    after: &str,
+    script: Option<&str>,
+) -> Option<(elf::Elf, elf::Elf)> {
+    let dir = std::env::temp_dir().join(format!("kiry-abi-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut built = Vec::new();
+    for (which, body) in [("old", before), ("new", after)] {
+        let src = dir.join(format!("{which}.c"));
+        std::fs::write(&src, body).unwrap();
+        let so = dir.join(format!("lib{which}.so"));
+        let mut c = Command::new("cc");
+        c.args(["-shared", "-fPIC", "-nostdlib"]);
+        if let Some(v) = script {
+            let map = dir.join("v.map");
+            std::fs::write(&map, v).unwrap();
+            c.arg(format!("-Wl,--version-script,{}", map.display()));
+        }
+        let ok = c.arg("-o").arg(&so).arg(&src).status();
+        match ok {
+            Ok(st) if st.success() => {}
+            _ => {
+                assert!(
+                    std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+                    "cc cannot build a shared library"
+                );
+                return None;
+            }
+        }
+        built.push(elf::parse(&std::fs::read(&so).unwrap()).unwrap());
+    }
+    let new = built.pop().unwrap();
+    Some((built.pop().unwrap(), new))
+}
+
+#[test]
+fn a_symbol_that_left_is_gone() {
+    let Some((old, new)) = pair(
+        "gone",
+        "void p(void){}\nvoid q(void){}\n",
+        "void p(void){}\n",
+        None,
+    ) else {
+        return;
+    };
+    let seen = elf::compare(&old.exports, &new.exports, false);
+    assert!(seen.contains(&elf::Change::Gone("q".into())), "{seen:?}");
+}
+
+// still resolves, still links, and the caller now gets NULL where it used to get an
+// address. no symbol set difference at all
+#[test]
+fn global_to_weak_is_a_change() {
+    let Some((old, new)) = pair(
+        "weak",
+        "void p(void){}\n",
+        "__attribute__((weak)) void p(void){}\n",
+        None,
+    ) else {
+        return;
+    };
+    let seen = elf::compare(&old.exports, &new.exports, false);
+    assert!(
+        seen.contains(&elf::Change::Weakened("p".into())),
+        "{seen:?}"
+    );
+}
+
+// an exported object's size is the object's size, which is how a c++ vtable growing by
+// one virtual method shows up while every name stays identical
+#[test]
+fn an_object_that_grew_is_a_change() {
+    let Some((old, new)) = pair("grew", "char t[8];\n", "char t[16];\n", None) else {
+        return;
+    };
+    let seen = elf::compare(&old.exports, &new.exports, false);
+    assert!(seen.contains(&elf::Change::Grew("t".into())), "{seen:?}");
+}
+
+// glibc's own pattern: keep the old version, make a new one default. every symbol is
+// still present and everything linked afterwards binds somewhere else
+#[test]
+fn moving_the_default_version_is_a_change_on_gnu_and_not_on_musl() {
+    let Some((old, new)) = pair(
+        "default",
+        "void p_impl(void){}\n__asm__(\".symver p_impl,p@@V1\");\n",
+        "void p_impl(void){}\n__asm__(\".symver p_impl,p@V1\");\n\
+         void p_new(void){}\n__asm__(\".symver p_new,p@@V2\");\n",
+        Some("V1 { global: p; local: *; };\nV2 { global: p; local: *; } V1;\n"),
+    ) else {
+        return;
+    };
+
+    let gnu = elf::compare(&old.exports, &new.exports, true);
+    assert!(
+        gnu.contains(&elf::Change::Undefaulted("p@V1".into())),
+        "{gnu:?}"
+    );
+
+    // musl's loader ignores versions, so the same two builds changed nothing it can see
+    let musl = elf::compare(&old.exports, &new.exports, false);
+    assert!(musl.is_empty(), "{musl:?}");
+}

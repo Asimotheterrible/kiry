@@ -1,3 +1,4 @@
+mod convert;
 mod sandbox;
 
 use std::collections::{HashMap, HashSet};
@@ -29,6 +30,7 @@ fn main() {
         Some("l") => list_cmd(&args[1..]),
         Some("doctor") => doctor_cmd(&args[1..]),
         Some("rebuild") => rebuild_cmd(&args[1..]),
+        Some("convert") => convert_cmd(&args[1..]),
         Some("sandbox") => {
             if let Err(e) = sandbox::init() {
                 die(e);
@@ -49,6 +51,7 @@ fn usage() {
     say!("       kiry l [--root DIR]");
     say!("       kiry doctor [--root DIR]");
     say!("       kiry rebuild [--root DIR] [-n]");
+    say!("       kiry convert [-n] <APKBUILD>... <into DIR>");
     say!("       kiry sandbox                    internal: build inside its closure");
     say!("       kiry <package dir>");
 }
@@ -249,6 +252,9 @@ fn compile(
     sandbox::assemble(root, t, &members, &sysroot)?;
 
     fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
+    let share = sysroot.join("usr/share/kiry");
+    mkdirs(&share)?;
+    fs::write(share.join("lib.sh"), LIB_SH).map_err(|e| format!("lib.sh: {e}"))?;
 
     let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut c = Command::new(me);
@@ -256,6 +262,8 @@ fn compile(
         .env("KIRY_SANDBOX", abs(&work)?)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("DESTDIR", "/dest")
+        // every apkbuild build() leans on abuild exporting this and never says -j itself
+        .env("MAKEFLAGS", format!("-j{}", jobs()))
         .env("KIRY_SRCDIR", "/src")
         .env("KIRY_TARGET", t)
         .env("KIRY_NAME", &p.name)
@@ -290,6 +298,35 @@ fn compile(
 
 // one top directory and nothing else means the build starts inside it, which is
 // what every recipe expects
+// the abuild helpers a converted body still calls. generated rather than packaged so it
+// cannot drift from the binary that writes it
+const LIB_SH: &str = "\
+default_prepare() {
+\tfor _s in $source; do
+\t\tcase \"$_s\" in
+\t\t*.patch) patch -p1 -i \"$srcdir/${_s##*/}\" || return 1 ;;
+\t\tesac
+\tdone
+}
+
+msg() { echo \">>> $*\"; }
+warning() { echo \">>> WARNING: $*\" >&2; }
+error() { echo \">>> ERROR: $*\" >&2; }
+die() { error \"$@\"; exit 1; }
+
+# abuild refreshes config.sub so an old one recognises musl. a tarball new enough to
+# package usually already does, and one that is not says so at configure
+update_config_sub() { :; }
+update_config_guess() { :; }
+";
+
+fn jobs() -> usize {
+    match std::env::var("KIRY_JOBS").ok().and_then(|v| v.parse().ok()) {
+        Some(n) if n > 0 => n,
+        _ => std::thread::available_parallelism().map_or(1, |n| n.get()),
+    }
+}
+
 fn unpacked(src: &Path) -> PathBuf {
     let Ok(rd) = fs::read_dir(src) else {
         return src.to_path_buf();
@@ -538,12 +575,21 @@ fn list_cmd(args: &[String]) {
     }
 }
 
-fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
-    let text = fs::read_to_string(root.join("etc/kiry/repos")).ok()?;
+fn repos(root: &Path) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(root.join("etc/kiry/repos")) else {
+        return Vec::new();
+    };
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| Path::new(l).join(name))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
+    repos(root)
+        .into_iter()
+        .map(|d| d.join(name))
         .find(|d| d.join("build").is_file())
 }
 
@@ -759,6 +805,45 @@ fn enqueue(root: &Path, broke: &[install::Broke], just: &HashSet<(String, String
     match db::write_queue(root, &all) {
         Ok(()) => say!("queued {}", all.len()),
         Err(e) => die(e.to_string()),
+    }
+}
+
+fn convert_cmd(args: &[String]) {
+    let mut offline = false;
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "-n" {
+            offline = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    let (root, _, rest) = opts(&rest);
+    let (out, names) = match rest.split_last() {
+        Some((out, names)) if !names.is_empty() => (PathBuf::from(out), names),
+        _ => die("convert wants one or more APKBUILDs and a directory to write into".into()),
+    };
+
+    let repos = repos(&root);
+    let alias = convert::aliases(&repos);
+    // the run is the survey, so an apkbuild that will not read is a line in it
+    let mut failed = 0;
+    for n in names {
+        match convert::recipe(Path::new(n), &out, !offline, &alias, &repos) {
+            Ok(r) => {
+                say!("{} converted", r.name);
+                for note in &r.notes {
+                    say!("  {note}");
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                say!("{n} failed {e}");
+            }
+        }
+    }
+    if failed > 0 {
+        std::process::exit(1);
     }
 }
 

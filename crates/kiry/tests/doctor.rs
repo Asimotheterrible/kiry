@@ -625,6 +625,58 @@ fn a_library_nothing_links_is_not_asked_about_its_symbols() {
     );
 }
 
+// perl installs /usr/bin/perl as a second name for perl5.44.0, and every script it ships
+// points at the hardlink. counting only Kind::File called all 32 of them interpreterless
+#[test]
+fn an_interpreter_reached_by_hardlink_is_there() {
+    if skip("hardlink") {
+        return;
+    }
+    let at = scratch("hardlink");
+    let root = at.join("root");
+
+    let real = at.join("fictionsh");
+    fs::write(&real, "an interpreter\n").unwrap();
+    let script = at.join("thing");
+    fs::write(&script, "#!/usr/bin/fictionsh\necho hi\n").unwrap();
+
+    let sum = kiry_core::sha256(fs::File::open(&real).unwrap()).unwrap();
+    fs::create_dir_all(root.join("usr/bin")).unwrap();
+    fs::copy(&real, root.join("usr/bin/fictionsh-1.0")).unwrap();
+    fs::hard_link(
+        root.join("usr/bin/fictionsh-1.0"),
+        root.join("usr/bin/fictionsh"),
+    )
+    .unwrap();
+    db::write(
+        &root,
+        &db::Installed {
+            name: "fictionsh".to_string(),
+            target: TARGET.to_string(),
+            version: Version::parse("1.0 1").unwrap(),
+            depends: Vec::new(),
+            manifest: vec![
+                db::Entry {
+                    mode: 0o755,
+                    kind: db::Kind::File(sum),
+                    path: "usr/bin/fictionsh-1.0".to_string(),
+                },
+                db::Entry {
+                    mode: 0o755,
+                    kind: db::Kind::Hard("usr/bin/fictionsh-1.0".to_string()),
+                    path: "usr/bin/fictionsh".to_string(),
+                },
+            ],
+        },
+    )
+    .unwrap();
+    install(&root, "thing", &[("usr/bin/thing", &script)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(ok, "a hardlinked interpreter was called missing: {out}");
+    assert!(!out.contains("no-interpreter"), "{out}");
+}
+
 // the kernel refuses to start a script whose interpreter is not installed, which is the
 // same shape of failure as a missing library and nothing was looking for it
 #[test]

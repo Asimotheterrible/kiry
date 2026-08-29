@@ -81,6 +81,16 @@ fn opts(args: &[String]) -> (PathBuf, bool, Vec<String>) {
     (PathBuf::from(root), force, rest)
 }
 
+// --root defaults to / and most of these commands write. checked only where one
+// mutates, so l and doctor still answer for the running system
+fn writes(root: &Path) {
+    let at = root.canonicalize();
+    let at = at.as_deref().unwrap_or(root);
+    if at == Path::new("/") && std::env::var_os("KIRY_ROOT_REALLY").is_none() {
+        die("refusing to write to /, set KIRY_ROOT_REALLY=1 to mean it".into());
+    }
+}
+
 fn build_cmd(args: &[String]) {
     let mut want = None;
     let mut verbose = false;
@@ -98,6 +108,7 @@ fn build_cmd(args: &[String]) {
     }
 
     let (root, _, dirs) = opts(&rest);
+    writes(&root);
     if dirs.is_empty() {
         die("nothing to build".into());
     }
@@ -154,24 +165,21 @@ fn build(
     Ok(ready.into_iter().map(|(_, (art, _))| art).collect())
 }
 
-fn sources(root: &Path, p: &Package) -> Result<Vec<(PathBuf, String)>, String> {
+fn sources(root: &Path, p: &Package) -> Result<Vec<(String, PathBuf, String)>, String> {
     let cache = root.join("var/kiry/cache/sources");
     mkdirs(&cache)?;
 
     let mut out = Vec::new();
     for (i, s) in p.sources.iter().enumerate() {
-        let path = if s.contains("://") {
-            let name = s.rsplit('/').next().unwrap_or("");
-            if name.is_empty() {
-                return Err(format!("{s}: no file name at the end of that"));
-            }
+        let (name, from) = filename(s)?;
+        let path = if from.contains("://") {
             let dst = cache.join(name);
             if !dst.exists() {
-                grab(s, &dst)?;
+                grab(from, &dst)?;
             }
             dst
         } else {
-            p.dir.join(s)
+            p.dir.join(from)
         };
 
         let sum = sha(&path)?;
@@ -185,9 +193,22 @@ fn sources(root: &Path, p: &Package) -> Result<Vec<(PathBuf, String)>, String> {
             Some(_) => {}
             None => eprintln!("kiry: {}: no checksum, sha256 is {sum}", path.display()),
         }
-        out.push((path, sum));
+        out.push((name.to_string(), path, sum));
     }
     Ok(out)
+}
+
+// name::url says what to call the thing, for the many urls that end in download or v1.2
+// or nothing at all. it is a file name in a shared cache, so it cannot be a path
+fn filename(s: &str) -> Result<(&str, &str), String> {
+    let (name, from) = match s.split_once("::") {
+        Some((n, u)) if !n.contains(['/', ':']) => (n, u),
+        _ => (s.rsplit('/').next().unwrap_or(""), s),
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("{s}: no file name in that"));
+    }
+    Ok((name, from))
 }
 
 fn grab(url: &str, dst: &Path) -> Result<(), String> {
@@ -217,7 +238,7 @@ fn compile(
     root: &Path,
     p: &Package,
     t: &str,
-    srcs: &[(PathBuf, String)],
+    srcs: &[(String, PathBuf, String)],
     verbose: bool,
 ) -> Result<PathBuf, String> {
     let work = root.join("var/kiry/stage").join(format!(
@@ -231,8 +252,8 @@ fn compile(
     mkdirs(&src)?;
     mkdirs(&dest)?;
 
-    for (path, _) in srcs {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    for (name, path, _) in srcs {
+        let name = name.as_str();
         if tarball(name) {
             run(
                 Command::new("tar").arg("-xf").arg(path).arg("-C").arg(&src),
@@ -283,6 +304,13 @@ fn compile(
         .env("DESTDIR", "/dest")
         // every apkbuild build() leans on abuild exporting this and never says -j itself
         .env("MAKEFLAGS", format!("-j{}", jobs()))
+        // nothing here cross compiles, so all three are the same triple
+        .env("CBUILD", triple(t))
+        .env("CHOST", triple(t))
+        .env("CTARGET", triple(t))
+        // the machine half of the target, which is what a case branch switches on
+        .env("CARCH", t.split('-').next().unwrap_or(t))
+        .env("CTARGET_ARCH", t.split('-').next().unwrap_or(t))
         .env("KIRY_SRCDIR", "/src")
         .env("KIRY_TARGET", t)
         .env("KIRY_NAME", &p.name)
@@ -337,6 +365,11 @@ die() { error \"$@\"; exit 1; }
 # package usually already does, and one that is not says so at configure
 update_config_sub() { :; }
 update_config_guess() { :; }
+
+# kiry builds one package and does not run upstream test suites, so both are always no
+subpackages_has() { return 1; }
+want_check() { return 1; }
+options_has() { case \" $options \" in *\" $1 \"*) return 0 ;; esac; return 1; }
 ";
 
 // abuild's wrapper, deviating twice: auto_features stays auto because the closure is
@@ -372,6 +405,17 @@ fn libdir(t: &str) -> &'static str {
         "/usr/lib64"
     } else {
         "/usr/lib"
+    }
+}
+
+// what clang -print-target-triple answers. a recipe reads it for a name rather than for
+// a decision -- LLVM_HOST_TRIPLE, clang/$CHOST.cfg, [target.$CHOST] -- and an empty one
+// is a wrong answer that builds
+fn triple(t: &str) -> &'static str {
+    if t.ends_with("gnu") {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        "x86_64-unknown-linux-musl"
     }
 }
 
@@ -472,7 +516,7 @@ fn meta(p: &Package, t: &str, hash: &str, art: &Path) -> Result<(), String> {
 
 // no target in here on purpose. every target of a package has to come out with the
 // same hash, which is the whole check
-fn recipe_hash(p: &Package, srcs: &[(PathBuf, String)]) -> Result<String, String> {
+fn recipe_hash(p: &Package, srcs: &[(String, PathBuf, String)]) -> Result<String, String> {
     let rd = fs::read_dir(&p.dir).map_err(|e| format!("{}: {e}", p.dir.display()))?;
     let mut names: Vec<String> = rd
         .flatten()
@@ -488,7 +532,7 @@ fn recipe_hash(p: &Package, srcs: &[(PathBuf, String)]) -> Result<String, String
         blob.extend_from_slice(&body);
     }
     // anything the build reads is either one of those files or a listed source
-    for (_, sum) in srcs {
+    for (_, _, sum) in srcs {
         blob.extend_from_slice(sum.as_bytes());
         blob.push(b'\n');
     }
@@ -532,6 +576,7 @@ fn took(start: Instant) -> String {
 
 fn install_cmd(args: &[String]) {
     let (root, force, names) = opts(args);
+    writes(&root);
     let archives: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
     if archives.is_empty() {
         die("nothing to install".into());
@@ -559,6 +604,7 @@ fn named(jobs: &[install::Job]) -> HashSet<(String, String)> {
 
 fn remove_cmd(args: &[String]) {
     let (root, force, names) = opts(args);
+    writes(&root);
     if names.is_empty() {
         die("nothing to remove".into());
     }
@@ -689,6 +735,7 @@ fn rebuild_cmd(args: &[String]) {
         }
     }
     let (root, _, extra) = opts(&rest);
+    writes(&root);
     if let Some(a) = extra.first() {
         die(format!("rebuild takes no arguments, got {a}"));
     }
@@ -990,7 +1037,9 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
     let mut here: HashMap<String, usize> = HashMap::new();
     let mut links: HashMap<String, String> = HashMap::new();
     let mut shebangs: Vec<(String, String, Vec<String>)> = Vec::new();
-    // every regular file, not only the ones that parse as elf: an interpreter is a file
+    // every regular file, not only the ones that parse as elf: an interpreter is a file.
+    // a hardlink is one too -- the same inode under a second name, which is how perl
+    // ships /usr/bin/perl beside perl5.44.0
     let mut present: HashSet<String> = HashSet::new();
     let mut out: Vec<Finding> = Vec::new();
 
@@ -1003,7 +1052,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
         // resolution. musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1
         // points at the loader itself
         for e in &rec.manifest {
-            if matches!(e.kind, db::Kind::File(_)) {
+            if matches!(e.kind, db::Kind::File(_) | db::Kind::Hard(_)) {
                 present.insert(fold(&e.path));
             }
             if let db::Kind::Link(t) = &e.kind {

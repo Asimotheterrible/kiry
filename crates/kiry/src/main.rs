@@ -1,6 +1,7 @@
 mod sandbox;
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,9 +11,6 @@ use std::time::Instant;
 use kiry_core::pkg::Package;
 use kiry_core::{db, elf, install, pkg};
 
-// a closed pipe is the readers business, not a failure of ours. rust ignores SIGPIPE
-// and turns the write error into a panic, which is how `kiry l | head` printed a
-// backtrace where every other unix tool goes quiet
 macro_rules! say {
     ($($a:tt)*) => {
         if writeln!(std::io::stdout(), $($a)*).is_err() {
@@ -30,6 +28,7 @@ fn main() {
         Some("r") => remove_cmd(&args[1..]),
         Some("l") => list_cmd(&args[1..]),
         Some("doctor") => doctor_cmd(&args[1..]),
+        Some("rebuild") => rebuild_cmd(&args[1..]),
         Some("sandbox") => {
             if let Err(e) = sandbox::init() {
                 die(e);
@@ -49,6 +48,7 @@ fn usage() {
     say!("       kiry r [--root DIR] [--force] <pkg>...");
     say!("       kiry l [--root DIR]");
     say!("       kiry doctor [--root DIR]");
+    say!("       kiry rebuild [--root DIR] [-n]");
     say!("       kiry sandbox                    internal: build inside its closure");
     say!("       kiry <package dir>");
 }
@@ -116,9 +116,12 @@ fn build_cmd(args: &[String]) {
     say!("cached {}", root.join("var/kiry/cache").display());
 }
 
-// every target compiles and packs before any of them is renamed into place, so a
-// package cannot leave half its targets in the cache
-fn build(root: &Path, p: &Package, targets: &[String], verbose: bool) -> Result<(), String> {
+fn build(
+    root: &Path,
+    p: &Package,
+    targets: &[String],
+    verbose: bool,
+) -> Result<Vec<PathBuf>, String> {
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
 
@@ -144,7 +147,7 @@ fn build(root: &Path, p: &Package, targets: &[String], verbose: bool) -> Result<
     for (_, work) in &built {
         let _ = fs::remove_dir_all(work);
     }
-    Ok(())
+    Ok(ready.into_iter().map(|(_, (art, _))| art).collect())
 }
 
 fn sources(root: &Path, p: &Package) -> Result<Vec<(PathBuf, String)>, String> {
@@ -183,8 +186,6 @@ fn sources(root: &Path, p: &Package) -> Result<Vec<(PathBuf, String)>, String> {
     Ok(out)
 }
 
-// %u is the url, %o the output. split on whitespace and exec directly, no shell,
-// so a url never gets a second round of quoting
 fn grab(url: &str, dst: &Path) -> Result<(), String> {
     let mut part = dst.as_os_str().to_owned();
     part.push(".part");
@@ -529,8 +530,139 @@ fn list_cmd(args: &[String]) {
     }
 }
 
-// the stale check goes when provides stops being a stored file, the linkage check
-// when nothing outside kiry can write to the root, so never
+fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
+    let text = fs::read_to_string(root.join("etc/kiry/repos")).ok()?;
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| Path::new(l).join(name))
+        .find(|d| d.join("build").is_file())
+}
+
+fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<Vec<usize>> {
+    let mut left: Vec<usize> = (0..want.len()).collect();
+    let mut out = Vec::new();
+    while !left.is_empty() {
+        let now: Vec<usize> = left
+            .iter()
+            .copied()
+            .filter(|i| {
+                let deps = recipes.get(&want[*i].0).map(|p| &p.depends);
+                !left.iter().any(|j| {
+                    j != i
+                        && deps.is_some_and(|d| d.iter().any(|x| !x.make && x.name == want[*j].0))
+                })
+            })
+            .collect();
+        if now.is_empty() {
+            // a cycle has to be declared, not guessed at. bootstrap is the file that
+            // says which member breaks it and none of these carry one
+            let names: Vec<&str> = left.iter().map(|i| want[*i].0.as_str()).collect();
+            die(format!(
+                "these need each other and none says how to start: {}",
+                names.join(" ")
+            ));
+        }
+        left.retain(|i| !now.contains(i));
+        out.push(now);
+    }
+    out
+}
+
+fn rebuild_cmd(args: &[String]) {
+    let mut dry = false;
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "-n" {
+            dry = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    let (root, _, extra) = opts(&rest);
+    if let Some(a) = extra.first() {
+        die(format!("rebuild takes no arguments, got {a}"));
+    }
+
+    let targets = match db::targets(&root) {
+        Ok(t) => t,
+        Err(e) => die(e.to_string()),
+    };
+
+    let mut want: Vec<(String, String)> = Vec::new();
+    for t in &targets {
+        for f in check(&root, t) {
+            if f.what.rebuilds() && !want.contains(&(f.pkg.clone(), t.clone())) {
+                want.push((f.pkg.clone(), t.clone()));
+            }
+        }
+    }
+    if want.is_empty() {
+        return;
+    }
+
+    let mut recipes: HashMap<String, Package> = HashMap::new();
+    for (name, _) in &want {
+        if recipes.contains_key(name) {
+            continue;
+        }
+        let Some(dir) = recipe(&root, name) else {
+            die(format!(
+                "{name} needs rebuilding and no repo has a recipe for it"
+            ));
+        };
+        match pkg::load(&dir) {
+            Ok(p) => recipes.insert(name.clone(), p),
+            Err(e) => die(e.to_string()),
+        };
+    }
+
+    let plan = levels(&want, &recipes);
+    if dry {
+        for i in plan.into_iter().flatten() {
+            say!("{} {} would rebuild", want[i].0, want[i].1);
+        }
+        return;
+    }
+
+    for level in plan {
+        // every member of a level compiles before any of it is installed, and the level
+        // below it is already in place, so each one links against what it will run with
+        let mut made = Vec::new();
+        for i in &level {
+            let (name, target) = &want[*i];
+            let p = &recipes[name];
+            match build(&root, p, std::slice::from_ref(target), false) {
+                Ok(arts) => made.extend(arts),
+                Err(e) => die(e),
+            }
+        }
+        let jobs = match install::plan(&root, &made, false) {
+            Ok(j) => j,
+            Err(e) => die(e.to_string()),
+        };
+        if let Err(e) = install::apply(&root, &jobs) {
+            die(e.to_string());
+        }
+        for j in &jobs {
+            say!("{} {} {} rebuilt", j.name, j.version.upstream, j.target);
+        }
+    }
+
+    let mut left = 0;
+    for t in &targets {
+        for f in check(&root, t) {
+            if f.what.rebuilds() {
+                say!("{} {t} {}", f.path, f.what);
+                left += 1;
+            }
+        }
+    }
+    if left > 0 {
+        std::process::exit(1);
+    }
+}
+
 fn doctor_cmd(args: &[String]) {
     let (root, _, rest) = opts(args);
     if let Some(a) = rest.first() {
@@ -562,15 +694,49 @@ const HOUSEKEEPING: &[&str] = &["_init", "_fini", "_edata", "_end", "__bss_start
 // a finding is a value rather than a line on stdout, so a caller can group or count
 // them without parsing what doctor printed
 struct Finding {
+    pkg: String,
     path: String,
-    what: String,
+    what: What,
+}
+
+enum What {
+    UnknownTarget,
+    Unreadable,
+    StaleProvides,
+    CrossTier(String),
+    Unresolved(String),
+    NoInterpreter(String),
+    MissingSymbol(String),
+    Duplicate(usize, String),
+}
+
+impl fmt::Display for What {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            What::UnknownTarget => write!(f, "- unknown-target"),
+            What::Unreadable => write!(f, "unreadable"),
+            What::StaleProvides => write!(f, "stale-provides"),
+            What::CrossTier(p) => write!(f, "cross-tier {p}"),
+            What::Unresolved(n) => write!(f, "unresolved {n}"),
+            What::NoInterpreter(w) => write!(f, "no-interpreter {w}"),
+            What::MissingSymbol(s) => write!(f, "missing-symbol {s}"),
+            What::Duplicate(n, p) => write!(f, "duplicate-symbols {n} {p}"),
+        }
+    }
+}
+
+impl What {
+    fn rebuilds(&self) -> bool {
+        matches!(self, What::Unresolved(_) | What::MissingSymbol(_))
+    }
 }
 
 fn check(root: &Path, target: &str) -> Vec<Finding> {
     let Some(dirs) = defaults(target) else {
         return vec![Finding {
+            pkg: "-".into(),
             path: target.to_string(),
-            what: "- unknown-target".into(),
+            what: What::UnknownTarget,
         }];
     };
 
@@ -580,9 +746,11 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
     };
 
     let mut elves = Vec::new();
+    // index-aligned with elves, the way here already is
+    let mut owners: Vec<String> = Vec::new();
     let mut here: HashMap<String, usize> = HashMap::new();
     let mut links: HashMap<String, String> = HashMap::new();
-    let mut shebangs: Vec<(String, Vec<String>)> = Vec::new();
+    let mut shebangs: Vec<(String, String, Vec<String>)> = Vec::new();
     // every regular file, not only the ones that parse as elf: an interpreter is a file
     let mut present: HashSet<String> = HashSet::new();
     let mut out: Vec<Finding> = Vec::new();
@@ -619,14 +787,15 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
             let o = match what {
                 install::Seen::Elf(o) => o,
                 install::Seen::Script(words) => {
-                    shebangs.push((path, words));
+                    shebangs.push((name.clone(), path, words));
                     continue;
                 }
                 install::Seen::Other => continue,
                 install::Seen::Bad => {
                     out.push(Finding {
+                        pkg: name.clone(),
                         path,
-                        what: "unreadable".into(),
+                        what: What::Unreadable,
                     });
                     continue;
                 }
@@ -639,6 +808,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
                     path: path.clone(),
                 });
             }
+            owners.push(name.clone());
             elves.push((path, o));
         }
 
@@ -651,8 +821,9 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
                 is.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
                 if was != is {
                     out.push(Finding {
+                        pkg: name.clone(),
                         path: name.clone(),
-                        what: "stale-provides".into(),
+                        what: What::StaleProvides,
                     });
                 }
             }
@@ -662,7 +833,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
 
     let sets = exported(&elves);
     let mut linked: HashSet<usize> = HashSet::new();
-    for (path, o) in &elves {
+    for (i, (path, o)) in elves.iter().enumerate() {
         let where_ = search(o, path, dirs);
         for want in &o.needed {
             match provider(&here, &links, want, &where_) {
@@ -673,14 +844,16 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
                     // errors. loader paths keep them apart until an rpath crosses over
                     if target.ends_with("gnu") && elves[j].0.starts_with("usr/lib/") {
                         out.push(Finding {
+                            pkg: owners[i].clone(),
                             path: path.clone(),
-                            what: format!("cross-tier {}", elves[j].0),
+                            what: What::CrossTier(elves[j].0.clone()),
                         });
                     }
                 }
                 None => out.push(Finding {
+                    pkg: owners[i].clone(),
                     path: path.clone(),
-                    what: format!("unresolved {want}"),
+                    what: What::Unresolved(want.clone()),
                 }),
             }
         }
@@ -688,7 +861,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
 
     // the kernel will not start a script whose interpreter is not there, which is the
     // same failure DT_NEEDED describes and nothing was checking it
-    for (path, words) in &shebangs {
+    for (pkg, path, words) in &shebangs {
         let mut want = words[0].trim_start_matches('/').to_string();
         // env looks the real one up on PATH, so that is the name that has to exist
         if want.ends_with("/env") || want == "env" {
@@ -711,22 +884,22 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
         };
         if !there {
             out.push(Finding {
+                pkg: pkg.clone(),
                 path: path.clone(),
-                what: format!("no-interpreter {}", words.join(" ")),
+                what: What::NoInterpreter(words.join(" ")),
             });
         }
     }
 
     for (i, (path, o)) in elves.iter().enumerate() {
-        // a library nothing links can only arrive through dlopen, and then its symbols
-        // come from whichever process opened it. python ships 4825 of those
         if !o.interp && !linked.contains(&i) {
             continue;
         }
         for want in missing(&elves, &sets, &here, &links, dirs, i) {
             out.push(Finding {
+                pkg: owners[i].clone(),
                 path: path.clone(),
-                what: format!("missing-symbol {want}"),
+                what: What::MissingSymbol(want),
             });
         }
     }
@@ -739,10 +912,6 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
             continue;
         }
         for sym in &o.exports {
-            // a weak export is c++ vague linkage: an inline function or a template
-            // instantiation lands in every object that used it, and the linker means for
-            // them to collapse. a version label names its own version node and every
-            // library that shares a version name carries one
             if sym.weak
                 || sym.version.as_deref() == Some(sym.name.as_str())
                 || HOUSEKEEPING.contains(&sym.name.as_str())
@@ -750,8 +919,6 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
                 continue;
             }
             let who = by_name.entry(&sym.name).or_default();
-            // one library exporting a name at two versions is one library, and exports
-            // arrive here in file order, so the last entry is the only one to look at
             if who.last() != Some(&i) {
                 who.push(i);
             }
@@ -771,8 +938,9 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
     dupes.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
     for ((a, b), n) in dupes {
         out.push(Finding {
+            pkg: owners[a].clone(),
             path: elves[a].0.clone(),
-            what: format!("duplicate-symbols {n} {}", elves[b].0),
+            what: What::Duplicate(n, elves[b].0.clone()),
         });
     }
     out
@@ -823,16 +991,6 @@ fn at_path(
     None
 }
 
-// a soname check passes a library that kept its name and dropped half its symbols, and
-// the binary linked against it dies at the first call that is not there. lazy binding
-// means launching it proves nothing either, so the definitions get counted here
-//
-// rpath inheritance down the closure is not modelled: a transitive library reachable
-// only through its parent's rpath reports as unresolved on its own walk instead, which
-// is a second finding rather than a missed one
-// one pair of sets per file, built once for the whole walk. unioning a closure per
-// consumer instead is tens of millions of inserts on a real root, to answer a question
-// that only ever needed a lookup
 type Exports<'a> = (HashSet<&'a str>, HashSet<(&'a str, Option<&'a str>)>);
 
 fn exported(elves: &[(String, elf::Elf)]) -> Vec<Exports<'_>> {

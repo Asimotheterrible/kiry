@@ -18,7 +18,6 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-// a tarball holding one top directory, like every upstream release
 fn tarball(at: &Path) -> PathBuf {
     let top = at.join("src/hello-1.0");
     fs::create_dir_all(&top).unwrap();
@@ -92,7 +91,6 @@ fn bootstrap(root: &Path) -> bool {
         return false;
     }
 
-    // ldd names the loader too, which walking DT_NEEDED by hand does not
     let out = Command::new("ldd").arg(&bb).output().unwrap();
     let mut files: Vec<(String, PathBuf)> = vec![("usr/bin/busybox".into(), bb.clone())];
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -377,8 +375,6 @@ fn a_transitive_library_arrives_with_the_link_that_names_it() {
         return;
     }
 
-    // mid is declared by the recipe, so deep is reached one hop further out and is not
-    // a direct member of anything
     shared(&at, &root, "deep");
     bare(&root, "mid", &["deep"]);
 
@@ -501,8 +497,6 @@ fn a_closed_pipe_is_not_a_panic() {
         return;
     }
 
-    // more output than a pipe buffer holds, so the writer is still going when the
-    // reader leaves. two lines would race and prove nothing
     for i in 0..2500 {
         db::write(
             &root,
@@ -530,4 +524,281 @@ fn a_closed_pipe_is_not_a_panic() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("panicked"), "{err}");
     assert!(out.status.success(), "{:?}", out.status);
+}
+
+// a compiler links against whatever the sysroot holds. these recipes say the same thing
+// with test and cp, which is all a busybox toolchain has, and linking against what is
+// there is the whole of what rebuild depends on
+fn lib(at: &Path, soname: &str) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{soname}.c"));
+    fs::write(&src, "void p(void){}\n").unwrap();
+    let out = at.join(soname);
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-nostdlib"])
+        .arg(format!("-Wl,-soname,{soname}"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap()
+        .success());
+    out
+}
+
+fn app(at: &Path, name: &str, against: &Path) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{name}.c"));
+    fs::write(&src, "void p(void);\nvoid _start(void){p();}\n").unwrap();
+    let out = at.join(name);
+    assert!(Command::new("cc")
+        .args(["-nostdlib", "-Wl,-rpath,$ORIGIN/../lib64"])
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .arg(against)
+        .status()
+        .unwrap()
+        .success());
+    out
+}
+
+fn place(root: &Path, name: &str, files: &[(&str, &Path)]) {
+    let mut manifest = Vec::new();
+    for (path, from) in files {
+        let dst = root.join(path);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let _ = fs::remove_file(&dst);
+        fs::copy(from, &dst).unwrap();
+        manifest.push(db::Entry {
+            mode: 0o755,
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(&dst).unwrap()).unwrap()),
+            path: (*path).to_string(),
+        });
+    }
+    db::write(
+        root,
+        &db::Installed {
+            name: name.into(),
+            target: "x86_64-gnu".into(),
+            version: Version::parse("1.0 1").unwrap(),
+            depends: Vec::new(),
+            manifest: manifest.clone(),
+        },
+    )
+    .unwrap();
+    let provides: Vec<db::Provide> = install::scan(root, &manifest)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(path, s)| {
+            let install::Seen::Elf(o) = s else {
+                return None;
+            };
+            Some(db::Provide {
+                soname: o.soname?,
+                versioned: o.versioned,
+                path,
+            })
+        })
+        .collect();
+    db::write_provides(root, "x86_64-gnu", name, &provides).unwrap();
+}
+
+// doctor names a path, rebuild has to get from there to a recipe and back to a working
+// root without being told anything else
+#[test]
+fn rebuild_recompiles_what_the_break_names() {
+    let at = scratch("rebuild");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    for d in ["installed", "provides"] {
+        let _ = fs::remove_dir_all(root.join(format!("usr/lib/kiry/db/{d}/x86_64-musl")));
+    }
+
+    let one = lib(&at.join("v1"), "libp.so.1");
+    let two = lib(&at.join("v2"), "libp.so.2");
+    let src = at.join("src/app-1.0");
+    fs::create_dir_all(&src).unwrap();
+    fs::copy(app(&at.join("a1"), "app-1", &one), src.join("app-1")).unwrap();
+    fs::copy(app(&at.join("a2"), "app-2", &two), src.join("app-2")).unwrap();
+
+    let arc = at.join("app-1.0.tar");
+    assert!(Command::new("tar")
+        .arg("-cf")
+        .arg(&arc)
+        .arg("-C")
+        .arg(at.join("src"))
+        .arg("app-1.0")
+        .status()
+        .unwrap()
+        .success());
+
+    let repo = at.join("repo");
+    let d = repo.join("app");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("version"), "1.0 1\n").unwrap();
+    fs::write(d.join("targets"), "x86_64-gnu\n").unwrap();
+    fs::write(d.join("sources"), "../../app-1.0.tar\n").unwrap();
+    fs::write(
+        d.join("checksums"),
+        format!(
+            "{}\n",
+            kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(d.join("depends"), "libp\n").unwrap();
+    fs::write(
+        d.join("build"),
+        "mkdir -p \"$DESTDIR/usr/bin\"\n\
+         if [ -e /usr/lib64/libp.so.2 ]; then cp app-2 \"$DESTDIR/usr/bin/app\"\n\
+         else cp app-1 \"$DESTDIR/usr/bin/app\"; fi\n",
+    )
+    .unwrap();
+    let bare = at.join("bare");
+    let half = at.join("half");
+    fs::create_dir_all(&bare).unwrap();
+    fs::create_dir_all(half.join("app")).unwrap();
+    fs::write(
+        root.join("etc/kiry/repos"),
+        format!(
+            "# where to look\n\n{}\n{}\n{}\n",
+            bare.display(),
+            half.display(),
+            repo.display()
+        ),
+    )
+    .unwrap();
+
+    let r = root.to_str().unwrap();
+    place(&root, "libp", &[("usr/lib64/libp.so.1", &one)]);
+    let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let arc = root.join("var/kiry/cache/app-1.0-1.x86_64-gnu.tar.zst");
+    let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let first = kiry(&["doctor", "--root", r]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+
+    // the soname moves under it, which is the break the whole engine exists for
+    place(&root, "libp", &[("usr/lib64/libp.so.2", &two)]);
+    let _ = fs::remove_file(root.join("usr/lib64/libp.so.1"));
+    let out = String::from_utf8_lossy(&kiry(&["doctor", "--root", r]).stdout).into_owned();
+    assert!(
+        out.contains("usr/bin/app x86_64-gnu unresolved libp.so.1"),
+        "{out}"
+    );
+
+    let o = kiry(&["rebuild", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("app 1.0 x86_64-gnu rebuilt"), "{said}");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let after = kiry(&["doctor", "--root", r]);
+    assert!(
+        after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+}
+
+// two broken consumers where alpha links beta, so the order the dependency asks for is
+// the reverse of the order they are found in. that is the whole point: a package cannot
+// compile against a dependency that has not been rebuilt and reinstalled yet
+fn two_consumers(at: &Path, root: &Path, deps: &str) -> PathBuf {
+    let one = lib(&at.join("v1"), "libp.so.1");
+    let two = lib(&at.join("v2"), "libp.so.2");
+    let arc = at.join("empty.tar");
+    let src = at.join("src/empty-1.0");
+    fs::create_dir_all(&src).unwrap();
+    assert!(Command::new("tar")
+        .arg("-cf")
+        .arg(&arc)
+        .arg("-C")
+        .arg(at.join("src"))
+        .arg("empty-1.0")
+        .status()
+        .unwrap()
+        .success());
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+
+    let repo = at.join("repo");
+    for (name, dep) in [("alpha", "beta"), ("beta", deps)] {
+        let d = repo.join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("version"), "1.0 1\n").unwrap();
+        fs::write(d.join("targets"), "x86_64-gnu\n").unwrap();
+        fs::write(d.join("sources"), "../../empty.tar\n").unwrap();
+        fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+        fs::write(d.join("depends"), format!("{dep}\n")).unwrap();
+        fs::write(d.join("build"), ":\n").unwrap();
+    }
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+
+    place(root, "libp", &[("usr/lib64/libp.so.1", &one)]);
+    place(
+        root,
+        "alpha",
+        &[("usr/bin/alpha", &app(&at.join("a"), "alpha", &one))],
+    );
+    place(
+        root,
+        "beta",
+        &[("usr/bin/beta", &app(&at.join("b"), "beta", &one))],
+    );
+    // the soname moves and both consumers are left naming one that is gone
+    place(root, "libp", &[("usr/lib64/libp.so.2", &two)]);
+    let _ = fs::remove_file(root.join("usr/lib64/libp.so.1"));
+    two
+}
+
+fn one_target_root(at: &Path) -> PathBuf {
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    assert!(bootstrap(&root));
+    for d in ["installed", "provides"] {
+        let _ = fs::remove_dir_all(root.join(format!("usr/lib/kiry/db/{d}/x86_64-musl")));
+    }
+    root
+}
+
+#[test]
+fn a_rebuild_waits_for_what_it_links() {
+    let at = scratch("order");
+    if !bootstrap(&at.join("probe")) {
+        return;
+    }
+    let root = one_target_root(&at);
+    two_consumers(&at, &root, "libp");
+
+    let o = kiry(&["rebuild", "--root", root.to_str().unwrap(), "-n"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    let a = said.find("alpha").unwrap_or(0);
+    let b = said.find("beta").unwrap_or(usize::MAX);
+    assert!(b < a, "alpha links beta and came first: {said}");
+}
+
+// a cycle cannot be resolved by ordering, and guessing at one is how a package manager
+// hangs instead of saying what is wrong
+#[test]
+fn a_rebuild_cycle_says_who_is_in_it() {
+    let at = scratch("cycle");
+    if !bootstrap(&at.join("probe")) {
+        return;
+    }
+    let root = one_target_root(&at);
+    two_consumers(&at, &root, "alpha");
+
+    let o = kiry(&["rebuild", "--root", root.to_str().unwrap(), "-n"]);
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "a cycle went through");
+    assert!(said.contains("alpha") && said.contains("beta"), "{said}");
 }

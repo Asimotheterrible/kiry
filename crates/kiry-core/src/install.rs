@@ -98,8 +98,16 @@ fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
 
 // TODO: a failure partway through leaves the earlier jobs applied
 pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
+    // what each name held before this batch, read while the record still says so
+    let mut was = Vec::new();
+    for j in jobs {
+        was.push(db::read(root, &j.target, &j.name).ok());
+    }
+
+    let mut kept: HashSet<String> = HashSet::new();
     for j in jobs {
         let manifest = archive::extract(root, &j.archive)?;
+        kept.extend(manifest.iter().map(|e| e.path.clone()));
         let provides = scan(root, &manifest)?
             .into_iter()
             .filter_map(|(path, s)| {
@@ -123,7 +131,38 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
         )?;
         db::write_provides(root, &j.target, &j.name, &provides)?;
     }
-    dispossess(root, jobs)
+    dispossess(root, jobs)?;
+    prune(root, &was, &kept)
+}
+
+// whatever a new version stopped shipping is left owned by nobody once the manifest
+// that named it is overwritten, and no check can see it after that. the whole batch
+// decides what survives, so a path one member drops and another picks up stays put
+fn prune(root: &Path, was: &[Option<db::Installed>], kept: &HashSet<String>) -> Result<(), Error> {
+    let stale: Vec<Vec<db::Entry>> = was
+        .iter()
+        .flatten()
+        .map(|old| {
+            old.manifest
+                .iter()
+                .filter(|e| !kept.contains(&e.path))
+                .cloned()
+                .collect()
+        })
+        .filter(|v: &Vec<db::Entry>| !v.is_empty())
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
+    for gone in &stale {
+        // the same rules removal uses: a file that no longer hashes to what the
+        // manifest said was edited by hand and is not ours to delete
+        unlink(&rootfd, gone)?;
+    }
+    Ok(())
 }
 
 // --force lets a package take a path from whoever had it. the database has to stop
@@ -459,15 +498,15 @@ pub fn remove(
 
     let mut done = Vec::new();
     for (name, rec) in recs {
-        done.push((name.clone(), unlink(&rootfd, &rec)?));
+        done.push((name.clone(), unlink(&rootfd, &rec.manifest)?));
         db::forget(root, target, &name)?;
     }
     Ok(done)
 }
 
-fn unlink(rootfd: &OwnedFd, rec: &db::Installed) -> Result<Removed, Error> {
+fn unlink(rootfd: &OwnedFd, manifest: &[db::Entry]) -> Result<Removed, Error> {
     let mut out = Removed::default();
-    for e in rec.manifest.iter().rev() {
+    for e in manifest.iter().rev() {
         let (parent, leaf) = match e.path.rfind('/') {
             Some(i) => (&e.path[..i], &e.path[i + 1..]),
             None => ("", e.path.as_str()),

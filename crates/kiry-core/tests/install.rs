@@ -30,11 +30,17 @@ fn paths(m: &[Member]) -> Vec<&str> {
 }
 
 fn pack(at: &Path, name: &str, deps: &[&str], files: &[&str]) -> PathBuf {
+    packed(at, name, deps, files, name)
+}
+
+// body separately, because two packages shipping identical bytes is the case where the
+// modified-file guard cannot tell one owner from the next
+fn packed(at: &Path, name: &str, deps: &[&str], files: &[&str], body: &str) -> PathBuf {
     let src = at.join(format!("{name}-src"));
     for f in files {
         let p = src.join(f);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, name.as_bytes()).unwrap();
+        fs::write(p, body.as_bytes()).unwrap();
     }
 
     let arc = at.join(format!("{name}.tar.zst"));
@@ -151,6 +157,67 @@ fn a_symlink_where_the_file_belongs_counts_as_modified() {
 
     assert_eq!(one(&root, "foo", false).kept, 1);
     assert!(p.symlink_metadata().unwrap().is_symlink());
+}
+
+fn at(d: &Path, sub: &str) -> PathBuf {
+    let p = d.join(sub);
+    fs::create_dir_all(&p).unwrap();
+    p
+}
+
+// the manifest that named a file is overwritten by the new version, so anything the new
+// version stopped shipping is left owned by nobody and no check can see it afterwards
+#[test]
+fn a_new_version_takes_the_files_it_stopped_shipping() {
+    let (d, root) = rooted("prune");
+    let v1 = pack(
+        &at(&d, "v1"),
+        "foo",
+        &[],
+        &["usr/share/foo/keep", "usr/share/foo/gone"],
+    );
+    run(&root, &[v1], false).unwrap();
+    assert!(root.join("usr/share/foo/gone").exists());
+
+    let v2 = pack(&at(&d, "v2"), "foo", &[], &["usr/share/foo/keep"]);
+    run(&root, &[v2], false).unwrap();
+    assert!(root.join("usr/share/foo/keep").exists());
+    assert!(!root.join("usr/share/foo/gone").exists());
+}
+
+// same rule removal already follows: a file that no longer hashes to what the manifest
+// said was edited by hand, and is not ours to delete
+#[test]
+fn a_dropped_file_edited_by_hand_stays() {
+    let (d, root) = rooted("prune-edited");
+    let v1 = pack(&at(&d, "v1"), "foo", &[], &["usr/share/foo/x"]);
+    run(&root, &[v1], false).unwrap();
+    fs::write(root.join("usr/share/foo/x"), b"edited by hand").unwrap();
+
+    let v2 = pack(&at(&d, "v2"), "foo", &[], &["usr/share/foo/y"]);
+    run(&root, &[v2], false).unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("usr/share/foo/x")).unwrap(),
+        "edited by hand"
+    );
+}
+
+// the whole batch decides what survives. a path one member gives up and another takes
+// over has a new owner, not no owner, and the order they were named in decides nothing
+#[test]
+fn a_path_another_member_picks_up_survives_the_drop() {
+    let (d, root) = rooted("prune-handover");
+    let v1 = pack(&at(&d, "v1"), "foo", &[], &["usr/share/x", "usr/share/foo"]);
+    run(&root, &[v1], false).unwrap();
+
+    let v2 = pack(&at(&d, "v2"), "foo", &[], &["usr/share/foo"]);
+    // identical bytes, so nothing but the batch keep-set can save this file
+    let bar = packed(&at(&d, "bar"), "bar", &[], &["usr/share/x"], "foo");
+    run(&root, &[v2, bar], false).unwrap();
+
+    assert!(root.join("usr/share/x").exists());
+    let rec = db::read(&root, "x86_64-musl", "bar").unwrap();
+    assert!(rec.manifest.iter().any(|e| e.path == "usr/share/x"));
 }
 
 #[test]

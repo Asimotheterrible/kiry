@@ -97,28 +97,61 @@ fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
 }
 
 // TODO: a failure partway through leaves the earlier jobs applied
-pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
+// a library that changed under everything already linked to it. the soname is the name
+// consumers asked for, so it is what finds them again
+#[derive(Debug, Clone)]
+pub struct Broke {
+    pub target: String,
+    pub soname: String,
+    pub changed: Vec<elf::Change>,
+}
+
+pub fn apply(root: &Path, jobs: &[Job]) -> Result<Vec<Broke>, Error> {
     // what each name held before this batch, read while the record still says so
     let mut was = Vec::new();
     for j in jobs {
         was.push(db::read(root, &j.target, &j.name).ok());
     }
 
+    // exports read while the old library is still on disk. extraction is what makes
+    // this unrepeatable: afterwards there is nothing left to compare against
+    let mut before = Vec::new();
+    for old in &was {
+        before.push(match old {
+            Some(o) => libraries(root, &o.manifest)?,
+            None => HashMap::new(),
+        });
+    }
+
+    let mut broke = Vec::new();
     let mut kept: HashSet<String> = HashSet::new();
-    for j in jobs {
+    for (i, j) in jobs.iter().enumerate() {
         let manifest = archive::extract(root, &j.archive)?;
         kept.extend(manifest.iter().map(|e| e.path.clone()));
-        let provides = scan(root, &manifest)?
-            .into_iter()
-            .filter_map(|(path, s)| {
-                let Seen::Elf(o) = s else { return None };
-                Some(db::Provide {
-                    soname: o.soname?,
-                    versioned: o.versioned,
-                    path,
-                })
-            })
-            .collect::<Vec<_>>();
+
+        let mut provides = Vec::new();
+        for (path, seen) in scan(root, &manifest)? {
+            let Seen::Elf(o) = seen else { continue };
+            let Some(soname) = o.soname else { continue };
+            if let Some(old) = before[i].get(&path) {
+                // a target decides this, not the library: a musl loader ignores versions
+                // even where one carries them, so keying on them there invents breaks
+                let changed = elf::compare(&old.exports, &o.exports, j.target.ends_with("gnu"));
+                if !changed.is_empty() {
+                    broke.push(Broke {
+                        target: j.target.clone(),
+                        soname: soname.clone(),
+                        changed,
+                    });
+                }
+            }
+            provides.push(db::Provide {
+                soname,
+                versioned: o.versioned,
+                path,
+            });
+        }
+
         db::write(
             root,
             &db::Installed {
@@ -132,7 +165,18 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<(), Error> {
         db::write_provides(root, &j.target, &j.name, &provides)?;
     }
     dispossess(root, jobs)?;
-    prune(root, &was, &kept)
+    prune(root, &was, &kept)?;
+    Ok(broke)
+}
+
+fn libraries(root: &Path, manifest: &[db::Entry]) -> Result<HashMap<String, elf::Elf>, Error> {
+    Ok(scan(root, manifest)?
+        .into_iter()
+        .filter_map(|(path, s)| match s {
+            Seen::Elf(o) if o.soname.is_some() => Some((path, o)),
+            _ => None,
+        })
+        .collect())
 }
 
 // whatever a new version stopped shipping is left owned by nobody once the manifest

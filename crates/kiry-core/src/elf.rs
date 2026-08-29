@@ -230,7 +230,7 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
 // what changed between two builds of one library that resolving symbols cannot see.
 // a symbol that left is caught by the loader and by doctor; these are the ones that are
 // still there and no longer mean what they meant
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Gone(String),
     // global to weak still resolves, and the consumer that used to link gets NULL
@@ -242,6 +242,14 @@ pub enum Change {
     // gnu only: new links bind to the default version, so moving which one is default
     // changes what everything built afterwards gets
     Undefaulted(String),
+}
+
+impl Change {
+    pub fn symbol(&self) -> &str {
+        match self {
+            Change::Gone(s) | Change::Weakened(s) | Change::Grew(s) | Change::Undefaulted(s) => s,
+        }
+    }
 }
 
 // versions decide identity on the gnu target and are decoration on musl, whose loader

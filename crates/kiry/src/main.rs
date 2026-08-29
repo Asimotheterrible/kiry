@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -255,6 +256,24 @@ fn compile(
     let share = sysroot.join("usr/share/kiry");
     mkdirs(&share)?;
     fs::write(share.join("lib.sh"), LIB_SH).map_err(|e| format!("lib.sh: {e}"))?;
+    // files rather than shell functions because ash refuses a hyphen in a function name,
+    // and generated because libdir is the target's
+    let bin = sysroot.join("usr/bin");
+    mkdirs(&bin)?;
+    // muon does not read argv0, so compile and install need a name to reach it by too
+    for (n, body) in [
+        ("abuild-meson", MESON.replace("@LIBDIR@", libdir(t))),
+        ("abuild-muon", MESON.replace("@LIBDIR@", libdir(t))),
+        (
+            "meson",
+            "#!/bin/sh -e\nexec muon meson \"$@\"\n".to_string(),
+        ),
+    ] {
+        let at = bin.join(n);
+        fs::write(&at, &body).map_err(|e| format!("{n}: {e}"))?;
+        fs::set_permissions(&at, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("{n}: {e}"))?;
+    }
 
     let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut c = Command::new(me);
@@ -319,6 +338,42 @@ die() { error \"$@\"; exit 1; }
 update_config_sub() { :; }
 update_config_guess() { :; }
 ";
+
+// abuild's wrapper, deviating twice: auto_features stays auto because the closure is
+// what a detection can see, and libdir follows the target
+const MESON: &str = "\
+#!/bin/sh -e
+exec muon meson setup \\
+\t-Dprefix=/usr \\
+\t-Dlibdir=@LIBDIR@ \\
+\t-Dlibexecdir=/usr/libexec \\
+\t-Dbindir=/usr/bin \\
+\t-Dsbindir=/usr/sbin \\
+\t-Dincludedir=/usr/include \\
+\t-Ddatadir=/usr/share \\
+\t-Dmandir=/usr/share/man \\
+\t-Dlocaledir=/usr/share/locale \\
+\t-Dsysconfdir=/etc \\
+\t-Dlocalstatedir=/var \\
+\t-Dsharedstatedir=/var/lib \\
+\t-Dbuildtype=plain \\
+\t-Dauto_features=auto \\
+\t-Dwrap_mode=nodownload \\
+\t-Ddefault_library=shared \\
+\t-Db_lto=false \\
+\t-Db_staticpic=true \\
+\t-Db_pie=true \\
+\t-Dwerror=false \\
+\t\"$@\"
+";
+
+fn libdir(t: &str) -> &'static str {
+    if t.ends_with("gnu") {
+        "/usr/lib64"
+    } else {
+        "/usr/lib"
+    }
+}
 
 fn jobs() -> usize {
     match std::env::var("KIRY_JOBS").ok().and_then(|v| v.parse().ok()) {

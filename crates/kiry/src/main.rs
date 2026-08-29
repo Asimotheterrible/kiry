@@ -448,13 +448,21 @@ fn install_cmd(args: &[String]) {
         Ok(j) => j,
         Err(e) => die(e.to_string()),
     };
-    if let Err(e) = install::apply(&root, &jobs) {
-        die(e.to_string());
-    }
+    let broke = match install::apply(&root, &jobs) {
+        Ok(b) => b,
+        Err(e) => die(e.to_string()),
+    };
 
     for j in &jobs {
         say!("{} {} {} ok", j.name, j.version.upstream, j.target);
     }
+    enqueue(&root, &broke, &named(&jobs));
+}
+
+fn named(jobs: &[install::Job]) -> HashSet<(String, String)> {
+    jobs.iter()
+        .map(|j| (j.target.clone(), j.name.clone()))
+        .collect()
 }
 
 fn remove_cmd(args: &[String]) {
@@ -590,6 +598,13 @@ fn rebuild_cmd(args: &[String]) {
     };
 
     let mut want: Vec<(String, String)> = Vec::new();
+    // the queue names consumers of a library whose abi moved, which resolves fine and
+    // so is invisible to a check. the checks name what is already broken
+    for q in db::read_queue(&root).unwrap_or_default() {
+        if !want.contains(&(q.name.clone(), q.target.clone())) {
+            want.push((q.name, q.target));
+        }
+    }
     for t in &targets {
         for f in check(&root, t) {
             if f.what.rebuilds() && !want.contains(&(f.pkg.clone(), t.clone())) {
@@ -641,12 +656,25 @@ fn rebuild_cmd(args: &[String]) {
             Ok(j) => j,
             Err(e) => die(e.to_string()),
         };
-        if let Err(e) = install::apply(&root, &jobs) {
-            die(e.to_string());
-        }
+        let broke = match install::apply(&root, &jobs) {
+            Ok(b) => b,
+            Err(e) => die(e.to_string()),
+        };
         for j in &jobs {
             say!("{} {} {} rebuilt", j.name, j.version.upstream, j.target);
         }
+        enqueue(&root, &broke, &named(&jobs));
+    }
+
+    // a rebuild that ran is off the queue whether or not it fixed anything, or the next
+    // drain starts from the same list. what these rebuilds queued in turn stays
+    let left_over: Vec<db::Queued> = db::read_queue(&root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|q| !want.contains(&(q.name.clone(), q.target.clone())))
+        .collect();
+    if let Err(e) = db::write_queue(&root, &left_over) {
+        die(e.to_string());
     }
 
     let mut left = 0;
@@ -660,6 +688,77 @@ fn rebuild_cmd(args: &[String]) {
     }
     if left > 0 {
         std::process::exit(1);
+    }
+}
+
+// an abi break is only a break for the consumers that used what moved. everything that
+// links libfoo is the set doctor would give; the ones whose undefined symbols name a
+// symbol that actually changed is the set worth rebuilding
+fn affected(
+    root: &Path,
+    broke: &[install::Broke],
+    just: &HashSet<(String, String)>,
+) -> Vec<db::Queued> {
+    let mut out = Vec::new();
+    for b in broke {
+        let versions = b.target.ends_with("gnu");
+        let moved: HashSet<&str> = b.changed.iter().map(|c| c.symbol()).collect();
+        let Ok(names) = db::installed(root, &b.target) else {
+            continue;
+        };
+        for name in names {
+            if just.contains(&(b.target.clone(), name.clone())) {
+                continue;
+            }
+            let Ok(rec) = db::read(root, &b.target, &name) else {
+                continue;
+            };
+            let Ok(seen) = install::scan(root, &rec.manifest) else {
+                continue;
+            };
+            let uses = seen.iter().any(|(_, s)| {
+                let install::Seen::Elf(o) = s else {
+                    return false;
+                };
+                o.needed.contains(&b.soname)
+                    && o.undefined
+                        .iter()
+                        .any(|u| moved.contains(symbol(u, versions).as_str()))
+            });
+            if uses {
+                out.push(db::Queued {
+                    target: b.target.clone(),
+                    soname: b.soname.clone(),
+                    name,
+                });
+            }
+        }
+    }
+    out
+}
+
+// the same key compare built its changes with, or the two sides never meet
+fn symbol(s: &elf::Sym, versions: bool) -> String {
+    match (versions, &s.version) {
+        (true, Some(v)) => format!("{}@{v}", s.name),
+        _ => s.name.clone(),
+    }
+}
+
+// what the batch left behind for rebuild to drain. an empty set is the early cutoff:
+// a library whose exports only grew breaks nobody and queues nothing
+fn enqueue(root: &Path, broke: &[install::Broke], just: &HashSet<(String, String)>) {
+    let want = affected(root, broke, just);
+    if want.is_empty() {
+        return;
+    }
+    let mut all = db::read_queue(root).unwrap_or_default();
+    all.extend(want);
+    all.sort();
+    all.dedup();
+    match db::write_queue(root, &all) {
+        Ok(()) => say!("queued {}", all.len()),
+        Err(e) => die(e.to_string()),
     }
 }
 

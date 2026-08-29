@@ -802,3 +802,257 @@ fn a_rebuild_cycle_says_who_is_in_it() {
     assert!(!o.status.success(), "a cycle went through");
     assert!(said.contains("alpha") && said.contains("beta"), "{said}");
 }
+
+fn lib_with(at: &Path, soname: &str, body: &str) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{soname}.c"));
+    fs::write(&src, body).unwrap();
+    let out = at.join(soname);
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-nostdlib"])
+        .arg(format!("-Wl,-soname,{soname}"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap()
+        .success());
+    out
+}
+
+fn app_calling(at: &Path, name: &str, sym: &str, against: &Path) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{name}.c"));
+    fs::write(
+        &src,
+        format!("void {sym}(void);\nvoid _start(void){{{sym}();}}\n"),
+    )
+    .unwrap();
+    let out = at.join(name);
+    assert!(Command::new("cc")
+        .args(["-nostdlib", "-Wl,-rpath,$ORIGIN/../lib64"])
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .arg(against)
+        .status()
+        .unwrap()
+        .success());
+    out
+}
+
+fn archive(at: &Path, name: &str, files: &[(&str, &Path)]) -> PathBuf {
+    let src = at.join(format!("{name}-stage"));
+    let _ = fs::remove_dir_all(&src);
+    for (path, from) in files {
+        let dst = src.join(path);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::copy(from, &dst).unwrap();
+    }
+    let arc = at.join(format!("{name}.tar.zst"));
+    let _ = fs::remove_file(&arc);
+    assert!(Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "cd {} && tar cf - . | zstd -q -o {}",
+            src.display(),
+            arc.display()
+        ))
+        .status()
+        .unwrap()
+        .success());
+    let meta = at.join(format!("{name}.tar.zst.meta"));
+    let _ = fs::remove_dir_all(&meta);
+    fs::create_dir_all(&meta).unwrap();
+    fs::write(meta.join("name"), "foo\n").unwrap();
+    fs::write(meta.join("version"), "1.0 1\n").unwrap();
+    fs::write(meta.join("targets"), "x86_64-gnu\n").unwrap();
+    fs::write(meta.join("depends"), "").unwrap();
+    arc
+}
+
+fn queued(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join("usr/lib/kiry/db/queue"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+// two consumers of one library, one calling p and one calling q. dropping q resolves
+// fine for both, so nothing is broken yet and no check can see it. the queue is the
+// only thing that knows, and it has to name the caller of q and not the other one
+#[test]
+fn only_the_consumer_that_used_what_left_is_queued() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-filter");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let both = lib_with(
+        &at.join("v1"),
+        "libp.so.1",
+        "void p(void){}\nvoid q(void){}\n",
+    );
+    let gone = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
+
+    let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &both)]);
+    let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    place(
+        &root,
+        "usep",
+        &[(
+            "usr/bin/usep",
+            &app_calling(&at.join("a"), "usep", "p", &both),
+        )],
+    );
+    place(
+        &root,
+        "useq",
+        &[(
+            "usr/bin/useq",
+            &app_calling(&at.join("b"), "useq", "q", &both),
+        )],
+    );
+
+    let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &gone)]);
+    let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let q = queued(&root);
+    assert!(
+        q.iter().any(|l| l.ends_with(" useq")),
+        "useq calls q and is not queued: {q:?}"
+    );
+    assert!(
+        !q.iter().any(|l| l.ends_with(" usep")),
+        "usep never called q and was queued anyway: {q:?}"
+    );
+}
+
+// a library that only gained a symbol guarantees everything it used to. the queue stays
+// empty, which is the cutoff that keeps a patch bump from rebuilding the world
+#[test]
+fn a_library_that_only_grew_queues_nobody() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-cutoff");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let one = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\n");
+    let two = lib_with(
+        &at.join("v2"),
+        "libp.so.1",
+        "void p(void){}\nvoid q(void){}\n",
+    );
+
+    let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &one)]);
+    let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    place(
+        &root,
+        "usep",
+        &[(
+            "usr/bin/usep",
+            &app_calling(&at.join("a"), "usep", "p", &one),
+        )],
+    );
+
+    let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &two)]);
+    let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(queued(&root).is_empty(), "{:?}", queued(&root));
+}
+
+// a shared library, not an executable. linking a data symbol into an executable gets a
+// copy relocation and the symbol comes out defined there, which is a fixture artefact
+// and not how a real consumer of one looks
+fn touching(at: &Path, name: &str, against: &Path) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{name}.c"));
+    fs::write(&src, "extern char t[];\nvoid u(void){t[0]=1;}\n").unwrap();
+    let out = at.join(name);
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-nostdlib"])
+        .arg(format!("-Wl,-soname,{name}"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .arg(against)
+        .status()
+        .unwrap()
+        .success());
+    out
+}
+
+// an object growing leaves every name in place, so a binary rebuilt against the new one
+// still names it. the package that ships the library was rebuilt with it and is done;
+// queueing it would put it straight back in line to rebuild itself forever. a consumer
+// in another package is the one that still has to catch up
+#[test]
+fn a_package_does_not_queue_itself_for_its_own_library() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-self");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let small = lib_with(&at.join("v1"), "libp.so.1", "char t[8];\nvoid p(void){}\n");
+    let big = lib_with(&at.join("v2"), "libp.so.1", "char t[16];\nvoid p(void){}\n");
+
+    let first = archive(
+        &at,
+        "foo-1",
+        &[
+            ("usr/lib64/libp.so.1", &small),
+            (
+                "usr/lib64/libtool.so.1",
+                &touching(&at.join("t1"), "libtool.so.1", &small),
+            ),
+        ],
+    );
+    let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    place(
+        &root,
+        "other",
+        &[(
+            "usr/lib64/libother.so.1",
+            &touching(&at.join("o1"), "libother.so.1", &small),
+        )],
+    );
+
+    let second = archive(
+        &at,
+        "foo-2",
+        &[
+            ("usr/lib64/libp.so.1", &big),
+            (
+                "usr/lib64/libtool.so.1",
+                &touching(&at.join("t2"), "libtool.so.1", &big),
+            ),
+        ],
+    );
+    let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let q = queued(&root);
+    assert!(
+        q.iter().any(|l| l.ends_with(" other")),
+        "other still links the old layout and is not queued: {q:?}"
+    );
+    assert!(
+        !q.iter().any(|l| l.ends_with(" foo")),
+        "foo ships the library and was rebuilt with it: {q:?}"
+    );
+}

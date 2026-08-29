@@ -277,6 +277,70 @@ pub fn write(root: &Path, rec: &Installed) -> Result<(), Error> {
     put(&d.join("manifest"), &manifest)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Queued {
+    pub target: String,
+    pub name: String,
+    pub soname: String,
+}
+
+pub fn queue(root: &Path) -> PathBuf {
+    root.join(DB).join("queue")
+}
+
+// three fields, package last for the same reason a manifest puts the path last. a line
+// deleted by hand is a rebuild declined, which is the only control this needs
+pub fn read_queue(root: &Path) -> Result<Vec<Queued>, Error> {
+    let p = queue(root);
+    let text = match fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(p, e)),
+    };
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut f = line.splitn(3, ' ');
+        let (Some(t), Some(so), Some(name)) = (f.next(), f.next(), f.next()) else {
+            return Err(Error::Manifest {
+                line: n + 1,
+                why: "wants target, soname, package",
+            });
+        };
+        out.push(Queued {
+            target: t.to_string(),
+            soname: so.to_string(),
+            name: name.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+pub fn write_queue(root: &Path, q: &[Queued]) -> Result<(), Error> {
+    let mut q = q.to_vec();
+    q.sort();
+    q.dedup();
+    let p = queue(root);
+    if q.is_empty() {
+        return match fs::remove_file(&p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(p, e)),
+        };
+    }
+    if let Some(d) = p.parent() {
+        fs::create_dir_all(d).map_err(|e| Error::Io(d.to_path_buf(), e))?;
+    }
+    let mut body = String::new();
+    for e in &q {
+        body.push_str(&format!("{} {} {}\n", e.target, e.soname, e.name));
+    }
+    put(&p, &body)
+}
+
 fn put(p: &Path, body: &str) -> Result<(), Error> {
     fs::write(p, body).map_err(|e| Error::Io(p.to_path_buf(), e))
 }

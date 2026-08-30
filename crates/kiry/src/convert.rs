@@ -22,6 +22,9 @@ const WANT: &[&str] = &[
     // the split forms leaves makedepends empty. libedit's ncurses is in _host
     "makedepends_host",
     "makedepends_build",
+    // to tell a private helper from a subpackage function, which is the one kind that
+    // must not come across
+    "subpackages",
     "builddir",
 ];
 
@@ -87,25 +90,24 @@ pub fn recipe(
         .unwrap_or("")
         .split_whitespace()
     {
-        // alpine renames a source when the url's basename is wrong. kiry names the
-        // cached file after the url, so the rename has nowhere to land
-        if let Some((as_, _)) = entry.split_once("::") {
-            notes.push(format!("renamed source {as_} kept under its url name"));
-        }
-        let url = entry.rsplit("::").next().unwrap_or(entry);
-        let file = url.rsplit('/').next().unwrap_or(url);
+        // name::url, which kiry spells the same way. the sha512 is keyed by the name,
+        // so reading the url's basename instead loses the checksum as well as the name
+        let (file, url) = match entry.split_once("::") {
+            Some((n, u)) if !n.contains(['/', ':']) => (n, u),
+            _ => (entry.rsplit('/').next().unwrap_or(entry), entry),
+        };
 
         files.push(file.to_string());
-        let local = dir.join(file);
+        let local = dir.join(url);
         let at = if url.contains("://") {
             if !fetch {
                 notes.push(format!("{file} not fetched, no checksum"));
-                sources.push(url.to_string());
+                sources.push(entry.to_string());
                 continue;
             }
             let dst = d.join(file);
             grab(url, &dst)?;
-            sources.push(url.to_string());
+            sources.push(entry.to_string());
             dst
         } else if local.is_file() {
             fs::copy(&local, d.join(file)).map_err(|e| format!("{file}: {e}"))?;
@@ -194,22 +196,46 @@ pub fn recipe(
         }
     }
     script.push_str(&format!(
-        "source=\"{}\"\nbuilddir=\"{builddir}\"\ncd \"$builddir\"\n",
+        "source=\"{}\"\nbuilddir=\"{builddir}\"\n",
         files.join(" ")
     ));
+
+    // definitions rather than inlined bodies, which is what abuild runs too. 852 scripts
+    // declare a local in a phase and ash refuses one outside a function. it also puts a
+    // helper like _configure in scope wherever in the file it happens to be written
+    let subs = subpackage_funcs(
+        &name,
+        v.get("subpackages").map(String::as_str).unwrap_or(""),
+    );
+    let mut wrote: Vec<String> = Vec::new();
+    for f in functions(&text) {
+        if subs.contains(&f) || SKIP.contains(&f.as_str()) || wrote.contains(&f) {
+            continue;
+        }
+        let Some(b) = body(&text, &f) else { continue };
+        wrote.push(f.clone());
+        script.push_str(&format!(
+            "\n{f}() {{\n{}}}\n",
+            b.replace("$pkgdir", "$DESTDIR")
+                .replace("${pkgdir}", "$DESTDIR")
+        ));
+    }
+    // abuild runs default_prepare when an apkbuild defines no prepare() of its own, and
+    // that is the only thing applying the patches for 1505 of them. leaving it out built
+    // them unpatched and said nothing
+    if !wrote.iter().any(|w| w == "prepare") {
+        script.push_str("\nprepare() {\n\tdefault_prepare\n}\n");
+        wrote.push("prepare".to_string());
+    }
+    script.push_str("\ncd \"$builddir\"\n");
+
     let mut had = false;
-    for f in ["prepare", "build", "package"] {
-        match body(&text, f) {
-            Some(b) => {
-                had = true;
-                script.push('\n');
-                script.push_str(
-                    &b.replace("$pkgdir", "$DESTDIR")
-                        .replace("${pkgdir}", "$DESTDIR"),
-                );
-            }
-            None if f == "prepare" => {}
-            None => notes.push(format!("no {f}() in the apkbuild")),
+    for f in PHASES {
+        if wrote.iter().any(|w| w == f) {
+            had = *f != "prepare" || had;
+            script.push_str(&format!("{f}\n"));
+        } else {
+            notes.push(format!("no {f}() in the apkbuild"));
         }
     }
     if !had {
@@ -323,6 +349,51 @@ fn variables(apkbuild: &Path) -> Result<(HashMap<String, String>, Vec<String>), 
 
 // alpine writes one function per line-anchored brace, so the closing } is in column
 // zero and nothing nested can be mistaken for it
+// the abuild phases kiry runs, in order
+const PHASES: &[&str] = &["prepare", "build", "package"];
+// alpine runs these and kiry does not: it builds, it does not test what it built
+const SKIP: &[&str] = &["check", "sanitycheck"];
+
+// every top level definition, in the order they are written
+fn functions(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(open) = line.find("()") else {
+            continue;
+        };
+        if !line[open + 2..].trim_start().starts_with('{') {
+            continue;
+        }
+        let name = &line[..open];
+        if !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+// abuild runs dev() for the subpackage foo-dev, or the name after a colon when one is
+// given. those move files into a package kiry does not build, so they stay behind
+fn subpackage_funcs(pkg: &str, subpackages: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in subpackages.split_whitespace() {
+        let mut parts = entry.split(':');
+        let name = parts.next().unwrap_or("");
+        match parts.next().filter(|s| !s.is_empty()) {
+            Some(f) => out.push(f.to_string()),
+            None => {
+                let short = name.strip_prefix(pkg).unwrap_or(name);
+                let short = short.strip_prefix('-').unwrap_or(short);
+                out.push(short.replace(['-', '+', '.'], "_"));
+            }
+        }
+    }
+    out
+}
+
 fn body(text: &str, name: &str) -> Option<String> {
     let open = format!("{name}() {{");
     let mut out = String::new();

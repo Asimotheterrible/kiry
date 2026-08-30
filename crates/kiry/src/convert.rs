@@ -26,6 +26,9 @@ const WANT: &[&str] = &[
     // must not come across
     "subpackages",
     "builddir",
+    // abuild passes it to every patch in default_prepare. readline's upstream patches
+    // are -p0 and land on the wrong file at -p1
+    "patch_args",
 ];
 
 // what could not be carried across, reported rather than guessed at
@@ -195,10 +198,17 @@ pub fn recipe(
             script.push_str(&format!("{n}=\"{val}\"\n"));
         }
     }
+    // the raw entries, not the names they land under. abuild's $source holds what the
+    // apkbuild wrote, and 64 recipes reach for ${p##*/} to get a name back out of it --
+    // bash matches */bash[0-9][0-9]-[0-9]* to find its vendor patches, and a bare name
+    // never matches, so nine security patches went unapplied and nothing said so
     script.push_str(&format!(
         "source=\"{}\"\nbuilddir=\"{builddir}\"\n",
-        files.join(" ")
+        sources.join(" ")
     ));
+    if let Some(a) = v.get("patch_args").filter(|a| !a.is_empty()) {
+        script.push_str(&format!("patch_args=\"{a}\"\n"));
+    }
 
     // definitions rather than inlined bodies, which is what abuild runs too. 852 scripts
     // declare a local in a phase and ash refuses one outside a function. it also puts a

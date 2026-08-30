@@ -321,6 +321,231 @@ fn fetches_once_and_keeps_it() {
     assert!(root.join("var/kiry/cache/sources/hello-1.0.tar").exists());
 }
 
+// a transitive dependency is declared, so it is not ambience -- autoconf is not autoconf
+// without the perl that runs it. only what a configure script reads to decide a feature
+// is there stays behind the direct/transitive line
+#[test]
+fn a_transitive_dependency_keeps_everything_but_its_headers() {
+    let at = scratch("transitive");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    // deep: a tool nobody declares directly, carrying a binary and a header
+    let deep = recipe(
+        &at,
+        "x86_64-musl",
+        "mkdir -p \"$DESTDIR/usr/bin\" \"$DESTDIR/usr/include\" \"$DESTDIR/usr/lib/pkgconfig\"\n\
+         printf '#!/bin/sh\\necho deep-ran\\n' > \"$DESTDIR/usr/bin/deeptool\"\n\
+         chmod 755 \"$DESTDIR/usr/bin/deeptool\"\n\
+         echo 'int deep;' > \"$DESTDIR/usr/include/deep.h\"\n\
+         echo 'Name: deep' > \"$DESTDIR/usr/lib/pkgconfig/deep.pc\"\n",
+    );
+    fs::write(deep.join("name"), "deep\n").ok();
+    let deep2 = deep.parent().unwrap().join("deep");
+    let _ = fs::rename(&deep, &deep2);
+    let o = kiry(&[
+        "b",
+        "--root",
+        root.to_str().unwrap(),
+        deep2.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let art = cache(&root, ".tar.zst");
+    let a = format!("{}/var/kiry/cache/{}", root.display(), art[0]);
+    assert!(kiry(&["i", "--root", root.to_str().unwrap(), &a])
+        .status
+        .success());
+
+    // mid depends on deep at runtime; top declares only mid
+    let mid = deep2.parent().unwrap().join("mid");
+    fs::create_dir_all(&mid).unwrap();
+    fs::write(mid.join("version"), "1 0\n").unwrap();
+    fs::write(mid.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(
+        mid.join("depends"),
+        format!("{}\n", deep2.file_name().unwrap().to_str().unwrap()),
+    )
+    .unwrap();
+    fs::write(mid.join("sources"), "").unwrap();
+    fs::write(mid.join("checksums"), "").unwrap();
+    fs::write(
+        mid.join("build"),
+        "mkdir -p \"$DESTDIR/usr/bin\"\necho mid > \"$DESTDIR/usr/bin/midtool\"\n",
+    )
+    .unwrap();
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), mid.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let mida = cache(&root, ".tar.zst")
+        .into_iter()
+        .find(|n| n.starts_with("mid-"))
+        .unwrap();
+    let a = format!("{}/var/kiry/cache/{mida}", root.display());
+    assert!(kiry(&["i", "--root", root.to_str().unwrap(), &a])
+        .status
+        .success());
+
+    let top = mid.parent().unwrap().join("top");
+    fs::create_dir_all(&top).unwrap();
+    fs::write(top.join("version"), "1 0\n").unwrap();
+    fs::write(top.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(top.join("depends"), "mid make\n").unwrap();
+    fs::write(top.join("sources"), "").unwrap();
+    fs::write(top.join("checksums"), "").unwrap();
+    fs::write(
+        top.join("build"),
+        "mkdir -p \"$DESTDIR/usr/bin\"\n\
+         deeptool > /dev/null || { echo NO-DEEPTOOL >&2; exit 1; }\n\
+         test ! -e /usr/include/deep.h || { echo HEADER-LEAKED >&2; exit 1; }\n\
+         test ! -e /usr/lib/pkgconfig/deep.pc || { echo PC-LEAKED >&2; exit 1; }\n\
+         echo ok > \"$DESTDIR/usr/bin/toptool\"\n",
+    )
+    .unwrap();
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), top.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+// --root defaults to /, which is the running system. every command that writes refuses
+// it outright rather than relying on the caller to always pass --root
+#[test]
+fn writing_to_slash_is_refused() {
+    for args in [
+        vec!["b", "/nonexistent"],
+        vec!["i", "/nonexistent.tar.zst"],
+        vec!["r", "nonexistent"],
+        vec!["rebuild"],
+    ] {
+        let mut a = args.clone();
+        a.extend(["--root", "/"]);
+        let o = kiry(&a);
+        assert!(!o.status.success(), "{args:?} was allowed");
+        let said = String::from_utf8_lossy(&o.stderr);
+        assert!(said.contains("refusing to write to /"), "{args:?}: {said}");
+        assert!(said.contains("KIRY_ROOT_REALLY"), "{args:?}: {said}");
+    }
+
+    // with no --root at all it is the same root, so the guard has to catch that too
+    let o = kiry(&["rebuild"]);
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("refusing to write to /"),
+        "an unqualified rebuild was allowed"
+    );
+
+    // reads are not writes: doctor and l still answer for the running system
+    for args in [vec!["l", "--root", "/"], vec!["doctor", "--root", "/"]] {
+        let o = kiry(&args);
+        assert!(
+            !String::from_utf8_lossy(&o.stderr).contains("refusing"),
+            "{args:?} was refused"
+        );
+    }
+}
+
+// abuild exports the triple and 1700 recipes read it. most only pass it to configure,
+// which guesses right anyway, but LLVM_HOST_TRIPLE and clang/$CHOST.cfg take it as a
+// name -- an unset one is a wrong answer that builds and installs
+#[test]
+fn a_build_is_told_which_triple_it_is() {
+    let at = scratch("triple");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$CBUILD $CHOST $CTARGET $CARCH\" > \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let art = cache(&root, ".tar.zst");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
+            root.display(),
+            art[0]
+        ))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        said.trim(),
+        "x86_64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-unknown-linux-musl x86_64",
+        "{said}"
+    );
+}
+
+// the cache is one directory for every package, and plenty of urls end in download or
+// v1.2.tar.gz. named, two of those are two files instead of whichever arrived first
+#[test]
+fn a_named_source_lands_under_its_name() {
+    let at = scratch("named");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let arc = at.join("hello-1.0.tar");
+    fs::write(
+        d.join("sources"),
+        "hello-1.0.tar::https://example/archive/refs/tags/v1.0\n",
+    )
+    .unwrap();
+
+    let fetcher = at.join("fetch.sh");
+    fs::write(
+        &fetcher,
+        format!(
+            "#!/bin/sh\ntest \"$1\" = https://example/archive/refs/tags/v1.0\ncp {} \"$2\"\n",
+            arc.display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod")
+        .arg("+x")
+        .arg(&fetcher)
+        .status()
+        .unwrap();
+
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("KIRY_FETCH", format!("{} %u %o", fetcher.display()))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(root.join("var/kiry/cache/sources/hello-1.0.tar").exists());
+    assert!(!root.join("var/kiry/cache/sources/v1.0").exists());
+}
+
+// a name with a slash falls back to the basename and cannot reach out of the cache, but
+// .. has no slash. it names the cache itself, and the build then fails hashing a
+// directory, which says nothing about the line that caused it
+#[test]
+fn a_name_that_is_not_a_name_says_so() {
+    let at = scratch("badname");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    for bad in ["..::https://example/x", "::https://example/x"] {
+        fs::write(d.join("sources"), format!("{bad}\n")).unwrap();
+        let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+        assert!(!o.status.success());
+        let said = String::from_utf8_lossy(&o.stderr);
+        assert!(said.contains("no file name in that"), "{bad}: {said}");
+    }
+    assert!(artifacts(&root).is_empty());
+}
+
 #[test]
 fn a_failed_build_points_at_its_log() {
     let at = scratch("log");

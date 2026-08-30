@@ -46,6 +46,18 @@ done
 
 rm -f "$work/stage/busybox/bin/patch"
 
+# the root is usrmerged, so /bin /sbin /lib /lib64 are symlinks and nothing may own a
+# path through one. alpine is not merged, so its trees are moved before they are packed
+echo "usrmerge"
+for st in "$work"/stage/*; do
+    for d in bin sbin lib lib64; do
+        [ -d "$st/$d" ] || continue
+        mkdir -p "$st/usr/$d"
+        cp -a "$st/$d/." "$st/usr/$d/"
+        rm -rf "$st/$d"
+    done
+done
+
 echo "toolchain names"
 gccdir=$(cd "$work/stage/libgcc-static" && echo usr/lib/gcc/*/*)
 llvmbin=$(cd "$work/stage/llvm20" && echo usr/lib/llvm*/bin)
@@ -99,6 +111,14 @@ done < "$list"
 pack toollinks 1 0 clang20,lld20,llvm20,libgcc,libgcc-static 0
 
 echo "installing"
+# the four have to exist before anything lands, because PT_INTERP says
+# /lib/ld-musl-x86_64.so.1 and every third script says /usr/bin/env
+mkdir -p "$root/usr/bin" "$root/usr/sbin" "$root/usr/lib"
+for d in bin sbin lib; do
+    [ -e "$root/$d" ] || ln -s "usr/$d" "$root/$d"
+done
+[ -e "$root/lib64" ] || ln -s usr/lib "$root/lib64"
+
 "$kiry" i --root "$root" "$work"/pkg/*.tar.zst
 
 mkdir -p "$root/etc/kiry"

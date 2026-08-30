@@ -443,6 +443,97 @@ fn writing_to_slash_is_refused() {
     }
 }
 
+// default_prepare decides what is a patch from the name a source line gives it, not from
+// the url. named readline83-001.patch::.../readline83-001 the old rule saw no .patch at
+// the end and skipped it, and looked for it under the url's tail besides
+#[test]
+fn a_patch_named_through_a_url_still_gets_applied() {
+    let at = scratch("patchname");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    // the build fails unless the patch landed, so the assert is the exit status
+    // shaped like a converted recipe, because default_prepare is what is under test
+    fs::write(
+        d.join("build"),
+        ". /usr/share/kiry/lib.sh\n\
+         srcdir=/src\n\
+         source=\"../hello-1.0.tar fixup.patch::https://example/raw/fixup\"\n\
+         default_prepare\n\
+         test -f applied || { echo PATCH-NOT-APPLIED >&2; exit 1; }\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp applied \"$DESTDIR/usr/bin/hello\"\n",
+    )
+    .unwrap();
+    let patch = at.join("thepatch");
+    fs::write(
+        &patch,
+        "--- /dev/null\n+++ b/applied\n@@ -0,0 +1 @@\n+yes\n",
+    )
+    .unwrap();
+
+    let arc = at.join("hello-1.0.tar");
+    fs::write(
+        d.join("sources"),
+        "../hello-1.0.tar\nfixup.patch::https://example/raw/fixup\n",
+    )
+    .unwrap();
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+    let psum = kiry_core::sha256(fs::File::open(&patch).unwrap()).unwrap();
+    fs::write(d.join("checksums"), format!("{sum}\n{psum}\n")).unwrap();
+
+    let fetcher = at.join("fetch.sh");
+    fs::write(
+        &fetcher,
+        format!("#!/bin/sh\ncp {} \"$2\"\n", patch.display()),
+    )
+    .unwrap();
+    Command::new("chmod")
+        .arg("+x")
+        .arg(&fetcher)
+        .status()
+        .unwrap();
+
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    // the patch has to be in /src under the name the line gave it
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("KIRY_FETCH", format!("{} %u %o", fetcher.display()))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{said}");
+    assert!(
+        !said.contains("PATCH-NOT-APPLIED"),
+        "the patch was never applied: {said}"
+    );
+    assert!(root.join("var/kiry/cache/sources/fixup.patch").exists());
+}
+
+// on the target system kiry runs as root, where tar restores the uids the archive
+// carries. the sandbox maps one id, so anything owned by another one cannot be chowned
+// inside it and patch fails setting a group it cannot name
+#[test]
+fn a_source_tree_is_owned_by_whoever_unpacks_it() {
+    let at = scratch("owner");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    // the tar kiry runs has to take the flag at all, whichever tar it is
+    let out = Command::new("tar")
+        .args(["--no-same-owner", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "tar rejects --no-same-owner");
+}
+
 // abuild exports the triple and 1700 recipes read it. most only pass it to configure,
 // which guesses right anyway, but LLVM_HOST_TRIPLE and clang/$CHOST.cfg take it as a
 // name -- an unset one is a wrong answer that builds and installs

@@ -68,6 +68,61 @@ fn a_case_on_carch_decides_a_private_variable() {
     assert!(!script.contains("narrow"), "{script}");
 }
 
+// $source holds what the apkbuild wrote, not the names the files land under. 64 recipes
+// reach for ${p##*/} to get a name back out of it, and bash finds its vendor patches by
+// matching */bash[0-9][0-9]-[0-9]*, which a bare name never matches
+#[test]
+fn source_holds_the_entries_and_patch_args_comes_with_them() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("srcline");
+    let (d, _) = convert(
+        &at,
+        "pkgname=thing\npkgver=1.0\npkgrel=0\n\
+         patch_args=\"-p0\"\n\
+         source=\"thing-1.0.tar.gz::https://example.invalid/get?id=7\n\
+         https://example.invalid/patches/thing-001\n\
+         local.patch\"\n\
+         build() {\n\tmake\n}\n\
+         package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    assert!(
+        script.contains("thing-1.0.tar.gz::https://example.invalid/get?id=7"),
+        "{script}"
+    );
+    assert!(
+        script.contains("https://example.invalid/patches/thing-001"),
+        "{script}"
+    );
+    assert!(script.contains("patch_args=\"-p0\""), "{script}");
+
+    // and a pattern with a slash in it still finds the entry, which is the whole point
+    let o = Command::new("busybox")
+        .args([
+            "ash",
+            "-c",
+            &format!(
+                "{}\nfor p in $source; do case $p in */thing-[0-9]*) echo hit ${{p##*/}} ;; esac; done",
+                script
+                    .lines()
+                    .take_while(|l| !l.starts_with("prepare()"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .replace(". /usr/share/kiry/lib.sh", ":")
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout).trim(),
+        "hit thing-001",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
 // abuild runs default_prepare when an apkbuild writes no prepare() of its own. 1505
 // recipes carry patches and define none, and without this they build unpatched and
 // succeed, which is the failure that says nothing

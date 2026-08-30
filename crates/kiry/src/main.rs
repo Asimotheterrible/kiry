@@ -25,6 +25,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("-h") | Some("--help") => usage(),
+        Some("--version") => say!("kiry {}", env!("CARGO_PKG_VERSION")),
         Some("b") => build_cmd(&args[1..]),
         Some("i") => install_cmd(&args[1..]),
         Some("r") => remove_cmd(&args[1..]),
@@ -255,8 +256,15 @@ fn compile(
     for (name, path, _) in srcs {
         let name = name.as_str();
         if tarball(name) {
+            // as root tar restores the archive's own uids, and the sandbox maps one id,
+            // so a build running as root gets a /src it cannot chown inside the namespace
             run(
-                Command::new("tar").arg("-xf").arg(path).arg("-C").arg(&src),
+                Command::new("tar")
+                    .arg("--no-same-owner")
+                    .arg("-xf")
+                    .arg(path)
+                    .arg("-C")
+                    .arg(&src),
                 name,
             )?;
         } else {
@@ -350,8 +358,12 @@ fn compile(
 const LIB_SH: &str = "\
 default_prepare() {
 \tfor _s in $source; do
-\t\tcase \"$_s\" in
-\t\t*.patch) patch -p1 -i \"$srcdir/${_s##*/}\" || return 1 ;;
+\t\t# name::url says what a source is called, so the name decides both whether
+\t\t# this is a patch and what to look for it under
+\t\t_f=${_s%%::*}
+\t\t_f=${_f##*/}
+\t\tcase \"$_f\" in
+\t\t*.patch) patch ${patch_args:--p1} -i \"$srcdir/$_f\" || return 1 ;;
 \t\tesac
 \tdone
 }

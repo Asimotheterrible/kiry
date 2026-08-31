@@ -1133,12 +1133,14 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
 
     let sets = exported(&elves);
     let mut linked: HashSet<usize> = HashSet::new();
+    let mut needs: Vec<Vec<usize>> = vec![Vec::new(); elves.len()];
     for (i, (path, o)) in elves.iter().enumerate() {
         let where_ = search(o, path, dirs);
         for want in &o.needed {
             match provider(&here, &links, want, &where_) {
                 Some(j) => {
                     linked.insert(j);
+                    needs[i].push(j);
                     // musl ignores symbol versions, so a gnu binary that reaches into
                     // the musl tree binds to whatever has the right name and nothing
                     // errors. loader paths keep them apart until an rpath crosses over
@@ -1191,8 +1193,28 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
         }
     }
 
+    // a perl xs module is dlopened, so nothing links it and it is not asked. the library
+    // it pulls in is linked, but only by something equally unknowable, and the question
+    // is no more answerable there: texinfo's libtexinfo leaves PL_current_context to
+    // whatever interpreter loads it. what decides is reachability from something the
+    // loader itself resolves, not whether anything at all names the file
+    let mut asked: HashSet<usize> = HashSet::new();
+    let mut walk: Vec<usize> = elves
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, o))| o.interp)
+        .map(|(i, _)| i)
+        .collect();
+    while let Some(i) = walk.pop() {
+        if !asked.insert(i) {
+            continue;
+        }
+        walk.extend(needs[i].iter().copied());
+    }
+
     for (i, (path, o)) in elves.iter().enumerate() {
-        if !o.interp && !linked.contains(&i) {
+        let _ = o;
+        if !asked.contains(&i) {
             continue;
         }
         for want in missing(&elves, &sets, &here, &links, dirs, i) {
@@ -1208,7 +1230,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
     // caller gets, silently. the index holds every export already, so this is a group-by
     let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, (_, o)) in elves.iter().enumerate() {
-        if o.soname.is_none() || !linked.contains(&i) {
+        if o.soname.is_none() || !asked.contains(&i) {
             continue;
         }
         for sym in &o.exports {

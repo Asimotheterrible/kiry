@@ -597,6 +597,71 @@ fn against_name(at: &Path, name: &str, lib: &Path, asks: &str, rpath: Option<&st
     out
 }
 
+// a perl xs module is dlopened, so nothing links it and it is not asked. the library it
+// pulls in is linked, but only by something equally unknowable. texinfo ships exactly
+// this shape and it made 123 findings out of symbols perl supplies at load time
+#[test]
+fn a_library_reached_only_through_a_dlopened_one_is_not_asked_either() {
+    if skip("chain") {
+        return;
+    }
+    let at = scratch("chain");
+    let root = at.join("root");
+
+    // the bottom of the chain leaves q to whatever interpreter loads it
+    let deep = libsrc(&at, "libdeep.so.1", "void q(void);\nvoid d(void){q();}\n");
+    // the module links it and is itself dlopened, so nothing names the module
+    let module = at.join("libmod.so.1");
+    let src = at.join("mod.c");
+    fs::write(&src, "void d(void);\nvoid m(void){d();}\n").unwrap();
+    let ok = Command::new("cc")
+        .args([
+            "-shared",
+            "-fPIC",
+            "-nostdlib",
+            "-Wl,--allow-shlib-undefined",
+            "-Wl,-soname,libmod.so.1",
+            "-Wl,-rpath,$ORIGIN",
+        ])
+        .arg("-o")
+        .arg(&module)
+        .arg(&src)
+        .arg(&deep)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+
+    install(
+        &root,
+        "chain",
+        &[
+            ("usr/lib64/libdeep.so.1", &deep),
+            ("usr/lib64/libmod.so.1", &module),
+        ],
+    );
+    let (ok, out) = doctor(&root);
+    assert!(ok && out.is_empty(), "expected silence, got {out:?}");
+
+    // a program that links the module makes the whole chain answerable again
+    let app = bin_calling(
+        &at,
+        "app",
+        "void m(void);\nvoid _start(void){m();}\n",
+        &module,
+    );
+    install(&root, "app", &[("usr/bin/app", &app)]);
+    let (ok, out) = doctor(&root);
+    assert!(!ok, "a chain a program can reach still owes its symbols");
+    assert!(
+        out.contains(&format!("usr/lib64/libdeep.so.1 {TARGET} missing-symbol q")),
+        "{out}"
+    );
+}
+
+fn bin_calling(at: &Path, name: &str, body: &str, against: &Path) -> PathBuf {
+    binsrc(at, name, body, against, Some("$ORIGIN/../lib64"))
+}
+
 // a library nothing links can only be reached through dlopen, and then its symbols come
 // from whichever process opened it. python ships thousands of such modules and every one
 // of them leans on the interpreter for its CPython symbols

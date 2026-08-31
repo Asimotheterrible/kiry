@@ -29,6 +29,8 @@ const WANT: &[&str] = &[
     // abuild passes it to every patch in default_prepare. readline's upstream patches
     // are -p0 and land on the wrong file at -p1
     "patch_args",
+    // options_has reads it, and abuild keeps .la files only when it names libtool
+    "options",
 ];
 
 // what could not be carried across, reported rather than guessed at
@@ -206,8 +208,10 @@ pub fn recipe(
         "source=\"{}\"\nbuilddir=\"{builddir}\"\n",
         sources.join(" ")
     ));
-    if let Some(a) = v.get("patch_args").filter(|a| !a.is_empty()) {
-        script.push_str(&format!("patch_args=\"{a}\"\n"));
+    for k in ["patch_args", "options"] {
+        if let Some(a) = v.get(k).filter(|a| !a.is_empty()) {
+            script.push_str(&format!("{k}=\"{a}\"\n"));
+        }
     }
 
     // definitions rather than inlined bodies, which is what abuild runs too. 852 scripts
@@ -251,6 +255,13 @@ pub fn recipe(
     if !had {
         return Err(format!("{name}: no build() or package() to convert"));
     }
+    // what abuild strips after package(). the info index is generated from the pages
+    // beside it, so 395 recipes would each claim the same file, and a .la names build
+    // paths that are gone by the time anything reads them
+    script.push_str(
+        "\nrm -f \"$DESTDIR\"/usr/share/info/dir\n\
+         options_has libtool || find \"$DESTDIR\" -name '*.la' -delete\n",
+    );
 
     put(&d.join("version"), &format!("{ver} {rev}\n"))?;
     put(&d.join("targets"), "x86_64-musl\n")?;

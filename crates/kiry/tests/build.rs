@@ -511,6 +511,38 @@ fn a_patch_named_through_a_url_still_gets_applied() {
     assert!(root.join("var/kiry/cache/sources/fixup.patch").exists());
 }
 
+// a build that allocates without bound takes the machine down rather than itself, and
+// the process the oom killer picks is whatever else was running. binutils' configure
+// probe for ada did exactly that
+#[test]
+fn a_build_cannot_allocate_past_the_cap() {
+    let at = scratch("memcap");
+    // the allocation succeeding is what fails the build, so the assert is the exit status
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "mkdir -p \"$DESTDIR/usr/bin\"\n\
+         if dd if=/dev/zero of=/dev/null bs=256M count=1 2>/dev/null; then\n\
+         \techo CAP-DID-NOT-BITE >&2; exit 1\n\
+         fi\n\
+         cp greeting \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("KIRY_MEM", "64")
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(!said.contains("CAP-DID-NOT-BITE"), "{said}");
+    assert!(o.status.success(), "{said}");
+}
+
 // on the target system kiry runs as root, where tar restores the uids the archive
 // carries. the sandbox maps one id, so anything owned by another one cannot be chowned
 // inside it and patch fails setting a group it cannot name

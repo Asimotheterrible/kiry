@@ -117,7 +117,9 @@ mkdir -p "$root/usr/bin" "$root/usr/sbin" "$root/usr/lib"
 for d in bin sbin lib; do
     [ -e "$root/$d" ] || ln -s "usr/$d" "$root/$d"
 done
-[ -e "$root/lib64" ] || ln -s usr/lib "$root/lib64"
+# /usr/lib is musl and /usr/lib64 is gnu, so lib64 is not another name for lib. it
+# dangles until the gnu tier lands, which is the point: nothing musl may resolve through it
+[ -e "$root/lib64" ] || ln -s usr/lib64 "$root/lib64"
 
 "$kiry" i --root "$root" "$work"/pkg/*.tar.zst
 

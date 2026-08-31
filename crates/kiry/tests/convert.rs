@@ -142,10 +142,13 @@ fn an_apkbuild_with_no_prepare_still_applies_its_patches() {
     let script = fs::read_to_string(d.join("build")).unwrap();
     assert!(script.contains("prepare() {"), "{script}");
     assert!(script.contains("default_prepare"), "{script}");
-    assert!(script.trim_end().ends_with("package"), "{script}");
-    // and it runs before build
+    // called in order, and prepare before the two that need what it applied
     let p = script.rfind("\nprepare\n").unwrap();
-    assert!(p < script.rfind("\nbuild\n").unwrap(), "{script}");
+    let b = script.rfind("\nbuild\n").unwrap();
+    assert!(
+        p < b && b < script.rfind("\npackage\n").unwrap(),
+        "{script}"
+    );
 
     // one that writes its own is left alone
     let at = scratch("ownprep");
@@ -292,7 +295,11 @@ fn pkgdir_becomes_destdir() {
     );
     let script = fs::read_to_string(d.join("build")).unwrap();
     assert!(!script.contains("pkgdir"), "{script}");
-    assert_eq!(script.matches("$DESTDIR").count(), 2, "{script}");
+    // both spellings in the body were rewritten, counted inside package() so the
+    // cleanup abuild also does after it cannot pad the number
+    let body = script.split("package() {").nth(1).unwrap();
+    let body = body.split("\n}").next().unwrap();
+    assert_eq!(body.matches("$DESTDIR").count(), 2, "{script}");
 }
 
 // abuild runs each phase as a function and 852 scripts declare a local in one. inlined

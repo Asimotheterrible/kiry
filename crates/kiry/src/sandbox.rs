@@ -83,7 +83,8 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
         ("bin", "usr/bin"),
         ("sbin", "usr/sbin"),
         ("lib", "usr/lib"),
-        ("lib64", "usr/lib"),
+        // usr/lib is musl and usr/lib64 is gnu, so this is not a second name for lib
+        ("lib64", "usr/lib64"),
     ] {
         let dst = into.join(link);
         fs::create_dir_all(into.join(to)).map_err(|e| format!("{}: {e}", dst.display()))?;
@@ -221,6 +222,23 @@ pub fn init() -> Result<(), String> {
         },
     )
     .map_err(|e| format!("rlimit: {e}"))?;
+    // a build that allocates without bound takes the machine down rather than itself,
+    // and the process the oom killer picks is whatever else was running. binutils'
+    // configure probe for ada handed clang a .adb and it ran until there was no memory
+    // left. RLIMIT_DATA rather than AS: since 4.7 it covers anonymous mmap, which is
+    // what a runaway allocator uses, and it does not count address space a linker only
+    // reserves
+    if let Some(cap) = memcap() {
+        process::setrlimit(
+            process::Resource::Data,
+            process::Rlimit {
+                current: Some(cap),
+                maximum: Some(cap),
+            },
+        )
+        .map_err(|e| format!("rlimit: {e}"))?;
+    }
+
     let cwd = crate::unpacked(Path::new("/src"));
     process::chdir(&cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
 
@@ -247,6 +265,25 @@ fn devices(root: &Path) -> Result<(), String> {
         mount::mount_bind(format!("/dev/{n}"), &at).map_err(|e| format!("bind {n}: {e}"))?;
     }
     Ok(())
+}
+
+// half of what the machine has, per process. KIRY_MEM is megabytes and 0 turns it off
+fn memcap() -> Option<u64> {
+    if let Ok(v) = std::env::var("KIRY_MEM") {
+        return match v.parse::<u64>() {
+            Ok(0) | Err(_) => None,
+            Ok(mb) => Some(mb * 1024 * 1024),
+        };
+    }
+    let info = fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = info
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .trim()
+        .trim_end_matches(" kB")
+        .parse::<u64>()
+        .ok()?;
+    Some(kb * 1024 / 2)
 }
 
 fn write(path: &str, body: &str) -> Result<(), String> {

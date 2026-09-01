@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use rustix::fs::{Mode, OFlags, ResolveFlags};
@@ -205,6 +206,10 @@ fn apply<R: Read>(
             .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
 
             let mut out = fs::File::from(fd);
+            // the same umask, on a file this time. 0644 and 0755 survive it and 0666
+            // does not, and which modes happen to be safe is not a thing to rely on
+            out.set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|e| Error::Io(m.path.clone().into(), e))?;
             let mut h = Sha256::new();
             let mut buf = [0u8; 64 * 1024];
             loop {
@@ -257,10 +262,18 @@ fn clear(pfd: &OwnedFd, name: &str) {
     let _ = rustix::fs::unlinkat(pfd, name, rustix::fs::AtFlags::empty());
 }
 
+// mkdirat takes the umask off whatever it is handed, and a directory that is already
+// there keeps the mode it was made with. either way the manifest would say 1777 and /tmp
+// would be 1755, so the mode is set rather than asked for
 fn mkdir(pfd: &OwnedFd, name: &str, mode: u32, blame: &str) -> Result<(), Error> {
     match rustix::fs::mkdirat(pfd, name, Mode::from_bits_truncate(mode)) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::EXIST) => Ok(()),
+        Ok(()) | Err(rustix::io::Errno::EXIST) => rustix::fs::chmodat(
+            pfd,
+            name,
+            Mode::from_bits_truncate(mode),
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|e| Error::Io(blame.into(), e.into())),
         Err(e) => Err(Error::Io(blame.into(), e.into())),
     }
 }
@@ -478,6 +491,14 @@ mod tests {
             self.raw(p, EntryType::Symlink, 0o777, Some(t));
             self
         }
+        fn dir_mode(mut self, p: &str, mode: u32) -> Self {
+            self.raw(p, EntryType::Directory, mode, None);
+            self
+        }
+        fn file_mode(mut self, p: &str, mode: u32) -> Self {
+            self.raw(p, EntryType::Regular, mode, None);
+            self
+        }
         fn done(self) -> Vec<u8> {
             self.0.into_inner().unwrap()
         }
@@ -641,6 +662,36 @@ mod tests {
             assert!(
                 parent_fd(&rootfd, bad, &mut junk).is_err(),
                 "openat2 let {bad:?} through, RESOLVE_BENEATH is not doing its job"
+            );
+        }
+    }
+
+    // mkdirat and openat take the umask off the mode they are handed, and a directory
+    // already on disk keeps whatever it was made with. /tmp came out 1755 with the
+    // manifest saying 1777, which is every user able to unlink every other user's files.
+    // `already` is the half that does not depend on what umask this runs under
+    #[test]
+    fn the_mode_on_disk_is_the_mode_the_manifest_says() {
+        let r = root("modes");
+        fs::create_dir(r.join("already")).unwrap();
+        fs::set_permissions(r.join("already"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let t = Tar::new()
+            .dir_mode("already", 0o1777)
+            .dir_mode("tmp", 0o1777)
+            .file_mode("shared", 0o666)
+            .done();
+
+        let rootfd =
+            rustix::fs::open(&r, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+        let mut manifest = Vec::new();
+        walk(&r, &t[..], |e, m| apply(&rootfd, e, m, &mut manifest)).unwrap();
+
+        for (path, want) in [("already", 0o1777), ("tmp", 0o1777), ("shared", 0o666)] {
+            let got = fs::metadata(r.join(path)).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(
+                got, want,
+                "{path} landed as {got:o}, manifest says {want:o}"
             );
         }
     }

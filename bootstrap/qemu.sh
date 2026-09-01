@@ -63,6 +63,56 @@ echo "packing $size image"
 rm -f "$work/root.img"
 mke2fs -q -t ext4 -d "$stage" -F -m 0 -L kiry "$work/root.img" "$size"
 
+if [ -n "$KIRY_QEMU_EFI" ]; then
+    esp=$work/esp.img
+    disk=$work/disk.img
+    espmb=64
+    rootmb=$(( $(stat -c %s "$work/root.img") / 1048576 ))
+
+    rm -f "$esp" "$disk"
+    mformat -i "$esp" -C -T $(( espmb * 2048 )) -v KIRYESP ::
+    mmd -i "$esp" ::/EFI ::/EFI/BOOT
+    mcopy -i "$esp" "$kernel" ::/EFI/BOOT/kiry.efi
+
+    # firmware auto-booting the fallback path passes no cmdline, so startup.nsh stands
+    # in for the LoadOptions a real boot entry would carry
+    shell=$(ls /usr/share/edk2-ovmf/Shell.efi /usr/share/edk2/OvmfX64/Shell.efi 2>/dev/null | head -1)
+    if [ -n "$shell" ]; then
+        mcopy -i "$esp" "$shell" ::/EFI/BOOT/BOOTX64.EFI
+        printf 'FS0:\\EFI\\BOOT\\kiry.efi root=PARTLABEL=kiry-root rw init=%s console=ttyS0\r\n' "$initarg" > "$work/startup.nsh"
+        mcopy -i "$esp" "$work/startup.nsh" ::/startup.nsh
+    else
+        # no shell, so CONFIG_CMDLINE is the only cmdline and the console is the
+        # framebuffer rather than this pipe
+        mcopy -i "$esp" "$kernel" ::/EFI/BOOT/BOOTX64.EFI
+    fi
+
+    # the kernel parses gpt itself, so root=PARTLABEL= needs nothing alive in userspace
+    truncate -s $(( (espmb + rootmb + 2) * 1048576 )) "$disk"
+    sfdisk -q --label gpt "$disk" >/dev/null <<SFDISK
+start=2048, size=$(( espmb * 2048 )), type=uefi, name="kiry-esp"
+start=$(( espmb * 2048 + 2048 )), size=$(( rootmb * 2048 )), type=linux, name="kiry-root"
+SFDISK
+
+    dd if="$esp" of="$disk" bs=1M seek=1 conv=notrunc status=none
+    dd if="$work/root.img" of="$disk" bs=1M seek=$(( espmb + 1 )) conv=notrunc status=none
+
+    acc=tcg
+    [ -r /dev/kvm ] && [ -w /dev/kvm ] && acc=kvm
+    ovmf=$(ls /usr/share/edk2-ovmf/OVMF_CODE.fd /usr/share/edk2/OvmfX64/OVMF_CODE.fd 2>/dev/null | head -1)
+    [ -n "$ovmf" ] || { echo "qemu: no OVMF firmware found" >&2; exit 1; }
+    vars=$(ls /usr/share/edk2-ovmf/OVMF_VARS.fd /usr/share/edk2/OvmfX64/OVMF_VARS.fd 2>/dev/null | head -1)
+    cp "$vars" "$work/vars.fd"
+
+    echo "booting $acc through uefi"
+    exec qemu-system-x86_64 \
+    	-m "$mem" -smp "$cpus" -nographic -no-reboot \
+    	-accel "$acc" -cpu max \
+    	-drive if=pflash,format=raw,unit=0,readonly=on,file="$ovmf" \
+    	-drive if=pflash,format=raw,unit=1,file="$work/vars.fd" \
+    	-drive file="$disk",format=raw,if=virtio
+fi
+
 # -cpu max: the default qemu64 has no avx and a prebuilt gnu binary takes SIGILL on it
 acc=tcg
 [ -r /dev/kvm ] && [ -w /dev/kvm ] && acc=kvm

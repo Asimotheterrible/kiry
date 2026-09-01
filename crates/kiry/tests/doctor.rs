@@ -742,6 +742,56 @@ fn an_interpreter_reached_by_hardlink_is_there() {
     assert!(!out.contains("no-interpreter"), "{out}");
 }
 
+// glibc ships tzselect and ldd as #!/bin/bash and the bash that answers is the musl
+// one. every target's files were being looked for inside that target alone, so five of
+// glibc's own scripts came back interpreterless on a root where /bin/sh runs fine
+#[test]
+fn an_interpreter_the_other_target_owns_is_there() {
+    if skip("crossshebang") {
+        return;
+    }
+    let at = scratch("crossshebang");
+    let root = at.join("root");
+    let script = at.join("thing");
+    fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+    install(&root, "thing", &[("usr/bin/thing", &script)]);
+
+    let sh = at.join("sh");
+    fs::write(&sh, "a shell\n").unwrap();
+    let dst = root.join("usr/bin/sh");
+    fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    fs::copy(&sh, &dst).unwrap();
+    db::write(
+        &root,
+        &db::Installed {
+            name: "busybox".to_string(),
+            target: "x86_64-musl".to_string(),
+            version: Version::parse("1.0 1").unwrap(),
+            depends: Vec::new(),
+            manifest: vec![
+                db::Entry {
+                    mode: 0o755,
+                    kind: db::Kind::File(kiry_core::sha256(fs::File::open(&dst).unwrap()).unwrap()),
+                    path: "usr/bin/sh".to_string(),
+                },
+                db::Entry {
+                    mode: 0o777,
+                    kind: db::Kind::Link("usr/bin".to_string()),
+                    path: "bin".to_string(),
+                },
+            ],
+        },
+    )
+    .unwrap();
+
+    let (ok, out) = doctor(&root);
+    assert!(
+        ok,
+        "a shell the other target owns was called missing: {out}"
+    );
+    assert!(!out.contains("no-interpreter"), "{out}");
+}
+
 // the kernel refuses to start a script whose interpreter is not installed, which is the
 // same shape of failure as a missing library and nothing was looking for it
 #[test]

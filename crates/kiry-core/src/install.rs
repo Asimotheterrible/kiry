@@ -43,16 +43,22 @@ pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, 
     Ok(jobs)
 }
 
+// there is one filesystem and the targets share it, so a gnu package taking a musl
+// package's path is the same collision as two musl packages doing it. checked per
+// target, glibc quietly wrote its own stdio.h over musl's and nothing said a word
 fn paths(root: &Path, jobs: &[Job]) -> Result<(), Error> {
-    let replacing: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
+    let replacing: Vec<(&str, &str)> = jobs
+        .iter()
+        .map(|j| (j.name.as_str(), j.target.as_str()))
+        .collect();
 
     let mut owner: HashMap<String, String> = HashMap::new();
-    for j in jobs {
-        for name in db::installed(root, &j.target)? {
-            if replacing.contains(&name.as_str()) {
+    for t in db::targets(root)? {
+        for name in db::installed(root, &t)? {
+            if replacing.contains(&(name.as_str(), t.as_str())) {
                 continue;
             }
-            for e in db::read(root, &j.target, &name)?.manifest {
+            for e in db::read(root, &t, &name)?.manifest {
                 if !matches!(e.kind, db::Kind::Dir) {
                     owner.insert(e.path, name.clone());
                 }
@@ -221,11 +227,22 @@ fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
             .map(|m| m.path.as_str())
             .collect();
 
-        for name in db::installed(root, &j.target)? {
-            if name == j.name {
+        // the same reach the check has: a path taken from the other target leaves a
+        // record there claiming a file that is no longer its own
+        for (t, name) in db::targets(root)?
+            .into_iter()
+            .flat_map(|t| {
+                db::installed(root, &t)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |n| (t.clone(), n))
+            })
+            .collect::<Vec<_>>()
+        {
+            if name == j.name && t == j.target {
                 continue;
             }
-            let mut rec = db::read(root, &j.target, &name)?;
+            let mut rec = db::read(root, &t, &name)?;
             let before = rec.manifest.len();
             rec.manifest
                 .retain(|e| matches!(e.kind, db::Kind::Dir) || !taken.contains(e.path.as_str()));
@@ -236,11 +253,11 @@ fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
                 // keeping what the manifest still holds rather than dropping what was
                 // taken also heals an entry an older kiry left behind
                 let own: HashSet<&str> = rec.manifest.iter().map(|e| e.path.as_str()).collect();
-                let kept: Vec<db::Provide> = db::read_provides(root, &j.target, &name)?
+                let kept: Vec<db::Provide> = db::read_provides(root, &t, &name)?
                     .into_iter()
                     .filter(|p| own.contains(p.path.as_str()))
                     .collect();
-                db::write_provides(root, &j.target, &name, &kept)?;
+                db::write_provides(root, &t, &name, &kept)?;
             }
         }
     }
@@ -417,6 +434,47 @@ mod tests {
             }
             other => panic!("wanted Conflict, got {other:?}"),
         }
+    }
+
+    // the targets are two databases over one filesystem. glibc installed usr/include
+    // over musl's copy of it and the check, looking only inside x86_64-gnu, saw nothing
+    #[test]
+    fn a_path_the_other_target_owns_is_refused_too() {
+        let root = scratch("crosstarget");
+        record(&root, "musl", &["usr/include/stdio.h"]);
+
+        let mut j = job("glibc", &[], &["usr/include/stdio.h"]);
+        j.target = "x86_64-gnu".to_string();
+        match paths(&root, &[j]) {
+            Err(Error::Conflict { path, owner }) => {
+                assert_eq!(path, "usr/include/stdio.h");
+                assert_eq!(owner, "musl");
+            }
+            other => panic!("wanted Conflict, got {other:?}"),
+        }
+    }
+
+    // the same name on both targets is one recipe built twice, not a package taking its
+    // own path back. only the record for the target being written stands aside
+    #[test]
+    fn one_recipe_on_two_targets_replaces_only_its_own() {
+        let root = scratch("bothtargets");
+        record(&root, "linux-headers", &["usr/include/linux/fs.h"]);
+
+        let mut j = job(
+            "linux-headers",
+            &[],
+            &["usr/x86_64-linux-gnu/usr/include/linux/fs.h"],
+        );
+        j.target = "x86_64-gnu".to_string();
+        assert!(paths(&root, &[j]).is_ok());
+
+        let mut clash = job("linux-headers", &[], &["usr/include/linux/fs.h"]);
+        clash.target = "x86_64-gnu".to_string();
+        assert!(
+            matches!(paths(&root, &[clash]), Err(Error::Conflict { .. })),
+            "the musl build's path was taken without a word"
+        );
     }
 
     #[test]

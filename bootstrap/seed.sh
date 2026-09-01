@@ -112,7 +112,8 @@ pack toollinks 1 0 clang20,lld20,llvm20,libgcc,libgcc-static 0
 
 echo "installing"
 # the four have to exist before anything lands, because PT_INTERP says
-# /lib/ld-musl-x86_64.so.1 and every third script says /usr/bin/env
+# /lib/ld-musl-x86_64.so.1 and every third script says /usr/bin/env. made by hand here
+# and owned by nobody until core/baselayout is built and claims them
 mkdir -p "$root/usr/bin" "$root/usr/sbin" "$root/usr/lib"
 for d in bin sbin lib; do
     [ -e "$root/$d" ] || ln -s "usr/$d" "$root/$d"

@@ -7,6 +7,7 @@ work=${KIRY_QEMU:-$HOME/.cache/kiry/qemu}
 mem=${KIRY_QEMU_MEM:-4096}
 cpus=${KIRY_QEMU_CPUS:-4}
 size=${KIRY_QEMU_SIZE:-8G}
+init=${KIRY_QEMU_INIT:-script}
 
 kernel=$(ls -1 "$root"/boot/vmlinuz-* 2>/dev/null | tail -1)
 [ -n "$kernel" ] || { echo "qemu: no kernel in $root/boot, build core/linux first" >&2; exit 1; }
@@ -30,6 +31,14 @@ fi
 
 if [ $# -gt 0 ]; then
     printf '%s\n' "$*" > "$stage/.run"
+fi
+
+if [ "$init" = nitro ]; then
+    [ -x "$stage/usr/sbin/nitro" ] || { echo "qemu: no nitro in $root" >&2; exit 1; }
+    rm -f "$stage/etc/nitro/ttyS0/down"
+    initarg=/usr/sbin/nitro
+else
+    initarg=/init
 fi
 
 cat > "$stage/init" <<'EOF'
@@ -63,4 +72,4 @@ exec qemu-system-x86_64 \
 	-accel "$acc" -cpu max \
 	-kernel "$kernel" \
 	-drive file="$work/root.img",format=raw,if=virtio \
-	-append "root=/dev/vda rw init=/init console=ttyS0 panic=5"
+	-append "root=/dev/vda rw init=$initarg console=ttyS0 panic=5"

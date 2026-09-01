@@ -19,6 +19,16 @@ pub struct Member {
     pub name: String,
     // direct deps hand over their whole manifest, everything else only its libraries
     pub direct: bool,
+    // a build tool runs on this machine, so it is the host's build of it. what is being
+    // compiled against is the target's. the two coexist because musl is usr/lib and
+    // /lib/ld-musl and gnu is usr/lib64 and /lib64/ld-linux
+    pub target: String,
+}
+
+// what a build tool has to be to start, which is what this machine runs. KIRY_HOST
+// because a root seeded from a glibc distro is a gnu host until phase 2 replaces it
+pub fn host() -> String {
+    std::env::var("KIRY_HOST").unwrap_or_else(|_| "x86_64-musl".into())
 }
 
 // every build gets a shell and a compiler without asking, so depends says what goes on
@@ -47,27 +57,34 @@ pub fn toolchain(root: &Path) -> Result<Vec<Dep>, String> {
 pub fn closure(root: &Path, target: &str, deps: &[Dep]) -> Result<Vec<Member>, String> {
     let mut out: Vec<Member> = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut queue: Vec<String> = Vec::new();
+    let mut queue: Vec<(String, String)> = Vec::new();
 
+    let host = host();
     for d in toolchain(root)?.iter().chain(deps) {
-        if seen.insert(d.name.clone()) {
+        // the toolchain set is make deps, so it comes from the host either way
+        let t = if d.make { host.as_str() } else { target };
+        if seen.insert((d.name.clone(), t.to_string())) {
             out.push(Member {
                 name: d.name.clone(),
                 direct: true,
+                target: t.to_string(),
             });
-            queue.push(d.name.clone());
+            queue.push((d.name.clone(), t.to_string()));
         }
     }
 
-    while let Some(name) = queue.pop() {
-        let rec = db::read(root, target, &name).map_err(|e| e.to_string())?;
+    while let Some((name, t)) = queue.pop() {
+        let rec = db::read(root, &t, &name).map_err(|e| e.to_string())?;
+        // a library a host tool loads is a host library, and one the target links is the
+        // target's. the edge inherits the target of the package it came from
         for d in rec.depends.iter().filter(|d| !d.make) {
-            if seen.insert(d.name.clone()) {
+            if seen.insert((d.name.clone(), t.clone())) {
                 out.push(Member {
                     name: d.name.clone(),
                     direct: false,
+                    target: t.clone(),
                 });
-                queue.push(d.name.clone());
+                queue.push((d.name.clone(), t.clone()));
             }
         }
     }
@@ -76,7 +93,7 @@ pub fn closure(root: &Path, target: &str, deps: &[Dep]) -> Result<Vec<Member>, S
 
 // provides already records which installed files are shared libraries, so a transitive
 // dep needs no filename guessing and no dev subpackage split
-pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> Result<(), String> {
+pub fn assemble(root: &Path, members: &[Member], into: &Path) -> Result<(), String> {
     // the sysroot is the root's shape or nothing in it starts: PT_INTERP says
     // /lib/ld-musl-x86_64.so.1 and the loader lives in /usr/lib
     for (link, to) in [
@@ -94,7 +111,7 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
     }
 
     for m in members {
-        let rec = db::read(root, target, &m.name).map_err(|e| e.to_string())?;
+        let rec = db::read(root, &m.target, &m.name).map_err(|e| e.to_string())?;
         for e in &rec.manifest {
             if !m.direct && builds_against(&e.path) {
                 continue;
@@ -317,11 +334,12 @@ mod tests {
     }
 
     // a package with a header, a pkg-config file and a library, all really on disk
-    fn install(root: &Path, name: &str, deps: &[Dep]) {
-        let lib = format!("usr/lib64/lib{name}.so.1");
+    fn install(root: &Path, t: &str, name: &str, deps: &[Dep]) {
+        let dir = if t == host() { "usr/lib" } else { "usr/lib64" };
+        let lib = format!("{dir}/lib{name}.so.1");
         let paths = [
             format!("usr/include/{name}.h"),
-            format!("usr/lib64/pkgconfig/{name}.pc"),
+            format!("{dir}/pkgconfig/{name}.pc"),
             lib.clone(),
         ];
         for p in &paths {
@@ -333,7 +351,7 @@ mod tests {
             root,
             &db::Installed {
                 name: name.to_string(),
-                target: T.to_string(),
+                target: t.to_string(),
                 version: Version::parse("1.0 1").unwrap(),
                 depends: deps.to_vec(),
                 manifest: paths
@@ -349,7 +367,7 @@ mod tests {
         .unwrap();
         db::write_provides(
             root,
-            T,
+            t,
             name,
             &[db::Provide {
                 soname: format!("lib{name}.so.1"),
@@ -363,8 +381,8 @@ mod tests {
     #[test]
     fn the_toolchain_is_in_every_closure_without_a_recipe_naming_it() {
         let root = scratch("toolchain");
-        install(&root, "busybox", &[]);
-        install(&root, "zlib", &[]);
+        install(&root, &host(), "busybox", &[]);
+        install(&root, T, "zlib", &[]);
         fs::create_dir_all(root.join("etc/kiry")).unwrap();
         fs::write(
             root.join("etc/kiry/toolchain"),
@@ -381,19 +399,41 @@ mod tests {
         assert!(names.contains(&"zlib"), "{names:?}");
     }
 
+    // a build tool has to run on this machine and what is compiled against has to be
+    // the target's. the same name is installed on both and each edge picks its own
+    #[test]
+    fn a_build_tool_comes_from_the_host_and_a_library_from_the_target() {
+        let root = scratch("split");
+        install(&root, &host(), "zlib", &[]);
+        install(&root, T, "zlib", &[]);
+
+        let c = closure(&root, T, &[dep("zlib", true), dep("zlib", false)]).unwrap();
+        let mut got: Vec<&str> = c.iter().map(|m| m.target.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(got, [T, host().as_str()], "both builds of zlib or neither");
+
+        let into = scratch("splitinto");
+        assemble(&root, &c, &into).unwrap();
+        assert!(into.join("usr/lib/libzlib.so.1").exists(), "no host build");
+        assert!(
+            into.join("usr/lib64/libzlib.so.1").exists(),
+            "no target build"
+        );
+    }
+
     #[test]
     fn no_toolchain_file_means_no_toolchain() {
         let root = scratch("notoolchain");
-        install(&root, "zlib", &[]);
+        install(&root, T, "zlib", &[]);
         assert_eq!(closure(&root, T, &[dep("zlib", false)]).unwrap().len(), 1);
     }
 
     #[test]
     fn a_build_dependency_does_not_drag_its_own_build_dependencies_in() {
         let root = scratch("closure");
-        install(&root, "gcc", &[dep("gccdep", true)]);
-        install(&root, "gccdep", &[]);
-        install(&root, "zlib", &[]);
+        install(&root, &host(), "gcc", &[dep("gccdep", true)]);
+        install(&root, &host(), "gccdep", &[]);
+        install(&root, T, "zlib", &[]);
 
         let c = closure(&root, T, &[dep("gcc", true), dep("zlib", false)]).unwrap();
         let names: Vec<&str> = c.iter().map(|m| m.name.as_str()).collect();
@@ -410,8 +450,8 @@ mod tests {
     #[test]
     fn a_cycle_in_the_recorded_depends_does_not_hang() {
         let root = scratch("cycle");
-        install(&root, "freetype", &[dep("harfbuzz", false)]);
-        install(&root, "harfbuzz", &[dep("freetype", false)]);
+        install(&root, T, "freetype", &[dep("harfbuzz", false)]);
+        install(&root, T, "harfbuzz", &[dep("freetype", false)]);
 
         let c = closure(&root, T, &[dep("freetype", false)]).unwrap();
         assert_eq!(c.len(), 2);
@@ -421,12 +461,12 @@ mod tests {
     #[test]
     fn a_transitive_dependency_hands_over_libraries_and_no_headers() {
         let root = scratch("layers");
-        install(&root, "png", &[dep("zlib", false)]);
-        install(&root, "zlib", &[]);
+        install(&root, T, "png", &[dep("zlib", false)]);
+        install(&root, T, "zlib", &[]);
 
         let c = closure(&root, T, &[dep("png", false)]).unwrap();
         let into = root.join("sysroot");
-        assemble(&root, T, &c, &into).unwrap();
+        assemble(&root, &c, &into).unwrap();
 
         assert!(
             into.join("usr/include/png.h").exists(),
@@ -450,12 +490,12 @@ mod tests {
     #[test]
     fn nothing_outside_the_closure_is_placed_at_all() {
         let root = scratch("outside");
-        install(&root, "png", &[]);
-        install(&root, "openssl", &[]);
+        install(&root, T, "png", &[]);
+        install(&root, T, "openssl", &[]);
 
         let c = closure(&root, T, &[dep("png", false)]).unwrap();
         let into = root.join("sysroot");
-        assemble(&root, T, &c, &into).unwrap();
+        assemble(&root, &c, &into).unwrap();
 
         assert!(into.join("usr/lib64/libpng.so.1").exists());
         assert!(

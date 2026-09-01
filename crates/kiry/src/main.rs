@@ -279,7 +279,7 @@ fn compile(
 
     let sysroot = work.join("sysroot");
     let members = sandbox::closure(root, t, &p.depends)?;
-    sandbox::assemble(root, t, &members, &sysroot)?;
+    sandbox::assemble(root, &members, &sysroot)?;
 
     fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
     let share = sysroot.join("usr/share/kiry");
@@ -312,8 +312,11 @@ fn compile(
         .env("DESTDIR", "/dest")
         // every apkbuild build() leans on abuild exporting this and never says -j itself
         .env("MAKEFLAGS", format!("-j{}", jobs()))
-        // nothing here cross compiles, so all three are the same triple
-        .env("CBUILD", triple(t))
+        // build is this machine, host is what the output has to run on. they are the
+        // same triple for a musl package built on musl and they are not for a gnu one,
+        // which is the only cross this tree does. told they matched, gcc's configure
+        // read musl's headers as glibc's and compiled a call to mallinfo2
+        .env("CBUILD", triple(&sandbox::host()))
         .env("CHOST", triple(t))
         .env("CTARGET", triple(t))
         // the machine half of the target, which is what a case branch switches on
@@ -1063,19 +1066,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
         // the loader opens a path, so a symlink on the way to a library is part of
         // resolution. musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1
         // points at the loader itself
-        for e in &rec.manifest {
-            if matches!(e.kind, db::Kind::File(_) | db::Kind::Hard(_)) {
-                present.insert(fold(&e.path));
-            }
-            if let db::Kind::Link(t) = &e.kind {
-                let to = if let Some(abs) = t.strip_prefix('/') {
-                    abs.to_string()
-                } else {
-                    format!("{}/{t}", dirname(&e.path))
-                };
-                links.insert(fold(&e.path), fold(&to));
-            }
-        }
+        index(&rec.manifest, &mut present, &mut links);
 
         let seen = match install::scan(root, &rec.manifest) {
             Ok(s) => s,
@@ -1163,6 +1154,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
 
     // the kernel will not start a script whose interpreter is not there, which is the
     // same failure DT_NEEDED describes and nothing was checking it
+    let (anywhere, anylinks) = everywhere(root);
     for (pkg, path, words) in &shebangs {
         let mut want = words[0].trim_start_matches('/').to_string();
         // env looks the real one up on PATH, so that is the name that has to exist
@@ -1178,11 +1170,11 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
             }
         }
         let there = if want.contains('/') {
-            exists(&present, &links, &want)
+            exists(&anywhere, &anylinks, &want)
         } else {
             ["usr/bin", "usr/sbin"]
                 .iter()
-                .any(|d| exists(&present, &links, &format!("{d}/{want}")))
+                .any(|d| exists(&anywhere, &anylinks, &format!("{d}/{want}")))
         };
         if !there {
             out.push(Finding {
@@ -1281,6 +1273,52 @@ fn provider(
     where_
         .iter()
         .find_map(|d| at_path(here, links, &format!("{d}/{want}")))
+}
+
+// the loader opens a path, so a symlink on the way to a library is part of resolution.
+// musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1 points at the loader
+// itself. a hardlink is a file too, which is how perl ships /usr/bin/perl beside
+// perl5.44.0
+fn index(
+    manifest: &[db::Entry],
+    present: &mut HashSet<String>,
+    links: &mut HashMap<String, String>,
+) {
+    for e in manifest {
+        if matches!(e.kind, db::Kind::File(_) | db::Kind::Hard(_)) {
+            present.insert(fold(&e.path));
+        }
+        if let db::Kind::Link(t) = &e.kind {
+            let to = if let Some(abs) = t.strip_prefix('/') {
+                abs.to_string()
+            } else {
+                format!("{}/{t}", dirname(&e.path))
+            };
+            links.insert(fold(&e.path), fold(&to));
+        }
+    }
+}
+
+// a shebang names a path and a path has no tier. /bin/sh runs whatever libc built it,
+// so glibc's own scripts reach the busybox sh the musl side owns. linkage stays inside
+// one target -- that is what cross-tier exists to catch -- but this does not
+fn everywhere(root: &Path) -> (HashSet<String>, HashMap<String, String>) {
+    let mut present = HashSet::new();
+    let mut links = HashMap::new();
+    let Ok(targets) = db::targets(root) else {
+        return (present, links);
+    };
+    for t in &targets {
+        let Ok(names) = db::installed(root, t) else {
+            continue;
+        };
+        for n in &names {
+            if let Ok(rec) = db::read(root, t, n) {
+                index(&rec.manifest, &mut present, &mut links);
+            }
+        }
+    }
+    (present, links)
 }
 
 fn exists(present: &HashSet<String>, links: &HashMap<String, String>, path: &str) -> bool {

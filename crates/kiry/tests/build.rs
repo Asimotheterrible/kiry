@@ -57,6 +57,17 @@ fn kiry(args: &[&str]) -> Output {
     Command::new(KIRY).args(args).output().unwrap()
 }
 
+// the seed is this machine's busybox and this machine runs glibc, so a fixture whose
+// packages are gnu has a gnu host too. everything else here is musl on musl, where the
+// two are the same answer and saying so changes nothing
+fn kiry_on(host: &str, args: &[&str]) -> Output {
+    Command::new(KIRY)
+        .args(args)
+        .env("KIRY_HOST", host)
+        .output()
+        .unwrap()
+}
+
 fn cache(root: &Path, suffix: &str) -> Vec<String> {
     let Ok(rd) = fs::read_dir(root.join("var/kiry/cache")) else {
         return Vec::new();
@@ -566,6 +577,43 @@ fn a_source_tree_is_owned_by_whoever_unpacks_it() {
     assert!(out.status.success(), "tar rejects --no-same-owner");
 }
 
+// build is this machine and host is what the output runs on. a gnu package built on a
+// musl machine is the one place they differ, and told they matched, gcc's configure read
+// musl's headers as glibc's and compiled a call to mallinfo2 that is not there
+#[test]
+fn a_cross_build_is_told_the_two_triples_apart() {
+    let at = scratch("crosstriple");
+    let d = recipe(
+        &at,
+        "x86_64-gnu",
+        "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$CBUILD $CHOST\" > \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let art = cache(&root, ".tar.zst");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
+            root.display(),
+            art[0]
+        ))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        said.trim(),
+        "x86_64-unknown-linux-musl x86_64-unknown-linux-gnu",
+        "{said}"
+    );
+}
+
 // abuild exports the triple and 1700 recipes read it. most only pass it to configure,
 // which guesses right anyway, but LLVM_HOST_TRIPLE and clang/$CHOST.cfg take it as a
 // name -- an unset one is a wrong answer that builds and installs
@@ -1024,12 +1072,12 @@ fn rebuild_recompiles_what_the_break_names() {
 
     let r = root.to_str().unwrap();
     place(&root, "libp", &[("usr/lib64/libp.so.1", &one)]);
-    let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
+    let o = kiry_on("x86_64-gnu", &["b", "--root", r, d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let arc = root.join("var/kiry/cache/app-1.0-1.x86_64-gnu.tar.zst");
-    let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
+    let o = kiry_on("x86_64-gnu", &["i", "--root", r, arc.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let first = kiry(&["doctor", "--root", r]);
+    let first = kiry_on("x86_64-gnu", &["doctor", "--root", r]);
     assert!(
         first.status.success(),
         "{}",
@@ -1039,18 +1087,19 @@ fn rebuild_recompiles_what_the_break_names() {
     // the soname moves under it, which is the break the whole engine exists for
     place(&root, "libp", &[("usr/lib64/libp.so.2", &two)]);
     let _ = fs::remove_file(root.join("usr/lib64/libp.so.1"));
-    let out = String::from_utf8_lossy(&kiry(&["doctor", "--root", r]).stdout).into_owned();
+    let out = String::from_utf8_lossy(&kiry_on("x86_64-gnu", &["doctor", "--root", r]).stdout)
+        .into_owned();
     assert!(
         out.contains("usr/bin/app x86_64-gnu unresolved libp.so.1"),
         "{out}"
     );
 
-    let o = kiry(&["rebuild", "--root", r]);
+    let o = kiry_on("x86_64-gnu", &["rebuild", "--root", r]);
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(said.contains("app 1.0 x86_64-gnu rebuilt"), "{said}");
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
-    let after = kiry(&["doctor", "--root", r]);
+    let after = kiry_on("x86_64-gnu", &["doctor", "--root", r]);
     assert!(
         after.status.success(),
         "{}",

@@ -15,6 +15,9 @@ size=${KIRY_QEMU_SIZE:-8G}
 # KIRY_QEMU_INIT=nitro boots what the root actually installed, rather than the throwaway
 # script below. the serial console service ships `down`, so it gets turned on here
 init=${KIRY_QEMU_INIT:-script}
+# KIRY_QEMU_INITRD=<file> boots through an initramfs, which is the only way to reach a
+# luks root: cryptsetup is userspace and the kernel cannot open one on its own
+initrd=${KIRY_QEMU_INITRD:-}
 
 kernel=$(ls -1 "$root"/boot/vmlinuz-* 2>/dev/null | tail -1)
 [ -n "$kernel" ] || { echo "qemu: no kernel in $root/boot, build core/linux first" >&2; exit 1; }
@@ -48,6 +51,14 @@ if [ "$init" = nitro ]; then
     initarg=/usr/sbin/nitro
 else
     initarg=/init
+fi
+
+# with an initramfs the kernel runs its /init and that decides what comes next, so
+# naming one here would only confuse the two
+if [ -n "$initrd" ]; then
+    initopt=
+else
+    initopt="init=$initarg"
 fi
 
 cat > "$stage/init" <<'EOF'
@@ -139,4 +150,5 @@ exec qemu-system-x86_64 \
 	-accel "$acc" -cpu max \
 	-kernel "$kernel" \
 	-drive file="$work/root.img",format=raw,if=virtio \
-	-append "root=/dev/vda rw init=$initarg console=ttyS0 panic=5"
+	${initrd:+-initrd "$initrd"} \
+	-append "root=/dev/vda rw $initopt console=ttyS0 panic=5"

@@ -290,6 +290,13 @@ fn compile(
     let bin = sysroot.join("usr/bin");
     mkdirs(&bin)?;
     // muon does not read argv0, so compile and install need a name to reach it by too
+    let cmake_toolchain = share.join("toolchain.cmake");
+    fs::write(
+        &cmake_toolchain,
+        TOOLCHAIN_CMAKE.replace("@LIBDIR@", libdir(t).trim_start_matches("/usr/")),
+    )
+    .map_err(|e| format!("toolchain.cmake: {e}"))?;
+
     for (n, body) in [
         ("abuild-meson", MESON.replace("@LIBDIR@", libdir(t))),
         ("abuild-muon", MESON.replace("@LIBDIR@", libdir(t))),
@@ -322,6 +329,7 @@ fn compile(
         // the machine half of the target, which is what a case branch switches on
         .env("CARCH", t.split('-').next().unwrap_or(t))
         .env("CTARGET_ARCH", t.split('-').next().unwrap_or(t))
+        .env("CMAKE_TOOLCHAIN_FILE", "/usr/share/kiry/toolchain.cmake")
         .env("KIRY_SRCDIR", "/src")
         .env("KIRY_TARGET", t)
         .env("KIRY_NAME", &p.name)
@@ -389,6 +397,15 @@ options_has() { case \" $options \" in *\" $1 \"*) return 0 ;; esac; return 1; }
 
 // abuild's wrapper, deviating twice: auto_features stays auto because the closure is
 // what a detection can see, and libdir follows the target
+// cmake's GNUInstallDirs picks lib64 on any 64-bit linux that is not debian, arch or
+// alpine -- it looks for /etc/alpine-release, which this tree deliberately does not have.
+// usr/lib64 is the gnu tier, so a musl package landing there is the cross-tier bug the
+// split directory exists to prevent. a toolchain file is the documented way in, and
+// cmake reads its path from the environment
+const TOOLCHAIN_CMAKE: &str = "\
+set(CMAKE_INSTALL_LIBDIR \"@LIBDIR@\")
+";
+
 const MESON: &str = "\
 #!/bin/sh -e
 exec muon meson setup \\

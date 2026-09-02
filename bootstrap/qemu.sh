@@ -22,6 +22,13 @@ initrd=${KIRY_QEMU_INITRD:-}
 # passthrough: that backend hands the guest /dev/tpm0, which is the real machine's tpm,
 # and sealing against it would persist into hardware
 tpm=${KIRY_QEMU_TPM:-}
+# KIRY_QEMU_SECUREBOOT=1 boots the firmware that actually enforces db. it starts in
+# setup mode with no keys, which is where a real machine starts too
+secureboot=${KIRY_QEMU_SECUREBOOT:-}
+# KIRY_QEMU_REUSE=1 boots the disk and the nvram a previous run left behind. enrolling
+# keys and then proving they are enforced takes two boots, and the second one has to
+# see what the first one wrote
+reuse=${KIRY_QEMU_REUSE:-}
 swtpm_bin=${KIRY_SWTPM:-$HOME/.cache/kiry/swtpm/prefix/bin/swtpm}
 
 kernel=$(ls -1 "$root"/boot/vmlinuz-* 2>/dev/null | tail -1)
@@ -31,20 +38,28 @@ echo "kernel $kernel"
 # hardlinked, so staging a 3GB root costs nothing and the caches can be dropped from
 # the copy without touching the real one
 stage=$work/stage
+if [ -n "$reuse" ]; then
+    [ -r "$work/disk.img" ] || { echo "qemu: nothing to reuse in $work" >&2; exit 1; }
+    echo "reusing $work/disk.img"
+else
 rm -rf "$stage"
 mkdir -p "$work"
 cp -al "$root" "$stage"
 rm -rf "$stage/var/kiry/cache" "$stage/var/kiry/log"
 
-# no recipe builds kiry yet, so the booted system gets the binary the same way seed.sh
-# finds one. a root that cannot run `kiry doctor` on itself is not proving much
+# a root with core/kiry installed already has one and it is the musl build. only a root
+# that does not gets the host binary, the way seed.sh finds one -- and rm first, because
+# the stage is hardlinked and a cp would write through to the real root
 kiry=${KIRY:-}
-if [ -z "$kiry" ]; then
+if [ -z "$kiry" ] && [ ! -x "$stage/usr/bin/kiry" ]; then
     for c in "$here/../target/release/kiry" "$here/../target/debug/kiry"; do
         [ -x "$c" ] && { kiry=$c; break; }
     done
 fi
-[ -n "$kiry" ] && cp "$kiry" "$stage/usr/bin/kiry"
+if [ -n "$kiry" ]; then
+    rm -f "$stage/usr/bin/kiry"
+    cp "$kiry" "$stage/usr/bin/kiry"
+fi
 
 if [ $# -gt 0 ]; then
     printf '%s\n' "$*" > "$stage/.run"
@@ -87,7 +102,34 @@ chmod 755 "$stage/init"
 
 echo "packing $size image"
 rm -f "$work/root.img"
-mke2fs -q -t ext4 -d "$stage" -F -m 0 -L kiry "$work/root.img" "$size"
+# mke2fs -d copies the uid it finds and the stage is hardlinked to a root staged by
+# whoever ran kiry, so without this every file in the image belongs to that user and a
+# boot test disagrees with the image usb.sh builds. openntpd is the only thing that
+# says so out loud; everything else is quietly wrong
+own=$(id -u):$(id -g)
+restore() { doas chown -R "$own" "$root" "$stage" 2>/dev/null; }
+trap restore EXIT INT TERM
+doas chown -R 0:0 "$stage"
+doas mke2fs -q -t ext4 -d "$stage" -F -m 0 -L kiry "$work/root.img" "$size"
+doas chown "$own" "$work/root.img"
+restore
+trap - EXIT INT TERM
+fi
+
+tpmargs=""
+if [ -n "$tpm" ]; then
+    [ -x "$swtpm_bin" ] || { echo "qemu: no swtpm at $swtpm_bin" >&2; exit 1; }
+    tpmstate=$work/tpm
+    [ -n "$reuse" ] || rm -rf "$tpmstate"
+    mkdir -p "$tpmstate"
+    LD_LIBRARY_PATH=$(dirname "$swtpm_bin")/../lib "$swtpm_bin" socket \
+        --tpm2 --tpmstate dir="$tpmstate" \
+        --ctrl type=unixio,path="$tpmstate/sock" \
+        --flags startup-clear --daemon
+    trap 'kill %1 2>/dev/null; pkill -f "tpmstate dir=$tpmstate" 2>/dev/null' EXIT
+    tpmargs="-chardev socket,id=chrtpm,path=$tpmstate/sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-crb,tpmdev=tpm0"
+    echo "software tpm at $tpmstate"
+fi
 
 # KIRY_QEMU_EFI=1 wraps that filesystem in a gpt disk with an esp and boots it the way
 # a real machine does: firmware, EFI/BOOT/BOOTX64.EFI, the kernel's own efi stub. no -kernel
@@ -95,7 +137,10 @@ mke2fs -q -t ext4 -d "$stage" -F -m 0 -L kiry "$work/root.img" "$size"
 if [ -n "$KIRY_QEMU_EFI" ]; then
     esp=$work/esp.img
     disk=$work/disk.img
-    espmb=64
+    espmb=${KIRY_QEMU_ESPMB:-128}
+    if [ -n "$reuse" ]; then
+        rootmb=0
+    else
     rootmb=$(( $(stat -c %s "$work/root.img") / 1048576 ))
 
     rm -f "$esp" "$disk"
@@ -128,47 +173,60 @@ SFDISK
 
     dd if="$esp" of="$disk" bs=1M seek=1 conv=notrunc status=none
     dd if="$work/root.img" of="$disk" bs=1M seek=$(( espmb + 1 )) conv=notrunc status=none
+    fi
 
     acc=tcg
     [ -r /dev/kvm ] && [ -w /dev/kvm ] && acc=kvm
-    ovmf=$(ls /usr/share/edk2-ovmf/OVMF_CODE.fd /usr/share/edk2/OvmfX64/OVMF_CODE.fd 2>/dev/null | head -1)
-    [ -n "$ovmf" ] || { echo "qemu: no OVMF firmware found" >&2; exit 1; }
-    vars=$(ls /usr/share/edk2-ovmf/OVMF_VARS.fd /usr/share/edk2/OvmfX64/OVMF_VARS.fd 2>/dev/null | head -1)
-    cp "$vars" "$work/vars.fd"
+    code=OVMF_CODE.fd
+    varsname=OVMF_VARS.fd
+    # the secboot firmware is built SMM_REQUIRE, so it wants a q35 with smm and a
+    # pflash the world outside smm cannot write. on a plain pc machine it hangs before
+    # it prints anything at all
+    machine=
+    if [ -n "$secureboot" ]; then
+        code=OVMF_CODE.secboot.fd
+        # not OVMF_VARS.secboot.fd -- that one ships with microsoft's keys already
+        # enrolled, so the firmware is enforcing from the first boot and there is no
+        # setup mode to enroll into. the empty varstore is where a cleared machine is
+        varsname=OVMF_VARS.fd
+        machine="-machine q35,smm=on -global driver=cfi.pflash01,property=secure,value=on -global ICH9-LPC.disable_s3=1"
+    fi
+    ovmf=$(ls /usr/share/edk2-ovmf/$code /usr/share/edk2/OvmfX64/$code 2>/dev/null | head -1)
+    [ -n "$ovmf" ] || { echo "qemu: no $code found" >&2; exit 1; }
+    if [ -z "$reuse" ]; then
+        vars=$(ls /usr/share/edk2-ovmf/$varsname /usr/share/edk2/OvmfX64/$varsname 2>/dev/null | head -1)
+        cp "$vars" "$work/vars.fd"
+    fi
 
     echo "booting $acc through uefi"
     exec qemu-system-x86_64 \
     	-m "$mem" -smp "$cpus" -nographic -no-reboot \
-    	-accel "$acc" -cpu max \
+    	-accel "$acc" -cpu max $machine \
     	-drive if=pflash,format=raw,unit=0,readonly=on,file="$ovmf" \
     	-drive if=pflash,format=raw,unit=1,file="$work/vars.fd" \
-    	-drive file="$disk",format=raw,if=virtio
+    	$tpmargs \
+    	-drive file="$disk",format=raw,if=virtio ${KIRY_QEMU_DISK:+-drive file=$KIRY_QEMU_DISK,format=raw,if=virtio}
 fi
+
+# KIRY_QEMU_NET=1 gives the guest qemu's user-mode network, which is enough to prove a
+# tls trust store and a dns lookup without touching a real interface
+net=${KIRY_QEMU_NET:+-netdev user,id=n0 -device virtio-net-pci,netdev=n0}
+
+# KIRY_QEMU_DISK=path attaches a second raw disk as vdb. an install writes to a disk
+# that is not the one it booted from, so rehearsing one needs somewhere to write
+disk2=${KIRY_QEMU_DISK:+-drive file=$KIRY_QEMU_DISK,format=raw,if=virtio}
 
 # -cpu max because the default qemu64 has no avx and a prebuilt gnu binary compiled for
 # a real machine takes SIGILL on it. kvm when the machine allows it
 acc=tcg
 [ -r /dev/kvm ] && [ -w /dev/kvm ] && acc=kvm
-tpmargs=""
-if [ -n "$tpm" ]; then
-    [ -x "$swtpm_bin" ] || { echo "qemu: no swtpm at $swtpm_bin" >&2; exit 1; }
-    tpmstate=$work/tpm
-    rm -rf "$tpmstate"; mkdir -p "$tpmstate"
-    LD_LIBRARY_PATH=$(dirname "$swtpm_bin")/../lib "$swtpm_bin" socket \
-        --tpm2 --tpmstate dir="$tpmstate" \
-        --ctrl type=unixio,path="$tpmstate/sock" \
-        --flags startup-clear --daemon
-    trap 'kill %1 2>/dev/null; pkill -f "tpmstate dir=$tpmstate" 2>/dev/null' EXIT
-    tpmargs="-chardev socket,id=chrtpm,path=$tpmstate/sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-crb,tpmdev=tpm0"
-    echo "software tpm at $tpmstate"
-fi
-
 echo "booting $acc"
 exec qemu-system-x86_64 \
 	-m "$mem" -smp "$cpus" -nographic -no-reboot \
 	-accel "$acc" -cpu max \
 	-kernel "$kernel" \
 	-drive file="$work/root.img",format=raw,if=virtio \
+	$net $disk2 \
 	${initrd:+-initrd "$initrd"} \
 	$tpmargs \
 	-append "root=/dev/vda rw $initopt console=ttyS0 panic=5"

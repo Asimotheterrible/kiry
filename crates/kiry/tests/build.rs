@@ -614,6 +614,45 @@ fn a_cross_build_is_told_the_two_triples_apart() {
     );
 }
 
+// cmake's GNUInstallDirs defaults to lib64 on any 64-bit linux it does not recognise,
+// and it recognises alpine by a file this tree deliberately does not ship. a musl
+// package landing in usr/lib64 is in the gnu tier's directory
+#[test]
+fn a_cmake_build_is_told_which_libdir_the_target_uses() {
+    for (target, want) in [("x86_64-musl", "lib"), ("x86_64-gnu", "lib64")] {
+        let at = scratch(&format!("cmakelibdir-{target}"));
+        let d = recipe(
+            &at,
+            target,
+            "mkdir -p \"$DESTDIR/usr/bin\"\ncat \"$CMAKE_TOOLCHAIN_FILE\" > \"$DESTDIR/usr/bin/hello\"\n",
+        );
+        let root = at.join("root");
+        fs::create_dir_all(&root).unwrap();
+        if !bootstrap(&root) {
+            return;
+        }
+
+        let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let art = cache(&root, ".tar.zst");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
+                root.display(),
+                art[0]
+            ))
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            said.trim(),
+            format!("set(CMAKE_INSTALL_LIBDIR \"{want}\")"),
+            "{target} got {said}"
+        );
+    }
+}
+
 // abuild exports the triple and 1700 recipes read it. most only pass it to configure,
 // which guesses right anyway, but LLVM_HOST_TRIPLE and clang/$CHOST.cfg take it as a
 // name -- an unset one is a wrong answer that builds and installs

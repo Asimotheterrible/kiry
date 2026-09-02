@@ -9,6 +9,9 @@ cpus=${KIRY_QEMU_CPUS:-4}
 size=${KIRY_QEMU_SIZE:-8G}
 init=${KIRY_QEMU_INIT:-script}
 initrd=${KIRY_QEMU_INITRD:-}
+# never the passthrough backend: that one hands the guest the real machine's tpm
+tpm=${KIRY_QEMU_TPM:-}
+swtpm_bin=${KIRY_SWTPM:-$HOME/.cache/kiry/swtpm/prefix/bin/swtpm}
 
 kernel=$(ls -1 "$root"/boot/vmlinuz-* 2>/dev/null | tail -1)
 [ -n "$kernel" ] || { echo "qemu: no kernel in $root/boot, build core/linux first" >&2; exit 1; }
@@ -123,6 +126,20 @@ fi
 # -cpu max: the default qemu64 has no avx and a prebuilt gnu binary takes SIGILL on it
 acc=tcg
 [ -r /dev/kvm ] && [ -w /dev/kvm ] && acc=kvm
+tpmargs=""
+if [ -n "$tpm" ]; then
+    [ -x "$swtpm_bin" ] || { echo "qemu: no swtpm at $swtpm_bin" >&2; exit 1; }
+    tpmstate=$work/tpm
+    rm -rf "$tpmstate"; mkdir -p "$tpmstate"
+    LD_LIBRARY_PATH=$(dirname "$swtpm_bin")/../lib "$swtpm_bin" socket \
+        --tpm2 --tpmstate dir="$tpmstate" \
+        --ctrl type=unixio,path="$tpmstate/sock" \
+        --flags startup-clear --daemon
+    trap 'kill %1 2>/dev/null; pkill -f "tpmstate dir=$tpmstate" 2>/dev/null' EXIT
+    tpmargs="-chardev socket,id=chrtpm,path=$tpmstate/sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-crb,tpmdev=tpm0"
+    echo "software tpm at $tpmstate"
+fi
+
 echo "booting $acc"
 exec qemu-system-x86_64 \
 	-m "$mem" -smp "$cpus" -nographic -no-reboot \
@@ -130,4 +147,5 @@ exec qemu-system-x86_64 \
 	-kernel "$kernel" \
 	-drive file="$work/root.img",format=raw,if=virtio \
 	${initrd:+-initrd "$initrd"} \
+	$tpmargs \
 	-append "root=/dev/vda rw $initopt console=ttyS0 panic=5"

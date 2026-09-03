@@ -174,6 +174,14 @@ SFDISK
     	-drive file="$disk",format=raw,if=virtio ${KIRY_QEMU_DISK:+-drive file=$KIRY_QEMU_DISK,format=raw,if=virtio}
 fi
 
+# plain virtio-gpu means mesa finds no driver and gl falls back to softpipe. gl means
+# virgl, which needs a backend that holds a gl context without opening a window
+case ${KIRY_QEMU_GPU:-} in
+    gl) gpu="-device virtio-gpu-gl-pci -display egl-headless" ;;
+    ?*) gpu="-device virtio-gpu-pci" ;;
+    *)  gpu= ;;
+esac
+
 net=${KIRY_QEMU_NET:+-netdev user,id=n0 -device virtio-net-pci,netdev=n0}
 
 disk2=${KIRY_QEMU_DISK:+-drive file=$KIRY_QEMU_DISK,format=raw,if=virtio}
@@ -187,7 +195,7 @@ exec qemu-system-x86_64 \
 	-accel "$acc" -cpu max \
 	-kernel "$kernel" \
 	-drive file="$work/root.img",format=raw,if=virtio \
-	$net $disk2 \
+	$net $disk2 $gpu \
 	${initrd:+-initrd "$initrd"} \
 	$tpmargs \
 	-append "root=/dev/vda rw $initopt console=ttyS0 panic=5"

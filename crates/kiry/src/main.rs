@@ -83,12 +83,19 @@ fn opts(args: &[String]) -> (PathBuf, bool, Vec<String>) {
 }
 
 // --root defaults to / and most of these commands write. checked only where one
-// mutates, so l and doctor still answer for the running system
+// mutates, so l and doctor still answer for the running system.
+//
+// what is refused is a / that no kiry installed anything into, which is the machine
+// this gets built on. on the installed system / is the root it owns and there is
+// nothing to guard against
 fn writes(root: &Path) {
     let at = root.canonicalize();
     let at = at.as_deref().unwrap_or(root);
-    if at == Path::new("/") && std::env::var_os("KIRY_ROOT_REALLY").is_none() {
-        die("refusing to write to /, set KIRY_ROOT_REALLY=1 to mean it".into());
+    if at == Path::new("/")
+        && !Path::new("/usr/lib/kiry/db/installed").is_dir()
+        && std::env::var_os("KIRY_ROOT_REALLY").is_none()
+    {
+        die("refusing to write to /, which no kiry owns. set KIRY_ROOT_REALLY=1 to mean it".into());
     }
 }
 

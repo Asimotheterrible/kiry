@@ -281,6 +281,19 @@ fn devices(root: &Path) -> Result<(), String> {
         fs::write(&at, "").map_err(|e| format!("{}: {e}", at.display()))?;
         mount::mount_bind(format!("/dev/{n}"), &at).map_err(|e| format!("bind {n}: {e}"))?;
     }
+    // 28 aports install a file by reading a heredoc back out of /dev/stdin, so these
+    // are as load-bearing as the device nodes. /proc is already mounted, which is
+    // where a real /dev points them
+    for (n, to) in [
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+        ("fd", "/proc/self/fd"),
+    ] {
+        let at = dev.join(n);
+        symlink(to, &at).map_err(|e| format!("{}: {e}", at.display()))?;
+    }
+
     // sem_open is a file under /dev/shm on musl, so without this any build that
     // starts a python process pool dies on an import rather than on a missing tool
     let shm = dev.join("shm");

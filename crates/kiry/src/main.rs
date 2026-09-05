@@ -314,7 +314,18 @@ fn compile(
     let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut c = Command::new(me);
     c.arg("sandbox")
+        // an inherited CFLAGS or PYTHONPATH would change a build without appearing
+        // in any recipe, and the closure is meant to be the whole of what one sees
+        .env_clear()
         .env("KIRY_SANDBOX", abs(&work)?)
+        .env("HOME", "/src")
+        .env("TMPDIR", "/tmp")
+        .env("TERM", "dumb")
+        // c.utf8 rather than c: musl has it, and python trips over unicode paths
+        // under plain c
+        .env("LANG", "C.UTF-8")
+        .env("LC_ALL", "C.UTF-8")
+        .env("TZ", "UTC")
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("DESTDIR", "/dest")
         // every apkbuild build() leans on abuild exporting this and never says -j itself
@@ -335,6 +346,14 @@ fn compile(
         .env("KIRY_NAME", &p.name)
         .env("KIRY_VERSION", &p.version.upstream)
         .env("KIRY_REV", p.version.rev.to_string());
+
+    // read on the far side of the clear, so they have to cross by name. without the
+    // cap a build that allocates without bound takes the machine down, not itself
+    for k in ["KIRY_MEM", "KIRY_HOST"] {
+        if let Some(v) = std::env::var_os(k) {
+            c.env(k, v);
+        }
+    }
 
     // the log is written either way. -v only decides whether you also watch it
     let log = root.join("var/kiry/log").join(format!(

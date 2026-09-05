@@ -96,6 +96,15 @@ restore() { doas chown -R "$own" "$root"; doas rm -rf "$work"; }
 trap restore EXIT
 doas chown -R 0:0 "$tree"
 
+# every home belongs to whoever /etc/passwd says it does. the chown above is for system
+# files, and mke2fs -d copies the uid it finds -- a root-owned home is one the user
+# cannot write a single file into
+for h in "$tree"/home/*; do
+	[ -d "$h" ] || continue
+	u=$(awk -F: -v n="$(basename "$h")" '$1==n {print $3":"$4}' "$tree/etc/passwd")
+	[ -n "$u" ] && doas chown -R "$u" "$h"
+done
+
 # doas: the chown above made parts unreadable, and a du that cannot enter /root
 # undercounts until mke2fs runs out of blocks
 rootmb=$(( $(doas du -sm "$tree" | cut -f1) + slackmb ))

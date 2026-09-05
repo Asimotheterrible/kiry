@@ -6,7 +6,7 @@ root=${1:-$HOME/.cache/kiry/root}
 work=${KIRY_QEMU:-$HOME/.cache/kiry/qemu}
 mem=${KIRY_QEMU_MEM:-4096}
 cpus=${KIRY_QEMU_CPUS:-4}
-size=${KIRY_QEMU_SIZE:-8G}
+size=${KIRY_QEMU_SIZE:-}
 init=${KIRY_QEMU_INIT:-script}
 initrd=${KIRY_QEMU_INITRD:-}
 # never the passthrough backend: that one hands the guest the real machine's tpm
@@ -27,7 +27,9 @@ else
 rm -rf "$stage"
 mkdir -p "$work"
 cp -al "$root" "$stage"
-rm -rf "$stage/var/kiry/cache" "$stage/var/kiry/log"
+# build trees, packages and logs, none of which a boot test reads. the stage alone
+# was ten gigabytes of the seventeen this image was being sized for
+rm -rf "$stage/var/kiry/cache" "$stage/var/kiry/log" "$stage/var/kiry/stage"
 
 # rm first: the stage is hardlinked and a cp would write through to the real root
 kiry=${KIRY:-}
@@ -63,6 +65,9 @@ cat > "$stage/init" <<'EOF'
 #!/bin/sh
 busybox mount -t proc proc /proc
 busybox mount -t sysfs sys /sys
+busybox mkdir -p /dev/pts /dev/shm
+busybox mount -t devpts -o gid=5,mode=620 devpts /dev/pts
+busybox mount -t tmpfs -o mode=1777 shm /dev/shm
 export PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin
 export HOME=/root TERM=linux
 if [ -f /.run ]; then
@@ -77,6 +82,7 @@ fi
 EOF
 chmod 755 "$stage/init"
 
+[ -n "$size" ] || size=$(( $(du -sm "$stage" | cut -f1) + 2048 ))m
 echo "packing $size image"
 rm -f "$work/root.img"
 # mke2fs -d copies the uid it finds, so without this every file in the image belongs
@@ -182,6 +188,8 @@ case ${KIRY_QEMU_GPU:-} in
     *)  gpu= ;;
 esac
 
+extra=${KIRY_QEMU_ARGS:-}
+
 net=${KIRY_QEMU_NET:+-netdev user,id=n0 -device virtio-net-pci,netdev=n0}
 
 disk2=${KIRY_QEMU_DISK:+-drive file=$KIRY_QEMU_DISK,format=raw,if=virtio}
@@ -197,5 +205,5 @@ exec qemu-system-x86_64 \
 	-drive file="$work/root.img",format=raw,if=virtio \
 	$net $disk2 $gpu \
 	${initrd:+-initrd "$initrd"} \
-	$tpmargs \
+	$tpmargs $extra \
 	-append "root=/dev/vda rw $initopt console=ttyS0 panic=5"

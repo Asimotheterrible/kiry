@@ -281,6 +281,18 @@ fn devices(root: &Path) -> Result<(), String> {
         fs::write(&at, "").map_err(|e| format!("{}: {e}", at.display()))?;
         mount::mount_bind(format!("/dev/{n}"), &at).map_err(|e| format!("bind {n}: {e}"))?;
     }
+    // sem_open is a file under /dev/shm on musl, so without this any build that
+    // starts a python process pool dies on an import rather than on a missing tool
+    let shm = dev.join("shm");
+    fs::create_dir(&shm).map_err(|e| format!("{}: {e}", shm.display()))?;
+    mount::mount(
+        "tmpfs",
+        &shm,
+        "tmpfs",
+        MountFlags::empty(),
+        Some(c"mode=1777"),
+    )
+    .map_err(|e| format!("mount shm: {e}"))?;
     Ok(())
 }
 

@@ -151,7 +151,7 @@ fn build(
 ) -> Result<Vec<PathBuf>, String> {
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
-    let f = flags(root, &p.name)?;
+    let f = flags(root, &p.name, Some(&p.dir))?;
 
     let mut built = Vec::new();
     for t in targets {
@@ -598,6 +598,85 @@ update_config_guess() { :; }
 
 # kiry builds one package and does not run upstream test suites, so both are always no
 subpackages_has() { return 1; }
+# gentoo's names, doing to the environment what the recipe's filter file does to the
+# resolution. both halves exist because some builds only find out at configure time
+_kiry_drop() {
+\t_pat=$1
+\tshift
+\t_out=
+\tfor _f in \"$@\"; do
+\t\tcase \"$_f\" in
+\t\t$_pat) ;;
+\t\t*) _out=\"$_out $_f\" ;;
+\t\tesac
+\tdone
+\techo \"${_out# }\"
+}
+
+filter-flags() {
+\tfor _p in \"$@\"; do
+\t\tCFLAGS=$(_kiry_drop \"$_p\" $CFLAGS)
+\t\tCXXFLAGS=$(_kiry_drop \"$_p\" $CXXFLAGS)
+\tdone
+\texport CFLAGS CXXFLAGS
+}
+
+filter-ldflags() {
+\tfor _p in \"$@\"; do
+\t\tLDFLAGS=$(_kiry_drop \"$_p\" $LDFLAGS)
+\tdone
+\texport LDFLAGS
+}
+
+filter-lto() {
+\tfilter-flags '-flto*'
+\tfilter-ldflags '-flto*' '-Wl,--thinlto-jobs=*'
+}
+
+append-flags() {
+\tCFLAGS=\"$CFLAGS $*\"
+\tCXXFLAGS=\"$CXXFLAGS $*\"
+\texport CFLAGS CXXFLAGS
+}
+
+# in place, so the declarative half in the recipe filter file gives the same answer
+replace-flags() {
+\t_c= _x=
+\tfor _f in $CFLAGS; do
+\t\tcase \"$_f\" in $1) _c=\"$_c $2\" ;; *) _c=\"$_c $_f\" ;; esac
+\tdone
+\tfor _f in $CXXFLAGS; do
+\t\tcase \"$_f\" in $1) _x=\"$_x $2\" ;; *) _x=\"$_x $_f\" ;; esac
+\tdone
+\tCFLAGS=${_c# }
+\tCXXFLAGS=${_x# }
+\texport CFLAGS CXXFLAGS
+}
+
+strip-flags() {
+\t_c= _x=
+\tfor _f in $CFLAGS; do
+\t\tcase \"$_f\" in -O*|-march=*|-mtune=*|-mcpu=*|-pipe|-g*) _c=\"$_c $_f\" ;; esac
+\tdone
+\tfor _f in $CXXFLAGS; do
+\t\tcase \"$_f\" in -O*|-march=*|-mtune=*|-mcpu=*|-pipe|-g*) _x=\"$_x $_f\" ;; esac
+\tdone
+\tCFLAGS=${_c# }
+\tCXXFLAGS=${_x# }
+\texport CFLAGS CXXFLAGS
+}
+
+# the one that has to ask the compiler, so it prints what survived instead of setting it
+test-flags() {
+\t_out=
+\tfor _f in \"$@\"; do
+\t\tif ${CC:-cc} \"$_f\" -x c -c -o /dev/null /dev/null 2>/dev/null; then
+\t\t\t_out=\"$_out $_f\"
+\t\tfi
+\tdone
+\techo \"${_out# }\"
+}
+
 want_check() { return 1; }
 options_has() { case \" $options \" in *\" $1 \"*) return 0 ;; esac; return 1; }
 ";
@@ -938,8 +1017,8 @@ fn settings(root: &Path, name: &str) -> Result<Vec<(String, String, String)>, St
             Err(e) => return Err(format!("{}: {e}", at.display())),
         };
         for (n, l) in text.lines().enumerate() {
-            let l = l.trim();
-            if l.is_empty() || l.starts_with('#') {
+            let l = l.split('#').next().unwrap_or("").trim();
+            if l.is_empty() {
                 continue;
             }
             let (k, v) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
@@ -956,7 +1035,110 @@ fn settings(root: &Path, name: &str) -> Result<Vec<(String, String, String)>, St
     Ok(out)
 }
 
-fn flags(root: &Path, name: &str) -> Result<Flags, String> {
+// gentoo's names, because the portage grep that seeds these files writes them and a
+// translation step would be one more thing to get wrong. subtractive on purpose: the
+// recipe takes something out of what resolved, it does not restate the set, so raising
+// -O2 to -O3 globally still reaches a package that only dropped lto
+const VERBS: &[&str] = &[
+    "filter-lto",
+    "filter-flags",
+    "filter-ldflags",
+    "strip-flags",
+    "append-flags",
+    "replace-flags",
+];
+
+// what strip-flags leaves standing. anything that changes code generation in a way a
+// build can be picky about goes, and the ones that decide how fast and for what stay
+const KEPT_FLAGS: &[&str] = &["-O", "-march=", "-mtune=", "-mcpu=", "-pipe", "-g"];
+
+// one trailing * and nothing else. enough for -march=* and -flto*, and a full glob
+// would invite patterns nobody can predict the effect of
+fn like(pat: &str, s: &str) -> bool {
+    match pat.strip_suffix('*') {
+        Some(p) => s.starts_with(p),
+        None => s == pat,
+    }
+}
+
+fn filters(dir: &Path) -> Result<Vec<(String, String, String)>, String> {
+    let at = dir.join("filter");
+    let text = match fs::read_to_string(&at) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", at.display())),
+    };
+    let mut out = Vec::new();
+    for (n, l) in text.lines().enumerate() {
+        // the reason lives on the line, so a filter that looks wrong in six months has
+        // it beside it rather than in a commit nobody will go looking for
+        let l = l.split('#').next().unwrap_or("").trim();
+        if l.is_empty() {
+            continue;
+        }
+        let (k, v) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
+        if !VERBS.contains(&k) {
+            return Err(format!("{}:{}: {k} is not a flag-o-matic verb", at.display(), n + 1));
+        }
+        out.push((at.display().to_string(), k.into(), v.trim().into()));
+    }
+    Ok(out)
+}
+
+// applied after both config files, so what a recipe takes out is taken out of whatever
+// resolved rather than of a fixed set
+fn filtered(
+    from: &[(String, String, String)],
+    c: &mut Vec<String>,
+    cxx: &mut Vec<String>,
+    ld: &mut Vec<String>,
+) -> Result<(), String> {
+    for (src, k, v) in from {
+        let args: Vec<&str> = v.split_whitespace().collect();
+        match k.as_str() {
+            // the flag is in all three: clang wants it compiling and linking both, and
+            // the jobs cap is meaningless once it is gone
+            "filter-lto" => {
+                for l in [&mut *c, &mut *cxx, &mut *ld] {
+                    l.retain(|f| !f.starts_with("-flto") && !f.starts_with("-Wl,--thinlto-jobs"));
+                }
+            }
+            "filter-flags" => {
+                for l in [&mut *c, &mut *cxx] {
+                    l.retain(|f| !args.iter().any(|p| like(p, f)));
+                }
+            }
+            "filter-ldflags" => ld.retain(|f| !args.iter().any(|p| like(p, f))),
+            "strip-flags" => {
+                for l in [&mut *c, &mut *cxx] {
+                    l.retain(|f| KEPT_FLAGS.iter().any(|k| f.starts_with(k)));
+                }
+            }
+            "append-flags" => {
+                for a in &args {
+                    c.push((*a).to_string());
+                    cxx.push((*a).to_string());
+                }
+            }
+            "replace-flags" => {
+                let [was, now] = args[..] else {
+                    return Err(format!("{src}: replace-flags wants two flags, got {v:?}"));
+                };
+                for l in [&mut *c, &mut *cxx] {
+                    for f in l.iter_mut() {
+                        if like(was, f) {
+                            *f = now.to_string();
+                        }
+                    }
+                }
+            }
+            _ => unreachable!("verb list and match are the same list"),
+        }
+    }
+    Ok(())
+}
+
+fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
     let from = settings(root, name)?;
     let mut knob: HashMap<&str, String> =
         KNOBS.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
@@ -1029,24 +1211,32 @@ fn flags(root: &Path, name: &str) -> Result<Flags, String> {
     link.push("-Wl,-O2".into());
 
     // the file's own lines last, so appending -O0 or -g really does win
-    let join = |a: &[String], b: &[String]| {
-        a.iter()
-            .chain(b.iter())
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim()
-            .to_string()
-    };
+    let mut cf: Vec<String> = base.iter().chain(c.iter()).flat_map(words).collect();
+    let mut cxf: Vec<String> = base.iter().chain(cxx.iter()).flat_map(words).collect();
+    let mut ldf: Vec<String> = link.iter().chain(ld.iter()).flat_map(words).collect();
+
+    let mut from = from;
+    if let Some(d) = dir {
+        let f = filters(d)?;
+        filtered(&f, &mut cf, &mut cxf, &mut ldf)?;
+        from.extend(f);
+    }
+
     use_flags.sort();
     Ok(Flags {
-        cflags: join(&base, &c),
-        cxxflags: join(&base, &cxx),
-        ldflags: join(&link, &ld),
+        cflags: cf.join(" "),
+        cxxflags: cxf.join(" "),
+        ldflags: ldf.join(" "),
         use_flags,
         env,
         from,
     })
+}
+
+// a setting holds a whole line of flags and a filter names one at a time, so the line
+// has to come apart before anything can be taken out of it
+fn words(s: &String) -> Vec<String> {
+    s.split_whitespace().map(str::to_string).collect()
 }
 
 fn flags_cmd(args: &[String]) {
@@ -1067,12 +1257,16 @@ fn flags_cmd(args: &[String]) {
         if queue {
             die("--queue takes no package".into());
         }
-        let f = match flags(&root, name) {
+        let dir = recipe(&root, name);
+        let f = match flags(&root, name, dir.as_deref()) {
             Ok(f) => f,
             Err(e) => die(e),
         };
         for (src, k, v) in &f.from {
-            say!("{src} {k} {v}");
+            match v.is_empty() {
+                true => say!("{src} {k}"),
+                false => say!("{src} {k} {v}"),
+            }
         }
         for l in f.record() {
             say!("resolved {l}");
@@ -1090,7 +1284,8 @@ fn flags_cmd(args: &[String]) {
             let Ok(rec) = db::read(&root, t, &name) else {
                 continue;
             };
-            let now = match flags(&root, &name) {
+            let dir = recipe(&root, &name);
+            let now = match flags(&root, &name, dir.as_deref()) {
                 Ok(f) => f.record(),
                 Err(e) => die(e),
             };

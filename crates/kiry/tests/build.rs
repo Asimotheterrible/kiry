@@ -1922,3 +1922,116 @@ fn a_record_that_still_resolves_is_left_alone() {
     assert_eq!(String::from_utf8_lossy(&o.stdout), "");
     assert!(!db::queue(&root).exists());
 }
+
+// recipe() finds a package by a build script, so the filter needs one beside it
+fn filtered(root: &Path, at: &Path, name: &str, body: &str) {
+    let repo = at.join("repo");
+    let d = repo.join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("build"), GOOD).unwrap();
+    fs::write(d.join("filter"), body).unwrap();
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+}
+
+// the point of the whole subsystem: the recipe takes lto back out, and the -O3 the
+// config raised globally still arrives
+#[test]
+fn a_filter_is_subtractive_and_not_an_override() {
+    let root = scratch("filterlto");
+    config(&root, None, "OPT -O3\nCFLAGS_MARCH znver3\nLTO thin\n");
+    filtered(&root, &root, "mesa", "filter-lto  # oomed at 16 jobs, 2026-09-09\n");
+
+    let said = resolved(&root, "mesa");
+    assert!(
+        said.contains("resolved CFLAGS -O3 -march=znver3 -g0"),
+        "{said}"
+    );
+    assert!(said.contains("resolved LDFLAGS -Wl,-O2"), "{said}");
+    assert!(!said.contains("flto"), "{said}");
+    assert!(!said.contains("thinlto-jobs"), "{said}");
+    // the reason stays on the line and out of the flags
+    assert!(!said.contains("oomed"), "{said}");
+}
+
+#[test]
+fn a_filter_verb_that_is_not_one_is_refused_by_name() {
+    let root = scratch("filtertypo");
+    filtered(&root, &root, "mesa", "filter-lto\nfliter-flags -O2\n");
+
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), "mesa"]);
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("filter:2"), "{said}");
+    assert!(said.contains("fliter-flags is not a flag-o-matic verb"), "{said}");
+}
+
+#[test]
+fn the_other_verbs_reach_the_flags_they_name() {
+    let root = scratch("filterverbs");
+    config(&root, None, "OPT -O3\nCFLAGS_MARCH znver3\nCFLAGS -fomit-frame-pointer\n");
+    filtered(
+        &root,
+        &root,
+        "thing",
+        "replace-flags -O3 -O2\nfilter-flags -march=*\nappend-flags -fPIC\n",
+    );
+
+    let said = resolved(&root, "thing");
+    assert!(
+        said.contains("resolved CFLAGS -O2 -g0 -fomit-frame-pointer -fPIC"),
+        "{said}"
+    );
+}
+
+// only the ones that decide how fast and for what survive
+#[test]
+fn strip_flags_keeps_what_decides_code_generation() {
+    let root = scratch("filterstrip");
+    config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\nCFLAGS -fomit-frame-pointer -DNDEBUG\n");
+    filtered(&root, &root, "thing", "strip-flags\n");
+
+    let said = resolved(&root, "thing");
+    assert!(said.contains("resolved CFLAGS -O2 -march=znver3 -g0\n"), "{said}");
+}
+
+// the declarative half cannot help a build that only finds out at configure time, so
+// the same verbs have to be reachable from the script
+#[test]
+fn a_build_reaches_flag_o_matic_through_lib_sh() {
+    let at = scratch("libsh");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        ". /usr/share/kiry/lib.sh\n\
+         filter-lto\n\
+         replace-flags -O2 -Os\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\n\
+         echo \"$CFLAGS|$LDFLAGS\" > \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let art = cache(&root, ".tar.zst");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
+            root.display(),
+            art[0]
+        ))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    // test-flags is the one verb that asks the compiler, and this fixture's closure is
+    // busybox with no compiler in it, so it is exercised against ash directly instead
+    let mut f = said.trim().split('|');
+    assert_eq!(f.next(), Some("-Os -march=znver3 -g0"), "{said}");
+    assert_eq!(f.next(), Some("-Wl,-O2"), "{said}");
+}

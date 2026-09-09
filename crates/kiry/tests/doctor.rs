@@ -1,4 +1,4 @@
-// doctor answers the same question ldd does, so ldd is what it gets checked against.
+// doctor answers the same question ldd does, so ldd is what it gets checked against
 // the fixtures are placed and recorded the way install records them rather than built
 // through b: what is under test is linkage, not the build path
 
@@ -514,7 +514,7 @@ fn versioned_lib(at: &Path, node: &str) -> PathBuf {
     out
 }
 
-// alpine ships libscudo.so with no DT_SONAME at all and lld asks for it by that name.
+// alpine ships libscudo.so with no DT_SONAME at all and lld asks for it by that name
 // DT_NEEDED names a file, and the loader opens it without ever asking what the library
 // calls itself
 #[test]

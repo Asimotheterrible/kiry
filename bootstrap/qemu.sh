@@ -11,7 +11,10 @@ root=${1:-$HOME/.cache/kiry/root}
 work=${KIRY_QEMU:-$HOME/.cache/kiry/qemu}
 mem=${KIRY_QEMU_MEM:-4096}
 cpus=${KIRY_QEMU_CPUS:-4}
-size=${KIRY_QEMU_SIZE:-8G}
+# empty means measure the stage, the way usb.sh does. a fixed number was 8G and the
+# root outgrew it, and mke2fs says so as "Could not allocate block", which reads like
+# a bug in the image rather than a number that went stale
+size=${KIRY_QEMU_SIZE:-}
 # KIRY_QEMU_INIT=nitro boots what the root actually installed, rather than the throwaway
 # script below. the serial console service ships `down`, so it gets turned on here
 init=${KIRY_QEMU_INIT:-script}
@@ -86,6 +89,12 @@ cat > "$stage/init" <<'EOF'
 # devtmpfs is already mounted, the kernel does it before handing over
 busybox mount -t proc proc /proc
 busybox mount -t sysfs sys /sys
+# what SYS/setup mounts, because a test that boots this script instead of nitro
+# still has to look like the system. without devpts nothing that opens a terminal
+# works and foot says so as "failed to open PTY: No such file or directory"
+busybox mkdir -p /dev/pts /dev/shm
+busybox mount -t devpts -o gid=5,mode=620 devpts /dev/pts
+busybox mount -t tmpfs -o mode=1777 shm /dev/shm
 export PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin
 export HOME=/root TERM=linux
 if [ -f /.run ]; then
@@ -100,6 +109,7 @@ fi
 EOF
 chmod 755 "$stage/init"
 
+[ -n "$size" ] || size=$(( $(du -sm "$stage" | cut -f1) + 2048 ))m
 echo "packing $size image"
 rm -f "$work/root.img"
 # mke2fs -d copies the uid it finds and the stage is hardlinked to a root staged by
@@ -208,6 +218,24 @@ SFDISK
     	-drive file="$disk",format=raw,if=virtio ${KIRY_QEMU_DISK:+-drive file=$KIRY_QEMU_DISK,format=raw,if=virtio}
 fi
 
+# KIRY_QEMU_GPU=1 attaches a virtio-gpu, which is what makes /dev/dri/card0 appear. it
+# is the only way to run a compositor in here, and it lands on the same dumb-buffer path
+# a card with no driver of its own would
+# KIRY_QEMU_GPU=1 is a plain virtio-gpu: /dev/dri/card0 appears and mesa finds no
+# driver for it, so anything gl falls back to softpipe. KIRY_QEMU_GPU=gl is virgl, which
+# needs a display backend that can hold a gl context, and egl-headless is the one that
+# does not open a window
+case ${KIRY_QEMU_GPU:-} in
+    gl) gpu="-device virtio-gpu-gl-pci -display egl-headless" ;;
+    ?*) gpu="-device virtio-gpu-pci" ;;
+    *)  gpu= ;;
+esac
+
+# KIRY_QEMU_ARGS=... goes on the end of the command line as is. a monitor socket is
+# what it exists for: checking what the guest actually put on the screen means asking
+# qemu for a screendump, and nothing inside the guest can answer that
+extra=${KIRY_QEMU_ARGS:-}
+
 # KIRY_QEMU_NET=1 gives the guest qemu's user-mode network, which is enough to prove a
 # tls trust store and a dns lookup without touching a real interface
 net=${KIRY_QEMU_NET:+-netdev user,id=n0 -device virtio-net-pci,netdev=n0}
@@ -226,7 +254,7 @@ exec qemu-system-x86_64 \
 	-accel "$acc" -cpu max \
 	-kernel "$kernel" \
 	-drive file="$work/root.img",format=raw,if=virtio \
-	$net $disk2 \
+	$net $disk2 $gpu \
 	${initrd:+-initrd "$initrd"} \
-	$tpmargs \
+	$tpmargs $extra \
 	-append "root=/dev/vda rw $initopt console=ttyS0 panic=5"

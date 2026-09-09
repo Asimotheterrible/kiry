@@ -1,7 +1,7 @@
 mod convert;
 mod sandbox;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use kiry_core::pkg::Package;
+use kiry_core::pkg::{Dep, Package};
 use kiry_core::{db, elf, install, pkg};
 
 macro_rules! say {
@@ -84,11 +84,18 @@ fn opts(args: &[String]) -> (PathBuf, bool, Vec<String>) {
 
 // --root defaults to / and most of these commands write. checked only where one
 // mutates, so l and doctor still answer for the running system
+//
+// what is refused is a / that no kiry installed anything into, which is the machine
+// this gets built on. on the installed system / is the root it owns and there is
+// nothing to guard against
 fn writes(root: &Path) {
     let at = root.canonicalize();
     let at = at.as_deref().unwrap_or(root);
-    if at == Path::new("/") && std::env::var_os("KIRY_ROOT_REALLY").is_none() {
-        die("refusing to write to /, set KIRY_ROOT_REALLY=1 to mean it".into());
+    if at == Path::new("/")
+        && !Path::new("/usr/lib/kiry/db/installed").is_dir()
+        && std::env::var_os("KIRY_ROOT_REALLY").is_none()
+    {
+        die("refusing to write to /, which no kiry owns. set KIRY_ROOT_REALLY=1 to mean it".into());
     }
 }
 
@@ -164,6 +171,53 @@ fn build(
         let _ = fs::remove_dir_all(work);
     }
     Ok(ready.into_iter().map(|(_, (art, _))| art).collect())
+}
+
+// the gnu tier is a library layer. its recipes are the same ones the musl target uses,
+// so they also build the binaries and drop the config files that come with a library --
+// a second bzip2, a second CA.pl -- and /usr/bin and /etc have one owner across every
+// target, so the install is refused over a file nobody wanted twice
+//
+// the same holds for the documentation under usr/share. that path is musl's datadir --
+// the target's is inside the sysroot -- and the man page, the licence and the html
+// manual are byte-identical between the two builds anyway, so the second one is refused
+// over a file it had no reason to write. anything under usr/share a gnu build genuinely
+// needs, a pkg-config file or a cmake package, gets relocated by the recipe instead
+//
+// dropped rather than refused, because the alternative is the same three lines in
+// twenty recipes and each one able to forget. printed rather than silent, because a
+// build that quietly discards what it just made is the kind of thing that gets
+// diagnosed twice
+fn trim(dest: &Path, t: &str, name: &str) -> Result<(), String> {
+    if !t.ends_with("gnu") {
+        return Ok(());
+    }
+
+    let mut dropped = Vec::new();
+    for d in [
+        "usr/bin",
+        "usr/sbin",
+        // /bin and /sbin are symlinks into /usr here, so a recipe that installs to
+        // either lands on the same owned path by a different name
+        "bin",
+        "sbin",
+        "etc",
+        "usr/share/man",
+        "usr/share/doc",
+        "usr/share/info",
+        "usr/share/licenses",
+        "usr/share/locale",
+    ] {
+        let at = dest.join(d);
+        if at.exists() {
+            fs::remove_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+            dropped.push(d);
+        }
+    }
+    if !dropped.is_empty() {
+        say!("{name} {t} dropped {}", dropped.join(" "));
+    }
+    Ok(())
 }
 
 fn sources(root: &Path, p: &Package) -> Result<Vec<(String, PathBuf, String)>, String> {
@@ -278,7 +332,8 @@ fn compile(
     }
 
     let sysroot = work.join("sysroot");
-    let members = sandbox::closure(root, t, &p.depends)?;
+    let deps: Vec<Dep> = p.depends.iter().filter(|d| d.applies(t)).cloned().collect();
+    let members = sandbox::closure(root, t, &deps)?;
     sandbox::assemble(root, &members, &sysroot)?;
 
     fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
@@ -293,16 +348,77 @@ fn compile(
     let cmake_toolchain = share.join("toolchain.cmake");
     fs::write(
         &cmake_toolchain,
-        TOOLCHAIN_CMAKE.replace("@LIBDIR@", libdir(t).trim_start_matches("/usr/")),
+        TOOLCHAIN_CMAKE
+            .replace("@LIBDIR@", libdir(t).trim_start_matches("/usr/"))
+            .replace("@INCLUDEDIR@", incdir(t).trim_start_matches("/usr/"))
+            .replace("@DATADIR@", datadir(t).trim_start_matches("/usr/"))
+            .replace("@FIND@", if t.ends_with("gnu") { TOOLCHAIN_FIND } else { "" }),
     )
     .map_err(|e| format!("toolchain.cmake: {e}"))?;
 
+    // autoconf reads CONFIG_SITE before it decides anything, so a gnu package lands in
+    // /usr/lib64 without a single recipe saying --libdir. same standing as the cmake
+    // toolchain file: the target decides the layout, not the recipe
+    let config_site = share.join("config.site");
+    fs::write(
+        &config_site,
+        CONFIG_SITE
+            .replace("@LIBDIR@", libdir(t))
+            .replace("@INCLUDEDIR@", incdir(t))
+            .replace("@DATADIR@", datadir(t)),
+    )
+    .map_err(|e| format!("config.site: {e}"))?;
+
+    // cc is clang and clang defaults to the triple it was built for, which is the
+    // host's. a plain ./configure and a plain Makefile call cc and never look at CHOST,
+    // so without this a gnu build links musl, installs into usr/lib and reports success
+    //
+    // the gnu sysroot is where glibc puts its headers -- /usr/include is musl's -- and
+    // core/glibc installs the usr/lib64 name inside it that makes the libraries
+    // reachable from there too
+    // compiler-rt and libunwind in this tree are built for musl, so a gnu link asking
+    // for clang's defaults comes back with -lunwind missing. libgcc is what the gnu
+    // substrate ships, and core/gcc-runtime keeps its archives and linker script for
+    // exactly this
+    // the sysroot holds the headers and the runtime libraries are outside it, at
+    // /usr/lib64, so -l has to be told. -lstdc++ is the one that finds this out: it has
+    // no pkg-config file to carry a -L, so elfutils' demangler probe linked against
+    // nothing and configure decided libstdc++ had no __cxa_demangle in it
+    //
+    // -stdlib on the c compiler too, because this clang defaults to libc++ and rewrites
+    // a literal -lstdc++ to match its default -- so the probe went looking for libc++,
+    // which is llvm-runtimes' and built for musl
+    let sysroot_arg = if t.ends_with("gnu") {
+        " --sysroot=/usr/x86_64-linux-gnu --start-no-unused-arguments \
+-L/usr/lib64 -Wl,-rpath-link,/usr/lib64 -stdlib=libstdc++ \
+--rtlib=libgcc --unwindlib=libgcc --end-no-unused-arguments"
+    } else {
+        ""
+    };
+    let cc = CC_WRAPPER
+        .replace("@TRIPLE@", triple(t))
+        .replace("@SYSROOT@", sysroot_arg);
+    // no directory means no c++ in this closure, which a c package is entitled to. the
+    // flags come out empty and a c++ compile then fails at its first include, which says
+    // more than a wrapper that refused to be written
+    let cxx_extra = match gcc_headers(&sysroot) {
+        Some(d) => format!(
+            " -cxx-isystem {d} -cxx-isystem {d}/x86_64-linux-gnu -cxx-isystem {d}/backward"
+        ),
+        None => String::new(),
+    };
+
     for (n, body) in [
-        ("abuild-meson", MESON.replace("@LIBDIR@", libdir(t))),
-        ("abuild-muon", MESON.replace("@LIBDIR@", libdir(t))),
+        ("abuild-meson", meson_wrapper(t)),
+        ("abuild-muon", meson_wrapper(t)),
         (
             "meson",
             "#!/bin/sh -e\nexec muon meson \"$@\"\n".to_string(),
+        ),
+        ("kiry-cc", cc.replace("@REAL@", "clang")),
+        (
+            "kiry-c++",
+            cc.replace("@REAL@", "clang++").replace("\"$@\"", &format!("{cxx_extra} \"$@\"")),
         ),
     ] {
         let at = bin.join(n);
@@ -314,7 +430,18 @@ fn compile(
     let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut c = Command::new(me);
     c.arg("sandbox")
+        // an inherited CFLAGS or PYTHONPATH would change a build without appearing
+        // in any recipe, and the closure is meant to be the whole of what one sees
+        .env_clear()
         .env("KIRY_SANDBOX", abs(&work)?)
+        .env("HOME", "/src")
+        .env("TMPDIR", "/tmp")
+        .env("TERM", "dumb")
+        // c.utf8 rather than c: musl has it, and python trips over unicode paths
+        // under plain c
+        .env("LANG", "C.UTF-8")
+        .env("LC_ALL", "C.UTF-8")
+        .env("TZ", "UTC")
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("DESTDIR", "/dest")
         // every apkbuild build() leans on abuild exporting this and never says -j itself
@@ -330,11 +457,37 @@ fn compile(
         .env("CARCH", t.split('-').next().unwrap_or(t))
         .env("CTARGET_ARCH", t.split('-').next().unwrap_or(t))
         .env("CMAKE_TOOLCHAIN_FILE", "/usr/share/kiry/toolchain.cmake")
+        .env("CONFIG_SITE", "/usr/share/kiry/config.site")
+        // for the configures that are not autoconf and read no site file. a handful of
+        // recipes pass these as --libdir and friends; the rest never see them
+        .env("KIRY_LIBDIR", libdir(t))
+        .env("KIRY_INCLUDEDIR", incdir(t))
+        .env("KIRY_DATADIR", datadir(t))
+        // pkgconf's built-in path is /usr/lib/pkgconfig, which is musl's. a gnu build
+        // asking for libdrm would be handed the musl one's cflags and libs and link
+        // against it without a word, which is the whole failure the split directory
+        // exists to prevent, arriving through a text file
+        .env(
+            "PKG_CONFIG_LIBDIR",
+            format!("{}/pkgconfig:{}/pkgconfig", libdir(t), datadir(t)),
+        )
+        // named rather than left to cc, because a configure that goes looking finds
+        // clang either way and the point is the flags that come with it
+        .env("CC", "kiry-cc")
+        .env("CXX", "kiry-c++")
         .env("KIRY_SRCDIR", "/src")
         .env("KIRY_TARGET", t)
         .env("KIRY_NAME", &p.name)
         .env("KIRY_VERSION", &p.version.upstream)
         .env("KIRY_REV", p.version.rev.to_string());
+
+    // read on the far side of the clear, so they have to cross by name. without the
+    // cap a build that allocates without bound takes the machine down, not itself
+    for k in ["KIRY_MEM", "KIRY_HOST"] {
+        if let Some(v) = std::env::var_os(k) {
+            c.env(k, v);
+        }
+    }
 
     // the log is written either way. -v only decides whether you also watch it
     let log = root.join("var/kiry/log").join(format!(
@@ -351,7 +504,10 @@ fn compile(
     }
 
     match c.status() {
-        Ok(s) if s.success() => Ok(work),
+        Ok(s) if s.success() => {
+            trim(&dest, t, &p.name)?;
+            Ok(work)
+        }
         Ok(_) if verbose => Err(format!("{} {t}: build failed", p.name)),
         Ok(_) => Err(format!(
             "{} {t}: build failed, log is {}",
@@ -375,6 +531,9 @@ default_prepare() {
 \t\t_f=${_f##*/}
 \t\tcase \"$_f\" in
 \t\t*.patch) patch ${patch_args:--p1} -i \"$srcdir/$_f\" || return 1 ;;
+\t\t*.patch.gz) gzip -cd \"$srcdir/$_f\" | patch ${patch_args:--p1} || return 1 ;;
+\t\t*.patch.xz) xz -cd \"$srcdir/$_f\" | patch ${patch_args:--p1} || return 1 ;;
+\t\t*.patch.bz2) bzip2 -cd \"$srcdir/$_f\" | patch ${patch_args:--p1} || return 1 ;;
 \t\tesac
 \tdone
 }
@@ -395,15 +554,53 @@ want_check() { return 1; }
 options_has() { case \" $options \" in *\" $1 \"*) return 0 ;; esac; return 1; }
 ";
 
+// autoconf sources this before it decides anything, so libdir follows the target
+// without a recipe passing --libdir. hand-rolled configures do not read it and still
+// need the flag; that is a handful of recipes rather than all of them
+const CONFIG_SITE: &str = "\
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+datarootdir=@DATADIR@
+";
+
+// cc is clang and clang defaults to the triple it was built for. a plain ./configure
+// and a plain Makefile call cc and never look at CHOST, so a gnu build without this
+// links musl and installs into usr/lib and says it worked
+//
+// the no-unused-arguments pair is not decoration. --rtlib and --unwindlib mean nothing
+// to a -c compile and clang warns about each one, and a configure that probes by
+// checking whether the compiler printed anything reads that as the feature missing
+// zlib decided it had no strerror this way, then failed to build against its own
+// conclusion
+//
+// exec rather than a shell function so $CC being split on whitespace behaves, and -e so
+// a missing clang says so instead of returning success
+const CC_WRAPPER: &str = "\
+#!/bin/sh -e
+exec @REAL@ --target=@TRIPLE@@SYSROOT@ \"$@\"
+";
+
 // abuild's wrapper, deviating twice: auto_features stays auto because the closure is
 // what a detection can see, and libdir follows the target
 // cmake's GNUInstallDirs picks lib64 on any 64-bit linux that is not debian, arch or
-// alpine -- it looks for /etc/alpine-release, which this tree deliberately does not have.
+// alpine -- it looks for /etc/alpine-release, which this tree deliberately does not have
 // usr/lib64 is the gnu tier, so a musl package landing there is the cross-tier bug the
 // split directory exists to prevent. a toolchain file is the documented way in, and
 // cmake reads its path from the environment
 const TOOLCHAIN_CMAKE: &str = "\
 set(CMAKE_INSTALL_LIBDIR \"@LIBDIR@\")
+set(CMAKE_INSTALL_INCLUDEDIR \"@INCLUDEDIR@\")
+set(CMAKE_INSTALL_DATAROOTDIR \"@DATADIR@\")
+@FIND@";
+
+// find_package looks under the prefixes cmake knows about, and the gnu tier's headers
+// and cmake packages are in the sysroot, which is not one of them -- vulkan-loader asks
+// for VulkanHeaders and is told it is not installed while it sits in the closure
+// programs stay off it: a build tool that runs here is the host's
+const TOOLCHAIN_FIND: &str = "\
+set(CMAKE_PREFIX_PATH \"/usr/x86_64-linux-gnu/usr\")
+set(CMAKE_FIND_ROOT_PATH \"/usr/x86_64-linux-gnu\")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 ";
 
 const MESON: &str = "\
@@ -414,10 +611,10 @@ exec muon meson setup \\
 \t-Dlibexecdir=/usr/libexec \\
 \t-Dbindir=/usr/bin \\
 \t-Dsbindir=/usr/sbin \\
-\t-Dincludedir=/usr/include \\
-\t-Ddatadir=/usr/share \\
-\t-Dmandir=/usr/share/man \\
-\t-Dlocaledir=/usr/share/locale \\
+\t-Dincludedir=@INCLUDEDIR@ \\
+\t-Ddatadir=@DATADIR@ \\
+\t-Dmandir=@DATADIR@/man \\
+\t-Dlocaledir=@DATADIR@/locale \\
 \t-Dsysconfdir=/etc \\
 \t-Dlocalstatedir=/var \\
 \t-Dsharedstatedir=/var/lib \\
@@ -431,6 +628,56 @@ exec muon meson setup \\
 \t-Dwerror=false \\
 \t\"$@\"
 ";
+
+// /usr/include is musl's and a glibc header set over it would make every later musl
+// build compile against the wrong libc, so the gnu tier's headers live in the sysroot
+// core/glibc already populates. the same goes for everything arch-independent: two
+// targets of one recipe ship the same man page, and one filesystem has one owner, so
+// without this the second target is refused at install over a file that is genuinely
+// identical. libraries stay in /usr/lib64, which is where the loader looks
+fn incdir(t: &str) -> &'static str {
+    if t.ends_with("gnu") {
+        "/usr/x86_64-linux-gnu/usr/include"
+    } else {
+        "/usr/include"
+    }
+}
+
+fn datadir(t: &str) -> &'static str {
+    if t.ends_with("gnu") {
+        "/usr/x86_64-linux-gnu/usr/share"
+    } else {
+        "/usr/share"
+    }
+}
+
+// libc++ is llvm-runtimes' and llvm-runtimes is built for musl, so a gnu c++ compile
+// reaches through libc++'s headers into musl's internal ones -- bits/alltypes.h, which
+// glibc has never heard of. libstdc++ is what the gnu substrate ships
+//
+// -stdlib alone does not get there: clang works out where libstdc++'s headers are from
+// the gcc installation sitting next to its own binary and never consults --sysroot for
+// them, so it looks in /usr/include/c++, which is musl's side
+fn gcc_headers(sysroot: &Path) -> Option<String> {
+    let at = sysroot.join("usr/x86_64-linux-gnu/usr/include/c++");
+    let mut v: Vec<String> = fs::read_dir(&at)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    Some(format!(
+        "/usr/x86_64-linux-gnu/usr/include/c++/{}",
+        v.pop()?
+    ))
+}
+
+fn meson_wrapper(t: &str) -> String {
+    MESON
+        .replace("@LIBDIR@", libdir(t))
+        .replace("@INCLUDEDIR@", incdir(t))
+        .replace("@DATADIR@", datadir(t))
+}
 
 fn libdir(t: &str) -> &'static str {
     if t.ends_with("gnu") {
@@ -539,10 +786,13 @@ fn meta(p: &Package, t: &str, hash: &str, art: &Path) -> Result<(), String> {
     put(&d.join("targets"), &format!("{t}\n"))?;
     put(&d.join("hash"), &format!("{hash}\n"))?;
 
-    let deps = p.dir.join("depends");
-    if deps.is_file() {
-        fs::copy(&deps, d.join("depends")).map_err(|e| format!("{}: {e}", deps.display()))?;
+    // one line per dep that applies to this target, the same narrowing targets gets --
+    // an artifact is built for one target and carries what that build actually used
+    let mut deps = String::new();
+    for x in p.depends.iter().filter(|x| x.applies(t)) {
+        deps.push_str(&format!("{x}\n"));
     }
+    put(&d.join("depends"), &deps)?;
     Ok(())
 }
 
@@ -626,6 +876,47 @@ fn install_cmd(args: &[String]) {
         say!("{} {} {} ok", j.name, j.version.upstream, j.target);
     }
     enqueue(&root, &broke, &named(&jobs));
+    hooks(&root, jobs.iter().map(|j| j.target.clone()).collect());
+}
+
+// a generated file that has to be rebuilt whenever a target's tree changes, and the
+// first one is the gnu ld.so.cache: pressure-vessel reads it, and glibc's ldconfig has
+// to be run somewhere /usr/lib is not visible, because its builtin directory list is
+// /usr/lib and /usr/lib64 and no config file subtracts from it. that is a chroot and a
+// bind mount, so it cannot live in kiry-core and does not belong in the binary either
+//
+// config rather than package data. a directory of scripts is fixable from a rescue
+// shell without rebuilding whatever installed it, which is the hand-edit invariant
+// applied to the one thing that runs while a system is half-assembled
+//
+// argv is the targets the transaction touched, so a hook for one tier can return
+// without doing anything. the transaction already happened, so a hook that fails is
+// reported and not fatal -- there is nothing left to roll back, and dying here would
+// only hide what landed
+fn hooks(root: &Path, targets: BTreeSet<String>) {
+    let dir = root.join("etc/kiry/hooks.d");
+    let Ok(rd) = fs::read_dir(&dir) else {
+        return;
+    };
+
+    let mut found: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    found.sort();
+
+    for h in found {
+        // executable or it is not a hook. that turns one off without deleting it, and
+        // it passes over editor droppings for free
+        match h.metadata() {
+            Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => {}
+            _ => continue,
+        }
+        let mut c = Command::new(&h);
+        c.args(&targets).env("KIRY_ROOT", root);
+        match c.status() {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!("kiry: {}: {s}", h.display()),
+            Err(e) => eprintln!("kiry: {}: {e}", h.display()),
+        }
+    }
 }
 
 fn named(jobs: &[install::Job]) -> HashSet<(String, String)> {
@@ -685,6 +976,7 @@ fn remove_cmd(args: &[String]) {
             say!("{name} {t} removed {} file{s}{note}", r.gone);
         }
     }
+    hooks(&root, plan.iter().map(|(t, _)| (*t).clone()).collect());
 }
 
 fn list_cmd(args: &[String]) {
@@ -737,7 +1029,11 @@ fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<
                 let deps = recipes.get(&want[*i].0).map(|p| &p.depends);
                 !left.iter().any(|j| {
                     j != i
-                        && deps.is_some_and(|d| d.iter().any(|x| !x.make && x.name == want[*j].0))
+                        && deps.is_some_and(|d| {
+                            d.iter().any(|x| {
+                                !x.make && x.applies(&want[*i].1) && x.name == want[*j].0
+                            })
+                        })
                 })
             })
             .collect();
@@ -844,6 +1140,7 @@ fn rebuild_cmd(args: &[String]) {
             say!("{} {} {} rebuilt", j.name, j.version.upstream, j.target);
         }
         enqueue(&root, &broke, &named(&jobs));
+        hooks(&root, jobs.iter().map(|j| j.target.clone()).collect());
     }
 
     // a rebuild that ran is off the queue whether or not it fixed anything, or the next
@@ -1069,7 +1366,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
     let mut here: HashMap<String, usize> = HashMap::new();
     let mut links: HashMap<String, String> = HashMap::new();
     let mut shebangs: Vec<(String, String, Vec<String>)> = Vec::new();
-    // every regular file, not only the ones that parse as elf: an interpreter is a file.
+    // every regular file, not only the ones that parse as elf: an interpreter is a file
     // a hardlink is one too -- the same inode under a second name, which is how perl
     // ships /usr/bin/perl beside perl5.44.0
     let mut present: HashSet<String> = HashSet::new();
@@ -1292,7 +1589,7 @@ fn provider(
         .find_map(|d| at_path(here, links, &format!("{d}/{want}")))
 }
 
-// the loader opens a path, so a symlink on the way to a library is part of resolution.
+// the loader opens a path, so a symlink on the way to a library is part of resolution
 // musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1 points at the loader
 // itself. a hardlink is a file too, which is how perl ships /usr/bin/perl beside
 // perl5.44.0
@@ -1494,11 +1791,7 @@ fn show(dir: &str) {
     say!("targets {}", p.targets.join(" "));
 
     for d in &p.depends {
-        if d.make {
-            say!("dep {} make", d.name);
-        } else {
-            say!("dep {}", d.name);
-        }
+        say!("dep {d}");
     }
 
     for (i, src) in p.sources.iter().enumerate() {

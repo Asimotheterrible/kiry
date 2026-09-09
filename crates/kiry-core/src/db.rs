@@ -261,11 +261,7 @@ pub fn write(root: &Path, rec: &Installed) -> Result<(), Error> {
 
     let mut depends = String::new();
     for d in &rec.depends {
-        depends.push_str(&d.name);
-        if d.make {
-            depends.push_str(" make");
-        }
-        depends.push('\n');
+        depends.push_str(&format!("{d}\n"));
     }
 
     let d = dir(root, &rec.target, &rec.name);

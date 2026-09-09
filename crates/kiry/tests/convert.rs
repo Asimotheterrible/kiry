@@ -468,7 +468,7 @@ fn a_package_that_reads_ctarget_is_not_a_cross_compiler() {
 }
 
 // a body says $pkgver as readily as it says $srcdir. an unset one expands to nothing
-// instead of failing, so install libbz2.so.$pkgver lands a file called libbz2.so.
+// instead of failing, so install libbz2.so.$pkgver lands a file called libbz2.so
 #[test]
 fn the_script_knows_its_own_name_and_version() {
     if !have_busybox() {

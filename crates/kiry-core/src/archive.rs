@@ -668,7 +668,7 @@ mod tests {
 
     // mkdirat and openat take the umask off the mode they are handed, and a directory
     // already on disk keeps whatever it was made with. /tmp came out 1755 with the
-    // manifest saying 1777, which is every user able to unlink every other user's files.
+    // manifest saying 1777, which is every user able to unlink every other user's files
     // `already` is the half that does not depend on what umask this runs under
     #[test]
     fn the_mode_on_disk_is_the_mode_the_manifest_says() {

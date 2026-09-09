@@ -249,7 +249,7 @@ fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
             if rec.manifest.len() != before {
                 db::write(root, &rec)?;
                 // provides names paths as well, and a record pointing at a file the
-                // package no longer owns is the exact thing the stale check reports.
+                // package no longer owns is the exact thing the stale check reports
                 // keeping what the manifest still holds rather than dropping what was
                 // taken also heals an entry an older kiry left behind
                 let own: HashSet<&str> = rec.manifest.iter().map(|e| e.path.as_str()).collect();
@@ -387,6 +387,8 @@ mod tests {
                 .map(|d| Dep {
                     name: d.to_string(),
                     make: false,
+                    host: false,
+                    only: None,
                 })
                 .collect(),
             archive: PathBuf::from(format!("{name}.tar.zst")),

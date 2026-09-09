@@ -39,7 +39,35 @@ impl fmt::Display for Version {
 #[derive(Debug, Clone)]
 pub struct Dep {
     pub name: String,
+    // build-time only: not a runtime edge, so nothing follows it outward and removing
+    // the named package is not blocked by this one
     pub make: bool,
+    // resolved under KIRY_HOST rather than the target being built
+    pub host: bool,
+    // a target suffix the line is restricted to, matched the way a triple ends. musl
+    // needs fts and obstack and argp as separate packages and glibc has all three
+    // built in, so on gnu those names must not resolve to anything at all
+    pub only: Option<String>,
+}
+
+impl Dep {
+    pub fn applies(&self, target: &str) -> bool {
+        self.only.as_deref().is_none_or(|o| target.ends_with(o))
+    }
+}
+
+// the line this came from, so a record written back out reads like the recipe did
+impl fmt::Display for Dep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)?;
+        if self.make {
+            write!(f, "{}", if self.host { " make" } else { " build" })?;
+        }
+        match &self.only {
+            Some(o) => write!(f, " {o}"),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -114,15 +142,30 @@ pub(crate) fn lines(p: &Path) -> Result<Vec<String>, Error> {
         .collect())
 }
 
-// " make" suffix means build-only
+// both suffixes mean build-only and they differ in which target answers. " make" is a
+// tool that runs during the build, so the host's copy of it is the right one -- bison,
+// perl. " build" is something compiled against, so it has to be the target's --
+// xorgproto, wayland-protocols, and every other package that is only headers. one word
+// meant both until a gnu build looked for X11/Xfuncproto.h and found musl's
 pub(crate) fn depends_from(ls: Vec<String>) -> Vec<Dep> {
     let mut out = Vec::new();
     for l in ls {
         let mut f = l.split_whitespace();
         let Some(name) = f.next() else { continue };
+        // the two words after the name are told apart by which they are rather than by
+        // position, so neither order can be got wrong by hand
+        let (mut kind, mut only) = (None, None);
+        for w in f {
+            match w {
+                "make" | "build" => kind = Some(w),
+                _ => only = Some(w.to_string()),
+            }
+        }
         out.push(Dep {
             name: name.to_string(),
-            make: f.next() == Some("make"),
+            make: kind == Some("make") || kind == Some("build"),
+            host: kind == Some("make"),
+            only,
         });
     }
     out
@@ -186,6 +229,34 @@ mod tests {
         assert!(!p.depends[0].make);
         assert_eq!(p.depends[2].name, "muon");
         assert!(p.depends[2].make);
+    }
+
+    #[test]
+    fn a_dep_can_be_restricted_to_one_target() {
+        let d = depends_from(
+            [
+                "musl-fts musl",
+                "bsd-compat-headers build musl",
+                // the other order, because a hand-written line gets both
+                "argp-standalone musl build",
+                "zlib",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        );
+
+        assert_eq!(d[0].only.as_deref(), Some("musl"));
+        assert!(!d[0].make, "the target word was read as a kind");
+        assert!(d[1].make && !d[1].host);
+        assert!(d[2].make && !d[2].host && d[2].only.as_deref() == Some("musl"));
+
+        for x in &d[..3] {
+            assert!(x.applies("x86_64-musl"), "{x} is musl's");
+            assert!(!x.applies("x86_64-gnu"), "{x} reached the gnu build");
+        }
+        assert!(d[3].applies("x86_64-gnu"), "an unrestricted dep got dropped");
+        assert_eq!(d[1].to_string(), "bsd-compat-headers build musl");
     }
 
     #[test]

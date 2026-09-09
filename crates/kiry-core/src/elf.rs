@@ -520,6 +520,10 @@ fn symbols(
             None => (None, true),
         };
 
+        // a versioned undefined symbol names the version it wants, not one it defines,
+        // so there is no default for it to be -- readelf writes those with one @ for the
+        // same reason. an unversioned one has no @ at all and stays
+        let default = default && (version.is_none() || shndx != SHN_UNDEF);
         let sym = Sym {
             name: string(strs, name.into())?,
             version,

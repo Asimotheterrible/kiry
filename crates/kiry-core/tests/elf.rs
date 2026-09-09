@@ -305,13 +305,28 @@ fn dyn_syms(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
     map
 }
 
+// gnu readelf's get_symbol_version_string guards the print on st_name != vda_name, so
+// it never writes GLIBC_2.10@GLIBC_2.10 for the abs symbol glibc points at its own
+// verdef entry. llvm-readelf has no such guard and prints it, so which one is on the
+// path decides whether that version is there to compare against
+fn readelf_is_llvms() -> bool {
+    static IS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS.get_or_init(|| {
+        Command::new("readelf")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("LLVM"))
+    })
+}
+
 fn mine(e: &elf::Elf) -> Vec<RSym> {
+    let llvm = readelf_is_llvms();
     let f = |s: &elf::Sym, undefined: bool| RSym {
         name: s.name.clone(),
-        // glibc exports every version name as an ABS symbol pointed at its own verdef
-        // entry, and get_symbol_version_string guards the print on st_name != vda_name,
-        // so readelf never writes GLIBC_2.10@GLIBC_2.10
-        version: s.version.clone().filter(|v| *v != s.name),
+        version: s
+            .version
+            .clone()
+            .filter(|v| llvm || *v != s.name),
         default: s.default,
         weak: s.weak,
         object: s.object,
@@ -436,11 +451,17 @@ fn reads_a_symbol_too_big_for_readelf_to_print_in_decimal() {
                 .nth(2)
                 .is_some_and(|s| s.starts_with("0x"))
     });
-    assert!(
-        hex,
-        "readelf printed the size in decimal, so the fixture no longer reaches the \
-         hex branch and this test proves nothing"
-    );
+    // llvm-readelf prints every size in decimal, so where readelf is llvm's the hex
+    // branch in the harness cannot be reached and only the size below still means
+    // something. the claim is guarded rather than the whole test, which still checks
+    // that kiry reads the size right either way
+    if !hex {
+        assert!(
+            std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+            "readelf printed the size in decimal, so the fixture no longer reaches the \
+             hex branch and this test proves less than it says"
+        );
+    }
 
     let got = mine(&elf::parse(&std::fs::read(&so).unwrap()).unwrap());
     let want = &dyn_syms(&[&so])[&so];

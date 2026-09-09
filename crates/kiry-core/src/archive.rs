@@ -157,7 +157,7 @@ fn walk<R: Read>(
 
 // mkdirat, symlinkat and linkat take no resolve flags, so the parent is opened with
 // openat2 first and the last component created relative to that fd
-pub fn extract(root: &Path, archive: &Path) -> Result<Vec<db::Entry>, Error> {
+pub fn extract(root: &Path, archive: &Path, skip: &[String]) -> Result<Vec<db::Entry>, Error> {
     let f = fs::File::open(archive).map_err(|e| Error::Io(archive.to_path_buf(), e))?;
     let z = ruzstd::decoding::StreamingDecoder::new(io::BufReader::new(f)).map_err(|_| {
         Error::Archive {
@@ -169,8 +169,12 @@ pub fn extract(root: &Path, archive: &Path) -> Result<Vec<db::Entry>, Error> {
     let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
 
+    let keep = setuid_allowed(root);
     let mut manifest: Vec<db::Entry> = Vec::new();
-    walk(root, z, |entry, m| apply(&rootfd, entry, m, &mut manifest)).map_err(|e| match e {
+    walk(root, z, |entry, m| {
+        apply(&rootfd, entry, m, &keep, skip, &mut manifest)
+    })
+    .map_err(|e| match e {
         Error::Io(p, inner) if p.as_os_str().is_empty() => Error::Io(archive.to_path_buf(), inner),
         other => other,
     })?;
@@ -182,18 +186,36 @@ fn apply<R: Read>(
     rootfd: &OwnedFd,
     entry: &mut tar::Entry<'_, R>,
     m: &Member,
+    keep: &[String],
+    skip: &[String],
     manifest: &mut Vec<db::Entry>,
 ) -> Result<(), Error> {
     let (parent, name) = split(&m.path);
     let pfd = parent_fd(rootfd, parent, manifest)?;
 
-    // /etc/kiry/setuid does not exist yet
-    let mode = m.mode & 0o1777;
+    let mode = if keep.iter().any(|p| p == &m.path) {
+        m.mode & 0o7777
+    } else {
+        m.mode & 0o1777
+    };
 
     let kind = match &m.what {
         What::Dir => {
             mkdir(&pfd, name, mode, &m.path)?;
             db::Kind::Dir
+        }
+        // records the archive's hash, not the disk's, so unlink still refuses to delete it
+        What::File if skip.iter().any(|p| p == &m.path) => {
+            let mut h = Sha256::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = entry.read(&mut buf).map_err(anon)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            db::Kind::File(hex(&h.finalize()))
         }
         What::File => {
             clear(&pfd, name);
@@ -206,10 +228,6 @@ fn apply<R: Read>(
             .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
 
             let mut out = fs::File::from(fd);
-            // the same umask, on a file this time. 0644 and 0755 survive it and 0666
-            // does not, and which modes happen to be safe is not a thing to rely on
-            out.set_permissions(fs::Permissions::from_mode(mode))
-                .map_err(|e| Error::Io(m.path.clone().into(), e))?;
             let mut h = Sha256::new();
             let mut buf = [0u8; 64 * 1024];
             loop {
@@ -221,6 +239,11 @@ fn apply<R: Read>(
                 out.write_all(&buf[..n])
                     .map_err(|e| Error::Io(m.path.clone().into(), e))?;
             }
+            // after the write, not before: writing takes setuid back off for anyone
+            // without CAP_FSETID. it also undoes the umask openat applied, which 0644
+            // and 0755 happen to survive and 0666 does not -- not a thing to rely on
+            out.set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|e| Error::Io(m.path.clone().into(), e))?;
             db::Kind::File(hex(&h.finalize()))
         }
         What::Link(target) => {
@@ -249,6 +272,20 @@ fn apply<R: Read>(
         path: m.path.clone(),
     });
     Ok(())
+}
+
+// setuid and setgid come off everything by default. /etc/kiry/setuid names the
+// exceptions, one absolute path per line, and a root without the file gets none of
+// them -- the repair path has to be safe on a system with no config left
+fn setuid_allowed(root: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(root.join("etc/kiry/setuid")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.trim_start_matches('/').to_string())
+        .collect()
 }
 
 fn split(path: &str) -> (&str, &str) {
@@ -685,7 +722,7 @@ mod tests {
         let rootfd =
             rustix::fs::open(&r, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
         let mut manifest = Vec::new();
-        walk(&r, &t[..], |e, m| apply(&rootfd, e, m, &mut manifest)).unwrap();
+        walk(&r, &t[..], |e, m| apply(&rootfd, e, m, &[], &[], &mut manifest)).unwrap();
 
         for (path, want) in [("already", 0o1777), ("tmp", 0o1777), ("shared", 0o666)] {
             let got = fs::metadata(r.join(path)).unwrap().permissions().mode() & 0o7777;

@@ -356,7 +356,7 @@ fn it_extracts_a_real_tarball() {
 
     let dest = r.join("dest");
     fs::create_dir_all(&dest).unwrap();
-    let man = archive::extract(&dest, &arc).unwrap();
+    let man = archive::extract(&dest, &arc, &[]).unwrap();
 
     assert_eq!(
         fs::read_to_string(dest.join("usr/bin/foo")).unwrap(),
@@ -398,7 +398,7 @@ fn a_file_replaces_a_symlink_already_on_disk() {
     fs::write(dest.join("canary"), b"do not touch").unwrap();
     std::os::unix::fs::symlink("/canary", dest.join("usr/bin/foo")).unwrap();
 
-    archive::extract(&dest, &arc).unwrap();
+    archive::extract(&dest, &arc, &[]).unwrap();
 
     assert_eq!(
         fs::read_to_string(dest.join("canary")).unwrap(),
@@ -410,6 +410,40 @@ fn a_file_replaces_a_symlink_already_on_disk() {
         .symlink_metadata()
         .unwrap()
         .is_symlink());
+}
+
+// the allowlist is what /etc/kiry/setuid is for, and a root that has not got the file
+// is the default the test above pins
+#[test]
+fn a_listed_path_keeps_its_setuid_bit() {
+    let r = root("suid-allowed");
+    let src = r.join("src");
+    fs::create_dir_all(src.join("usr/bin")).unwrap();
+    let p = src.join("usr/bin/doas");
+    fs::write(&p, b"x").unwrap();
+    fs::set_permissions(
+        &p,
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o4755),
+    )
+    .unwrap();
+    let arc = r.join("p.tar.zst");
+    build(&src, &arc);
+
+    let dest = r.join("dest");
+    fs::create_dir_all(dest.join("etc/kiry")).unwrap();
+    fs::write(
+        dest.join("etc/kiry/setuid"),
+        "# a comment\n\n/usr/bin/doas\n/usr/bin/never-shipped\n",
+    )
+    .unwrap();
+    let man = archive::extract(&dest, &arc, &[]).unwrap();
+
+    let e = man.iter().find(|e| e.path == "usr/bin/doas").unwrap();
+    assert_eq!(e.mode, 0o4755, "setuid missing from the manifest");
+    let on_disk = <fs::Metadata as std::os::unix::fs::MetadataExt>::mode(
+        &fs::metadata(dest.join("usr/bin/doas")).unwrap(),
+    );
+    assert_eq!(on_disk & 0o7777, 0o4755, "setuid missing on disk");
 }
 
 #[test]
@@ -429,7 +463,7 @@ fn setuid_bits_do_not_survive() {
 
     let dest = r.join("dest");
     fs::create_dir_all(&dest).unwrap();
-    let man = archive::extract(&dest, &arc).unwrap();
+    let man = archive::extract(&dest, &arc, &[]).unwrap();
 
     let e = man.iter().find(|e| e.path == "usr/bin/ping").unwrap();
     assert_eq!(e.mode, 0o755, "setuid survived into the manifest");

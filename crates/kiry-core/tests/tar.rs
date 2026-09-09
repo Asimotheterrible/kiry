@@ -82,7 +82,7 @@ fn extract_with(tar: &str, src: &Path, at: &Path, name: &str) -> Vec<db::Entry> 
     let ok = Command::new("sh").arg("-c").arg(&sh).status().unwrap();
     assert!(ok.success(), "{tar} failed to build the corpus");
 
-    let mut m = archive::extract(&root, &arc).unwrap();
+    let mut m = archive::extract(&root, &arc, &[]).unwrap();
     m.sort_by(|a, b| a.path.cmp(&b.path));
     m
 }

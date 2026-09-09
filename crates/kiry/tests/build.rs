@@ -201,6 +201,8 @@ fn bootstrap(root: &Path) -> bool {
                 version: Version::parse("1.0 1").unwrap(),
                 depends: Vec::new(),
                 manifest: manifest.clone(),
+                hash: String::new(),
+                users: Vec::new(),
             },
         )
         .unwrap();
@@ -223,6 +225,8 @@ fn bootstrap(root: &Path) -> bool {
                 version: Version::parse("1.0 1").unwrap(),
                 depends: Vec::new(),
                 manifest: Vec::new(),
+                hash: String::new(),
+                users: Vec::new(),
             },
         )
         .unwrap();
@@ -983,6 +987,8 @@ fn record(root: &Path, name: &str, deps: &[&str], manifest: Vec<db::Entry>) {
                 })
                 .collect(),
             manifest,
+            hash: String::new(),
+            users: Vec::new(),
         },
     )
     .unwrap();
@@ -1007,6 +1013,8 @@ fn a_closed_pipe_is_not_a_panic() {
                 version: Version::parse("1.0 1").unwrap(),
                 depends: Vec::new(),
                 manifest: Vec::new(),
+                hash: String::new(),
+                users: Vec::new(),
             },
         )
         .unwrap();
@@ -1085,6 +1093,8 @@ fn place(root: &Path, name: &str, files: &[(&str, &Path)]) {
             version: Version::parse("1.0 1").unwrap(),
             depends: Vec::new(),
             manifest: manifest.clone(),
+            hash: String::new(),
+            users: Vec::new(),
         },
     )
     .unwrap();
@@ -1373,6 +1383,11 @@ fn archive(at: &Path, name: &str, files: &[(&str, &Path)]) -> PathBuf {
     arc
 }
 
+// the package is the third field, and a line now carries the symbols after it
+fn queued_pkg(l: &str) -> &str {
+    l.split(' ').nth(2).unwrap_or("")
+}
+
 fn queued(root: &Path) -> Vec<String> {
     fs::read_to_string(root.join("usr/lib/kiry/db/queue"))
         .unwrap_or_default()
@@ -1428,12 +1443,123 @@ fn only_the_consumer_that_used_what_left_is_queued() {
 
     let q = queued(&root);
     assert!(
-        q.iter().any(|l| l.ends_with(" useq")),
+        q.iter().any(|l| queued_pkg(l) == "useq"),
         "useq calls q and is not queued: {q:?}"
     );
     assert!(
-        !q.iter().any(|l| l.ends_with(" usep")),
+        !q.iter().any(|l| queued_pkg(l) == "usep"),
         "usep never called q and was queued anyway: {q:?}"
+    );
+}
+
+// a config file the admin changed is theirs. a library that does not match its manifest
+// is a broken install, and preserving it would hide the break behind a working-looking one
+#[test]
+fn an_edited_config_survives_and_a_library_does_not() {
+    let at = scratch("edited");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let src = at.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let put = |n: &str, b: &str| -> PathBuf {
+        let p = src.join(n);
+        fs::write(&p, b).unwrap();
+        p
+    };
+
+    let one = archive(
+        &at,
+        "cfg-1",
+        &[
+            ("etc/thing.conf", &put("c1", "shipped\n")),
+            ("usr/lib/thing.so", &put("l1", "one\n")),
+        ],
+    );
+    assert!(kiry(&["i", "--root", r, one.to_str().unwrap()])
+        .status
+        .success());
+
+    fs::write(root.join("etc/thing.conf"), b"mine\n").unwrap();
+    fs::write(root.join("usr/lib/thing.so"), b"tampered\n").unwrap();
+
+    let two = archive(
+        &at,
+        "cfg-2",
+        &[
+            ("etc/thing.conf", &put("c2", "shipped2\n")),
+            ("usr/lib/thing.so", &put("l2", "two\n")),
+        ],
+    );
+    let o = kiry(&["i", "--root", r, "--force", two.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    assert_eq!(
+        fs::read(root.join("etc/thing.conf")).unwrap(),
+        b"mine\n",
+        "the edit was overwritten"
+    );
+    assert_eq!(
+        fs::read(root.join("usr/lib/thing.so")).unwrap(),
+        b"two\n",
+        "a library was kept instead of replaced"
+    );
+}
+
+// putting the symbol back is the other way a break ends, and the entry has to go with it
+#[test]
+fn a_symbol_that_comes_back_clears_the_entry() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-heal");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let both = lib_with(
+        &at.join("v1"),
+        "libp.so.1",
+        "void p(void){}\nvoid q(void){}\n",
+    );
+    let gone = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
+
+    let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &both)]);
+    assert!(kiry(&["i", "--root", r, first.to_str().unwrap()])
+        .status
+        .success());
+
+    place(
+        &root,
+        "useq",
+        &[(
+            "usr/bin/useq",
+            &app_calling(&at.join("b"), "useq", "q", &both),
+        )],
+    );
+
+    let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &gone)]);
+    assert!(kiry(&["i", "--root", r, "--force", second.to_str().unwrap()])
+        .status
+        .success());
+    assert!(
+        queued(&root).iter().any(|l| queued_pkg(l) == "useq"),
+        "useq was never queued: {:?}",
+        queued(&root)
+    );
+
+    let third = archive(&at, "foo-3", &[("usr/lib64/libp.so.1", &both)]);
+    assert!(kiry(&["i", "--root", r, "--force", third.to_str().unwrap()])
+        .status
+        .success());
+
+    let o = kiry(&["rebuild", "--root", r, "-n"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        queued(&root).is_empty(),
+        "q came back and useq is still queued: {:?}",
+        queued(&root)
     );
 }
 
@@ -1550,11 +1676,11 @@ fn a_package_does_not_queue_itself_for_its_own_library() {
 
     let q = queued(&root);
     assert!(
-        q.iter().any(|l| l.ends_with(" other")),
+        q.iter().any(|l| queued_pkg(l) == "other"),
         "other still links the old layout and is not queued: {q:?}"
     );
     assert!(
-        !q.iter().any(|l| l.ends_with(" foo")),
+        !q.iter().any(|l| queued_pkg(l) == "foo"),
         "foo ships the library and was rebuilt with it: {q:?}"
     );
 }

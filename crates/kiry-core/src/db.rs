@@ -123,6 +123,9 @@ pub struct Installed {
     pub version: Version,
     pub depends: Vec<Dep>,
     pub manifest: Vec<Entry>,
+    // empty when an older kiry wrote the record
+    pub hash: String,
+    pub users: Vec<String>,
 }
 
 // one soname a package hands to everything that links against it. versioned says
@@ -252,6 +255,11 @@ pub fn read(root: &Path, target: &str, name: &str) -> Result<Installed, Error> {
         version: Version::parse(&pkg::required(&d.join("version"))?)?,
         depends: pkg::depends_from(pkg::lines(&d.join("depends"))?),
         manifest: parse_manifest(&pkg::required(&d.join("manifest"))?)?,
+        hash: fs::read_to_string(d.join("hash"))
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        users: pkg::lines(&d.join("users"))?,
     })
 }
 
@@ -270,6 +278,12 @@ pub fn write(root: &Path, rec: &Installed) -> Result<(), Error> {
     // TODO: wants to land atomically, the install path will care about that
     put(&d.join("version"), &format!("{}\n", rec.version))?;
     put(&d.join("depends"), &depends)?;
+    if !rec.hash.is_empty() {
+        put(&d.join("hash"), &format!("{}\n", rec.hash))?;
+    }
+    if !rec.users.is_empty() {
+        put(&d.join("users"), &format!("{}\n", rec.users.join("\n")))?;
+    }
     put(&d.join("manifest"), &manifest)
 }
 
@@ -278,6 +292,7 @@ pub struct Queued {
     pub target: String,
     pub name: String,
     pub soname: String,
+    pub changed: Vec<String>,
 }
 
 pub fn queue(root: &Path) -> PathBuf {
@@ -299,7 +314,7 @@ pub fn read_queue(root: &Path) -> Result<Vec<Queued>, Error> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut f = line.splitn(3, ' ');
+        let mut f = line.splitn(4, ' ');
         let (Some(t), Some(so), Some(name)) = (f.next(), f.next(), f.next()) else {
             return Err(Error::Manifest {
                 line: n + 1,
@@ -310,6 +325,13 @@ pub fn read_queue(root: &Path) -> Result<Vec<Queued>, Error> {
             target: t.to_string(),
             soname: so.to_string(),
             name: name.to_string(),
+            changed: f
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect(),
         });
     }
     Ok(out)
@@ -332,7 +354,13 @@ pub fn write_queue(root: &Path, q: &[Queued]) -> Result<(), Error> {
     }
     let mut body = String::new();
     for e in &q {
-        body.push_str(&format!("{} {} {}\n", e.target, e.soname, e.name));
+        body.push_str(&format!(
+            "{} {} {} {}\n",
+            e.target,
+            e.soname,
+            e.name,
+            e.changed.join(",")
+        ));
     }
     put(&p, &body)
 }
@@ -503,6 +531,8 @@ mod tests {
             version: Version::parse("25.2.0 1").unwrap(),
             depends: pkg::depends_from(vec!["libdrm".to_string(), "muon make".to_string()]),
             manifest: parse_manifest(&sample()).unwrap(),
+            hash: String::new(),
+            users: Vec::new(),
         };
 
         write(&root, &rec).unwrap();
@@ -542,6 +572,8 @@ mod tests {
                 kind: Kind::Dir,
                 path: "/nope".to_string(),
             }],
+            hash: String::new(),
+            users: Vec::new(),
         };
 
         assert!(matches!(write(&root, &rec), Err(Error::BadPath(_))));

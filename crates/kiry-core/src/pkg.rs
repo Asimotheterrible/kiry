@@ -79,6 +79,7 @@ pub struct Package {
     pub checksums: Vec<String>,
     pub depends: Vec<Dep>,
     pub targets: Vec<String>,
+    pub users: Vec<String>,
 }
 
 pub fn load(dir: &Path) -> Result<Package, Error> {
@@ -105,6 +106,7 @@ pub fn load(dir: &Path) -> Result<Package, Error> {
     }
 
     let depends = depends_from(lines(&dir.join("depends"))?);
+    let users = lines(&dir.join("users"))?;
 
     // one line or one per line, either way
     let mut targets = Vec::new();
@@ -123,6 +125,7 @@ pub fn load(dir: &Path) -> Result<Package, Error> {
         checksums,
         depends,
         targets,
+        users,
     })
 }
 

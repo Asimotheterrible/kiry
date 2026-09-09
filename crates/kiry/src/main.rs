@@ -31,6 +31,7 @@ fn main() {
         Some("r") => remove_cmd(&args[1..]),
         Some("l") => list_cmd(&args[1..]),
         Some("doctor") => doctor_cmd(&args[1..]),
+        Some("owns") => owns_cmd(&args[1..]),
         Some("rebuild") => rebuild_cmd(&args[1..]),
         Some("convert") => convert_cmd(&args[1..]),
         Some("sandbox") => {
@@ -51,7 +52,8 @@ fn usage() {
     say!("       kiry i [--root DIR] [--force] <archive>...");
     say!("       kiry r [--root DIR] [--force] <pkg>...");
     say!("       kiry l [--root DIR]");
-    say!("       kiry doctor [--root DIR]");
+    say!("       kiry doctor [--root DIR] [--files] [--orphans]");
+    say!("       kiry owns [--root DIR] <path>...");
     say!("       kiry rebuild [--root DIR] [-n]");
     say!("       kiry convert [-n] <APKBUILD>... <into DIR>");
     say!("       kiry sandbox                    internal: build inside its closure");
@@ -188,9 +190,30 @@ fn build(
 // twenty recipes and each one able to forget. printed rather than silent, because a
 // build that quietly discards what it just made is the kind of thing that gets
 // diagnosed twice
+// the gnu ld.so.cache is built by running these, and steam wants a cache to exist
+const KEPT: &[&str] = &[
+    // DESTDIR has no usrmerge symlink, so glibc's sbin is a real directory here
+    "sbin/ldconfig",
+    "usr/sbin/ldconfig",
+    "etc/kiry/hooks.d/50-ldconfig",
+];
+
 fn trim(dest: &Path, t: &str, name: &str) -> Result<(), String> {
     if !t.ends_with("gnu") {
         return Ok(());
+    }
+
+    let aside = dest.join(".kiry-kept");
+    let mut kept = Vec::new();
+    for k in KEPT {
+        let at = dest.join(k);
+        if !at.exists() {
+            continue;
+        }
+        let to = aside.join(k);
+        mkdirs(to.parent().unwrap_or(&aside))?;
+        fs::rename(&at, &to).map_err(|e| format!("{}: {e}", at.display()))?;
+        kept.push(*k);
     }
 
     let mut dropped = Vec::new();
@@ -202,6 +225,7 @@ fn trim(dest: &Path, t: &str, name: &str) -> Result<(), String> {
         "bin",
         "sbin",
         "etc",
+        "usr/lib64/udev",
         "usr/share/man",
         "usr/share/doc",
         "usr/share/info",
@@ -214,8 +238,21 @@ fn trim(dest: &Path, t: &str, name: &str) -> Result<(), String> {
             dropped.push(d);
         }
     }
+
+    for k in &kept {
+        let at = dest.join(k);
+        mkdirs(at.parent().unwrap_or(dest))?;
+        fs::rename(aside.join(k), &at).map_err(|e| format!("{}: {e}", at.display()))?;
+    }
+    if aside.exists() {
+        fs::remove_dir_all(&aside).map_err(|e| format!("{}: {e}", aside.display()))?;
+    }
+
     if !dropped.is_empty() {
         say!("{name} {t} dropped {}", dropped.join(" "));
+    }
+    if !kept.is_empty() {
+        say!("{name} {t} kept {}", kept.join(" "));
     }
     Ok(())
 }
@@ -710,9 +747,14 @@ fn unpacked(src: &Path) -> PathBuf {
         return src.to_path_buf();
     };
 
+    // patches and the odd config file sit next to the tarball they belong to, so only
+    // the directories decide this. two of them and there is no one tree to start in
     let mut only = None;
     for e in rd.flatten() {
-        if only.is_some() || !e.path().is_dir() {
+        if !e.path().is_dir() {
+            continue;
+        }
+        if only.is_some() {
             return src.to_path_buf();
         }
         only = Some(e.path());
@@ -785,6 +827,7 @@ fn meta(p: &Package, t: &str, hash: &str, art: &Path) -> Result<(), String> {
     put(&d.join("version"), &format!("{}\n", p.version))?;
     put(&d.join("targets"), &format!("{t}\n"))?;
     put(&d.join("hash"), &format!("{hash}\n"))?;
+    put(&d.join("users"), &format!("{}\n", p.users.join("\n")))?;
 
     // one line per dep that applies to this target, the same narrowing targets gets --
     // an artifact is built for one target and carries what that build actually used
@@ -867,7 +910,7 @@ fn install_cmd(args: &[String]) {
         Ok(j) => j,
         Err(e) => die(e.to_string()),
     };
-    let broke = match install::apply(&root, &jobs) {
+    let done = match install::apply(&root, &jobs) {
         Ok(b) => b,
         Err(e) => die(e.to_string()),
     };
@@ -875,7 +918,10 @@ fn install_cmd(args: &[String]) {
     for j in &jobs {
         say!("{} {} {} ok", j.name, j.version.upstream, j.target);
     }
-    enqueue(&root, &broke, &named(&jobs));
+    for p in &done.edits {
+        say!("kept /{p}, edited since it was installed");
+    }
+    enqueue(&root, &done.broke, &named(&jobs));
     hooks(&root, jobs.iter().map(|j| j.target.clone()).collect());
 }
 
@@ -1076,7 +1122,17 @@ fn rebuild_cmd(args: &[String]) {
     let mut want: Vec<(String, String)> = Vec::new();
     // the queue names consumers of a library whose abi moved, which resolves fine and
     // so is invisible to a check. the checks name what is already broken
-    for q in db::read_queue(&root).unwrap_or_default() {
+    let queued = db::read_queue(&root).unwrap_or_default();
+    let (healed, live): (Vec<_>, Vec<_>) = queued.into_iter().partition(|q| back(&root, q));
+    for q in &healed {
+        say!("{} {} dropped, {} is whole again", q.name, q.target, q.soname);
+    }
+    if !healed.is_empty() {
+        if let Err(e) = db::write_queue(&root, &live) {
+            die(e.to_string());
+        }
+    }
+    for q in live {
         if !want.contains(&(q.name.clone(), q.target.clone())) {
             want.push((q.name, q.target));
         }
@@ -1132,10 +1188,14 @@ fn rebuild_cmd(args: &[String]) {
             Ok(j) => j,
             Err(e) => die(e.to_string()),
         };
-        let broke = match install::apply(&root, &jobs) {
+        let done = match install::apply(&root, &jobs) {
             Ok(b) => b,
             Err(e) => die(e.to_string()),
         };
+        let broke = done.broke;
+        for p in &done.edits {
+            say!("kept /{p}, edited since it was installed");
+        }
         for j in &jobs {
             say!("{} {} {} rebuilt", j.name, j.version.upstream, j.target);
         }
@@ -1180,6 +1240,16 @@ fn affected(
     for b in broke {
         let versions = b.target.ends_with("gnu");
         let moved: HashSet<&str> = b.changed.iter().map(|c| c.symbol()).collect();
+        // only a name that left can be shown to have come back. a grown object is
+        // present either way, so nothing is recorded for it and the entry never clears
+        let gone: HashSet<&str> = b
+            .changed
+            .iter()
+            .filter_map(|c| match c {
+                elf::Change::Gone(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
         let Ok(names) = db::installed(root, &b.target) else {
             continue;
         };
@@ -1207,11 +1277,37 @@ fn affected(
                     target: b.target.clone(),
                     soname: b.soname.clone(),
                     name,
+                    changed: gone.iter().map(|s| (*s).to_string()).collect(),
                 });
             }
         }
     }
     out
+}
+
+// an entry records the names that left. if the library exports all of them again the
+// consumer was never going to break, whatever put them back
+fn back(root: &Path, q: &db::Queued) -> bool {
+    if q.changed.is_empty() {
+        return false;
+    }
+    let Ok(names) = db::installed(root, &q.target) else {
+        return false;
+    };
+    let versions = q.target.ends_with("gnu");
+    for name in names {
+        let Ok(ps) = db::read_provides(root, &q.target, &name) else {
+            continue;
+        };
+        for pv in ps.iter().filter(|p| p.soname == q.soname) {
+            let Ok(o) = elf::read(&root.join(&pv.path)) else {
+                continue;
+            };
+            let have: HashSet<String> = o.exports.iter().map(|e| symbol(e, versions)).collect();
+            return q.changed.iter().all(|c| have.contains(c));
+        }
+    }
+    false
 }
 
 // the same key compare built its changes with, or the two sides never meet
@@ -1278,10 +1374,66 @@ fn convert_cmd(args: &[String]) {
     }
 }
 
+// a path answers with the package that claims it, on whichever target claims it. more
+// than one is a bug the path check exists to prevent, so all of them are printed
+fn owns_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    if rest.is_empty() {
+        die("owns wants a path".into());
+    }
+
+    let targets = match db::targets(&root) {
+        Ok(t) => t,
+        Err(e) => die(e.to_string()),
+    };
+
+    let mut owner: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for t in &targets {
+        for name in db::installed(&root, t).unwrap_or_default() {
+            let Ok(rec) = db::read(&root, t, &name) else {
+                continue;
+            };
+            for e in rec.manifest {
+                owner
+                    .entry(e.path)
+                    .or_default()
+                    .push((name.clone(), t.clone()));
+            }
+        }
+    }
+
+    let mut missed = false;
+    for want in &rest {
+        // the manifest holds paths relative to the root, and a caller types the
+        // absolute one they were just shown
+        let key = want.trim_start_matches('/');
+        match owner.get(key) {
+            Some(who) => {
+                for (name, t) in who {
+                    say!("/{key} {name} {t}");
+                }
+            }
+            None => {
+                say!("/{key} owned by nobody");
+                missed = true;
+            }
+        }
+    }
+    if missed {
+        std::process::exit(1);
+    }
+}
+
 fn doctor_cmd(args: &[String]) {
     let (root, _, rest) = opts(args);
-    if let Some(a) = rest.first() {
-        die(format!("doctor takes no arguments, got {a}"));
+    let mut files = false;
+    let mut orphans = false;
+    for a in &rest {
+        match a.as_str() {
+            "--files" => files = true,
+            "--orphans" => orphans = true,
+            _ => die(format!("doctor takes no arguments, got {a}")),
+        }
     }
 
     let targets = match db::targets(&root) {
@@ -1296,9 +1448,165 @@ fn doctor_cmd(args: &[String]) {
             found += 1;
         }
     }
+    for f in drift(&root, &targets) {
+        say!("{} {} {}", f.path, f.pkg, f.what);
+        found += 1;
+    }
+    if files {
+        for f in changed(&root, &targets) {
+            say!("{} {} {}", f.path, f.pkg, f.what);
+            found += 1;
+        }
+    }
+    if orphans {
+        let (loose, ignored) = unowned(&root, &targets);
+        for f in &loose {
+            say!("{} {}", f.path, f.what);
+        }
+        found += loose.len();
+        if ignored > 0 {
+            say!("{ignored} more matched /etc/kiry/unowned");
+        }
+    }
     if found > 0 {
         std::process::exit(1);
     }
+}
+
+// off by default. every manifest names a hash and reading five gigabytes back is a
+// different kind of check from the ones that answer out of the index
+fn changed(root: &Path, targets: &[String]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for t in targets {
+        for name in db::installed(root, t).unwrap_or_default() {
+            let Ok(rec) = db::read(root, t, &name) else {
+                continue;
+            };
+            for p in install::modified(root, &rec.manifest).unwrap_or_default() {
+                out.push(Finding {
+                    pkg: name.clone(),
+                    path: p,
+                    what: What::Modified,
+                });
+            }
+        }
+    }
+    out
+}
+
+// what no manifest claims, under the directories packages install into. /etc/kiry/unowned
+// takes one path prefix per line, and what it hides is counted rather than dropped
+fn unowned(root: &Path, targets: &[String]) -> (Vec<Finding>, usize) {
+    let mut owned: HashSet<String> = HashSet::new();
+    for t in targets {
+        for name in db::installed(root, t).unwrap_or_default() {
+            if let Ok(rec) = db::read(root, t, &name) {
+                owned.extend(rec.manifest.into_iter().map(|e| e.path));
+            }
+        }
+    }
+
+    let skip: Vec<String> = fs::read_to_string(root.join("etc/kiry/unowned"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.trim_start_matches('/').to_string())
+        .collect();
+
+    let mut out = Vec::new();
+    let mut ignored = 0;
+    let mut stack: Vec<String> = vec!["usr".into(), "etc".into()];
+    while let Some(rel) = stack.pop() {
+        let Ok(rd) = fs::read_dir(root.join(&rel)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Some(leaf) = e.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            let path = format!("{rel}/{leaf}");
+            // a symlink is an entry, never a way further down: following one leaves the
+            // tree being walked
+            let dir = e.file_type().is_ok_and(|f| f.is_dir());
+            if dir {
+                stack.push(path.clone());
+            }
+            if owned.contains(&path) {
+                continue;
+            }
+            if skip.iter().any(|s| path == *s || path.starts_with(&format!("{s}/"))) {
+                ignored += 1;
+                continue;
+            }
+            // a directory nobody claims is where an unowned file lives, and saying both
+            // is the same finding twice
+            if !dir {
+                out.push(Finding {
+                    pkg: "-".into(),
+                    path,
+                    what: What::Unowned,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    (out, ignored)
+}
+
+// every target of one recipe is built from the same files, so the hashes have to match
+// they stop matching when a recipe is bumped and only one target is rebuilt
+fn drift(root: &Path, targets: &[String]) -> Vec<Finding> {
+    let mut seen: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for t in targets {
+        for name in db::installed(root, t).unwrap_or_default() {
+            let Ok(rec) = db::read(root, t, name.as_str()) else {
+                continue;
+            };
+            if !rec.hash.is_empty() {
+                seen.entry(name).or_default().push((t.clone(), rec.hash));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (name, mut ts) in seen {
+        ts.sort();
+        let Some((_, first)) = ts.first() else {
+            continue;
+        };
+        if let Some((t, _)) = ts.iter().find(|(_, h)| h != first) {
+            out.push(Finding {
+                pkg: t.clone(),
+                path: name,
+                what: What::TargetDrift(ts[0].0.clone()),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+// kiry never writes /etc/passwd. a recipe says which accounts it expects and doctor
+// reports the ones that are not there
+fn missing_users(root: &Path, target: &str, names: &[String]) -> Vec<Finding> {
+    let passwd = fs::read_to_string(root.join("etc/passwd")).unwrap_or_default();
+    let have: HashSet<&str> = passwd.lines().filter_map(|l| l.split(':').next()).collect();
+
+    let mut out = Vec::new();
+    for name in names {
+        let Ok(rec) = db::read(root, target, name) else {
+            continue;
+        };
+        for u in rec.users.iter().filter(|u| !have.contains(u.as_str())) {
+            out.push(Finding {
+                pkg: name.clone(),
+                path: name.clone(),
+                what: What::MissingUser(u.clone()),
+            });
+        }
+    }
+    out
 }
 
 // the linker gives every object these for itself, and the loader reaches DT_INIT and
@@ -1323,6 +1631,10 @@ enum What {
     NoInterpreter(String),
     MissingSymbol(String),
     Duplicate(usize, String),
+    MissingUser(String),
+    TargetDrift(String),
+    Modified,
+    Unowned,
 }
 
 impl fmt::Display for What {
@@ -1336,6 +1648,10 @@ impl fmt::Display for What {
             What::NoInterpreter(w) => write!(f, "no-interpreter {w}"),
             What::MissingSymbol(s) => write!(f, "missing-symbol {s}"),
             What::Duplicate(n, p) => write!(f, "duplicate-symbols {n} {p}"),
+            What::MissingUser(u) => write!(f, "missing-user {u}"),
+            What::TargetDrift(o) => write!(f, "target-drift {o}"),
+            What::Modified => write!(f, "modified"),
+            What::Unowned => write!(f, "unowned"),
         }
     }
 }
@@ -1571,6 +1887,7 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
             what: What::Duplicate(n, elves[b].0.clone()),
         });
     }
+    out.extend(missing_users(root, target, &names));
     out
 }
 

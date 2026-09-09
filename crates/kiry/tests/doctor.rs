@@ -129,6 +129,8 @@ fn installed(root: &Path, name: &str, files: &[(&str, &Path)], links: &[(&str, &
             version: Version::parse("1.0 1").unwrap(),
             depends: Vec::new(),
             manifest: manifest.clone(),
+            hash: String::new(),
+            users: Vec::new(),
         },
     )
     .unwrap();
@@ -732,6 +734,8 @@ fn an_interpreter_reached_by_hardlink_is_there() {
                     path: "usr/bin/fictionsh".to_string(),
                 },
             ],
+            hash: String::new(),
+            users: Vec::new(),
         },
     )
     .unwrap();
@@ -780,6 +784,8 @@ fn an_interpreter_the_other_target_owns_is_there() {
                     path: "bin".to_string(),
                 },
             ],
+            hash: String::new(),
+            users: Vec::new(),
         },
     )
     .unwrap();

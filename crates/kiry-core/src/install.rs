@@ -17,6 +17,8 @@ pub struct Job {
     pub depends: Vec<Dep>,
     pub archive: PathBuf,
     pub members: Vec<archive::Member>,
+    pub hash: String,
+    pub users: Vec<String>,
 }
 
 // every archive is read and checked before any of it is applied, so the order they
@@ -24,7 +26,7 @@ pub struct Job {
 pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, Error> {
     let mut jobs = Vec::new();
     for a in archives {
-        let (name, target, version, depends) = meta(a)?;
+        let (name, target, version, depends, hash, users) = meta(a)?;
         let members = archive::plan(root, a)?;
         jobs.push(Job {
             name,
@@ -33,6 +35,8 @@ pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, 
             depends,
             archive: a.clone(),
             members,
+            hash,
+            users,
         });
     }
 
@@ -112,7 +116,12 @@ pub struct Broke {
     pub changed: Vec<elf::Change>,
 }
 
-pub fn apply(root: &Path, jobs: &[Job]) -> Result<Vec<Broke>, Error> {
+pub struct Applied {
+    pub broke: Vec<Broke>,
+    pub edits: Vec<String>,
+}
+
+pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
     // what each name held before this batch, read while the record still says so
     let mut was = Vec::new();
     for j in jobs {
@@ -130,9 +139,15 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Vec<Broke>, Error> {
     }
 
     let mut broke = Vec::new();
+    let mut edits = Vec::new();
     let mut kept: HashSet<String> = HashSet::new();
     for (i, j) in jobs.iter().enumerate() {
-        let manifest = archive::extract(root, &j.archive)?;
+        let skip = match &was[i] {
+            Some(o) => edited(root, &o.manifest)?,
+            None => Vec::new(),
+        };
+        let manifest = archive::extract(root, &j.archive, &skip)?;
+        edits.extend(skip);
         kept.extend(manifest.iter().map(|e| e.path.clone()));
 
         let mut provides = Vec::new();
@@ -166,13 +181,50 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Vec<Broke>, Error> {
                 version: j.version.clone(),
                 depends: j.depends.clone(),
                 manifest,
+                hash: j.hash.clone(),
+                users: j.users.clone(),
             },
         )?;
         db::write_provides(root, &j.target, &j.name, &provides)?;
     }
     dispossess(root, jobs)?;
     prune(root, &was, &kept)?;
-    Ok(broke)
+    Ok(Applied { broke, edits })
+}
+
+fn edited(root: &Path, manifest: &[db::Entry]) -> Result<Vec<String>, Error> {
+    Ok(modified(root, manifest)?
+        .into_iter()
+        // only /etc. a binary that does not match its manifest is a broken install and
+        // wants overwriting, not preserving
+        .filter(|p| p.starts_with("etc/"))
+        .collect())
+}
+
+pub fn modified(root: &Path, manifest: &[db::Entry]) -> Result<Vec<String>, Error> {
+    let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
+
+    let mut out = Vec::new();
+    for e in manifest {
+        let db::Kind::File(want) = &e.kind else {
+            continue;
+        };
+        // only /etc. a binary that does not match its manifest is a broken install and
+        // wants overwriting, not preserving
+        let (parent, leaf) = match e.path.rfind('/') {
+            Some(i) => (&e.path[..i], &e.path[i + 1..]),
+            None => ("", e.path.as_str()),
+        };
+        let Ok(pfd) = archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent })
+        else {
+            continue;
+        };
+        if matches!(hash(&pfd, leaf), Ok(got) if got != *want) {
+            out.push(e.path.clone());
+        }
+    }
+    Ok(out)
 }
 
 fn libraries(root: &Path, manifest: &[db::Entry]) -> Result<HashMap<String, elf::Elf>, Error> {
@@ -342,7 +394,9 @@ pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Seen)>, 
 
 // sidecar is <archive>.meta, appended rather than derived, since the archive name
 // itself is a display name and is never parsed
-fn meta(a: &Path) -> Result<(String, String, Version, Vec<Dep>), Error> {
+type Meta = (String, String, Version, Vec<Dep>, String, Vec<String>);
+
+fn meta(a: &Path) -> Result<Meta, Error> {
     let d = PathBuf::from(format!("{}.meta", a.display()));
     let name = pkg::required(&d.join("name"))?.trim().to_string();
     let version = Version::parse(&pkg::required(&d.join("version"))?)?;
@@ -355,7 +409,13 @@ fn meta(a: &Path) -> Result<(String, String, Version, Vec<Dep>), Error> {
         _ => return Err(Error::Targets(d.join("targets"))),
     };
 
-    Ok((name, target, version, depends))
+    let hash = std::fs::read_to_string(d.join("hash"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let users = pkg::lines(&d.join("users"))?;
+
+    Ok((name, target, version, depends, hash, users))
 }
 
 #[cfg(test)]
@@ -400,6 +460,8 @@ mod tests {
                     path: p.to_string(),
                 })
                 .collect(),
+            hash: String::new(),
+            users: Vec::new(),
         }
     }
 
@@ -419,6 +481,8 @@ mod tests {
                         path: p.to_string(),
                     })
                     .collect(),
+                hash: String::new(),
+                users: Vec::new(),
             },
         )
         .unwrap();

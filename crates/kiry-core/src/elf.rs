@@ -227,7 +227,7 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
     })
 }
 
-// what changed between two builds of one library that resolving symbols cannot see.
+// what changed between two builds of one library that resolving symbols cannot see
 // a symbol that left is caught by the loader and by doctor; these are the ones that are
 // still there and no longer mean what they meant
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -164,16 +164,27 @@ pub fn recipe(
             };
             match alias.get(&n).map(String::as_str) {
                 Some("-") => notes.push(format!("{raw} has no equivalent here")),
+                // an apkbuild makedepends is a tool alpine runs during the build, so
+                // it converts to " make". a header-only one wants " build" instead and
+                // the apkbuild does not say which it is -- corrected by hand when a
+                // gnu target of the recipe cannot find its headers
                 Some(to) => depends.push(Dep {
                     name: to.to_string(),
                     make,
+                    host: make,
+                    only: None,
                 }),
-                None => depends.push(Dep { name: n, make }),
+                None => depends.push(Dep {
+                    name: n,
+                    make,
+                    host: make,
+                    only: None,
+                }),
             }
         }
     }
-    depends.sort_by(|a, b| (a.make, &a.name).cmp(&(b.make, &b.name)));
-    depends.dedup_by(|a, b| a.name == b.name && a.make == b.make);
+    depends.sort_by(|a, b| (a.make, a.host, &a.name).cmp(&(b.make, b.host, &b.name)));
+    depends.dedup_by(|a, b| a.name == b.name && a.make == b.make && a.host == b.host);
 
     for x in &depends {
         if !repos
@@ -191,7 +202,7 @@ pub fn recipe(
         .cloned()
         .unwrap_or_else(|| format!("/src/{name}-{ver}"));
     // a body says $pkgver as readily as it says $srcdir, and an unset one expands to
-    // nothing rather than failing, so libbz2.so.$pkgver installs as libbz2.so.
+    // nothing rather than failing, so libbz2.so.$pkgver installs as libbz2.so
     let mut script = format!(
         ". /usr/share/kiry/lib.sh\nsrcdir=/src\npkgname=\"{name}\"\npkgver=\"{ver}\"\npkgrel=\"{rev}\"\n"
     );
@@ -269,18 +280,7 @@ pub fn recipe(
     put(&d.join("checksums"), &joined(&checksums))?;
     put(
         &d.join("depends"),
-        &joined(
-            &depends
-                .iter()
-                .map(|x| {
-                    if x.make {
-                        format!("{} make", x.name)
-                    } else {
-                        x.name.clone()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ),
+        &joined(&depends.iter().map(|x| x.to_string()).collect::<Vec<_>>()),
     )?;
     put(&d.join("build"), &script)?;
 

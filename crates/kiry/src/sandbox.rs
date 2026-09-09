@@ -48,21 +48,61 @@ pub fn toolchain(root: &Path) -> Result<Vec<Dep>, String> {
         .map(|l| Dep {
             name: l.to_string(),
             make: true,
+            host: true,
+            only: None,
         })
         .collect())
 }
 
 // a build dep is needed to build, so its own build deps are not. only runtime edges
 // are followed outward
+// what a link needs before a recipe names anything, by the same suffix test libdir()
+// and triple() use, and a third of them rather than a config file because a build with
+// the wrong libc does not fail -- it succeeds and is wrong
+//
+// gcc-runtime is in the gnu list for libgcc, not for libstdc++: clang here defaults to
+// compiler-rt and libunwind and llvm-runtimes builds both for musl, so a gnu link is
+// told --rtlib=libgcc and then needs the thing. musl's side of that comes with the
+// toolchain set already
+pub fn substrate(t: &str) -> &'static [(&'static str, bool)] {
+    if t.ends_with("gnu") {
+        // gcc-stage1 is the odd one and it is a make dep because it is a host tool: it
+        // owns /usr/lib/gcc/x86_64-linux-gnu, which is the gcc installation clang looks
+        // for when it is told to target gnu, and where crtbeginS.o and crtendS.o live
+        // gcc-runtime deletes its own copy of that directory, deliberately -- what it
+        // ships is the runtime, not a toolchain
+        &[("glibc", false), ("gcc-runtime", false), ("gcc-stage1", true)]
+    } else {
+        &[("musl", false)]
+    }
+}
+
 pub fn closure(root: &Path, target: &str, deps: &[Dep]) -> Result<Vec<Member>, String> {
     let mut out: Vec<Member> = Vec::new();
     let mut seen = BTreeSet::new();
     let mut queue: Vec<(String, String)> = Vec::new();
 
     let host = host();
-    for d in toolchain(root)?.iter().chain(deps) {
+    // the target's libc, without asking, for the same reason the toolchain set is not
+    // restated in every recipe. it reads as if musl were already implicit and it is
+    // not: the toolchain set is make deps, so it resolves under the host, and for a
+    // musl package host and target are the same triple and its musl doubles as the
+    // target's by accident. a gnu package got nothing, and one recipe in the tree names
+    // musl against two that name glibc, so the convention was already "do not declare
+    // your libc" -- this makes it true for both targets instead of one
+    let implicit: Vec<Dep> = substrate(target)
+        .iter()
+        .map(|(n, make)| Dep {
+            name: (*n).to_string(),
+            make: *make,
+            host: *make,
+            only: None,
+        })
+        .collect();
+
+    for d in toolchain(root)?.iter().chain(implicit.iter()).chain(deps) {
         // the toolchain set is make deps, so it comes from the host either way
-        let t = if d.make { host.as_str() } else { target };
+        let t = if d.host { host.as_str() } else { target };
         if seen.insert((d.name.clone(), t.to_string())) {
             out.push(Member {
                 name: d.name.clone(),
@@ -281,6 +321,31 @@ fn devices(root: &Path) -> Result<(), String> {
         fs::write(&at, "").map_err(|e| format!("{}: {e}", at.display()))?;
         mount::mount_bind(format!("/dev/{n}"), &at).map_err(|e| format!("bind {n}: {e}"))?;
     }
+    // 28 aports install a file by reading a heredoc back out of /dev/stdin, so these
+    // are as load-bearing as the device nodes. /proc is already mounted, which is
+    // where a real /dev points them
+    for (n, to) in [
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+        ("fd", "/proc/self/fd"),
+    ] {
+        let at = dev.join(n);
+        symlink(to, &at).map_err(|e| format!("{}: {e}", at.display()))?;
+    }
+
+    // sem_open is a file under /dev/shm on musl, so without this any build that
+    // starts a python process pool dies on an import rather than on a missing tool
+    let shm = dev.join("shm");
+    fs::create_dir(&shm).map_err(|e| format!("{}: {e}", shm.display()))?;
+    mount::mount(
+        "tmpfs",
+        &shm,
+        "tmpfs",
+        MountFlags::empty(),
+        Some(c"mode=1777"),
+    )
+    .map_err(|e| format!("mount shm: {e}"))?;
     Ok(())
 }
 
@@ -326,10 +391,30 @@ mod tests {
         d
     }
 
+    // the substrate is in every closure whether a recipe names it or not, so a db root
+    // without it fails before the test has asserted anything
+    fn root(name: &str) -> PathBuf {
+        let d = scratch(name);
+        let h = host();
+        for (n, make) in substrate(T) {
+            install(&d, if *make { &h } else { T }, n, &[]);
+        }
+        d
+    }
+
+    // and it is never what a test is asking about, so it comes back out here
+    fn declared(c: &[Member]) -> Vec<&Member> {
+        c.iter()
+            .filter(|m| !substrate(T).iter().any(|(n, _)| *n == m.name))
+            .collect()
+    }
+
     fn dep(name: &str, make: bool) -> Dep {
         Dep {
             name: name.to_string(),
             make,
+            host: make,
+            only: None,
         }
     }
 
@@ -362,6 +447,8 @@ mod tests {
                         path: p.clone(),
                     })
                     .collect(),
+                hash: String::new(),
+                users: Vec::new(),
             },
         )
         .unwrap();
@@ -380,7 +467,7 @@ mod tests {
 
     #[test]
     fn the_toolchain_is_in_every_closure_without_a_recipe_naming_it() {
-        let root = scratch("toolchain");
+        let root = root("toolchain");
         install(&root, &host(), "busybox", &[]);
         install(&root, T, "zlib", &[]);
         fs::create_dir_all(root.join("etc/kiry")).unwrap();
@@ -391,7 +478,7 @@ mod tests {
         .unwrap();
 
         let c = closure(&root, T, &[dep("zlib", false)]).unwrap();
-        let names: Vec<&str> = c.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = declared(&c).iter().map(|m| m.name.as_str()).collect();
         assert!(
             names.contains(&"busybox"),
             "no shell in the sandbox: {names:?}"
@@ -403,12 +490,12 @@ mod tests {
     // the target's. the same name is installed on both and each edge picks its own
     #[test]
     fn a_build_tool_comes_from_the_host_and_a_library_from_the_target() {
-        let root = scratch("split");
+        let root = root("split");
         install(&root, &host(), "zlib", &[]);
         install(&root, T, "zlib", &[]);
 
         let c = closure(&root, T, &[dep("zlib", true), dep("zlib", false)]).unwrap();
-        let mut got: Vec<&str> = c.iter().map(|m| m.target.as_str()).collect();
+        let mut got: Vec<&str> = declared(&c).iter().map(|m| m.target.as_str()).collect();
         got.sort_unstable();
         assert_eq!(got, [T, host().as_str()], "both builds of zlib or neither");
 
@@ -423,14 +510,15 @@ mod tests {
 
     #[test]
     fn no_toolchain_file_means_no_toolchain() {
-        let root = scratch("notoolchain");
+        let root = root("notoolchain");
         install(&root, T, "zlib", &[]);
-        assert_eq!(closure(&root, T, &[dep("zlib", false)]).unwrap().len(), 1);
+        let c = closure(&root, T, &[dep("zlib", false)]).unwrap();
+        assert_eq!(declared(&c).len(), 1);
     }
 
     #[test]
     fn a_build_dependency_does_not_drag_its_own_build_dependencies_in() {
-        let root = scratch("closure");
+        let root = root("closure");
         install(&root, &host(), "gcc", &[dep("gccdep", true)]);
         install(&root, &host(), "gccdep", &[]);
         install(&root, T, "zlib", &[]);
@@ -449,18 +537,18 @@ mod tests {
 
     #[test]
     fn a_cycle_in_the_recorded_depends_does_not_hang() {
-        let root = scratch("cycle");
+        let root = root("cycle");
         install(&root, T, "freetype", &[dep("harfbuzz", false)]);
         install(&root, T, "harfbuzz", &[dep("freetype", false)]);
 
         let c = closure(&root, T, &[dep("freetype", false)]).unwrap();
-        assert_eq!(c.len(), 2);
+        assert_eq!(declared(&c).len(), 2);
     }
 
     // the two layer rule: headers come from what the recipe named, and nothing else
     #[test]
     fn a_transitive_dependency_hands_over_libraries_and_no_headers() {
-        let root = scratch("layers");
+        let root = root("layers");
         install(&root, T, "png", &[dep("zlib", false)]);
         install(&root, T, "zlib", &[]);
 
@@ -489,7 +577,7 @@ mod tests {
 
     #[test]
     fn nothing_outside_the_closure_is_placed_at_all() {
-        let root = scratch("outside");
+        let root = root("outside");
         install(&root, T, "png", &[]);
         install(&root, T, "openssl", &[]);
 

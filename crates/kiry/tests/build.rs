@@ -92,6 +92,31 @@ fn sidecars(root: &Path) -> Vec<String> {
 // phase 1 starts from a rootfs nobody built either, and the installed database is plain
 // text precisely so a package can be written by hand. one busybox is the whole toolchain
 // these recipes need: their scripts run echo, mkdir and cp, never a compiler
+fn interp(p: &Path) -> Option<String> {
+    let b = fs::read(p).ok()?;
+    let word = |at: usize| -> usize {
+        let mut v = 0usize;
+        for i in (0..8).rev() {
+            v = (v << 8) | *b.get(at + i).unwrap_or(&0) as usize;
+        }
+        v
+    };
+    let half = |at: usize| -> usize {
+        (*b.get(at + 1).unwrap_or(&0) as usize) << 8 | *b.get(at).unwrap_or(&0) as usize
+    };
+    let (off, size, num) = (word(0x20), half(0x36), half(0x38));
+    for i in 0..num {
+        let h = off + i * size;
+        if half(h) != 3 {
+            continue;
+        }
+        let (at, len) = (word(h + 0x08), word(h + 0x20));
+        let s = b.get(at..at + len)?;
+        return String::from_utf8(s.split(|c| *c == 0).next()?.to_vec()).ok();
+    }
+    None
+}
+
 fn bootstrap(root: &Path) -> bool {
     let bb = PathBuf::from("/usr/bin/busybox");
     if !bb.is_file() {
@@ -102,18 +127,28 @@ fn bootstrap(root: &Path) -> bool {
         return false;
     }
 
-    let out = Command::new("ldd").arg(&bb).output().unwrap();
+    // not ldd. it is glibc's on a root with the gnu tier installed and it answers
+    // "not found" for every musl binary, so the sandbox came out with no libc in it
+    let o = kiry_core::elf::read(&bb).unwrap();
+    let mut want: Vec<String> = o.needed.clone();
+    if let Some(i) = interp(&bb) {
+        want.push(i);
+    }
+
     let mut files: Vec<(String, PathBuf)> = vec![("usr/bin/busybox".into(), bb.clone())];
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let path = match line.split_whitespace().collect::<Vec<_>>()[..] {
-            [p, ..] if p.starts_with('/') => p.to_string(),
-            [_, "=>", p, ..] if p.starts_with('/') => p.to_string(),
-            _ => continue,
+    for n in want {
+        // the loader arrives by absolute path and a DT_NEEDED by name, and on musl they
+        // are the same file twice -- placed under both, because PT_INTERP is the kernel's
+        // lookup and neither one covers the other
+        let at = match n.strip_prefix('/') {
+            Some(a) => a.to_string(),
+            None => ["usr/lib", "usr/lib64", "lib", "lib64"]
+                .iter()
+                .map(|d| format!("{d}/{n}"))
+                .find(|a| Path::new("/").join(a).is_file())
+                .unwrap_or_else(|| panic!("nothing provides {n}, needed by busybox")),
         };
-        files.push((
-            path.trim_start_matches('/').to_string(),
-            PathBuf::from(path),
-        ));
+        files.push((at.clone(), PathBuf::from("/").join(&at)));
     }
 
     let mut manifest = Vec::new();
@@ -127,13 +162,21 @@ fn bootstrap(root: &Path) -> bool {
             path: at.clone(),
         });
     }
-    // busybox picks its applet out of argv[0], so this is the shell
-    std::os::unix::fs::symlink("busybox", root.join("usr/bin/sh")).unwrap();
-    manifest.push(db::Entry {
-        mode: 0o777,
-        kind: db::Kind::Link("busybox".into()),
-        path: "usr/bin/sh".into(),
-    });
+    // busybox picks its applet out of argv[0], so these are the tools. named one by
+    // one rather than left to the standalone shell, which reads /proc/self/exe and so
+    // depends on what the sandbox mounted
+    for a in [
+        "sh", "mkdir", "cp", "ln", "rm", "mv", "cat", "echo", "printf", "chmod", "find",
+        "head", "install", "patch", "tar", "dd", "true", "false", "sed", "touch",
+    ] {
+        let at = format!("usr/bin/{a}");
+        std::os::unix::fs::symlink("busybox", root.join(&at)).unwrap();
+        manifest.push(db::Entry {
+            mode: 0o777,
+            kind: db::Kind::Link("busybox".into()),
+            path: at,
+        });
+    }
 
     let provides: Vec<db::Provide> = install::scan(root, &manifest)
         .unwrap()
@@ -162,6 +205,27 @@ fn bootstrap(root: &Path) -> bool {
         )
         .unwrap();
         db::write_provides(root, target, "busybox", &provides).unwrap();
+    }
+
+    // every closure gets the target's libc without a recipe naming it, and an empty
+    // record is enough here -- the libc file came along with busybox above
+    for (t, n) in [
+        ("x86_64-musl", "musl"),
+        ("x86_64-gnu", "glibc"),
+        ("x86_64-gnu", "gcc-runtime"),
+        ("x86_64-musl", "gcc-stage1"),
+    ] {
+        db::write(
+            root,
+            &db::Installed {
+                name: n.into(),
+                target: t.into(),
+                version: Version::parse("1.0 1").unwrap(),
+                depends: Vec::new(),
+                manifest: Vec::new(),
+            },
+        )
+        .unwrap();
     }
 
     fs::create_dir_all(root.join("etc/kiry")).unwrap();
@@ -914,6 +978,8 @@ fn record(root: &Path, name: &str, deps: &[&str], manifest: Vec<db::Entry>) {
                 .map(|d| kiry_core::pkg::Dep {
                     name: (*d).to_string(),
                     make: false,
+                    host: false,
+                    only: None,
                 })
                 .collect(),
             manifest,

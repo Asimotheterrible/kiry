@@ -126,6 +126,7 @@ pub struct Installed {
     // empty when an older kiry wrote the record
     pub hash: String,
     pub users: Vec<String>,
+    pub flags: Vec<String>,
 }
 
 // one soname a package hands to everything that links against it. versioned says
@@ -260,6 +261,7 @@ pub fn read(root: &Path, target: &str, name: &str) -> Result<Installed, Error> {
             .trim()
             .to_string(),
         users: pkg::lines(&d.join("users"))?,
+        flags: pkg::lines(&d.join("flags"))?,
     })
 }
 
@@ -283,6 +285,9 @@ pub fn write(root: &Path, rec: &Installed) -> Result<(), Error> {
     }
     if !rec.users.is_empty() {
         put(&d.join("users"), &format!("{}\n", rec.users.join("\n")))?;
+    }
+    if !rec.flags.is_empty() {
+        put(&d.join("flags"), &format!("{}\n", rec.flags.join("\n")))?;
     }
     put(&d.join("manifest"), &manifest)
 }
@@ -354,13 +359,11 @@ pub fn write_queue(root: &Path, q: &[Queued]) -> Result<(), Error> {
     }
     let mut body = String::new();
     for e in &q {
-        body.push_str(&format!(
-            "{} {} {} {}\n",
-            e.target,
-            e.soname,
-            e.name,
-            e.changed.join(",")
-        ));
+        body.push_str(&format!("{} {} {}", e.target, e.soname, e.name));
+        if !e.changed.is_empty() {
+            body.push_str(&format!(" {}", e.changed.join(",")));
+        }
+        body.push('\n');
     }
     put(&p, &body)
 }
@@ -533,6 +536,7 @@ mod tests {
             manifest: parse_manifest(&sample()).unwrap(),
             hash: String::new(),
             users: Vec::new(),
+            flags: Vec::new(),
         };
 
         write(&root, &rec).unwrap();
@@ -574,6 +578,7 @@ mod tests {
             }],
             hash: String::new(),
             users: Vec::new(),
+            flags: Vec::new(),
         };
 
         assert!(matches!(write(&root, &rec), Err(Error::BadPath(_))));

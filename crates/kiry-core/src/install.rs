@@ -19,6 +19,7 @@ pub struct Job {
     pub members: Vec<archive::Member>,
     pub hash: String,
     pub users: Vec<String>,
+    pub flags: Vec<String>,
 }
 
 // every archive is read and checked before any of it is applied, so the order they
@@ -26,7 +27,7 @@ pub struct Job {
 pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, Error> {
     let mut jobs = Vec::new();
     for a in archives {
-        let (name, target, version, depends, hash, users) = meta(a)?;
+        let (name, target, version, depends, hash, users, flags) = meta(a)?;
         let members = archive::plan(root, a)?;
         jobs.push(Job {
             name,
@@ -37,6 +38,7 @@ pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, 
             members,
             hash,
             users,
+            flags,
         });
     }
 
@@ -183,6 +185,7 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
                 manifest,
                 hash: j.hash.clone(),
                 users: j.users.clone(),
+                flags: j.flags.clone(),
             },
         )?;
         db::write_provides(root, &j.target, &j.name, &provides)?;
@@ -394,7 +397,15 @@ pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Seen)>, 
 
 // sidecar is <archive>.meta, appended rather than derived, since the archive name
 // itself is a display name and is never parsed
-type Meta = (String, String, Version, Vec<Dep>, String, Vec<String>);
+type Meta = (
+    String,
+    String,
+    Version,
+    Vec<Dep>,
+    String,
+    Vec<String>,
+    Vec<String>,
+);
 
 fn meta(a: &Path) -> Result<Meta, Error> {
     let d = PathBuf::from(format!("{}.meta", a.display()));
@@ -414,8 +425,9 @@ fn meta(a: &Path) -> Result<Meta, Error> {
         .trim()
         .to_string();
     let users = pkg::lines(&d.join("users"))?;
+    let flags = pkg::lines(&d.join("flags"))?;
 
-    Ok((name, target, version, depends, hash, users))
+    Ok((name, target, version, depends, hash, users, flags))
 }
 
 #[cfg(test)]
@@ -462,6 +474,7 @@ mod tests {
                 .collect(),
             hash: String::new(),
             users: Vec::new(),
+            flags: Vec::new(),
         }
     }
 
@@ -483,6 +496,7 @@ mod tests {
                     .collect(),
                 hash: String::new(),
                 users: Vec::new(),
+                flags: Vec::new(),
             },
         )
         .unwrap();

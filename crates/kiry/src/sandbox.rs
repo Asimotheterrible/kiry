@@ -449,6 +449,7 @@ mod tests {
                     .collect(),
                 hash: String::new(),
                 users: Vec::new(),
+                flags: Vec::new(),
             },
         )
         .unwrap();

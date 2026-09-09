@@ -33,7 +33,8 @@ fn skip(why: &str) -> bool {
     }
     assert!(
         std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-        "{why}: cc and ldd are what this suite checks against"
+        "{why}: cc and ldd are what this suite checks against. \
+         musl ships no ldd, so set KIRY_TEST_ALLOW_SKIP=1 to skip it here"
     );
     true
 }

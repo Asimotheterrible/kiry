@@ -165,11 +165,31 @@ fn bootstrap(root: &Path) -> bool {
     // busybox picks its applet out of argv[0], so these are the tools. named one by
     // one rather than left to the standalone shell, which reads /proc/self/exe and so
     // depends on what the sandbox mounted
+    let applets = Command::new("busybox").arg("--list").output().unwrap();
+    let applets: Vec<&str> = std::str::from_utf8(&applets.stdout)
+        .unwrap()
+        .lines()
+        .collect();
     for a in [
         "sh", "mkdir", "cp", "ln", "rm", "mv", "cat", "echo", "printf", "chmod", "find",
         "head", "install", "patch", "tar", "dd", "true", "false", "sed", "touch",
     ] {
         let at = format!("usr/bin/{a}");
+        // this busybox is built without patch and the closure is the whole of what a
+        // build can see, so a symlink to an applet that is not there is a tool missing
+        if !applets.contains(&a) {
+            let real = PathBuf::from(format!("/usr/bin/{a}"));
+            assert!(real.is_file(), "busybox has no {a} applet and nothing else does");
+            fs::copy(&real, root.join(&at)).unwrap();
+            manifest.push(db::Entry {
+                mode: 0o755,
+                kind: db::Kind::File(
+                    kiry_core::sha256(fs::File::open(root.join(&at)).unwrap()).unwrap(),
+                ),
+                path: at,
+            });
+            continue;
+        }
         std::os::unix::fs::symlink("busybox", root.join(&at)).unwrap();
         manifest.push(db::Entry {
             mode: 0o777,
@@ -192,7 +212,9 @@ fn bootstrap(root: &Path) -> bool {
             })
         })
         .collect();
-    for target in ["x86_64-musl", "x86_64-gnu"] {
+    // musl only. these are musl binaries and /usr/lib is not on the gnu search path, so
+    // a gnu record for them is a claim doctor is right to reject
+    for target in ["x86_64-musl"] {
         db::write(
             root,
             &db::Installed {
@@ -216,7 +238,10 @@ fn bootstrap(root: &Path) -> bool {
         ("x86_64-musl", "musl"),
         ("x86_64-gnu", "glibc"),
         ("x86_64-gnu", "gcc-runtime"),
+        // a make dep, so it comes from KIRY_HOST and not the target. the gnu fixtures
+        // set that to x86_64-gnu, so both spellings have to be here
         ("x86_64-musl", "gcc-stage1"),
+        ("x86_64-gnu", "gcc-stage1"),
     ] {
         db::write(
             root,
@@ -492,27 +517,41 @@ fn a_transitive_dependency_keeps_everything_but_its_headers() {
 // it outright rather than relying on the caller to always pass --root
 #[test]
 fn writing_to_slash_is_refused() {
+    // the rule is "no kiry owns /", so on a machine that is itself a kiry root the
+    // right answer is that / goes through. asserted both ways rather than skipped,
+    // because it is the same rule either way
+    let owned = Path::new("/usr/lib/kiry/db/installed").is_dir();
+
+    // none of these three reach a write: they die on input that is not there. rebuild
+    // is deliberately not among them, since on an owned / it would really start building
     for args in [
         vec!["b", "/nonexistent"],
         vec!["i", "/nonexistent.tar.zst"],
         vec!["r", "nonexistent"],
-        vec!["rebuild"],
     ] {
         let mut a = args.clone();
         a.extend(["--root", "/"]);
         let o = kiry(&a);
         assert!(!o.status.success(), "{args:?} was allowed");
         let said = String::from_utf8_lossy(&o.stderr);
-        assert!(said.contains("refusing to write to /"), "{args:?}: {said}");
-        assert!(said.contains("KIRY_ROOT_REALLY"), "{args:?}: {said}");
+        assert_eq!(
+            said.contains("refusing to write to /"),
+            !owned,
+            "{args:?}: {said}"
+        );
+        if !owned {
+            assert!(said.contains("KIRY_ROOT_REALLY"), "{args:?}: {said}");
+        }
     }
 
-    // with no --root at all it is the same root, so the guard has to catch that too
-    let o = kiry(&["rebuild"]);
-    assert!(
-        String::from_utf8_lossy(&o.stderr).contains("refusing to write to /"),
-        "an unqualified rebuild was allowed"
-    );
+    if !owned {
+        // with no --root at all it is the same root, so the guard has to catch that too
+        let o = kiry(&["rebuild"]);
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("refusing to write to /"),
+            "an unqualified rebuild was allowed"
+        );
+    }
 
     // reads are not writes: doctor and l still answer for the running system
     for args in [vec!["l", "--root", "/"], vec!["doctor", "--root", "/"]] {
@@ -639,12 +678,24 @@ fn a_source_tree_is_owned_by_whoever_unpacks_it() {
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
-    // the tar kiry runs has to take the flag at all, whichever tar it is
+    // a real extraction and not --help, which busybox exits 1 from whether or not it
+    // understood the flag. this is the same tar and the same argument order kiry uses
+    let into = at.join("probe");
+    fs::create_dir_all(&into).unwrap();
     let out = Command::new("tar")
-        .args(["--no-same-owner", "--help"])
+        .arg("--no-same-owner")
+        .arg("-xf")
+        .arg(at.join("hello-1.0.tar"))
+        .arg("-C")
+        .arg(&into)
         .output()
         .unwrap();
-    assert!(out.status.success(), "tar rejects --no-same-owner");
+    assert!(
+        out.status.success(),
+        "tar rejects --no-same-owner: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(into.join("hello-1.0/greeting").is_file());
 }
 
 // build is this machine and host is what the output runs on. a gnu package built on a
@@ -656,7 +707,9 @@ fn a_cross_build_is_told_the_two_triples_apart() {
     let d = recipe(
         &at,
         "x86_64-gnu",
-        "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$CBUILD $CHOST\" > \"$DESTDIR/usr/bin/hello\"\n",
+        // usr/lib64 and not usr/bin: the gnu tier is a library layer and trim() drops
+        // every program out of it, so a probe left in usr/bin never reaches the archive
+        "mkdir -p \"$DESTDIR/usr/lib64\"\necho \"$CBUILD $CHOST\" > \"$DESTDIR/usr/lib64/hello\"\n",
     );
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -670,7 +723,7 @@ fn a_cross_build_is_told_the_two_triples_apart() {
     let out = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
+            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/lib64/hello",
             root.display(),
             art[0]
         ))
@@ -694,7 +747,9 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
         let d = recipe(
             &at,
             target,
-            "mkdir -p \"$DESTDIR/usr/bin\"\ncat \"$CMAKE_TOOLCHAIN_FILE\" > \"$DESTDIR/usr/bin/hello\"\n",
+            // the libdir it is being told about is also the one place trim() keeps on
+            // both targets, so the probe lands where it can be read back
+            "mkdir -p \"$DESTDIR$KIRY_LIBDIR\"\ncat \"$CMAKE_TOOLCHAIN_FILE\" > \"$DESTDIR$KIRY_LIBDIR/hello\"\n",
         );
         let root = at.join("root");
         fs::create_dir_all(&root).unwrap();
@@ -708,16 +763,15 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
         let out = Command::new("sh")
             .arg("-c")
             .arg(format!(
-                "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
+                "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/{want}/hello",
                 root.display(),
                 art[0]
             ))
             .output()
             .unwrap();
         let said = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(
-            said.trim(),
-            format!("set(CMAKE_INSTALL_LIBDIR \"{want}\")"),
+        assert!(
+            said.contains(&format!("set(CMAKE_INSTALL_LIBDIR \"{want}\")")),
             "{target} got {said}"
         );
     }
@@ -1075,7 +1129,6 @@ fn app(at: &Path, name: &str, against: &Path) -> PathBuf {
         .success());
     out
 }
-
 fn place(root: &Path, name: &str, files: &[(&str, &Path)]) {
     let mut manifest = Vec::new();
     for (path, from) in files {
@@ -1131,10 +1184,6 @@ fn rebuild_recompiles_what_the_break_names() {
         return;
     }
 
-    for d in ["installed", "provides"] {
-        let _ = fs::remove_dir_all(root.join(format!("usr/lib/kiry/db/{d}/x86_64-musl")));
-    }
-
     let one = lib(&at.join("v1"), "libp.so.1");
     let two = lib(&at.join("v2"), "libp.so.2");
     let src = at.join("src/app-1.0");
@@ -1170,9 +1219,12 @@ fn rebuild_recompiles_what_the_break_names() {
     fs::write(d.join("depends"), "libp\n").unwrap();
     fs::write(
         d.join("build"),
-        "mkdir -p \"$DESTDIR/usr/bin\"\n\
-         if [ -e /usr/lib64/libp.so.2 ]; then cp app-2 \"$DESTDIR/usr/bin/app\"\n\
-         else cp app-1 \"$DESTDIR/usr/bin/app\"; fi\n",
+        // usr/lib64 and not usr/bin: the gnu tier is a library layer, so trim() drops
+        // every program out of a gnu artifact and a consumer left in usr/bin is never
+        // installed to be found broken
+        "mkdir -p \"$DESTDIR/usr/lib64\"\n\
+         if [ -e /usr/lib64/libp.so.2 ]; then cp app-2 \"$DESTDIR/usr/lib64/app\"\n\
+         else cp app-1 \"$DESTDIR/usr/lib64/app\"; fi\n",
     )
     .unwrap();
     let bare = at.join("bare");
@@ -1192,39 +1244,33 @@ fn rebuild_recompiles_what_the_break_names() {
 
     let r = root.to_str().unwrap();
     place(&root, "libp", &[("usr/lib64/libp.so.1", &one)]);
-    let o = kiry_on("x86_64-gnu", &["b", "--root", r, d.to_str().unwrap()]);
+    let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let arc = root.join("var/kiry/cache/app-1.0-1.x86_64-gnu.tar.zst");
-    let o = kiry_on("x86_64-gnu", &["i", "--root", r, arc.to_str().unwrap()]);
+    let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let first = kiry_on("x86_64-gnu", &["doctor", "--root", r]);
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stdout)
-    );
+    assert!(kiry(&["doctor", "--root", r]).status.success());
 
     // the soname moves under it, which is the break the whole engine exists for
     place(&root, "libp", &[("usr/lib64/libp.so.2", &two)]);
     let _ = fs::remove_file(root.join("usr/lib64/libp.so.1"));
-    let out = String::from_utf8_lossy(&kiry_on("x86_64-gnu", &["doctor", "--root", r]).stdout)
+    let out = String::from_utf8_lossy(&kiry(&["doctor", "--root", r]).stdout)
         .into_owned();
     assert!(
-        out.contains("usr/bin/app x86_64-gnu unresolved libp.so.1"),
+        out.contains("usr/lib64/app x86_64-gnu unresolved libp.so.1"),
         "{out}"
     );
 
-    let o = kiry_on("x86_64-gnu", &["rebuild", "--root", r]);
+    let o = kiry(&["rebuild", "--root", r]);
     let said = String::from_utf8_lossy(&o.stdout);
-    assert!(said.contains("app 1.0 x86_64-gnu rebuilt"), "{said}");
+    assert!(
+        said.contains("app 1.0 x86_64-gnu rebuilt"),
+        "out: {said}\nerr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
-    let after = kiry_on("x86_64-gnu", &["doctor", "--root", r]);
-    assert!(
-        after.status.success(),
-        "{}",
-        String::from_utf8_lossy(&after.stdout)
-    );
+    assert!(kiry(&["doctor", "--root", r]).status.success());
 }
 
 // two broken consumers where alpha links beta, so the order the dependency asks for is

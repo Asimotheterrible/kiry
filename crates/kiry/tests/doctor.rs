@@ -131,6 +131,7 @@ fn installed(root: &Path, name: &str, files: &[(&str, &Path)], links: &[(&str, &
             manifest: manifest.clone(),
             hash: String::new(),
             users: Vec::new(),
+            flags: Vec::new(),
         },
     )
     .unwrap();
@@ -736,6 +737,7 @@ fn an_interpreter_reached_by_hardlink_is_there() {
             ],
             hash: String::new(),
             users: Vec::new(),
+            flags: Vec::new(),
         },
     )
     .unwrap();
@@ -786,6 +788,7 @@ fn an_interpreter_the_other_target_owns_is_there() {
             ],
             hash: String::new(),
             users: Vec::new(),
+            flags: Vec::new(),
         },
     )
     .unwrap();

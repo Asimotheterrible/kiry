@@ -33,6 +33,7 @@ fn main() {
         Some("doctor") => doctor_cmd(&args[1..]),
         Some("owns") => owns_cmd(&args[1..]),
         Some("rebuild") => rebuild_cmd(&args[1..]),
+        Some("flags") => flags_cmd(&args[1..]),
         Some("convert") => convert_cmd(&args[1..]),
         Some("sandbox") => {
             if let Err(e) = sandbox::init() {
@@ -55,6 +56,7 @@ fn usage() {
     say!("       kiry doctor [--root DIR] [--files] [--orphans]");
     say!("       kiry owns [--root DIR] <path>...");
     say!("       kiry rebuild [--root DIR] [-n]");
+    say!("       kiry flags [--root DIR] <pkg> | [--queue]");
     say!("       kiry convert [-n] <APKBUILD>... <into DIR>");
     say!("       kiry sandbox                    internal: build inside its closure");
     say!("       kiry <package dir>");
@@ -149,11 +151,12 @@ fn build(
 ) -> Result<Vec<PathBuf>, String> {
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
+    let f = flags(root, &p.name)?;
 
     let mut built = Vec::new();
     for t in targets {
         let start = Instant::now();
-        let work = compile(root, p, t, &srcs, verbose)?;
+        let work = compile(root, p, t, &srcs, &f, verbose)?;
         say!("{} {} {t} ok {}", p.name, p.version.upstream, took(start));
         built.push((t.clone(), work));
     }
@@ -167,7 +170,7 @@ fn build(
     // .meta for an artifact that never arrives
     for (t, (art, part)) in &ready {
         fs::rename(part, art).map_err(|e| format!("{}: {e}", art.display()))?;
-        meta(p, t, &hash, art)?;
+        meta(p, t, &hash, &f, art)?;
     }
     for (_, work) in &built {
         let _ = fs::remove_dir_all(work);
@@ -331,6 +334,7 @@ fn compile(
     p: &Package,
     t: &str,
     srcs: &[(String, PathBuf, String)],
+    f: &Flags,
     verbose: bool,
 ) -> Result<PathBuf, String> {
     let work = root.join("var/kiry/stage").join(format!(
@@ -516,7 +520,14 @@ fn compile(
         .env("KIRY_TARGET", t)
         .env("KIRY_NAME", &p.name)
         .env("KIRY_VERSION", &p.version.upstream)
-        .env("KIRY_REV", p.version.rev.to_string());
+        .env("KIRY_REV", p.version.rev.to_string())
+        .env("CFLAGS", &f.cflags)
+        .env("CXXFLAGS", &f.cxxflags)
+        .env("LDFLAGS", &f.ldflags)
+        .env("KIRY_FLAGS", f.use_flags.join(" "));
+    for (k, v) in &f.env {
+        c.env(k, v);
+    }
 
     // read on the far side of the clear, so they have to cross by name. without the
     // cap a build that allocates without bound takes the machine down, not itself
@@ -816,7 +827,7 @@ fn pack(root: &Path, p: &Package, t: &str, work: &Path) -> Result<(PathBuf, Path
     Ok((art, part))
 }
 
-fn meta(p: &Package, t: &str, hash: &str, art: &Path) -> Result<(), String> {
+fn meta(p: &Package, t: &str, hash: &str, f: &Flags, art: &Path) -> Result<(), String> {
     let mut d = art.as_os_str().to_owned();
     d.push(".meta");
     let d = PathBuf::from(d);
@@ -828,6 +839,7 @@ fn meta(p: &Package, t: &str, hash: &str, art: &Path) -> Result<(), String> {
     put(&d.join("targets"), &format!("{t}\n"))?;
     put(&d.join("hash"), &format!("{hash}\n"))?;
     put(&d.join("users"), &format!("{}\n", p.users.join("\n")))?;
+    put(&d.join("flags"), &format!("{}\n", f.record().join("\n")))?;
 
     // one line per dep that applies to this target, the same narrowing targets gets --
     // an artifact is built for one target and carries what that build actually used
@@ -863,6 +875,253 @@ fn recipe_hash(p: &Package, srcs: &[(String, PathBuf, String)]) -> Result<String
     }
 
     kiry_core::sha256(&blob[..]).map_err(|e| e.to_string())
+}
+
+// what a build compiles with. /etc/kiry/config first, then /etc/kiry/pkg/<name>, and
+// the two do not combine the same way: a knob is replaced so a package can say -O2
+// against a global -O3, while CFLAGS and its siblings append so a global change still
+// reaches a package that only added to it. taking something back out is what a recipe's
+// filter file is for
+//
+// knob names are the ones the failure table writes, so that table lands without a
+// translation step
+const KNOBS: &[(&str, &str)] = &[
+    ("OPT", "-O2"),
+    // empty rather than znver3: the machine belongs in the config, not the binary
+    ("CFLAGS_MARCH", ""),
+    ("LTO", "none"),
+    ("KIRY_THINLTO_JOBS", "8"),
+];
+
+struct Flags {
+    cflags: String,
+    cxxflags: String,
+    ldflags: String,
+    use_flags: Vec<String>,
+    // KIRY_* settings, handed to the build as themselves
+    env: Vec<(String, String)>,
+    // every line that contributed, in the order it was read
+    from: Vec<(String, String, String)>,
+}
+
+impl Flags {
+    // what goes in the record and the sidecar, and what a later resolve is compared
+    // against. only what a compiler sees: the provenance is not part of the answer
+    fn record(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (k, v) in [
+            ("CFLAGS", &self.cflags),
+            ("CXXFLAGS", &self.cxxflags),
+            ("LDFLAGS", &self.ldflags),
+        ] {
+            if !v.is_empty() {
+                out.push(format!("{k} {v}"));
+            }
+        }
+        if !self.use_flags.is_empty() {
+            out.push(format!("FLAGS {}", self.use_flags.join(" ")));
+        }
+        out
+    }
+}
+
+fn settings(root: &Path, name: &str) -> Result<Vec<(String, String, String)>, String> {
+    let mut out = Vec::new();
+    for f in [
+        PathBuf::from("etc/kiry/config"),
+        Path::new("etc/kiry/pkg").join(name),
+    ] {
+        let at = root.join(&f);
+        let text = match fs::read_to_string(&at) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{}: {e}", at.display())),
+        };
+        for (n, l) in text.lines().enumerate() {
+            let l = l.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            let (k, v) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
+            let known = k == "flags"
+                || k.starts_with("KIRY_")
+                || matches!(k, "CFLAGS" | "CXXFLAGS" | "LDFLAGS")
+                || KNOBS.iter().any(|(n, _)| *n == k);
+            if !known {
+                return Err(format!("/{}:{}: {k} is not a setting", f.display(), n + 1));
+            }
+            out.push((format!("/{}", f.display()), k.into(), v.trim().into()));
+        }
+    }
+    Ok(out)
+}
+
+fn flags(root: &Path, name: &str) -> Result<Flags, String> {
+    let from = settings(root, name)?;
+    let mut knob: HashMap<&str, String> =
+        KNOBS.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+    let (mut c, mut cxx, mut ld) = (Vec::new(), Vec::new(), Vec::new());
+    let mut use_flags: Vec<String> = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
+
+    for (_, k, v) in &from {
+        match k.as_str() {
+            "CFLAGS" => c.push(v.clone()),
+            "CXXFLAGS" => cxx.push(v.clone()),
+            "LDFLAGS" => ld.push(v.clone()),
+            // a later - takes one back off, so a package subtracts from the global set
+            // without restating it
+            "flags" => {
+                for t in v.split_whitespace() {
+                    let (on, n) = match t.strip_prefix('-') {
+                        Some(n) => (false, n),
+                        None => (true, t.strip_prefix('+').unwrap_or(t)),
+                    };
+                    use_flags.retain(|x| x != n);
+                    if on {
+                        use_flags.push(n.to_string());
+                    }
+                }
+            }
+            _ => {
+                if let Some(slot) = knob.get_mut(k.as_str()) {
+                    slot.clone_from(v);
+                }
+                if k.starts_with("KIRY_") {
+                    env.retain(|(x, _)| x != k);
+                    env.push((k.clone(), v.clone()));
+                }
+            }
+        }
+    }
+
+    let lto = knob["LTO"].as_str();
+    if !matches!(lto, "none" | "thin" | "full") {
+        return Err(format!("LTO is none, thin or full, not {lto}"));
+    }
+    let jobs = &knob["KIRY_THINLTO_JOBS"];
+    if jobs.parse::<u32>().is_err() {
+        return Err(format!("KIRY_THINLTO_JOBS wants a number, not {jobs}"));
+    }
+
+    let mut base: Vec<String> = Vec::new();
+    if !knob["OPT"].is_empty() {
+        base.push(knob["OPT"].clone());
+    }
+    if !knob["CFLAGS_MARCH"].is_empty() {
+        base.push(format!("-march={}", knob["CFLAGS_MARCH"]));
+    }
+    if lto != "none" {
+        base.push(format!("-flto={lto}"));
+    }
+    base.push("-g0".into());
+
+    let mut link: Vec<String> = Vec::new();
+    if lto != "none" {
+        link.push(format!("-flto={lto}"));
+    }
+    // 16 links at once against 32GB is where the machine starts swapping, and swapping
+    // costs more than the parallelism returns
+    if lto == "thin" {
+        link.push(format!("-Wl,--thinlto-jobs={jobs}"));
+    }
+    // lld's branch-to-branch rewriting, which it does not do below -O2
+    link.push("-Wl,-O2".into());
+
+    // the file's own lines last, so appending -O0 or -g really does win
+    let join = |a: &[String], b: &[String]| {
+        a.iter()
+            .chain(b.iter())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string()
+    };
+    use_flags.sort();
+    Ok(Flags {
+        cflags: join(&base, &c),
+        cxxflags: join(&base, &cxx),
+        ldflags: join(&link, &ld),
+        use_flags,
+        env,
+        from,
+    })
+}
+
+fn flags_cmd(args: &[String]) {
+    let mut queue = false;
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "--queue" {
+            queue = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    let (root, _, want) = opts(&rest);
+    if let Some(name) = want.first() {
+        if want.len() > 1 {
+            die("flags takes one package".into());
+        }
+        if queue {
+            die("--queue takes no package".into());
+        }
+        let f = match flags(&root, name) {
+            Ok(f) => f,
+            Err(e) => die(e),
+        };
+        for (src, k, v) in &f.from {
+            say!("{src} {k} {v}");
+        }
+        for l in f.record() {
+            say!("resolved {l}");
+        }
+        return;
+    }
+
+    let targets = match db::targets(&root) {
+        Ok(t) => t,
+        Err(e) => die(e.to_string()),
+    };
+    let mut stale = Vec::new();
+    for t in &targets {
+        for name in db::installed(&root, t).unwrap_or_default() {
+            let Ok(rec) = db::read(&root, t, &name) else {
+                continue;
+            };
+            let now = match flags(&root, &name) {
+                Ok(f) => f.record(),
+                Err(e) => die(e),
+            };
+            if rec.flags == now {
+                continue;
+            }
+            let why = if rec.flags.is_empty() {
+                "unrecorded"
+            } else {
+                "stale"
+            };
+            say!("{name} {t} {why}");
+            stale.push(db::Queued {
+                target: t.clone(),
+                name,
+                soname: "flags".into(),
+                changed: Vec::new(),
+            });
+        }
+    }
+    if !queue || stale.is_empty() {
+        return;
+    }
+    let mut all = db::read_queue(&root).unwrap_or_default();
+    all.extend(stale);
+    all.sort();
+    all.dedup();
+    match db::write_queue(&root, &all) {
+        Ok(()) => say!("queued {}", all.len()),
+        Err(e) => die(e.to_string()),
+    }
 }
 
 fn run(c: &mut Command, what: &str) -> Result<(), String> {

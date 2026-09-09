@@ -203,6 +203,7 @@ fn bootstrap(root: &Path) -> bool {
                 manifest: manifest.clone(),
                 hash: String::new(),
                 users: Vec::new(),
+                flags: Vec::new(),
             },
         )
         .unwrap();
@@ -227,6 +228,7 @@ fn bootstrap(root: &Path) -> bool {
                 manifest: Vec::new(),
                 hash: String::new(),
                 users: Vec::new(),
+                flags: Vec::new(),
             },
         )
         .unwrap();
@@ -989,6 +991,7 @@ fn record(root: &Path, name: &str, deps: &[&str], manifest: Vec<db::Entry>) {
             manifest,
             hash: String::new(),
             users: Vec::new(),
+            flags: Vec::new(),
         },
     )
     .unwrap();
@@ -1015,6 +1018,7 @@ fn a_closed_pipe_is_not_a_panic() {
                 manifest: Vec::new(),
                 hash: String::new(),
                 users: Vec::new(),
+                flags: Vec::new(),
             },
         )
         .unwrap();
@@ -1095,6 +1099,7 @@ fn place(root: &Path, name: &str, files: &[(&str, &Path)]) {
             manifest: manifest.clone(),
             hash: String::new(),
             users: Vec::new(),
+            flags: Vec::new(),
         },
     )
     .unwrap();
@@ -1683,4 +1688,191 @@ fn a_package_does_not_queue_itself_for_its_own_library() {
         !q.iter().any(|l| queued_pkg(l) == "foo"),
         "foo ships the library and was rebuilt with it: {q:?}"
     );
+}
+
+fn config(root: &Path, name: Option<&str>, body: &str) {
+    let at = match name {
+        Some(n) => root.join("etc/kiry/pkg").join(n),
+        None => root.join("etc/kiry/config"),
+    };
+    fs::create_dir_all(at.parent().unwrap()).unwrap();
+    fs::write(at, body).unwrap();
+}
+
+fn resolved(root: &Path, name: &str) -> String {
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), name]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+// the whole of subsystem 3 in one assertion. compile() named every variable it wanted
+// and CFLAGS was not among them, so every meson package in the tree was built at -O0
+// and nothing anywhere reported it
+#[test]
+fn a_build_is_handed_the_flags_the_config_resolves() {
+    let at = scratch("cflags");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$CFLAGS|$LDFLAGS\" > \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O3\nCFLAGS_MARCH znver3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let art = cache(&root, ".tar.zst");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
+            root.display(),
+            art[0]
+        ))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    let (c, ld) = said.trim().split_once('|').unwrap();
+    assert_eq!(c, "-O3 -march=znver3 -flto=thin -g0", "{said}");
+    assert_eq!(ld, "-flto=thin -Wl,--thinlto-jobs=8 -Wl,-O2", "{said}");
+}
+
+// what the sidecar carries is what the record ends up holding, which is the only
+// reason a later resolve has something to differ from
+#[test]
+fn an_artifact_records_what_it_was_built_with() {
+    let at = scratch("flagmeta");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "CFLAGS_MARCH znver3\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let meta = root
+        .join("var/kiry/cache")
+        .join(&sidecars(&root)[0])
+        .join("flags");
+    let said = fs::read_to_string(meta).unwrap();
+    assert!(said.contains("CFLAGS -O2 -march=znver3 -g0"), "{said}");
+}
+
+// a knob is the package's to replace and CFLAGS is the package's to add to. taking
+// something back out of the global set is what a recipe's filter file is for
+#[test]
+fn a_package_replaces_a_knob_and_appends_to_the_rest() {
+    let root = scratch("override");
+    config(&root, None, "OPT -O3\nCFLAGS_MARCH znver3\nCFLAGS -pipe\n");
+    config(&root, Some("glibc"), "OPT -O2\nLTO none\nCFLAGS -fno-lto\n");
+
+    let said = resolved(&root, "glibc");
+    assert!(
+        said.contains("resolved CFLAGS -O2 -march=znver3 -g0 -pipe -fno-lto"),
+        "{said}"
+    );
+    // where each line came from, or a filter that looks wrong in six months has no
+    // reason beside it
+    assert!(said.contains("/etc/kiry/config OPT -O3"), "{said}");
+    assert!(said.contains("/etc/kiry/pkg/glibc OPT -O2"), "{said}");
+}
+
+// a global flag turned off for one package, without that package restating the set
+#[test]
+fn a_later_minus_takes_a_flag_back_off() {
+    let root = scratch("useflags");
+    config(&root, None, "flags x11 wayland vulkan\n");
+    config(&root, Some("foot"), "flags -x11\n");
+
+    assert!(
+        resolved(&root, "foot").contains("resolved FLAGS vulkan wayland"),
+        "{}",
+        resolved(&root, "foot")
+    );
+}
+
+// silence on a typo would mean a flag that never applied and nothing saying so
+#[test]
+fn a_setting_that_is_not_one_is_refused_by_name() {
+    let root = scratch("typo");
+    config(&root, None, "OPT -O2\nCFLAG -pipe\n");
+
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), "mesa"]);
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("/etc/kiry/config:2"), "{said}");
+    assert!(said.contains("CFLAG is not a setting"), "{said}");
+}
+
+// the jobs cap is a thinlto thing, and lld warns at anything else
+#[test]
+fn thinlto_jobs_only_appear_under_thin() {
+    let root = scratch("ltojobs");
+    config(&root, None, "LTO full\n");
+    let said = resolved(&root, "mesa");
+    assert!(said.contains("resolved LDFLAGS -flto=full -Wl,-O2"), "{said}");
+    assert!(!said.contains("thinlto-jobs"), "{said}");
+}
+
+// editing the config is what fills this queue, and nothing else would notice
+#[test]
+fn a_record_that_no_longer_resolves_is_queued() {
+    let root = scratch("flagdiff");
+    record(&root, "mesa", &[], Vec::new());
+    db::write(
+        &root,
+        &db::Installed {
+            name: "wlroots".into(),
+            target: "x86_64-musl".into(),
+            version: Version::parse("1.0 1").unwrap(),
+            depends: Vec::new(),
+            manifest: Vec::new(),
+            hash: String::new(),
+            users: Vec::new(),
+            flags: vec!["CFLAGS -O2 -g0".into()],
+        },
+    )
+    .unwrap();
+
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), "--queue"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    // one was never recorded, the other was and no longer matches
+    assert!(said.contains("mesa x86_64-musl unrecorded"), "{said}");
+    assert!(said.contains("wlroots x86_64-musl stale"), "{said}");
+
+    let q = fs::read_to_string(db::queue(&root)).unwrap();
+    assert!(q.contains("x86_64-musl flags mesa"), "{q}");
+    assert!(q.contains("x86_64-musl flags wlroots"), "{q}");
+}
+
+// a package built with exactly what resolves now has nothing to rebuild for
+#[test]
+fn a_record_that_still_resolves_is_left_alone() {
+    let root = scratch("flagsame");
+    db::write(
+        &root,
+        &db::Installed {
+            name: "foot".into(),
+            target: "x86_64-musl".into(),
+            version: Version::parse("1.0 1").unwrap(),
+            depends: Vec::new(),
+            manifest: Vec::new(),
+            hash: String::new(),
+            users: Vec::new(),
+            flags: vec!["CFLAGS -O2 -g0".into(), "CXXFLAGS -O2 -g0".into(), "LDFLAGS -Wl,-O2".into()],
+        },
+    )
+    .unwrap();
+
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), "--queue"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
+    assert!(!db::queue(&root).exists());
 }

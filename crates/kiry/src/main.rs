@@ -34,6 +34,10 @@ fn main() {
         Some("owns") => owns_cmd(&args[1..]),
         Some("rebuild") => rebuild_cmd(&args[1..]),
         Some("flags") => flags_cmd(&args[1..]),
+        Some("why") => why_cmd(&args[1..]),
+        Some("search") => search_cmd(&args[1..]),
+        Some("log") => log_cmd(&args[1..]),
+        Some("stats") => stats_cmd(&args[1..]),
         Some("convert") => convert_cmd(&args[1..]),
         Some("sandbox") => {
             if let Err(e) = sandbox::init() {
@@ -57,6 +61,10 @@ fn usage() {
     say!("       kiry owns [--root DIR] <path>...");
     say!("       kiry rebuild [--root DIR] [-n]");
     say!("       kiry flags [--root DIR] <pkg> | [--queue]");
+    say!("       kiry why [--root DIR] <pkg>     what pulls it in");
+    say!("       kiry search [--root DIR] [term] recipes on offer");
+    say!("       kiry log [--root DIR] <pkg>     the last build log");
+    say!("       kiry stats [--root DIR]");
     say!("       kiry convert [-n] <APKBUILD>... <into DIR>");
     say!("       kiry sandbox                    internal: build inside its closure");
     say!("       kiry <package dir>");
@@ -2349,6 +2357,169 @@ fn enqueue(root: &Path, broke: &[install::Broke], just: &HashSet<(String, String
         Ok(()) => say!("queued {}", all.len()),
         Err(e) => die(e.to_string()),
     }
+}
+
+// what pulls a package in, which is the question asked before removing one. runtime
+// edges only: a build dep is gone once the build is
+fn why_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    let [name] = &rest[..] else {
+        die("why wants one package".into());
+    };
+
+    let targets = match db::targets(&root) {
+        Ok(t) => t,
+        Err(e) => die(e.to_string()),
+    };
+
+    let mut found = false;
+    for t in &targets {
+        let mut up: HashMap<String, Vec<String>> = HashMap::new();
+        let names = db::installed(&root, t).unwrap_or_default();
+        for n in &names {
+            let Ok(r) = db::read(&root, t, n) else { continue };
+            for d in r.depends.iter().filter(|d| !d.make && d.applies(t)) {
+                up.entry(d.name.clone()).or_default().push(n.clone());
+            }
+        }
+        if !names.iter().any(|n| n == name) && !up.contains_key(name) {
+            continue;
+        }
+        found = true;
+
+        // shortest path first, so the line printed for a package is the shortest reason
+        // it is here rather than every reason
+        let mut seen: HashSet<&str> = HashSet::from([name.as_str()]);
+        let mut queue: Vec<Vec<&str>> = vec![vec![name.as_str()]];
+        let mut out: Vec<String> = Vec::new();
+        while let Some(path) = queue.pop() {
+            let Some(last) = path.last() else { continue };
+            let Some(ups) = up.get(*last) else { continue };
+            for u in ups {
+                if !seen.insert(u.as_str()) {
+                    continue;
+                }
+                let mut next = path.clone();
+                next.push(u.as_str());
+                next.reverse();
+                out.push(format!("{t} {}", next.join(" ")));
+                next.reverse();
+                queue.insert(0, next);
+            }
+        }
+        out.sort();
+        for l in &out {
+            say!("{l}");
+        }
+        if out.is_empty() {
+            say!("{t} {name} nothing depends on it");
+        }
+    }
+    if !found {
+        die(format!("{name} is not installed"));
+    }
+}
+
+// the recipes on offer, which nothing else answers: l lists what is installed and a
+// package that is not cannot be found at all otherwise
+fn search_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    let want = rest.first().map(String::as_str).unwrap_or("");
+
+    let mut have: HashSet<String> = HashSet::new();
+    for t in db::targets(&root).unwrap_or_default() {
+        have.extend(db::installed(&root, &t).unwrap_or_default());
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for r in repos(&root) {
+        let repo = r.file_name().map_or_else(String::new, |x| x.to_string_lossy().into_owned());
+        let Ok(rd) = fs::read_dir(&r) else { continue };
+        for e in rd.flatten() {
+            let d = e.path();
+            let n = e.file_name().to_string_lossy().into_owned();
+            if !n.contains(want) || !d.join("build").is_file() {
+                continue;
+            }
+            let v = fs::read_to_string(d.join("version")).unwrap_or_default();
+            let v = v.split_whitespace().next().unwrap_or("?").to_string();
+            let mark = if have.contains(&n) { "installed" } else { "-" };
+            out.push(format!("{n} {v} {repo} {mark}"));
+        }
+    }
+    out.sort();
+    for l in &out {
+        say!("{l}");
+    }
+}
+
+// the log of the last build, which is otherwise a path nobody remembers
+fn log_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    let [name] = &rest[..] else {
+        die("log wants one package".into());
+    };
+
+    let d = root.join("var/kiry/log");
+    let Ok(rd) = fs::read_dir(&d) else {
+        die(format!("{}: no logs", d.display()));
+    };
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in rd.flatten() {
+        let f = e.file_name().to_string_lossy().into_owned();
+        // name-version-rev.target.log, and a version can hold a dash of its own
+        if !f.starts_with(&format!("{name}-")) || !f.ends_with(".log") {
+            continue;
+        }
+        let Ok(when) = e.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(b, _)| when > *b) {
+            best = Some((when, e.path()));
+        }
+    }
+    let Some((_, at)) = best else {
+        die(format!("no build log for {name}"));
+    };
+    match fs::read_to_string(&at) {
+        Ok(t) => {
+            say!("{}", at.display());
+            for l in t.lines() {
+                say!("{l}");
+            }
+        }
+        Err(e) => die(format!("{}: {e}", at.display())),
+    }
+}
+
+fn stats_cmd(args: &[String]) {
+    let (root, _, _) = opts(args);
+
+    for t in db::targets(&root).unwrap_or_default() {
+        say!("installed {t} {}", db::installed(&root, &t).unwrap_or_default().len());
+    }
+
+    let mut recipes = 0;
+    for r in repos(&root) {
+        let n = fs::read_dir(&r)
+            .map(|rd| rd.flatten().filter(|e| e.path().join("build").is_file()).count())
+            .unwrap_or(0);
+        say!("recipes {} {n}", r.display());
+        recipes += n;
+    }
+    say!("recipes total {recipes}");
+
+    let (mut arts, mut bytes) = (0u64, 0u64);
+    if let Ok(rd) = fs::read_dir(root.join("var/kiry/cache")) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().ends_with(".tar.zst") {
+                arts += 1;
+                bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    say!("cache {arts} artifacts {} MiB", bytes / (1024 * 1024));
+    say!("queued {}", db::read_queue(&root).unwrap_or_default().len());
 }
 
 fn convert_cmd(args: &[String]) {

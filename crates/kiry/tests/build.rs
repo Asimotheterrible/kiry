@@ -2138,3 +2138,89 @@ fn a_cycle_a_bootstrap_file_declares_can_be_planned() {
     assert!(lines.contains(&"beta x86_64-gnu would rebuild"), "{said}");
     assert!(lines.contains(&"alpha x86_64-gnu would rebuild"), "{said}");
 }
+
+#[test]
+fn why_shows_the_shortest_path_that_pulls_a_package_in() {
+    let root = scratch("why");
+    bare(&root, "app", &["mid"]);
+    bare(&root, "mid", &["leaf"]);
+    bare(&root, "leaf", &[]);
+    bare(&root, "loner", &[]);
+
+    let o = kiry(&["why", "--root", root.to_str().unwrap(), "leaf"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("x86_64-musl mid leaf"), "{said}");
+    assert!(said.contains("x86_64-musl app mid leaf"), "{said}");
+
+    let o = kiry(&["why", "--root", root.to_str().unwrap(), "loner"]);
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("nothing depends on it"),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    // a name nothing knows is an error, not an empty answer
+    assert!(!kiry(&["why", "--root", root.to_str().unwrap(), "absent"]).status.success());
+}
+
+// l answers for what is installed, and nothing answered for what is merely on offer
+#[test]
+fn search_finds_a_recipe_that_is_not_installed() {
+    let at = scratch("search");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    bare(&root, "here", &[]);
+    let repo = at.join("repo");
+    for n in ["here", "elsewhere", "unrelated"] {
+        let d = repo.join(n);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("build"), ":\n").unwrap();
+        fs::write(d.join("version"), "2.1 1\n").unwrap();
+    }
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+
+    let o = kiry(&["search", "--root", root.to_str().unwrap(), "here"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("here 2.1 repo installed"), "{said}");
+    assert!(said.contains("elsewhere 2.1 repo -"), "{said}");
+    assert!(!said.contains("unrelated"), "{said}");
+}
+
+#[test]
+fn log_prints_the_newest_build_log_for_a_package() {
+    let root = scratch("logcmd");
+    let d = root.join("var/kiry/log");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("hello-1.0-1.x86_64-musl.log"), "older\n").unwrap();
+    fs::write(d.join("other-1.0-1.x86_64-musl.log"), "not this one\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(d.join("hello-2.0-1.x86_64-musl.log"), "newest\n").unwrap();
+
+    let o = kiry(&["log", "--root", root.to_str().unwrap(), "hello"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("newest"), "{said}");
+    assert!(!said.contains("older"), "{said}");
+    assert!(!kiry(&["log", "--root", root.to_str().unwrap(), "absent"]).status.success());
+}
+
+#[test]
+fn stats_counts_what_is_there() {
+    let at = scratch("stats");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    bare(&root, "one", &[]);
+    bare(&root, "two", &[]);
+    let cache = root.join("var/kiry/cache");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("one-1.0-1.x86_64-musl.tar.zst"), vec![0u8; 4096]).unwrap();
+
+    let o = kiry(&["stats", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("installed x86_64-musl 2"), "{said}");
+    assert!(said.contains("cache 1 artifacts"), "{said}");
+    assert!(said.contains("queued 0"), "{said}");
+}

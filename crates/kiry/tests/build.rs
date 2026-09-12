@@ -2115,3 +2115,26 @@ fn a_failure_no_flag_can_fix_says_so_at_once() {
     // and nothing was written to the package's settings, since no setting would help
     assert!(!root.join("etc/kiry/pkg/hello").exists());
 }
+
+// the cycle above, with one member saying how to start it. the stand-in is built first
+// and the same package is still built properly afterwards
+#[test]
+fn a_cycle_a_bootstrap_file_declares_can_be_planned() {
+    let at = scratch("bootcycle");
+    if !bootstrap(&at.join("probe")) {
+        return;
+    }
+    let root = one_target_root(&at);
+    two_consumers(&at, &root, "alpha");
+    fs::write(at.join("repo/alpha/bootstrap"), ":\n").unwrap();
+
+    let o = kiry(&["rebuild", "--root", root.to_str().unwrap(), "-n"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines[0], "alpha x86_64-gnu would bootstrap", "{said}");
+    // beta can be built once the stand-in is in place, and alpha properly after it
+    assert!(lines.contains(&"beta x86_64-gnu would rebuild"), "{said}");
+    assert!(lines.contains(&"alpha x86_64-gnu would rebuild"), "{said}");
+}

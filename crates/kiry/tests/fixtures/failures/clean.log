@@ -1,0 +1,3 @@
+checking for gcc... kiry-cc
+[40/40] Linking target foo
+Test suite failed: 3 of 200 assertions

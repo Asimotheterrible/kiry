@@ -1,0 +1,4 @@
+checking for gcc... kiry-cc
+configure: creating ./config.status
+ar: creating libfoo.a
+ld.lld: error: libfoo.a(bar.o): Not a valid object file

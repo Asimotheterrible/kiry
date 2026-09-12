@@ -49,7 +49,7 @@ fn main() {
 }
 
 fn usage() {
-    say!("usage: kiry b [--root DIR] [--target T] [-v] <package dir>...");
+    say!("usage: kiry b [--root DIR] [--target T] [-v] [--recover] <package dir>...");
     say!("       kiry i [--root DIR] [--force] <archive>...");
     say!("       kiry r [--root DIR] [--force] <pkg>...");
     say!("       kiry l [--root DIR]");
@@ -106,11 +106,13 @@ fn writes(root: &Path) {
 fn build_cmd(args: &[String]) {
     let mut want = None;
     let mut verbose = false;
+    let mut fix = false;
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-v" => verbose = true,
+            "--recover" => fix = true,
             "--target" => match it.next() {
                 Some(t) => want = Some(t.clone()),
                 None => die("--target wants a name".into()),
@@ -135,7 +137,13 @@ fn build_cmd(args: &[String]) {
             Some(t) => vec![t.clone()],
             None => p.targets.clone(),
         };
-        if let Err(e) = build(&root, &p, &targets, verbose) {
+        if fix {
+            for t in &targets {
+                if let Err(e) = recover(&root, &p, t, verbose) {
+                    die(e);
+                }
+            }
+        } else if let Err(e) = build(&root, &p, &targets, verbose, false) {
             die(e);
         }
     }
@@ -148,10 +156,12 @@ fn build(
     p: &Package,
     targets: &[String],
     verbose: bool,
+    reuse: bool,
 ) -> Result<Vec<PathBuf>, String> {
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
-    let f = flags(root, &p.name, Some(&p.dir))?;
+    let mut f = flags(root, &p.name, Some(&p.dir))?;
+    f.reuse = reuse;
 
     let mut built = Vec::new();
     for t in targets {
@@ -329,6 +339,98 @@ fn grab(url: &str, dst: &Path) -> Result<(), String> {
     fs::rename(&part, dst).map_err(|e| format!("{}: {e}", dst.display()))
 }
 
+// full flags, then less of them. a check failure prints nothing a table could match, so
+// after the signatures are out this is the only thing left that knows anything
+const LADDER: &[(bool, &str)] = &[
+    (true, "filter-lto"),
+    (false, "LTO none"),
+    (false, "OPT -O2"),
+    (false, "CFLAGS_MARCH"),
+    (false, "CFLAGS -pipe"),
+];
+
+fn note(at: &Path, line: &str, why: &str) -> Result<(), String> {
+    let had = fs::read_to_string(at).unwrap_or_default();
+    if !line.is_empty() && had.lines().any(|l| l.split('#').next().unwrap_or("").trim() == line) {
+        return Ok(());
+    }
+    if let Some(d) = at.parent() {
+        fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let gap = if had.is_empty() || had.ends_with('\n') { "" } else { "\n" };
+    fs::write(at, format!("{had}{gap}# {} {why}\n{line}\n", today()))
+        .map_err(|e| format!("{}: {e}", at.display()))?;
+    if !line.is_empty() {
+        say!("{} {line}", at.display());
+    }
+    Ok(())
+}
+
+fn stuck(p: &Package, t: &str, why: &str) -> String {
+    let _ = note(&p.dir.join("filter"), "", &format!("stuck on {t}: {why}"));
+    format!("{} {t}: stuck, {why}", p.name)
+}
+
+// build fails, read the log, fix it, build again. three signature retries and never the
+// same action twice, then the ladder, then it is stuck and says why
+fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), String> {
+    let rs = rules(root)?;
+    let one = [t.to_string()];
+    let mut tried: Vec<String> = Vec::new();
+    let mut rung = 0;
+    let mut reuse = false;
+
+    loop {
+        match build(root, p, &one, verbose, reuse) {
+            Ok(_) => return Ok(()),
+            Err(e) => say!("{e}"),
+        }
+        let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
+        reuse = false;
+
+        if tried.len() < 3 {
+            if let Some(f) = scan(&rs, &log) {
+                if let Some(why) = f.act.strip_prefix("notaflag ") {
+                    return Err(stuck(p, t, why));
+                }
+                if !tried.contains(&f.act) {
+                    tried.push(f.act.clone());
+                    say!("{} {t} {} phase, {}", p.name, phase(&log), f.rule);
+                    if write_fix(root, &p.dir, &p.name, &f, &log)? {
+                        reuse = f.reuse;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let Some((filter, line)) = LADDER.get(rung) else {
+            return Err(stuck(p, t, "the ladder ran out"));
+        };
+        rung += 1;
+        let at = match filter {
+            true => p.dir.join("filter"),
+            false => root.join("etc/kiry/pkg").join(&p.name),
+        };
+        note(&at, line, &format!("rung {rung} after {} failed on {t}", phase(&log)))?;
+    }
+}
+
+fn cached(root: &Path, p: &Package, t: &str) -> Option<PathBuf> {
+    let a = root.join("var/kiry/cache").join(format!(
+        "{}-{}-{}.{t}.tar.zst",
+        p.name, p.version.upstream, p.version.rev
+    ));
+    a.is_file().then_some(a)
+}
+
+fn logpath(root: &Path, p: &Package, t: &str) -> PathBuf {
+    root.join("var/kiry/log").join(format!(
+        "{}-{}-{}.{t}.log",
+        p.name, p.version.upstream, p.version.rev
+    ))
+}
+
 fn compile(
     root: &Path,
     p: &Package,
@@ -341,14 +443,22 @@ fn compile(
         "{}-{}-{}.{t}",
         p.name, p.version.upstream, p.version.rev
     ));
-    let _ = fs::remove_dir_all(&work);
-
     let src = work.join("src");
     let dest = work.join("dest");
-    mkdirs(&src)?;
+
+    // a reuse retry keeps every object that compiled and re-invokes the build system,
+    // which relinks and nothing else. the source is byte-identical and only flags moved,
+    // so what is stale is decidable -- this is not the persistent tree that was rejected,
+    // and the tree still goes when the sequence ends
+    let again = f.reuse && src.is_dir();
+    if !again {
+        let _ = fs::remove_dir_all(&work);
+        mkdirs(&src)?;
+    }
+    let _ = fs::remove_dir_all(&dest);
     mkdirs(&dest)?;
 
-    for (name, path, _) in srcs {
+    for (name, path, _) in srcs.iter().filter(|_| !again) {
         let name = name.as_str();
         if tarball(name) {
             // as root tar restores the archive's own uids, and the sandbox maps one id,
@@ -538,10 +648,7 @@ fn compile(
     }
 
     // the log is written either way. -v only decides whether you also watch it
-    let log = root.join("var/kiry/log").join(format!(
-        "{}-{}-{}.{t}.log",
-        p.name, p.version.upstream, p.version.rev
-    ));
+    let log = logpath(root, p, t);
     if !verbose {
         mkdirs(&root.join("var/kiry/log"))?;
         let out = fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
@@ -973,6 +1080,8 @@ const KNOBS: &[(&str, &str)] = &[
 ];
 
 struct Flags {
+    // set only by a recovery retry whose rule said the fix touches no compile flag
+    reuse: bool,
     cflags: String,
     cxxflags: String,
     ldflags: String,
@@ -1224,6 +1333,7 @@ fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
 
     use_flags.sort();
     Ok(Flags {
+        reuse: false,
         cflags: cf.join(" "),
         cxxflags: cxf.join(" "),
         ldflags: ldf.join(" "),
@@ -1317,6 +1427,414 @@ fn flags_cmd(args: &[String]) {
         Ok(()) => say!("queued {}", all.len()),
         Err(e) => die(e.to_string()),
     }
+}
+
+// the subset the failure table needs and no more: literals, . , [\w=-] classes, \w \d \s,
+// (a|b) with a capture, and + * ? on anything that is not a group. five more crates for
+// patterns nobody is going to write is the trade thiserror and blake3 already lost
+//
+// two deliberate limits, both rejected at parse time rather than silently: a group takes
+// no quantifier, and groups do not nest. the table's alternations are literal strings,
+// so the first end a group finds is its only one
+#[derive(Debug, Clone)]
+enum Node {
+    Lit(char),
+    Any,
+    Class { spans: Vec<(char, char)>, neg: bool },
+    Group(usize, Vec<Vec<Piece>>),
+}
+
+#[derive(Debug, Clone)]
+struct Piece {
+    node: Node,
+    rep: (usize, usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct Rx {
+    prog: Vec<Piece>,
+    groups: usize,
+    src: String,
+}
+
+fn class_for(c: char) -> Option<Vec<(char, char)>> {
+    Some(match c {
+        'w' => vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
+        'd' => vec![('0', '9')],
+        's' => vec![(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')],
+        _ => return None,
+    })
+}
+
+fn brackets(cs: &[char], i: &mut usize) -> Result<Node, String> {
+    let neg = cs.get(*i) == Some(&'^');
+    if neg {
+        *i += 1;
+    }
+    let mut spans = Vec::new();
+    let mut first = true;
+    loop {
+        let Some(&c) = cs.get(*i) else {
+            return Err("[ with no ]".into());
+        };
+        if c == ']' && !first {
+            *i += 1;
+            return Ok(Node::Class { spans, neg });
+        }
+        first = false;
+        *i += 1;
+        if c == '\\' {
+            let Some(&e) = cs.get(*i) else {
+                return Err("\\ at the end of a class".into());
+            };
+            *i += 1;
+            match class_for(e) {
+                Some(s) => spans.extend(s),
+                None => spans.push((e, e)),
+            }
+            continue;
+        }
+        // a - before the ] is a literal one, which is how [\w=-] is written
+        if cs.get(*i) == Some(&'-') && cs.get(*i + 1).is_some_and(|n| *n != ']') {
+            let hi = cs[*i + 1];
+            *i += 2;
+            spans.push((c, hi));
+        } else {
+            spans.push((c, c));
+        }
+    }
+}
+
+fn pieces(cs: &[char], i: &mut usize, groups: &mut usize, top: bool) -> Result<Vec<Piece>, String> {
+    let mut out: Vec<Piece> = Vec::new();
+    while let Some(&c) = cs.get(*i) {
+        if !top && (c == '|' || c == ')') {
+            break;
+        }
+        *i += 1;
+        let node = match c {
+            '.' => Node::Any,
+            '[' => brackets(cs, i)?,
+            '\\' => {
+                let Some(&e) = cs.get(*i) else {
+                    return Err("\\ at the end of the pattern".into());
+                };
+                *i += 1;
+                match class_for(e) {
+                    Some(spans) => Node::Class { spans, neg: false },
+                    None => Node::Lit(e),
+                }
+            }
+            '(' => {
+                let n = *groups;
+                *groups += 1;
+                let mut alts = Vec::new();
+                loop {
+                    alts.push(pieces(cs, i, groups, false)?);
+                    match cs.get(*i) {
+                        Some('|') => *i += 1,
+                        Some(')') => {
+                            *i += 1;
+                            break;
+                        }
+                        _ => return Err("( with no )".into()),
+                    }
+                }
+                Node::Group(n, alts)
+            }
+            ')' | '|' => return Err(format!("{c} outside a group")),
+            '+' | '*' | '?' => return Err(format!("{c} with nothing before it")),
+            _ => Node::Lit(c),
+        };
+        let rep = match cs.get(*i) {
+            Some('+') => (1, usize::MAX),
+            Some('*') => (0, usize::MAX),
+            Some('?') => (0, 1),
+            _ => (1, 1),
+        };
+        if rep != (1, 1) {
+            *i += 1;
+            if matches!(node, Node::Group(..)) {
+                return Err("a group takes no + * or ?".into());
+            }
+        }
+        out.push(Piece { node, rep });
+    }
+    Ok(out)
+}
+
+impl Rx {
+    pub fn new(src: &str) -> Result<Rx, String> {
+        let cs: Vec<char> = src.chars().collect();
+        let (mut i, mut groups) = (0, 0);
+        let prog = pieces(&cs, &mut i, &mut groups, true)?;
+        Ok(Rx {
+            prog,
+            groups,
+            src: src.to_string(),
+        })
+    }
+
+    // unanchored, leftmost. the whole line is the haystack and the table's patterns are
+    // fragments of it
+    pub fn find(&self, hay: &str) -> Option<Vec<String>> {
+        let s: Vec<char> = hay.chars().collect();
+        for start in 0..=s.len() {
+            let mut caps = vec![None; self.groups];
+            if seq(&self.prog, &s, start, &mut caps).is_some() {
+                return Some(
+                    caps.into_iter()
+                        .map(|c| match c {
+                            Some((a, b)) => s[a..b].iter().collect(),
+                            None => String::new(),
+                        })
+                        .collect(),
+                );
+            }
+        }
+        None
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.src
+    }
+}
+
+fn one(n: &Node, s: &[char], i: usize) -> Option<usize> {
+    let &c = s.get(i)?;
+    let ok = match n {
+        Node::Lit(l) => c == *l,
+        Node::Any => true,
+        Node::Class { spans, neg } => spans.iter().any(|(a, b)| c >= *a && c <= *b) != *neg,
+        Node::Group(..) => return None,
+    };
+    ok.then_some(i + 1)
+}
+
+fn seq(ps: &[Piece], s: &[char], i: usize, caps: &mut Vec<Option<(usize, usize)>>) -> Option<usize> {
+    let Some((p, rest)) = ps.split_first() else {
+        return Some(i);
+    };
+
+    if let Node::Group(n, alts) = &p.node {
+        for a in alts {
+            let Some(mid) = seq(a, s, i, caps) else { continue };
+            if let Some(end) = seq(rest, s, mid, caps) {
+                caps[*n] = Some((i, mid));
+                return Some(end);
+            }
+        }
+        return None;
+    }
+
+    // greedy, then give characters back one at a time
+    let mut ends = vec![i];
+    let mut at = i;
+    while ends.len() <= p.rep.1 {
+        let Some(next) = one(&p.node, s, at) else { break };
+        at = next;
+        ends.push(at);
+    }
+    for k in (p.rep.0..ends.len()).rev() {
+        if let Some(e) = seq(rest, s, ends[k], caps) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+// a build failure has an error message in it, so read the message and fix it in one
+// attempt. the ladder below is for a check failure, which has no message at all
+//
+// first match wins and the rows are most-specific first, so /etc/kiry/failures.d is
+// consulted ahead of the table proper
+const FAILURES: &str = "\
+# regex                                      action                     retry
+LLVM ERROR: out of memory.*lto               set LTO thin               clean
+(out of memory|signal 9|exit status 137)     set KIRY_THINLTO_JOBS /2   reuse
+(Not a valid object file|invalid bitcode)    filter-lto                 clean
+unknown argument: '(-[fm][\\w=-]+)'          drop $1                    clean
+recompile with -fPIC                         append -fPIC               clean
+undefined symbol: __\\w+_chk                  append -U_FORTIFY_SOURCE   clean
+error: instruction requires:                 set CFLAGS_MARCH x86-64    clean
+undefined reference to `__isoc99_            notaflag musl-portability  clean
+PLEASE submit a bug report                   set OPT -O2                clean
+";
+
+struct Rule {
+    rx: Rx,
+    act: String,
+    // whether the work dir survives: it depends on whether the fix changes CFLAGS, not
+    // on which phase died and not on where the action is written
+    reuse: bool,
+}
+
+fn rules(root: &Path) -> Result<Vec<Rule>, String> {
+    let mut text = String::new();
+    // the user's rows first, so a local rule beats the shipped one it narrows
+    if let Ok(rd) = fs::read_dir(root.join("etc/kiry/failures.d")) {
+        let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+        files.sort();
+        for f in files {
+            text.push_str(&fs::read_to_string(&f).map_err(|e| format!("{}: {e}", f.display()))?);
+            text.push('\n');
+        }
+    }
+    match fs::read_to_string(root.join("usr/share/kiry/failures")) {
+        Ok(t) => text.push_str(&t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => text.push_str(FAILURES),
+        Err(e) => return Err(format!("usr/share/kiry/failures: {e}")),
+    }
+
+    let mut out = Vec::new();
+    for (n, l) in text.lines().enumerate() {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        // the pattern has single spaces in it, so only a run of two or a tab ends it
+        let mut f = l.split('\t').flat_map(|x| x.split("  ")).map(str::trim).filter(|x| !x.is_empty());
+        let (Some(rx), Some(act), reuse) = (f.next(), f.next(), f.next()) else {
+            return Err(format!("failures:{}: wants a pattern, an action and a retry", n + 1));
+        };
+        out.push(Rule {
+            rx: Rx::new(rx).map_err(|e| format!("failures:{}: {e}", n + 1))?,
+            act: act.to_string(),
+            reuse: match reuse {
+                Some("reuse") => true,
+                Some("clean") | None => false,
+                Some(x) => return Err(format!("failures:{}: retry is reuse or clean, not {x}", n + 1)),
+            },
+        });
+    }
+    Ok(out)
+}
+
+// what died, recorded beside the rule that fired. it decides nothing -- it is the first
+// thing wanted when a rule turns out to match the wrong thing
+fn phase(log: &str) -> &'static str {
+    let mut seen = "compile";
+    for l in log.lines() {
+        if l.starts_with("checking ") || l.contains("configure:") {
+            seen = "configure";
+        } else if l.contains("ld.lld:") || l.contains("undefined reference") || l.contains("relocation") {
+            seen = "link";
+        } else if l.contains("FAILED:")
+            || l.contains("Test suite")
+            || l.contains("tests failed")
+            || l.contains("Testing")
+            || l.starts_with("PASS")
+        {
+            seen = "check";
+        }
+    }
+    seen
+}
+
+struct Fix {
+    rule: String,
+    line: String,
+    act: String,
+    reuse: bool,
+}
+
+fn scan(rules: &[Rule], log: &str) -> Option<Fix> {
+    for r in rules {
+        for l in log.lines() {
+            let Some(caps) = r.rx.find(l) else { continue };
+            let mut act = r.act.clone();
+            for (i, c) in caps.iter().enumerate() {
+                act = act.replace(&format!("${}", i + 1), c);
+            }
+            return Some(Fix {
+                rule: r.rx.as_str().to_string(),
+                line: l.trim().to_string(),
+                act,
+                reuse: r.reuse,
+            });
+        }
+    }
+    None
+}
+
+// drop, append and filter-lto are the recipe's to carry; set is the machine's opinion
+// about one package and belongs beside the other settings
+fn write_fix(root: &Path, dir: &Path, name: &str, f: &Fix, log: &str) -> Result<bool, String> {
+    let mut w = f.act.split_whitespace();
+    let verb = w.next().unwrap_or("");
+    let rest: Vec<&str> = w.collect();
+
+    let (at, line) = match verb {
+        "drop" => (dir.join("filter"), format!("filter-flags {}", rest.join(" "))),
+        "append" => (dir.join("filter"), format!("append-flags {}", rest.join(" "))),
+        "filter-lto" => (dir.join("filter"), "filter-lto".to_string()),
+        "set" => {
+            let [k, v] = rest[..] else {
+                return Err(format!("set wants a name and a value, got {:?}", f.act));
+            };
+            let v = match v.strip_prefix('/') {
+                // the thinlto row halves what is there rather than naming a number, so
+                // the same rule fires again on a machine with different memory
+                Some(d) => {
+                    let by: usize = d.parse().map_err(|_| format!("{v} is not a divisor"))?;
+                    let now = flags(root, name, Some(dir))?;
+                    let was = now
+                        .from
+                        .iter()
+                        .rev()
+                        .find(|(_, n, _)| n == k)
+                        .and_then(|(_, _, x)| x.parse::<usize>().ok())
+                        .unwrap_or(8);
+                    (was / by.max(1)).max(1).to_string()
+                }
+                None => v.to_string(),
+            };
+            (
+                root.join("etc/kiry/pkg").join(name),
+                format!("{k} {v}"),
+            )
+        }
+        "notaflag" => return Ok(false),
+        _ => return Err(format!("{verb} is not an action")),
+    };
+
+    let had = fs::read_to_string(&at).unwrap_or_default();
+    // never the same fix twice: a rule that fired and did not help fires again on the
+    // next log, and an entry appended each time would grow without bound
+    if had.lines().any(|l| l.split('#').next().unwrap_or("").trim() == line) {
+        return Ok(false);
+    }
+    if let Some(d) = at.parent() {
+        fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    let day = today();
+    let body = format!(
+        "{had}{}# {day} {} failed, {}\n#   {}\n{line}\n",
+        if had.is_empty() || had.ends_with('\n') { "" } else { "\n" },
+        phase(log),
+        f.rule,
+        f.line,
+    );
+    fs::write(&at, body).map_err(|e| format!("{}: {e}", at.display()))?;
+    say!("{} {}", at.display(), line);
+    Ok(true)
+}
+
+// civil-from-days, for the one date a provenance line needs. a calendar crate to format
+// nine characters is the trade thiserror already lost
+fn today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let z = (secs / 86400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!("{:04}-{:02}-{:02}", yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 fn run(c: &mut Command, what: &str) -> Result<(), String> {
@@ -1633,9 +2151,14 @@ fn rebuild_cmd(args: &[String]) {
         for i in &level {
             let (name, target) = &want[*i];
             let p = &recipes[name];
-            match build(&root, p, std::slice::from_ref(target), false) {
-                Ok(arts) => made.extend(arts),
-                Err(e) => die(e),
+            // nobody is watching a drain of the whole queue, which is the case the
+            // signature table was written for
+            if let Err(e) = recover(&root, p, target, false) {
+                die(e);
+            }
+            match cached(&root, p, target) {
+                Some(a) => made.push(a),
+                None => die(format!("{} {target}: built nothing", p.name)),
             }
         }
         let jobs = match install::plan(&root, &made, false) {
@@ -2572,5 +3095,184 @@ fn show(dir: &str) {
             .and_then(|s| s.get(..8))
             .unwrap_or("--------");
         say!("src {sum} {src}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn hit(pat: &str, hay: &str) -> Option<Vec<String>> {
+        Rx::new(pat).unwrap().find(hay)
+    }
+
+    // every pattern the shipped table uses, against a line it has to catch
+    #[test]
+    fn the_table_patterns_match_the_lines_they_are_for() {
+        for (pat, line) in [
+            (
+                "unknown argument: '(-[fm][\\w=-]+)'",
+                "clang: error: unknown argument: '-fno-semantic-interposition'",
+            ),
+            ("(out of memory|signal 9|exit status 137)", "make: *** [all] Error 137 exit status 137"),
+            ("(Not a valid object file|invalid bitcode)", "ld.lld: error: Not a valid object file"),
+            ("recompile with -fPIC", "relocation R_X86_64_32 can not be used; recompile with -fPIC"),
+            ("undefined symbol: __\\w+_chk", "undefined symbol: __memcpy_chk"),
+            ("error: instruction requires:", "error: instruction requires: AVX-512"),
+            ("PLEASE submit a bug report", "PLEASE submit a bug report to https://llvm.org"),
+            ("LLVM ERROR: out of memory.*lto", "LLVM ERROR: out of memory while running lto"),
+        ] {
+            assert!(hit(pat, line).is_some(), "{pat} missed {line}");
+        }
+    }
+
+    #[test]
+    fn a_capture_is_what_drop_substitutes() {
+        let c = hit("unknown argument: '(-[fm][\\w=-]+)'", "error: unknown argument: '-march=znver9'").unwrap();
+        assert_eq!(c, vec!["-march=znver9"]);
+    }
+
+    #[test]
+    fn an_alternation_picks_the_branch_that_is_there() {
+        let c = hit("(out of memory|signal 9)", "killed: signal 9").unwrap();
+        assert_eq!(c, vec!["signal 9"]);
+    }
+
+    // .* is greedy and still has to give characters back for what follows it
+    #[test]
+    fn a_star_backs_off_until_the_rest_fits() {
+        assert!(hit("a.*z", "abcz middle z").is_some());
+        assert!(hit("a.*z", "abc").is_none());
+    }
+
+    #[test]
+    fn a_line_that_is_not_the_failure_does_not_match() {
+        for (pat, line) in [
+            ("recompile with -fPIC", "compiled with -fPIC already"),
+            ("undefined symbol: __\\w+_chk", "undefined symbol: __chk"),
+            ("(Not a valid object file|invalid bitcode)", "a valid object file"),
+        ] {
+            assert!(hit(pat, line).is_none(), "{pat} wrongly caught {line}");
+        }
+    }
+
+    // [\w=-] is how the unknown-argument row is written, so the - must be a literal
+    // and not the tail of a range
+    #[test]
+    fn a_class_takes_a_trailing_hyphen_literally() {
+        assert!(hit("x[\\w=-]+y", "xa=b-cy").is_some());
+        assert!(hit("x[\\w=-]+y", "x!y").is_none());
+        assert!(hit("[^a-z]", "Q").is_some());
+        assert!(hit("[^a-z]", "q").is_none());
+        assert!(Rx::new("[abc").is_err());
+    }
+
+    // rejected at parse time, because the matcher would otherwise be quietly wrong
+    #[test]
+    fn what_the_subset_refuses_it_refuses_out_loud() {
+        assert!(Rx::new("(a|b)+").is_err());
+        assert!(Rx::new("+x").is_err());
+        assert!(Rx::new("(ab").is_err());
+        assert!(Rx::new("a)").is_err());
+    }
+
+    // a corpus of real failures with the action each must produce. hermetic, no builds,
+    // and the place a pattern that starts over-matching gets caught
+    #[test]
+    fn every_captured_failure_gets_the_action_it_should() {
+        let at = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/failures");
+        let rs = rules(Path::new("/nonexistent-root")).unwrap();
+        let mut seen = 0;
+        for e in fs::read_dir(&at).unwrap().flatten() {
+            let log = e.path();
+            if log.extension().is_none_or(|x| x != "log") {
+                continue;
+            }
+            let want = fs::read_to_string(log.with_extension("want")).unwrap();
+            let want = want.trim();
+            let got = scan(&rs, &fs::read_to_string(&log).unwrap());
+            let got = got.as_ref().map_or("", |f| f.act.as_str());
+            assert_eq!(got, want, "{}", log.display());
+            seen += 1;
+        }
+        assert!(seen >= 8, "only {seen} fixtures found");
+    }
+
+    // the row the whole design is for: every object compiled, only the link died, so
+    // halving the jobs is a relink and not a rebuild
+    #[test]
+    fn only_the_oom_row_keeps_the_work_dir() {
+        let rs = rules(Path::new("/nonexistent-root")).unwrap();
+        let at = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/failures");
+        let reuse = |n: &str| {
+            scan(&rs, &fs::read_to_string(at.join(n)).unwrap())
+                .map(|f| f.reuse)
+                .unwrap()
+        };
+        assert!(reuse("oom-kill.log"));
+        assert!(!reuse("lto-oom.log"));
+        assert!(!reuse("bitcode.log"));
+    }
+
+    #[test]
+    fn the_phase_is_recorded_even_though_it_decides_nothing() {
+        let at = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/failures");
+        let of = |n: &str| phase(&fs::read_to_string(at.join(n)).unwrap());
+        assert_eq!(of("fpic.log"), "link");
+        assert_eq!(of("isa.log"), "compile");
+        assert_eq!(of("clean.log"), "check");
+    }
+
+    // most specific first, and the lto row has to win over the plain out-of-memory one
+    #[test]
+    fn the_first_row_that_matches_is_the_one_that_fires() {
+        let rs = rules(Path::new("/nonexistent-root")).unwrap();
+        let f = scan(&rs, "LLVM ERROR: out of memory while running lto backend").unwrap();
+        assert_eq!(f.act, "set LTO thin");
+    }
+
+    fn scratch(n: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("kiry-rx-{}", std::process::id()))
+            .join(n);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // the shipped file is the table, and the built-in is only what a root without one
+    // falls back to. this is also what checks the file kiry installs actually parses
+    #[test]
+    fn a_table_on_disk_replaces_the_built_in_one() {
+        let root = scratch("ondisk");
+        let at = root.join("usr/share/kiry");
+        fs::create_dir_all(&at).unwrap();
+        fs::write(at.join("failures"), FAILURES).unwrap();
+
+        let rs = rules(&root).unwrap();
+        assert_eq!(rs.len(), FAILURES.lines().filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty()).count());
+        assert_eq!(scan(&rs, "ld.lld: error: invalid bitcode").unwrap().act, "filter-lto");
+    }
+
+    // a local rule is consulted ahead of the shipped one it narrows
+    #[test]
+    fn a_rule_in_failures_d_is_tried_first() {
+        let root = scratch("failuresd");
+        let d = root.join("etc/kiry/failures.d");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("10-local"), "invalid bitcode  set LTO none  clean\n").unwrap();
+
+        let rs = rules(&root).unwrap();
+        assert_eq!(scan(&rs, "ld.lld: error: invalid bitcode").unwrap().act, "set LTO none");
+    }
+
+    #[test]
+    fn a_row_missing_its_retry_column_is_refused() {
+        let root = scratch("badrow");
+        let d = root.join("etc/kiry/failures.d");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("10-bad"), "boom  set LTO none  sometimes\n").unwrap();
+        assert!(rules(&root).is_err());
     }
 }

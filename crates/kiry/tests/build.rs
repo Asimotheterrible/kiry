@@ -2035,3 +2035,83 @@ fn a_build_reaches_flag_o_matic_through_lib_sh() {
     assert_eq!(f.next(), Some("-Os -march=znver3 -g0"), "{said}");
     assert_eq!(f.next(), Some("-Wl,-O2"), "{said}");
 }
+
+// the loop, end to end: a build that fails with something the table knows, the fix
+// written where it belongs, and the retry that then works
+#[test]
+fn a_failure_the_table_knows_is_fixed_and_rebuilt() {
+    let at = scratch("recover");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "case \"$CFLAGS\" in\n\
+         *-flto*) echo 'ld.lld: error: Not a valid object file' >&2; exit 1 ;;\n\
+         esac\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let f = fs::read_to_string(d.join("filter")).unwrap();
+    assert!(f.contains("filter-lto"), "{f}");
+    // the rule that fired, the line that matched and the date, beside the fix
+    assert!(f.contains("Not a valid object file"), "{f}");
+    assert!(f.contains("ld.lld: error:"), "{f}");
+    assert!(f.contains("link phase") || f.contains("link failed"), "{f}");
+}
+
+// nothing in the table matches, so the only thing left that knows anything is the ladder
+#[test]
+fn a_failure_nothing_matches_walks_down_the_ladder() {
+    let at = scratch("ladder");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "case \"$CFLAGS\" in\n\
+         *-O3*) echo 'the build is displeased' >&2; exit 1 ;;\n\
+         esac\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let pkg = fs::read_to_string(root.join("etc/kiry/pkg/hello")).unwrap();
+    assert!(pkg.contains("OPT -O2"), "{pkg}");
+    assert!(pkg.contains("rung"), "{pkg}");
+}
+
+// no flag change can reach a portability bug, so it says so instead of burning retries
+#[test]
+fn a_failure_no_flag_can_fix_says_so_at_once() {
+    let at = scratch("stuck");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "echo \"ld.lld: error: undefined reference to \\`__isoc99_sscanf'\" >&2\nexit 1\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("stuck, musl-portability"), "{said}");
+    // and nothing was written to the package's settings, since no setting would help
+    assert!(!root.join("etc/kiry/pkg/hello").exists());
+}

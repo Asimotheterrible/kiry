@@ -1,0 +1,3 @@
+[88/210] Compiling C object src/util/libmesa_util.a.p/u_debug.c.o
+cc1plus: fatal error: Killed signal terminated program
+make: *** [Makefile:412: all] exit status 137

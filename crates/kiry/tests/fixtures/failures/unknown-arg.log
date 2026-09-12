@@ -1,0 +1,3 @@
+[3/91] Compiling C object libfoo.so.p/src_a.c.o
+clang: error: unknown argument: '-fno-semantic-interposition'
+ninja: build stopped: subcommand failed.

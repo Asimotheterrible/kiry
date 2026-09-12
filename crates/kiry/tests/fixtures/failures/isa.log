@@ -1,0 +1,2 @@
+[12/40] Compiling C object libhw.a.p/simd.c.o
+simd.c:88:5: error: instruction requires: AVX-512F

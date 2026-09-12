@@ -1,0 +1,5 @@
+[142/318] Linking target src/gallium/targets/dri/libgallium_dri.so
+ld.lld: warning: section type mismatch
+LLVM ERROR: out of memory while running lto backend
+PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/
+ninja: build stopped: subcommand failed.

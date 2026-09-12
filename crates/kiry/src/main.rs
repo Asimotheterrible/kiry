@@ -143,7 +143,7 @@ fn build_cmd(args: &[String]) {
                     die(e);
                 }
             }
-        } else if let Err(e) = build(&root, &p, &targets, verbose, false) {
+        } else if let Err(e) = build(&root, &p, &targets, verbose, false, false) {
             die(e);
         }
     }
@@ -157,6 +157,7 @@ fn build(
     targets: &[String],
     verbose: bool,
     reuse: bool,
+    boot: bool,
 ) -> Result<Vec<PathBuf>, String> {
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
@@ -166,7 +167,7 @@ fn build(
     let mut built = Vec::new();
     for t in targets {
         let start = Instant::now();
-        let work = compile(root, p, t, &srcs, &f, verbose)?;
+        let work = compile(root, p, t, &srcs, &f, verbose, boot)?;
         say!("{} {} {t} ok {}", p.name, p.version.upstream, took(start));
         built.push((t.clone(), work));
     }
@@ -381,7 +382,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), Strin
     let mut reuse = false;
 
     loop {
-        match build(root, p, &one, verbose, reuse) {
+        match build(root, p, &one, verbose, reuse, false) {
             Ok(_) => return Ok(()),
             Err(e) => say!("{e}"),
         }
@@ -438,6 +439,7 @@ fn compile(
     srcs: &[(String, PathBuf, String)],
     f: &Flags,
     verbose: bool,
+    boot: bool,
 ) -> Result<PathBuf, String> {
     let work = root.join("var/kiry/stage").join(format!(
         "{}-{}-{}.{t}",
@@ -477,7 +479,23 @@ fn compile(
         }
     }
 
-    let script = p.dir.join("build");
+    // a bootstrap file declares that this package is the one that breaks its cycle. with
+    // nothing in it that is the whole claim -- the first pass is the ordinary build, run
+    // before the rest of the cycle rather than after, which is all some cycles are. one
+    // with a script in it runs that instead
+    let mut script = p.dir.join("build");
+    if boot {
+        let at = p.dir.join("bootstrap");
+        let has = fs::read_to_string(&at).map_or(false, |t| {
+            t.lines().any(|l| {
+                let l = l.trim();
+                !l.is_empty() && !l.starts_with('#')
+            })
+        });
+        if has {
+            script = at;
+        }
+    }
     if !script.is_file() {
         return Err(format!("{}: no build script", p.dir.display()));
     }
@@ -2036,8 +2054,12 @@ fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
         .find(|d| d.join("build").is_file())
 }
 
-fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<Vec<usize>> {
+// the bool is a bootstrap pass: the same package built from its bootstrap script, which
+// stands in for it until the real one can be built. it stays in the plan afterwards,
+// because a first pass is a stand-in and not the article
+fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<Vec<(usize, bool)>> {
     let mut left: Vec<usize> = (0..want.len()).collect();
+    let mut done: Vec<usize> = Vec::new();
     let mut out = Vec::new();
     while !left.is_empty() {
         let now: Vec<usize> = left
@@ -2047,6 +2069,7 @@ fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<
                 let deps = recipes.get(&want[*i].0).map(|p| &p.depends);
                 !left.iter().any(|j| {
                     j != i
+                        && !done.contains(j)
                         && deps.is_some_and(|d| {
                             d.iter().any(|x| {
                                 !x.make && x.applies(&want[*i].1) && x.name == want[*j].0
@@ -2057,15 +2080,26 @@ fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<
             .collect();
         if now.is_empty() {
             // a cycle has to be declared, not guessed at. bootstrap is the file that
-            // says which member breaks it and none of these carry one
-            let names: Vec<&str> = left.iter().map(|i| want[*i].0.as_str()).collect();
-            die(format!(
-                "these need each other and none says how to start: {}",
-                names.join(" ")
-            ));
+            // says which member breaks it, and a member only stands in once
+            let boot: Vec<usize> = left
+                .iter()
+                .copied()
+                .filter(|i| !done.contains(i))
+                .filter(|i| recipes.get(&want[*i].0).is_some_and(|p| p.dir.join("bootstrap").is_file()))
+                .collect();
+            if boot.is_empty() {
+                let names: Vec<&str> = left.iter().map(|i| want[*i].0.as_str()).collect();
+                die(format!(
+                    "these need each other and none says how to start: {}",
+                    names.join(" ")
+                ));
+            }
+            done.extend(&boot);
+            out.push(boot.into_iter().map(|i| (i, true)).collect());
+            continue;
         }
         left.retain(|i| !now.contains(i));
-        out.push(now);
+        out.push(now.into_iter().map(|i| (i, false)).collect());
     }
     out
 }
@@ -2138,8 +2172,9 @@ fn rebuild_cmd(args: &[String]) {
 
     let plan = levels(&want, &recipes);
     if dry {
-        for i in plan.into_iter().flatten() {
-            say!("{} {} would rebuild", want[i].0, want[i].1);
+        for (i, boot) in plan.into_iter().flatten() {
+            let how = if boot { "would bootstrap" } else { "would rebuild" };
+            say!("{} {} {how}", want[i].0, want[i].1);
         }
         return;
     }
@@ -2148,12 +2183,16 @@ fn rebuild_cmd(args: &[String]) {
         // every member of a level compiles before any of it is installed, and the level
         // below it is already in place, so each one links against what it will run with
         let mut made = Vec::new();
-        for i in &level {
+        for (i, boot) in &level {
             let (name, target) = &want[*i];
             let p = &recipes[name];
-            // nobody is watching a drain of the whole queue, which is the case the
-            // signature table was written for
-            if let Err(e) = recover(&root, p, target, false) {
+            // a bootstrap pass is a stand-in that exists to be replaced, so it is built
+            // straight rather than put through the recovery loop
+            let r = match boot {
+                true => build(&root, p, std::slice::from_ref(target), false, false, true).map(|_| ()),
+                false => recover(&root, p, target, false),
+            };
+            if let Err(e) = r {
                 die(e);
             }
             match cached(&root, p, target) {

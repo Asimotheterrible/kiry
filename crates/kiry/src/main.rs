@@ -660,6 +660,7 @@ fn compile(
         .env("CFLAGS", &f.cflags)
         .env("CXXFLAGS", &f.cxxflags)
         .env("LDFLAGS", &f.ldflags)
+        .env("RUSTFLAGS", &f.rustflags)
         .env("KIRY_FLAGS", f.use_flags.join(" "));
     for (k, v) in &f.env {
         c.env(k, v);
@@ -1111,6 +1112,7 @@ struct Flags {
     cflags: String,
     cxxflags: String,
     ldflags: String,
+    rustflags: String,
     use_flags: Vec<String>,
     // KIRY_* settings, handed to the build as themselves
     env: Vec<(String, String)>,
@@ -1127,6 +1129,7 @@ impl Flags {
             ("CFLAGS", &self.cflags),
             ("CXXFLAGS", &self.cxxflags),
             ("LDFLAGS", &self.ldflags),
+            ("RUSTFLAGS", &self.rustflags),
         ] {
             if !v.is_empty() {
                 out.push(format!("{k} {v}"));
@@ -1159,7 +1162,7 @@ fn settings(root: &Path, name: &str) -> Result<Vec<(String, String, String)>, St
             let (k, v) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
             let known = k == "flags"
                 || k.starts_with("KIRY_")
-                || matches!(k, "CFLAGS" | "CXXFLAGS" | "LDFLAGS")
+                || matches!(k, "CFLAGS" | "CXXFLAGS" | "LDFLAGS" | "RUSTFLAGS")
                 || KNOBS.iter().any(|(n, _)| *n == k);
             if !known {
                 return Err(format!("/{}:{}: {k} is not a setting", f.display(), n + 1));
@@ -1278,6 +1281,7 @@ fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
     let mut knob: HashMap<&str, String> =
         KNOBS.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
     let (mut c, mut cxx, mut ld) = (Vec::new(), Vec::new(), Vec::new());
+    let mut rs: Vec<String> = Vec::new();
     let mut use_flags: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
 
@@ -1286,6 +1290,7 @@ fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
             "CFLAGS" => c.push(v.clone()),
             "CXXFLAGS" => cxx.push(v.clone()),
             "LDFLAGS" => ld.push(v.clone()),
+            "RUSTFLAGS" => rs.push(v.clone()),
             // a later - takes one back off, so a package subtracts from the global set
             // without restating it
             "flags" => {
@@ -1345,10 +1350,24 @@ fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
     // lld's branch-to-branch rewriting, which it does not do below -O2
     link.push("-Wl,-O2".into());
 
+    // rustc reads none of the above, so -march never reached a rust package. no lto
+    // here though: cargo picks embed-bitcode from the profile and rustc refuses the
+    // pair, so which lto a crate gets stays its Cargo.toml's business
+    let mut rbase: Vec<String> = Vec::new();
+    if !knob["CFLAGS_MARCH"].is_empty() {
+        rbase.push(format!("-C target-cpu={}", knob["CFLAGS_MARCH"]));
+    }
+    if let Some(l) = knob["OPT"].strip_prefix("-O") {
+        if matches!(l, "0" | "1" | "2" | "3" | "s" | "z") {
+            rbase.push(format!("-C opt-level={l}"));
+        }
+    }
+
     // the file's own lines last, so appending -O0 or -g really does win
     let mut cf: Vec<String> = base.iter().chain(c.iter()).flat_map(words).collect();
     let mut cxf: Vec<String> = base.iter().chain(cxx.iter()).flat_map(words).collect();
     let mut ldf: Vec<String> = link.iter().chain(ld.iter()).flat_map(words).collect();
+    let rsf: Vec<String> = rbase.iter().chain(rs.iter()).flat_map(words).collect();
 
     let mut from = from;
     if let Some(d) = dir {
@@ -1363,6 +1382,7 @@ fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
         cflags: cf.join(" "),
         cxxflags: cxf.join(" "),
         ldflags: ldf.join(" "),
+        rustflags: rsf.join(" "),
         use_flags,
         env,
         from,
@@ -1442,14 +1462,21 @@ fn flags_cmd(args: &[String]) {
             });
         }
     }
-    if !queue || stale.is_empty() {
+    if !queue {
         return;
     }
-    let mut all = db::read_queue(&root).unwrap_or_default();
+    // this command owns the flags rows. a package that resolves clean now should not
+    // still be listed because it was stale an hour ago
+    let mut all: Vec<db::Queued> = db::read_queue(&root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|q| q.soname != "flags")
+        .collect();
     all.extend(stale);
     all.sort();
     all.dedup();
     match db::write_queue(&root, &all) {
+        Ok(()) if all.is_empty() => {}
         Ok(()) => say!("queued {}", all.len()),
         Err(e) => die(e.to_string()),
     }
@@ -2312,6 +2339,15 @@ fn affected(
 // an entry records the names that left. if the library exports all of them again the
 // consumer was never going to break, whatever put them back
 fn back(root: &Path, q: &db::Queued) -> bool {
+    // a flags row is not a soname. it says the record and the resolve disagree, so it
+    // heals the moment they agree again, which is what rebuilding the package does
+    if q.soname == "flags" {
+        let Ok(rec) = db::read(root, &q.target, &q.name) else {
+            return false;
+        };
+        let dir = recipe(root, &q.name);
+        return flags(root, &q.name, dir.as_deref()).is_ok_and(|f| rec.flags == f.record());
+    }
     if q.changed.is_empty() {
         return false;
     }

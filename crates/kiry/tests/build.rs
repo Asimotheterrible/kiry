@@ -1787,6 +1787,68 @@ fn a_build_is_handed_the_flags_the_config_resolves() {
     assert_eq!(ld, "-flto=thin -Wl,--thinlto-jobs=8 -Wl,-O2", "{said}");
 }
 
+// rustc reads none of CFLAGS, so a rust package was building for a generic x86-64 while
+// every c package around it got znver3
+#[test]
+fn a_rust_build_is_handed_the_machine_it_runs_on() {
+    let at = scratch("rustflags");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$RUSTFLAGS\" > \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let art = cache(&root, ".tar.zst");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
+            root.display(),
+            art[0]
+        ))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(said.trim(), "-C target-cpu=znver3 -C opt-level=2", "{said}");
+}
+
+// lto is the one thing not mapped across: cargo decides embed-bitcode from the profile
+// and rustc refuses that with -C lto, so a crate would stop building
+#[test]
+fn no_lto_reaches_rustflags() {
+    let at = scratch("rustnolto");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\nLTO full\n");
+    let said = resolved(&root, "anything");
+    assert!(said.contains("resolved RUSTFLAGS -C target-cpu=znver3 -C opt-level=2\n"), "{said}");
+    assert!(said.contains("resolved CFLAGS -O2 -march=znver3 -flto=full -g0"), "{said}");
+}
+
+// same last-wins rule the c flags have, and kiry's own package leans on it to keep the
+// opt-level its release profile asks for
+#[test]
+fn a_package_takes_the_rust_opt_level_back() {
+    let at = scratch("rustopt");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\n");
+    config(&root, Some("hello"), "RUSTFLAGS -C opt-level=3\n");
+    let said = resolved(&root, "hello");
+    assert!(
+        said.contains("resolved RUSTFLAGS -C target-cpu=znver3 -C opt-level=2 -C opt-level=3\n"),
+        "{said}"
+    );
+}
+
 // what the sidecar carries is what the record ends up holding, which is the only
 // reason a later resolve has something to differ from
 #[test]
@@ -1912,7 +1974,12 @@ fn a_record_that_still_resolves_is_left_alone() {
             manifest: Vec::new(),
             hash: String::new(),
             users: Vec::new(),
-            flags: vec!["CFLAGS -O2 -g0".into(), "CXXFLAGS -O2 -g0".into(), "LDFLAGS -Wl,-O2".into()],
+            flags: vec![
+                "CFLAGS -O2 -g0".into(),
+                "CXXFLAGS -O2 -g0".into(),
+                "LDFLAGS -Wl,-O2".into(),
+                "RUSTFLAGS -C opt-level=2".into(),
+            ],
         },
     )
     .unwrap();
@@ -1921,6 +1988,64 @@ fn a_record_that_still_resolves_is_left_alone() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(String::from_utf8_lossy(&o.stdout), "");
     assert!(!db::queue(&root).exists());
+}
+
+// the queue only ever grew: a package rebuilt into agreement stayed listed, so after a
+// drain the queue still named everything it had started with
+#[test]
+fn a_package_that_resolves_clean_leaves_the_queue() {
+    let root = scratch("flagdrop");
+    let rec = |flags: Vec<String>| db::Installed {
+        name: "foot".into(),
+        target: "x86_64-musl".into(),
+        version: Version::parse("1.0 1").unwrap(),
+        depends: Vec::new(),
+        manifest: Vec::new(),
+        hash: String::new(),
+        users: Vec::new(),
+        flags,
+    };
+
+    db::write(&root, &rec(vec!["CFLAGS -O1".into()])).unwrap();
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), "--queue"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let q = fs::read_to_string(db::queue(&root)).unwrap();
+    assert!(q.contains("x86_64-musl flags foot"), "{q}");
+
+    // what a rebuild would leave behind
+    db::write(
+        &root,
+        &rec(vec![
+            "CFLAGS -O2 -g0".into(),
+            "CXXFLAGS -O2 -g0".into(),
+            "LDFLAGS -Wl,-O2".into(),
+            "RUSTFLAGS -C opt-level=2".into(),
+        ]),
+    )
+    .unwrap();
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), "--queue"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!db::queue(&root).exists(), "{:?}", fs::read_to_string(db::queue(&root)));
+}
+
+// a soname row is someone else's, and regenerating the flags rows must not take it out
+#[test]
+fn regenerating_the_flags_rows_leaves_a_soname_row_alone() {
+    let root = scratch("flagkeep");
+    db::write_queue(
+        &root,
+        &[db::Queued {
+            target: "x86_64-musl".into(),
+            name: "mpv".into(),
+            soname: "libavcodec.so.62".into(),
+            changed: vec!["av_frame_get".into()],
+        }],
+    )
+    .unwrap();
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), "--queue"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let q = fs::read_to_string(db::queue(&root)).unwrap();
+    assert!(q.contains("x86_64-musl libavcodec.so.62 mpv av_frame_get"), "{q}");
 }
 
 // recipe() finds a package by a build script, so the filter needs one beside it

@@ -2213,6 +2213,7 @@ fn a_failure_the_table_knows_is_fixed_and_rebuilt() {
 }
 
 // nothing in the table matches, so the only thing left that knows anything is the ladder
+// the diagnostic shape is the part that earns it a rung: a compiler ran and complained
 #[test]
 fn a_failure_nothing_matches_walks_down_the_ladder() {
     let at = scratch("ladder");
@@ -2220,7 +2221,7 @@ fn a_failure_nothing_matches_walks_down_the_ladder() {
         &at,
         "x86_64-musl",
         "case \"$CFLAGS\" in\n\
-         *-O3*) echo 'the build is displeased' >&2; exit 1 ;;\n\
+         *-O3*) echo 'foo.c:3:9: error: the build is displeased' >&2; exit 1 ;;\n\
          esac\n\
          mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n",
     );
@@ -2259,6 +2260,70 @@ fn a_failure_no_flag_can_fix_says_so_at_once() {
     assert!(said.contains("stuck, musl-portability"), "{said}");
     // and nothing was written to the package's settings, since no setting would help
     assert!(!root.join("etc/kiry/pkg/hello").exists());
+}
+
+// a tool that is not installed is not a flag. the ladder used to spend all five rungs
+// finding that out and leave four settings and a filter line behind for someone to undo
+#[test]
+fn a_failure_before_anything_compiled_leaves_the_flags_alone() {
+    let at = scratch("nocompile");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "echo '/build: line 3: unzip: not found' >&2\nexit 1\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("nothing compiled"), "{said}");
+    // and it hands over the line worth reading, so the real reason costs no log opening
+    assert!(said.contains("unzip: not found"), "{said}");
+    assert!(!root.join("etc/kiry/pkg/hello").exists(), "wrote a setting");
+    assert!(!d.join("filter").exists(), "wrote a filter");
+}
+
+// every retry truncates the log, so without keeping one the failure that started the
+// recovery is gone by the time the rung that answered it is up for judgement
+#[test]
+fn the_attempt_that_started_a_recovery_keeps_its_log() {
+    let at = scratch("firstlog");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "case \"$CFLAGS\" in\n\
+         *-O3*) echo 'foo.c:3:9: error: the build is displeased' >&2; exit 1 ;;\n\
+         esac\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let logs = root.join("var/kiry/log");
+    let name = fs::read_dir(&logs)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|n| n.ends_with(".first.log"))
+        .unwrap_or_else(|| panic!("no first.log in {}", logs.display()));
+    let kept = fs::read_to_string(logs.join(&name)).unwrap();
+    assert!(kept.contains("the build is displeased"), "{kept}");
+    // and the live log is the attempt that worked, so the two say different things
+    let live = fs::read_to_string(logs.join(name.replace(".first.log", ".log"))).unwrap();
+    assert!(!live.contains("the build is displeased"), "{live}");
 }
 
 // the cycle above, with one member saying how to start it. the stand-in is built first

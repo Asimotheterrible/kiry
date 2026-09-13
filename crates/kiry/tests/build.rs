@@ -2267,10 +2267,13 @@ fn a_failure_no_flag_can_fix_says_so_at_once() {
 #[test]
 fn a_failure_before_anything_compiled_leaves_the_flags_alone() {
     let at = scratch("nocompile");
+    // the sign-off after the real complaint is what mozbuild does, and the last line is
+    // the wrong one to quote
     let d = recipe(
         &at,
         "x86_64-musl",
-        "echo '/build: line 3: unzip: not found' >&2\nexit 1\n",
+        "echo '/build: line 3: unzip: not found' >&2\n\
+         echo 'Streaming resource usage profile to: /src/obj/profile.json' >&2\nexit 1\n",
     );
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -2433,4 +2436,37 @@ fn stats_counts_what_is_there() {
     assert!(said.contains("installed x86_64-musl 2"), "{said}");
     assert!(said.contains("cache 1 artifacts"), "{said}");
     assert!(said.contains("queued 0"), "{said}");
+}
+
+// busybox's xz decoder caps the dictionary it will allocate, so a source packed with a
+// big one comes back as corrupt however right its checksum is. rustc's tarball uses
+// 128 MiB and this is the smallest thing that reproduces it -- the payload is three bytes
+#[test]
+fn a_source_packed_with_a_big_dictionary_still_unpacks() {
+    let at = scratch("bigdict");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+
+    let xz = at.join("hello-1.0.tar.xz");
+    let out = fs::File::create(&xz).unwrap();
+    assert!(Command::new("xz")
+        .arg("-c")
+        .arg("--check=none")
+        .arg("--lzma2=dict=128MiB")
+        .arg(at.join("hello-1.0.tar"))
+        .stdout(out)
+        .status()
+        .unwrap()
+        .success());
+    let sum = kiry_core::sha256(fs::File::open(&xz).unwrap()).unwrap();
+    fs::write(d.join("sources"), "../hello-1.0.tar.xz\n").unwrap();
+    fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }

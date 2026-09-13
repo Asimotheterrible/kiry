@@ -133,16 +133,20 @@ pub fn closure(root: &Path, target: &str, deps: &[Dep]) -> Result<Vec<Member>, S
 
 // provides already records which installed files are shared libraries, so a transitive
 // dep needs no filename guessing and no dev subpackage split
-pub fn assemble(root: &Path, members: &[Member], into: &Path) -> Result<(), String> {
+pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> Result<(), String> {
     // the sysroot is the root's shape or nothing in it starts: PT_INTERP says
-    // /lib/ld-musl-x86_64.so.1 and the loader lives in /usr/lib
-    for (link, to) in [
-        ("bin", "usr/bin"),
-        ("sbin", "usr/sbin"),
-        ("lib", "usr/lib"),
-        // usr/lib is musl and usr/lib64 is gnu, so this is not a second name for lib
-        ("lib64", "usr/lib64"),
-    ] {
+    // /lib/ld-musl-x86_64.so.1 and the loader lives in /usr/lib. usr/lib is always here
+    // even on a gnu build, bc every make dep resolves under the host and the host is musl
+    let mut shape = vec![("bin", "usr/bin"), ("sbin", "usr/sbin"), ("lib", "usr/lib")];
+    // usr/lib64 is gnu and is not a second name for lib, so a musl build does not get one
+    // clang decides its -L list by asking whether a directory is there, so an empty
+    // usr/lib64 is enough to put -L/usr/lib/../lib64 on every musl link -- harmless only
+    // for as long as nothing gnu is ever in the closure, which is not the guarantee the
+    // split tree is supposed to give
+    if target.ends_with("gnu") {
+        shape.push(("lib64", "usr/lib64"));
+    }
+    for (link, to) in shape {
         let dst = into.join(link);
         fs::create_dir_all(into.join(to)).map_err(|e| format!("{}: {e}", dst.display()))?;
         if !dst.exists() {
@@ -501,12 +505,31 @@ mod tests {
         assert_eq!(got, [T, host().as_str()], "both builds of zlib or neither");
 
         let into = scratch("splitinto");
-        assemble(&root, &c, &into).unwrap();
+        assemble(&root, T, &c, &into).unwrap();
         assert!(into.join("usr/lib/libzlib.so.1").exists(), "no host build");
         assert!(
             into.join("usr/lib64/libzlib.so.1").exists(),
             "no target build"
         );
+    }
+
+    // clang asks whether a directory is there before it puts -L in front of it, so an
+    // empty usr/lib64 in a musl sysroot is enough to aim a musl link at the gnu tree
+    #[test]
+    fn a_musl_sysroot_has_no_gnu_libdir_in_it() {
+        let root = root("nolib64");
+        let musl = host();
+        for (n, _) in substrate(&musl) {
+            install(&root, &musl, n, &[]);
+        }
+        install(&root, &musl, "zlib", &[]);
+        let c = closure(&root, &musl, &[dep("zlib", false)]).unwrap();
+        let into = scratch("nolib64into");
+        assemble(&root, &musl, &c, &into).unwrap();
+
+        assert!(into.join("usr/lib").is_dir(), "no musl libdir");
+        assert!(!into.join("usr/lib64").exists(), "the gnu tree reached a musl build");
+        assert!(!into.join("lib64").exists(), "the gnu tree reached a musl build");
     }
 
     #[test]
@@ -555,7 +578,7 @@ mod tests {
 
         let c = closure(&root, T, &[dep("png", false)]).unwrap();
         let into = root.join("sysroot");
-        assemble(&root, &c, &into).unwrap();
+        assemble(&root, T, &c, &into).unwrap();
 
         assert!(
             into.join("usr/include/png.h").exists(),
@@ -584,7 +607,7 @@ mod tests {
 
         let c = closure(&root, T, &[dep("png", false)]).unwrap();
         let into = root.join("sysroot");
-        assemble(&root, &c, &into).unwrap();
+        assemble(&root, T, &c, &into).unwrap();
 
         assert!(into.join("usr/lib64/libpng.so.1").exists());
         assert!(

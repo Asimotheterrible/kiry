@@ -399,6 +399,22 @@ fn compiled(log: &str) -> bool {
         })
 }
 
+// the line to put in front of someone. the last line is usually not it -- mozbuild signs
+// off with where it wrote a profile, four lines under the ValueError that stopped it --
+// so walk back for something that reads like a complaint and only fall back to the end
+fn blame(log: &str) -> &str {
+    let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines
+        .iter()
+        .rev()
+        .find(|l| {
+            let s = l.to_lowercase();
+            s.contains("error") || s.contains("not found") || s.contains("no such")
+        })
+        .or_else(|| lines.last())
+        .map_or("the log is empty", |l| l.trim())
+}
+
 // build fails, read the log, fix it, build again. three signature retries and never the
 // same action twice, then the ladder, then it is stuck and says why
 fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), String> {
@@ -441,17 +457,12 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), Strin
         }
 
         if !compiled(&log) {
-            // no note anywhere: the recipe and the settings are both innocent here, and
-            // the last line is the thing worth reading
-            let why = log
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("the log is empty");
+            // no note anywhere: the recipe and the settings are both innocent here
+            say!("first failure is {}", first.display());
             return Err(format!(
                 "{} {t}: stuck, nothing compiled: {}",
                 p.name,
-                why.trim()
+                blame(&log)
             ));
         }
 
@@ -522,17 +533,7 @@ fn compile(
     for (name, path, _) in srcs.iter().filter(|_| !again) {
         let name = name.as_str();
         if tarball(name) {
-            // as root tar restores the archive's own uids, and the sandbox maps one id,
-            // so a build running as root gets a /src it cannot chown inside the namespace
-            run(
-                Command::new("tar")
-                    .arg("--no-same-owner")
-                    .arg("-xf")
-                    .arg(path)
-                    .arg("-C")
-                    .arg(&src),
-                name,
-            )?;
+            untar(path, &src, name)?;
         } else {
             fs::copy(path, src.join(name)).map_err(|e| format!("{name}: {e}"))?;
         }
@@ -562,7 +563,7 @@ fn compile(
     let sysroot = work.join("sysroot");
     let deps: Vec<Dep> = p.depends.iter().filter(|d| d.applies(t)).cloned().collect();
     let members = sandbox::closure(root, t, &deps)?;
-    sandbox::assemble(root, &members, &sysroot)?;
+    sandbox::assemble(root, t, &members, &sysroot)?;
 
     fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
     let share = sysroot.join("usr/share/kiry");
@@ -869,10 +870,18 @@ options_has() { case \" $options \" in *\" $1 \"*) return 0 ;; esac; return 1; }
 // autoconf sources this before it decides anything, so libdir follows the target
 // without a recipe passing --libdir. hand-rolled configures do not read it and still
 // need the flag; that is a handful of recipes rather than all of them
+//
+// only where the recipe said nothing. autoconf reads the site file after it has parsed
+// the arguments, so a plain assignment here silently beats --includedir -- nspr asked
+// for /usr/include/nspr, got /usr/include, and pkg-config then dropped the -I as a
+// system default, which is how librewolf's gyp read ended up with an include of '%'
+// the strings compared are autoconf's own defaults, still unexpanded at this point
+// each one is an if rather than a && so the file cannot end on a false test, which
+// autoconf 2.71 treats as the site script having failed
 const CONFIG_SITE: &str = "\
-libdir=@LIBDIR@
-includedir=@INCLUDEDIR@
-datarootdir=@DATADIR@
+if test \"$libdir\" = '${exec_prefix}/lib'; then libdir=@LIBDIR@; fi
+if test \"$includedir\" = '${prefix}/include'; then includedir=@INCLUDEDIR@; fi
+if test \"$datarootdir\" = '${prefix}/share'; then datarootdir=@DATADIR@; fi
 ";
 
 // cc is clang and clang defaults to the triple it was built for. a plain ./configure
@@ -908,6 +917,15 @@ exec @REAL@ --target=@TRIPLE@@SYSROOT@ \"$@\"
 // the cache as UNINITIALIZED, and cmake resolves a relative one against the build dir the
 // moment anything retypes it to PATH. libogg packaged its own build tree that way. settling
 // the type here means the conversion never gets the chance
+//
+// the per-config flags are the same argument as -Dbuildtype=plain on the meson side
+// CMAKE_BUILD_TYPE=Release means -O3 -DNDEBUG and cmake appends it after the CXXFLAGS
+// kiry exported, so a config that says OPT -O2 gets built at -O3 and nothing says so
+// llvm found this the expensive way: the -O3 reaches the link too, becomes
+// -plugin-opt=O3, and lld 20.1.8 segfaults there with no diagnostic at all. NDEBUG stays,
+// bc that is what the build type means once the optimisation level is kiry's -- llvm
+// without it builds its assertions. defined here before the compiler is enabled, bc
+// cmake_initialize_per_config_variable only fills these in when they are not already set
 const TOOLCHAIN_CMAKE: &str = "\
 foreach(_d CMAKE_INSTALL_LIBDIR CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_DATAROOTDIR)
   if(DEFINED CACHE{${_d}})
@@ -917,6 +935,12 @@ endforeach()
 set(CMAKE_INSTALL_LIBDIR \"@LIBDIR@\" CACHE STRING \"\" FORCE)
 set(CMAKE_INSTALL_INCLUDEDIR \"@INCLUDEDIR@\" CACHE STRING \"\" FORCE)
 set(CMAKE_INSTALL_DATAROOTDIR \"@DATADIR@\" CACHE STRING \"\" FORCE)
+foreach(_l C CXX)
+  set(CMAKE_${_l}_FLAGS_DEBUG \"\" CACHE STRING \"\" FORCE)
+  foreach(_c RELEASE MINSIZEREL RELWITHDEBINFO)
+    set(CMAKE_${_l}_FLAGS_${_c} \"-DNDEBUG\" CACHE STRING \"\" FORCE)
+  endforeach()
+endforeach()
 @FIND@";
 
 // find_package looks under the prefixes cmake knows about, and the gnu tier's headers
@@ -1049,6 +1073,53 @@ fn unpacked(src: &Path) -> PathBuf {
         only = Some(e.path());
     }
     only.unwrap_or_else(|| src.to_path_buf())
+}
+
+// as root tar restores the archive's own uids, and the sandbox maps one id, so a build
+// running as root gets a /src it cannot chown inside the namespace
+//
+// busybox's xz decoder caps the dictionary it will allocate and rustc's source tarball is
+// packed with a 128 MiB one, so tar reads it as "corrupted data" on a file whose sha256 is
+// exactly what the recipe asked for. xz itself does the decoding and tar only ever sees a
+// tar -- the same shape as pack(), which already pipes through zstd. everything else keeps
+// tar's own decompression, which has never been the thing that was wrong
+fn untar(path: &Path, into: &Path, name: &str) -> Result<(), String> {
+    let tar = |extra: Option<Stdio>| {
+        let mut c = Command::new("tar");
+        c.arg("--no-same-owner").arg("-xf");
+        match extra {
+            Some(p) => c.arg("-").stdin(p),
+            None => c.arg(path),
+        };
+        c.arg("-C").arg(into);
+        c
+    };
+
+    if !(name.ends_with(".xz") || name.ends_with(".txz") || name.ends_with(".lzma")) {
+        return run(&mut tar(None), name);
+    }
+
+    let mut x = Command::new("xz")
+        .arg("-dc")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{name}: xz: {e}"))?;
+    let Some(pipe) = x.stdout.take() else {
+        return Err(format!("{name}: xz gave us no pipe"));
+    };
+
+    let t = tar(Some(Stdio::from(pipe)))
+        .status()
+        .map_err(|e| format!("{name}: tar: {e}"))?;
+    let x = x.wait().map_err(|e| format!("{name}: xz: {e}"))?;
+    if !x.success() {
+        return Err(format!("{name}: xz: {x}"));
+    }
+    if !t.success() {
+        return Err(format!("{name}: tar: {t}"));
+    }
+    Ok(())
 }
 
 fn tarball(name: &str) -> bool {
@@ -3585,5 +3656,47 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         fs::write(d.join("10-bad"), "boom  set LTO none  sometimes\n").unwrap();
         assert!(rules(&root).is_err());
+    }
+
+    fn site() -> String {
+        CONFIG_SITE
+            .replace("@LIBDIR@", "/usr/lib64")
+            .replace("@INCLUDEDIR@", "/usr/include")
+            .replace("@DATADIR@", "/usr/share")
+    }
+
+    // autoconf parses the arguments before it sources the site file, so an unguarded
+    // assignment beats --includedir. nspr asked for a subdirectory and got the default
+    #[test]
+    fn the_site_file_leaves_a_directory_the_recipe_chose() {
+        let ask = |pre: &str| {
+            let o = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "prefix=/usr; exec_prefix='${{prefix}}'; libdir='${{exec_prefix}}/lib'; \
+                     includedir='${{prefix}}/include'; datarootdir='${{prefix}}/share'; {pre}\n{}\n\
+                     echo \"$libdir $includedir\"",
+                    site()
+                ))
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        assert_eq!(ask(""), "/usr/lib64 /usr/include");
+        assert_eq!(ask("includedir=/usr/include/nspr"), "/usr/lib64 /usr/include/nspr");
+    }
+
+    // autoconf 2.71 reads a non-zero exit from the site script as the script having
+    // failed, so the last line has to succeed with every directory already set
+    #[test]
+    fn a_site_file_that_changes_nothing_still_succeeds() {
+        let o = Command::new("sh")
+            .arg("-c")
+            .arg(format!("libdir=/a; includedir=/b; datarootdir=/c\n{}", site()))
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
 }

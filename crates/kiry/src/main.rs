@@ -850,11 +850,22 @@ exec @REAL@ --target=@TRIPLE@@SYSROOT@ \"$@\"
 // cmake reads its path from the environment
 // cache entries rather than plain variables, bc GNUInstallDirs runs set_property(CACHE)
 // over whatever is already defined and a plain set leaves that nothing to act on --
-// libjpeg-turbo bundles a fork that errors out right there. no FORCE, so a -D still wins
+// libjpeg-turbo bundles a fork that errors out right there. FORCE bc which libdir a
+// target uses is kiry's call, not the recipe's -- every converted APKBUILD hardcodes
+// alpine's lib, and letting that through puts a gnu package in the musl tree
+// the retype above them is the other half: an untyped -DCMAKE_INSTALL_LIBDIR=lib lands in
+// the cache as UNINITIALIZED, and cmake resolves a relative one against the build dir the
+// moment anything retypes it to PATH. libogg packaged its own build tree that way. settling
+// the type here means the conversion never gets the chance
 const TOOLCHAIN_CMAKE: &str = "\
-set(CMAKE_INSTALL_LIBDIR \"@LIBDIR@\" CACHE PATH \"\")
-set(CMAKE_INSTALL_INCLUDEDIR \"@INCLUDEDIR@\" CACHE PATH \"\")
-set(CMAKE_INSTALL_DATAROOTDIR \"@DATADIR@\" CACHE PATH \"\")
+foreach(_d CMAKE_INSTALL_LIBDIR CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_DATAROOTDIR)
+  if(DEFINED CACHE{${_d}})
+    set_property(CACHE ${_d} PROPERTY TYPE STRING)
+  endif()
+endforeach()
+set(CMAKE_INSTALL_LIBDIR \"@LIBDIR@\" CACHE STRING \"\" FORCE)
+set(CMAKE_INSTALL_INCLUDEDIR \"@INCLUDEDIR@\" CACHE STRING \"\" FORCE)
+set(CMAKE_INSTALL_DATAROOTDIR \"@DATADIR@\" CACHE STRING \"\" FORCE)
 @FIND@";
 
 // find_package looks under the prefixes cmake knows about, and the gnu tier's headers

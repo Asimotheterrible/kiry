@@ -772,7 +772,7 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(
             said.contains(&format!(
-                "set(CMAKE_INSTALL_LIBDIR \"{want}\" CACHE PATH \"\")"
+                "set(CMAKE_INSTALL_LIBDIR \"{want}\" CACHE STRING \"\" FORCE)"
             )),
             "{target} got {said}"
         );
@@ -784,10 +784,16 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
                 .find(|l| l.starts_with(&format!("set(CMAKE_INSTALL_{var} ")))
                 .unwrap_or_else(|| panic!("{target} never set {var}: {said}"));
             assert!(
-                line.contains("CACHE PATH"),
-                "{target} set {var} as a plain variable: {line}"
+                line.contains("CACHE STRING") && line.contains("FORCE"),
+                "{target} does not settle {var} itself: {line}"
             );
         }
+        // and the half that keeps a recipe's own untyped -D relative. without it cmake
+        // resolves lib against the build dir and the package installs into its own tree
+        assert!(
+            said.contains("set_property(CACHE ${_d} PROPERTY TYPE STRING)"),
+            "{target} never settles the type of a -D it was handed: {said}"
+        );
     }
 }
 

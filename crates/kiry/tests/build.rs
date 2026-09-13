@@ -771,9 +771,23 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
             .unwrap();
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(
-            said.contains(&format!("set(CMAKE_INSTALL_LIBDIR \"{want}\")")),
+            said.contains(&format!(
+                "set(CMAKE_INSTALL_LIBDIR \"{want}\" CACHE PATH \"\")"
+            )),
             "{target} got {said}"
         );
+        // GNUInstallDirs runs set_property(CACHE) over every one of these, so a plain
+        // set is an error rather than an override -- libjpeg-turbo bundles a fork of it
+        for var in ["LIBDIR", "INCLUDEDIR", "DATAROOTDIR"] {
+            let line = said
+                .lines()
+                .find(|l| l.starts_with(&format!("set(CMAKE_INSTALL_{var} ")))
+                .unwrap_or_else(|| panic!("{target} never set {var}: {said}"));
+            assert!(
+                line.contains("CACHE PATH"),
+                "{target} set {var} as a plain variable: {line}"
+            );
+        }
     }
 }
 

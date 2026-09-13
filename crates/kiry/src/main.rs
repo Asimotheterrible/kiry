@@ -380,6 +380,25 @@ fn stuck(p: &Package, t: &str, why: &str) -> String {
     format!("{} {t}: stuck, {why}", p.name)
 }
 
+// a flag can only be the reason if a toolchain got far enough to have an opinion. a zip
+// tool that was not installed, a cd into a directory that is not there, a source whose
+// checksum moved -- none of those get better at -O2, and the ladder spends five rungs
+// finding that out, leaving four settings and a filter line behind that someone then has
+// to notice and take back out. a check that failed counts: it ran, and a miscompile is
+// exactly what the ladder is for
+fn compiled(log: &str) -> bool {
+    phase(log) == "check"
+        || log.lines().any(|l| {
+            l.contains("error:")
+                || l.contains("ld.lld:")
+                || l.contains("LLVM ERROR")
+                || l.contains("undefined reference")
+                || l.contains("undefined symbol")
+                || l.contains("collect2:")
+                || l.trim_start().starts_with("FAILED:")
+        })
+}
+
 // build fails, read the log, fix it, build again. three signature retries and never the
 // same action twice, then the ladder, then it is stuck and says why
 fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), String> {
@@ -388,6 +407,9 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), Strin
     let mut tried: Vec<String> = Vec::new();
     let mut rung = 0;
     let mut reuse = false;
+    // so a first.log that is there is always this run's
+    let first = firstlog(root, p, t);
+    let _ = fs::remove_file(&first);
 
     loop {
         match build(root, p, &one, verbose, reuse, false) {
@@ -396,6 +418,11 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), Strin
         }
         let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
         reuse = false;
+        // every retry truncates the log, so without this the failure that started it all
+        // is gone by the time anyone reads it and the rung that fixed it cannot be judged
+        if !first.exists() {
+            let _ = fs::copy(logpath(root, p, t), &first);
+        }
 
         if tried.len() < 3 {
             if let Some(f) = scan(&rs, &log) {
@@ -413,7 +440,23 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), Strin
             }
         }
 
+        if !compiled(&log) {
+            // no note anywhere: the recipe and the settings are both innocent here, and
+            // the last line is the thing worth reading
+            let why = log
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("the log is empty");
+            return Err(format!(
+                "{} {t}: stuck, nothing compiled: {}",
+                p.name,
+                why.trim()
+            ));
+        }
+
         let Some((filter, line)) = LADDER.get(rung) else {
+            say!("first failure is {}", first.display());
             return Err(stuck(p, t, "the ladder ran out"));
         };
         rung += 1;
@@ -431,6 +474,14 @@ fn cached(root: &Path, p: &Package, t: &str) -> Option<PathBuf> {
         p.name, p.version.upstream, p.version.rev
     ));
     a.is_file().then_some(a)
+}
+
+// the attempt that started a recovery, kept beside the log the retries keep overwriting
+fn firstlog(root: &Path, p: &Package, t: &str) -> PathBuf {
+    root.join("var/kiry/log").join(format!(
+        "{}-{}-{}.{t}.first.log",
+        p.name, p.version.upstream, p.version.rev
+    ))
 }
 
 fn logpath(root: &Path, p: &Package, t: &str) -> PathBuf {

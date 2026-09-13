@@ -848,10 +848,13 @@ exec @REAL@ --target=@TRIPLE@@SYSROOT@ \"$@\"
 // usr/lib64 is the gnu tier, so a musl package landing there is the cross-tier bug the
 // split directory exists to prevent. a toolchain file is the documented way in, and
 // cmake reads its path from the environment
+// cache entries rather than plain variables, bc GNUInstallDirs runs set_property(CACHE)
+// over whatever is already defined and a plain set leaves that nothing to act on --
+// libjpeg-turbo bundles a fork that errors out right there. no FORCE, so a -D still wins
 const TOOLCHAIN_CMAKE: &str = "\
-set(CMAKE_INSTALL_LIBDIR \"@LIBDIR@\")
-set(CMAKE_INSTALL_INCLUDEDIR \"@INCLUDEDIR@\")
-set(CMAKE_INSTALL_DATAROOTDIR \"@DATADIR@\")
+set(CMAKE_INSTALL_LIBDIR \"@LIBDIR@\" CACHE PATH \"\")
+set(CMAKE_INSTALL_INCLUDEDIR \"@INCLUDEDIR@\" CACHE PATH \"\")
+set(CMAKE_INSTALL_DATAROOTDIR \"@DATADIR@\" CACHE PATH \"\")
 @FIND@";
 
 // find_package looks under the prefixes cmake knows about, and the gnu tier's headers

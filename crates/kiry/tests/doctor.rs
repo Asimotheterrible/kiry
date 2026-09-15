@@ -1,4 +1,6 @@
-// doctor answers the same question ldd does, so ldd is what it gets checked against
+// doctor answers the same question ldd does, so ldd is what it gets checked against --
+// except glibc ships ldd as a #!/bin/bash script and the gnu trim drops usr/bin, so what
+// runs here is the loader with the three variables that script sets. same check, no shell
 // the fixtures are placed and recorded the way install records them rather than built
 // through b: what is under test is linkage, not the build path
 
@@ -11,6 +13,11 @@ use kiry_core::{db, install};
 
 const KIRY: &str = env!("CARGO_BIN_EXE_kiry");
 const TARGET: &str = "x86_64-gnu";
+// the fixtures carry the gnu label so they have to be gnu ELFs. cc here defaults to musl,
+// and a musl binary cannot be asked about a symbol version at all -- musl's loader
+// ignores versioning, which is exactly the half of doctor these fixtures exercise
+const TRIPLE: &str = "--target=x86_64-linux-gnu";
+const LOADER: &str = "/lib64/ld-linux-x86-64.so.2";
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir()
@@ -22,21 +29,45 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn skip(why: &str) -> bool {
-    let have = |p: &str| {
-        Command::new(p)
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
-    };
-    if have("cc") && have("ldd") {
+    if gnu_cc() && Path::new(LOADER).exists() {
         return false;
     }
     assert!(
         std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-        "{why}: cc and ldd are what this suite checks against. \
-         musl ships no ldd, so set KIRY_TEST_ALLOW_SKIP=1 to skip it here"
+        "{why}: a cc that emits for {TRIPLE} and {LOADER} are what this suite checks \
+         against. set KIRY_TEST_ALLOW_SKIP=1 to skip it here"
     );
     true
+}
+
+fn cc() -> Command {
+    let mut c = Command::new("cc");
+    c.arg(TRIPLE);
+    c
+}
+
+// a cc that does not know the triple gets that far as a compile and fails at the link, so
+// the probe has to reach a binary. once per run, and every test asks
+fn gnu_cc() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("kiry-doc-cc-{}", std::process::id()));
+        if fs::create_dir_all(&d).is_err() {
+            return false;
+        }
+        let src = d.join("probe.c");
+        if fs::write(&src, "void _start(void){}\n").is_err() {
+            return false;
+        }
+        let ok = cc()
+            .args(["-nostdlib", "-o"])
+            .arg(d.join("probe"))
+            .arg(&src)
+            .status()
+            .is_ok_and(|s| s.success());
+        let _ = fs::remove_dir_all(&d);
+        ok
+    })
 }
 
 // -nostdlib keeps libc out of DT_NEEDED, so the only unresolved thing in a fixture root
@@ -54,7 +85,7 @@ fn versioned(at: &Path, soname: &str, body: &str, script: Option<&str>) -> PathB
     let src = at.join(format!("{soname}.c"));
     fs::write(&src, body).unwrap();
     let out = at.join(soname);
-    let mut c = Command::new("cc");
+    let mut c = cc();
     c.args([
         "-shared",
         "-fPIC",
@@ -86,7 +117,7 @@ fn binsrc(at: &Path, name: &str, body: &str, against: &Path, rpath: Option<&str>
     let src = at.join(format!("{name}.c"));
     fs::write(&src, body).unwrap();
     let out = at.join(name);
-    let mut c = Command::new("cc");
+    let mut c = cc();
     // a library is allowed to leave symbols to whatever loads it, which is the case
     // under test. the linker refusing that would make the fixture unbuildable
     c.args(["-nostdlib", "-Wl,--allow-shlib-undefined"]);
@@ -179,32 +210,34 @@ fn doctor(root: &Path) -> (bool, String) {
     )
 }
 
-// ldd resolves against the real filesystem, which is what the fixture root is
-fn ldd_finds(bin: &Path, soname: &str) -> bool {
-    let o = Command::new("ldd")
-        .arg(bin)
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&o.stdout)
-        .lines()
-        .any(|l| l.contains(soname) && !l.contains("not found"))
-}
-
-// -r makes ldd resolve every relocation instead of stopping at the libraries, which is
-// the question doctor is asking. it reports on stderr
-fn ldd_relocs(bin: &Path) -> String {
-    let o = Command::new("ldd")
-        .args(["-r"])
-        .arg(bin)
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .unwrap();
+// LD_TRACE_LOADED_OBJECTS is the whole of ldd; LD_WARN and LD_BIND_NOW are what it adds
+// for -r. the loader traces and exits, so a fixture with a bare _start never runs
+fn traced(bin: &Path, relocs: bool) -> String {
+    let mut c = Command::new(LOADER);
+    c.env_remove("LD_LIBRARY_PATH")
+        .env("LD_TRACE_LOADED_OBJECTS", "1");
+    if relocs {
+        c.env("LD_WARN", "1").env("LD_BIND_NOW", "1");
+    }
+    let o = c.arg(bin).output().unwrap();
     format!(
         "{}{}",
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     )
+}
+
+// ldd resolves against the real filesystem, which is what the fixture root is
+fn ldd_finds(bin: &Path, soname: &str) -> bool {
+    traced(bin, false)
+        .lines()
+        .any(|l| l.contains(soname) && !l.contains("not found"))
+}
+
+// -r resolves every relocation instead of stopping at the libraries, which is the
+// question doctor is asking
+fn ldd_relocs(bin: &Path) -> String {
+    traced(bin, true)
 }
 
 #[test]
@@ -351,7 +384,7 @@ fn dt_rpath_resolves_when_there_is_no_runpath() {
     let src = at.join("m.c");
     fs::write(&src, "void p(void);\nvoid _start(void){p();}\n").unwrap();
     let b = at.join("app");
-    let ok = Command::new("cc")
+    let ok = cc()
         .args([
             "-nostdlib",
             "-Wl,--disable-new-dtags",
@@ -506,7 +539,7 @@ fn versioned_lib(at: &Path, node: &str) -> PathBuf {
     let src = at.join("v.c");
     fs::write(&src, "void p(void){}\n").unwrap();
     let out = at.join("libt.so.1");
-    let ok = Command::new("cc")
+    let ok = cc()
         .args(["-shared", "-fPIC", "-nostdlib", "-Wl,-soname,libt.so.1"])
         .arg(format!("-Wl,--version-script,{}", map.display()))
         .arg("-o")
@@ -567,7 +600,7 @@ fn nameless(at: &Path, name: &str) -> PathBuf {
     let src = at.join(format!("{name}.c"));
     fs::write(&src, "void p(void){}\n").unwrap();
     let out = at.join(name);
-    let ok = Command::new("cc")
+    let ok = cc()
         .args(["-shared", "-fPIC", "-nostdlib"])
         .arg("-o")
         .arg(&out)
@@ -584,7 +617,7 @@ fn against_name(at: &Path, name: &str, lib: &Path, asks: &str, rpath: Option<&st
     let src = at.join(format!("{name}.c"));
     fs::write(&src, "void p(void);\nvoid _start(void){p();}\n").unwrap();
     let out = at.join(name);
-    let mut c = Command::new("cc");
+    let mut c = cc();
     c.arg("-nostdlib");
     if let Some(r) = rpath {
         c.arg(format!("-Wl,-rpath,{r}"));
@@ -618,7 +651,7 @@ fn a_library_reached_only_through_a_dlopened_one_is_not_asked_either() {
     let module = at.join("libmod.so.1");
     let src = at.join("mod.c");
     fs::write(&src, "void d(void);\nvoid m(void){d();}\n").unwrap();
-    let ok = Command::new("cc")
+    let ok = cc()
         .args([
             "-shared",
             "-fPIC",
@@ -1016,18 +1049,19 @@ fn a_version_label_in_two_libraries_is_not_a_clash() {
     }
     let at = scratch("labels");
     let root = at.join("root");
-    let script = "V1 { global: a; b; local: *; };\n";
+    // a script may only name symbols the library defines, so the label is what the two
+    // share and the symbol under it is each library's own
     let one = versioned(
         &at.join("one"),
         "libone.so.1",
         "void a(void){}\n",
-        Some(script),
+        Some("V1 { global: a; local: *; };\n"),
     );
     let two = versioned(
         &at.join("two"),
         "libtwo.so.1",
         "void b(void){}\n",
-        Some(script),
+        Some("V1 { global: b; local: *; };\n"),
     );
     let ua = binsrc(
         &at.join("ua"),

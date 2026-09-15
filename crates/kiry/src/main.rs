@@ -46,7 +46,7 @@ fn main() {
                 die(e);
             }
         }
-        Some(dir) => show(dir),
+        Some(_) => show(&args),
         None => {
             usage();
             std::process::exit(2);
@@ -55,7 +55,7 @@ fn main() {
 }
 
 fn usage() {
-    say!("usage: kiry b [--root DIR] [--target T] [-v] [--recover] <package dir>...");
+    say!("usage: kiry b [--root DIR] [--target T] [-v] [--recover] <pkg>...");
     say!("       kiry i [--root DIR] [--force] <archive>...");
     say!("       kiry r [--root DIR] [--force] <pkg>...");
     say!("       kiry l [--root DIR]");
@@ -71,7 +71,7 @@ fn usage() {
     say!("       kiry stats [--root DIR]");
     say!("       kiry convert [-n] <APKBUILD>... <into DIR>");
     say!("       kiry sandbox                    internal: build inside its closure");
-    say!("       kiry <package dir>");
+    say!("       kiry <pkg>                      name, repo/name or a path");
 }
 
 fn die(msg: String) -> ! {
@@ -140,7 +140,11 @@ fn build_cmd(args: &[String]) {
     }
 
     for d in &dirs {
-        let p = match pkg::load(Path::new(d)) {
+        let at = match resolve(&root, d) {
+            Ok(at) => at,
+            Err(e) => die(e),
+        };
+        let p = match pkg::load(&at) {
             Ok(p) => p,
             Err(e) => die(e.to_string()),
         };
@@ -2217,15 +2221,28 @@ fn list_cmd(args: &[String]) {
     }
 }
 
+// in precedence order, which is the whole reason this is a list and not a readdir:
+// local overrides everything and testing loses to everything
+const REPOS: &[&str] = &["local", "core", "extra", "testing"];
+const REPOS_AT: &str = "var/db/kiry";
+
+// the file is the adjustable form and the default is the predetermined one, so a root
+// that has configured nothing still finds its recipes. /var/db rather than /var/kiry
+// because a recipe is written by hand and /var/kiry is the part you may delete
 fn repos(root: &Path) -> Vec<PathBuf> {
-    let Ok(text) = fs::read_to_string(root.join("etc/kiry/repos")) else {
-        return Vec::new();
-    };
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(PathBuf::from)
-        .collect()
+    if let Ok(text) = fs::read_to_string(root.join("etc/kiry/repos")) {
+        let out: Vec<PathBuf> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(PathBuf::from)
+            .collect();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    let at = root.join(REPOS_AT);
+    REPOS.iter().map(|r| at.join(r)).collect()
 }
 
 fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
@@ -2233,6 +2250,33 @@ fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
         .into_iter()
         .map(|d| d.join(name))
         .find(|d| d.join("build").is_file())
+}
+
+// a name, a repo/name, or a path. the path is tried first and only when something is
+// actually there, so a staging root or a scratch dir still builds and the two forms
+// never have to be told apart by their spelling
+fn resolve(root: &Path, arg: &str) -> Result<PathBuf, String> {
+    let at = PathBuf::from(arg);
+    if at.join("build").is_file() {
+        return Ok(at);
+    }
+    if let Some((repo, name)) = arg.split_once('/') {
+        let want = repos(root)
+            .into_iter()
+            .find(|r| r.file_name().is_some_and(|f| f == repo))
+            .map(|r| r.join(name));
+        if let Some(d) = want.filter(|d| d.join("build").is_file()) {
+            return Ok(d);
+        }
+    }
+    recipe(root, arg).ok_or_else(|| {
+        let where_ = repos(root)
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("no recipe {arg} in {where_}")
+    })
 }
 
 // the bool is a bootstrap pass: the same package built from its bootstrap script, which
@@ -3773,8 +3817,15 @@ fn fold(p: &str) -> String {
     parts.join("/")
 }
 
-fn show(dir: &str) {
-    let dir = PathBuf::from(dir);
+fn show(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    let [name] = &rest[..] else {
+        die("show wants one package".into());
+    };
+    let dir = match resolve(&root, name) {
+        Ok(d) => d,
+        Err(e) => die(e),
+    };
     let p = match pkg::load(&dir) {
         Ok(p) => p,
         Err(e) => die(e.to_string()),

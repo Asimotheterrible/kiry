@@ -2626,3 +2626,71 @@ fn sync_lists_only_what_moved_and_refuses_to_write() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+// a package manager that wants a directory is a package manager you cannot use from
+// anywhere but the repo. these four spellings all have to reach the same recipe
+#[test]
+fn a_recipe_is_reached_by_name_by_repo_and_by_path() {
+    let at = scratch("resolve");
+    let root = at.join("root");
+    let repo = at.join("core");
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+    offer(&repo, "thing", "1.0");
+
+    let r = root.to_str().unwrap();
+    for arg in ["thing", "core/thing", repo.join("thing").to_str().unwrap()] {
+        let o = Command::new(KIRY).args(["--root", r, arg]).output().unwrap();
+        assert!(o.status.success(), "{arg}: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(
+            String::from_utf8_lossy(&o.stdout).contains("thing 1.0 1"),
+            "{arg}: {}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+    }
+
+    // and the name that is nowhere says where it looked, because the answer is almost
+    // always that the repo list is not what you thought
+    let o = Command::new(KIRY).args(["--root", r, "absent"]).output().unwrap();
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("absent"), "{said}");
+    assert!(said.contains(repo.to_str().unwrap()), "{said}");
+}
+
+// a root that has configured nothing still has to find its recipes, or every fresh
+// install starts by writing a config file that only ever says the default
+#[test]
+fn repos_fall_back_to_the_built_in_place_when_nothing_configured() {
+    let at = scratch("defaultrepos");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    offer(&root.join("var/db/kiry/extra"), "found", "2.0");
+
+    let o = Command::new(KIRY)
+        .args(["--root", root.to_str().unwrap(), "found"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("found 2.0 1"));
+}
+
+// local wins and testing loses, which is why the default is a list in that order and
+// not whatever readdir hands back
+#[test]
+fn the_built_in_repos_are_in_precedence_order() {
+    let at = scratch("precedence");
+    let root = at.join("root");
+    let base = root.join("var/db/kiry");
+    fs::create_dir_all(&root).unwrap();
+    offer(&base.join("local"), "both", "9.9");
+    offer(&base.join("extra"), "both", "1.0");
+
+    let o = Command::new(KIRY)
+        .args(["--root", root.to_str().unwrap(), "both"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("both 9.9 1"), "{said}");
+}

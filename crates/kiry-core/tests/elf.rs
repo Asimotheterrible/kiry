@@ -245,8 +245,12 @@ fn dyn_syms(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
         .args(paths)
         .output()
         .expect("readelf failed to run");
-    let text = &String::from_utf8_lossy(&out.stdout);
+    read_dyn_syms(&String::from_utf8_lossy(&out.stdout), paths)
+}
 
+// split from the call so the hex size below can be handed a line directly. llvm-readelf
+// prints every size in decimal, so no binary this machine can build reaches that branch
+fn read_dyn_syms(text: &str, paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
     let mut map: BTreeMap<PathBuf, Vec<RSym>> = BTreeMap::new();
     // no File: header comes back when readelf was handed exactly one file
     let mut cur: Option<PathBuf> = match paths {
@@ -413,10 +417,10 @@ fn agrees_with_readelf_on_dynamic_symbols() {
     assert!(selfnamed > 0, "no version-definition symbol in the sample");
 }
 
-// nothing sampled here has an object big enough to cross readelf's decimal cutoff,
-// so a fixture is the only way to reach that branch on purpose
+// nothing sampled here carries an object anywhere near this size, so a fixture is the
+// only way to check a size that does not fit the small cases
 #[test]
-fn reads_a_symbol_too_big_for_readelf_to_print_in_decimal() {
+fn reads_a_two_hundred_kilobyte_symbol() {
     let dir = std::env::temp_dir().join(format!("kiry-big-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("t.c");
@@ -439,40 +443,31 @@ fn reads_a_symbol_too_big_for_readelf_to_print_in_decimal() {
         }
     }
 
-    let raw = Command::new("readelf")
-        .args(["--dyn-syms", "-W"])
-        .arg(&so)
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&raw.stdout);
-    let hex = text.lines().any(|l| {
-        l.split_whitespace().last() == Some("big")
-            && l.split_whitespace()
-                .nth(2)
-                .is_some_and(|s| s.starts_with("0x"))
-    });
-    // llvm-readelf prints every size in decimal, so where readelf is llvm's the hex
-    // branch in the harness cannot be reached and only the size below still means
-    // something. the claim is guarded rather than the whole test, which still checks
-    // that kiry reads the size right either way
-    if !hex {
-        assert!(
-            std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-            "readelf printed the size in decimal, so the fixture no longer reaches the \
-             hex branch and this test proves less than it says"
-        );
-    }
-
     let got = mine(&elf::parse(&std::fs::read(&so).unwrap()).unwrap());
     let want = &dyn_syms(&[&so])[&so];
     assert_eq!(got.len(), want.len(), "symbol count for the fixture");
     let big = got
         .iter()
         .find(|s| s.name == "big")
-        .unwrap_or_else(|| panic!("lost the symbol readelf prints in hex"));
+        .unwrap_or_else(|| panic!("lost the big symbol"));
     assert_eq!(big.size, 200_000);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// gnu readelf switches to hex past 99999 and llvm's never does, so which one is on the
+// path decides whether the harness ever sees this. parsing only decimal would silently
+// drop every symbol over that line
+#[test]
+fn the_harness_reads_a_size_readelf_wrote_in_hex() {
+    let at = PathBuf::from("/nowhere/libt.so");
+    let line = "     5: 0000000000004020 0x30d40 OBJECT  GLOBAL DEFAULT   22 big\n";
+    let got = read_dyn_syms(line, &[&at]);
+    let syms = &got[&at];
+    assert_eq!(syms.len(), 1);
+    assert_eq!(syms[0].name, "big");
+    assert_eq!(syms[0].size, 200_000);
+    assert!(syms[0].object);
 }
 
 // nothing installed here carries DT_HASH any more, the linker has defaulted to the

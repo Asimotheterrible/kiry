@@ -35,6 +35,8 @@ fn main() {
         Some("rebuild") => rebuild_cmd(&args[1..]),
         Some("flags") => flags_cmd(&args[1..]),
         Some("why") => why_cmd(&args[1..]),
+        Some("ahead") => ahead_cmd(&args[1..]),
+        Some("sync") => sync_cmd(&args[1..]),
         Some("search") => search_cmd(&args[1..]),
         Some("log") => log_cmd(&args[1..]),
         Some("stats") => stats_cmd(&args[1..]),
@@ -62,6 +64,8 @@ fn usage() {
     say!("       kiry rebuild [--root DIR] [-n]");
     say!("       kiry flags [--root DIR] <pkg> | [--queue]");
     say!("       kiry why [--root DIR] <pkg>     what pulls it in");
+    say!("       kiry ahead [--root DIR] [--net] [pkg]...  versions upstream moved");
+    say!("       kiry sync -n [--root DIR] [--net]         what a bump would do");
     say!("       kiry search [--root DIR] [term] recipes on offer");
     say!("       kiry log [--root DIR] <pkg>     the last build log");
     say!("       kiry stats [--root DIR]");
@@ -330,6 +334,14 @@ fn grab(url: &str, dst: &Path) -> Result<(), String> {
     part.push(".part");
     let part = PathBuf::from(part);
 
+    run(&mut fetcher(url, &part)?, url)?;
+
+    fs::rename(&part, dst).map_err(|e| format!("{}: {e}", dst.display()))
+}
+
+// split out so a probe can silence the progress meter. the template is the same one, and
+// a second env var for the same job is a second thing to get out of step
+fn fetcher(url: &str, dst: &Path) -> Result<Command, String> {
     let tmpl = std::env::var("KIRY_FETCH").unwrap_or_else(|_| "curl -fL --retry 3 -o %o %u".into());
     let mut words = tmpl.split_whitespace();
     let Some(prog) = words.next() else {
@@ -339,13 +351,11 @@ fn grab(url: &str, dst: &Path) -> Result<(), String> {
     let mut c = Command::new(prog);
     for w in words {
         c.arg(
-            w.replace("%o", &part.display().to_string())
+            w.replace("%o", &dst.display().to_string())
                 .replace("%u", url),
         );
     }
-    run(&mut c, url)?;
-
-    fs::rename(&part, dst).map_err(|e| format!("{}: {e}", dst.display()))
+    Ok(c)
 }
 
 // full flags, then less of them. a check failure prints nothing a table could match, so
@@ -2590,6 +2600,313 @@ fn why_cmd(args: &[String]) {
     if !found {
         die(format!("{name} is not installed"));
     }
+}
+
+// 275 recipes whose versions move by hand, and nothing said which had moved. two sources
+// answer that here: the aports clone, which is a file read, and a local/ recipe's tracker,
+// which is one fetch. repology was meant to be the third and its domain currently resolves
+// to 127.0.0.1, so there is nothing to write against
+//
+// read only on purpose. what lands as unknown below is what the scheme format has to
+// describe, and committing that format to 275 files before seeing the list is how it gets
+// written wrong
+#[derive(PartialEq)]
+enum Part {
+    Num(u64),
+    Sep,
+    Text(String),
+}
+
+fn parts(v: &str) -> Vec<Part> {
+    let kind = |c: char| {
+        if c.is_ascii_digit() {
+            0
+        } else if ".-_+~:".contains(c) {
+            1
+        } else {
+            2
+        }
+    };
+    let chars: Vec<char> = v.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let k = kind(chars[i]);
+        let at = i;
+        while i < chars.len() && kind(chars[i]) == k {
+            i += 1;
+        }
+        let s: String = chars[at..i].iter().collect();
+        out.push(match (k, s.parse::<u64>()) {
+            (0, Ok(n)) => Part::Num(n),
+            (1, _) => Part::Sep,
+            _ => Part::Text(s),
+        });
+    }
+    out
+}
+
+// upstream numbering is not semver, so this orders what it can and answers nothing where
+// it cannot. two digit runs compare as numbers and equal text carries on; anything else
+// -- rc against a release, a trailing letter, a date where a count was -- is a thing only
+// scheme will be able to say, and guessing it would report a bump that is a downgrade
+fn compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let (x, y) = (parts(a), parts(b));
+    for i in 0..x.len().min(y.len()) {
+        match (&x[i], &y[i]) {
+            (Part::Num(p), Part::Num(q)) if p != q => return Some(p.cmp(q)),
+            (Part::Num(_), Part::Num(_)) | (Part::Sep, Part::Sep) => {}
+            (Part::Text(p), Part::Text(q)) if p == q => {}
+            _ => return None,
+        }
+    }
+
+    // 1.2 against 1.2.1 is older and 1.2 against 1.2rc1 is newer, so what is left over
+    // decides only while it stays numeric. trailing zeros make it the same version
+    let rest = if x.len() > y.len() {
+        &x[y.len()..]
+    } else {
+        &y[x.len()..]
+    };
+    let mut bigger = false;
+    for p in rest {
+        match p {
+            Part::Num(n) => bigger |= *n > 0,
+            Part::Sep => {}
+            Part::Text(_) => return None,
+        }
+    }
+    if !bigger {
+        Some(Ordering::Equal)
+    } else if x.len() > y.len() {
+        Some(Ordering::Greater)
+    } else {
+        Some(Ordering::Less)
+    }
+}
+
+struct Up {
+    version: String,
+    from: String,
+}
+
+// the first pkgver= line. a value naming a variable needs the shell to resolve and half
+// reading it would put a literal $pkgver in the note, so it is left to the next source
+fn pkgver(text: &str) -> Option<String> {
+    let l = text.lines().find_map(|l| l.trim().strip_prefix("pkgver="))?;
+    let v = l.trim().trim_matches(['"', '\'']);
+    if v.is_empty() || v.contains('$') || !v.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+// main before community before testing, which is the order a pin would name them in and
+// the order aports itself promotes through
+fn from_aports(root: &Path, name: &str) -> Option<Up> {
+    let at = root.join("var/kiry/aports");
+    for repo in ["main", "community", "testing"] {
+        let f = at.join(repo).join(name).join("APKBUILD");
+        let Ok(text) = fs::read_to_string(&f) else {
+            continue;
+        };
+        let Some(version) = pkgver(&text) else {
+            continue;
+        };
+        return Some(Up {
+            version,
+            from: format!("aports/{repo}"),
+        });
+    }
+    None
+}
+
+// a tracker is a url and nothing else, so the body has to be a version on its own. the
+// steam one is a debian Packages file and comes back unknown, which is the first thing
+// the format will have to grow a way to say
+fn from_tracker(dir: &Path) -> Result<Up, &'static str> {
+    let text = fs::read_to_string(dir.join("tracker")).map_err(|_| "tracker unreadable")?;
+    let url = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .ok_or("tracker is empty")?;
+
+    let at = std::env::temp_dir().join(format!("kiry-tracker-{}", std::process::id()));
+    let _ = fs::remove_file(&at);
+    let mut c = fetcher(url, &at).map_err(|_| "no fetcher")?;
+    run(c.stderr(Stdio::null()), url).map_err(|_| "tracker fetch failed")?;
+    let body = fs::read_to_string(&at).map_err(|_| "tracker fetch wrote nothing")?;
+    let _ = fs::remove_file(&at);
+
+    let mut words = body.split_whitespace();
+    let v = words.next().ok_or("tracker answered nothing")?;
+    if words.next().is_some() || !v.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err("tracker body is not a version on its own");
+    }
+    Ok(Up {
+        version: v.to_string(),
+        from: "tracker".to_string(),
+    })
+}
+
+struct Row {
+    name: String,
+    ours: String,
+    target: String,
+    status: &'static str,
+    up: Option<Up>,
+    // either why there is no upstream version or what is odd about the one there is
+    note: String,
+}
+
+fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for r in repos(root) {
+        let repo = r
+            .file_name()
+            .map_or_else(String::new, |x| x.to_string_lossy().into_owned());
+        let Ok(rd) = fs::read_dir(&r) else { continue };
+        let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        dirs.sort();
+        for d in dirs {
+            let Ok(p) = pkg::load(&d) else { continue };
+            if !want.is_empty() && !want.contains(&p.name) {
+                continue;
+            }
+
+            let aport = from_aports(root, &p.name);
+            // a local/ recipe the aports clone now carries is one somebody else maintains
+            // for you, and nothing else in the tree would ever say so
+            let dropped = repo == "local" && aport.is_some();
+            let tracked = d.join("tracker").is_file();
+
+            let mut why = "no source";
+            let up = match aport {
+                Some(u) => Some(u),
+                None if tracked && !net => {
+                    why = "tracker not read, pass --net";
+                    None
+                }
+                None if tracked => match from_tracker(&d) {
+                    Ok(u) => Some(u),
+                    Err(e) => {
+                        why = e;
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let (status, mut note) = match &up {
+                None => ("unknown", why.to_string()),
+                Some(u) => match compare(&p.version.upstream, &u.version) {
+                    Some(std::cmp::Ordering::Equal) => ("ok", String::new()),
+                    Some(std::cmp::Ordering::Less) => ("behind", String::new()),
+                    Some(std::cmp::Ordering::Greater) => ("ahead", String::new()),
+                    None => ("unknown", "unordered".to_string()),
+                },
+            };
+            if dropped {
+                note = format!("{note} now in aports");
+            }
+            rows.push(Row {
+                name: p.name.clone(),
+                ours: p.version.upstream.clone(),
+                target: match &p.targets[..] {
+                    [one] => one.clone(),
+                    _ => "-".to_string(),
+                },
+                status,
+                up,
+                note: note.trim().to_string(),
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+// the columns are the standard order and the time is not one this command measures
+fn ahead_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    let net = rest.iter().any(|a| a == "--net");
+    let want: Vec<String> = rest.into_iter().filter(|a| !a.starts_with('-')).collect();
+
+    let rows = survey(&root, &want, net);
+    let w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    let v = rows.iter().map(|r| r.ours.len()).max().unwrap_or(0);
+    let t = rows.iter().map(|r| r.target.len()).max().unwrap_or(0);
+    for r in &rows {
+        let note = match &r.up {
+            Some(u) => format!("{} {} {}", u.version, u.from, r.note),
+            None => r.note.clone(),
+        };
+        say!(
+            "{:w$} {:v$} {:t$} {:8} {:5} {}",
+            r.name,
+            r.ours,
+            r.target,
+            r.status,
+            "-",
+            note.trim()
+        );
+    }
+
+    let count = |s: &str| rows.iter().filter(|r| r.status == s).count();
+    say!(
+        "{} recipes  {} behind  {} ahead  {} ok  {} unknown",
+        rows.len(),
+        count("behind"),
+        count("ahead"),
+        count("ok"),
+        count("unknown")
+    );
+}
+
+// what a bump would do, which is not what ahead prints: this names the APKBUILD a recipe
+// would be re-converted from and the testing/ entry it would land in
+fn sync_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    if !rest.iter().any(|a| a == "-n") {
+        die("sync wants -n. writing testing/ is not built".into());
+    }
+    let net = rest.iter().any(|a| a == "--net");
+    let want: Vec<String> = rest.into_iter().filter(|a| !a.starts_with('-')).collect();
+
+    let rows: Vec<Row> = survey(&root, &want, net)
+        .into_iter()
+        .filter(|r| r.status == "behind")
+        .collect();
+    let w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    let v = rows.iter().map(|r| r.ours.len()).max().unwrap_or(0);
+    let u = rows
+        .iter()
+        .filter_map(|r| r.up.as_ref().map(|u| u.version.len()))
+        .max()
+        .unwrap_or(0);
+    for r in &rows {
+        let Some(up) = &r.up else { continue };
+        let at = match up.from.strip_prefix("aports/") {
+            Some(repo) => root
+                .join("var/kiry/aports")
+                .join(repo)
+                .join(&r.name)
+                .join("APKBUILD")
+                .display()
+                .to_string(),
+            None => up.from.clone(),
+        };
+        say!(
+            "{:w$} {:v$} -> {:u$}  testing/{}  {at}",
+            r.name,
+            r.ours,
+            up.version,
+            r.name
+        );
+    }
+    say!("{} would be re-converted", rows.len());
 }
 
 // the recipes on offer, which nothing else answers: l lists what is installed and a

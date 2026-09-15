@@ -2470,3 +2470,159 @@ fn a_source_packed_with_a_big_dictionary_still_unpacks() {
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
+
+// the version a recipe carries moves by hand, so nothing in the tree said which had been
+// left behind. these drive the real aports layout because the layout is the input
+fn aport(root: &Path, repo: &str, name: &str, body: &str) {
+    let d = root.join("var/kiry/aports").join(repo).join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("APKBUILD"), body).unwrap();
+}
+
+fn offer(repo: &Path, name: &str, version: &str) {
+    let d = repo.join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("build"), ":\n").unwrap();
+    fs::write(d.join("version"), format!("{version} 1\n")).unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+}
+
+fn tree(name: &str) -> (PathBuf, PathBuf) {
+    let at = scratch(name);
+    let root = at.join("root");
+    let repo = at.join("extra");
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+    (root, repo)
+}
+
+fn ahead_of(root: &Path) -> String {
+    let o = kiry(&["ahead", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+#[test]
+fn ahead_orders_what_it_can_and_says_nothing_where_it_cannot() {
+    let (root, repo) = tree("ahead");
+    // a digit run is a number, so 08 and 8 are the same release and a trailing zero
+    // is not a bump. rc and a letter suffix are what scheme will have to describe
+    for (n, ours, theirs) in [
+        ("level", "1.2.3", "1.2.3"),
+        ("padded", "2026.8.19", "2026.08.19"),
+        ("trailing", "1.2", "1.2.0"),
+        ("older", "1.2.3", "1.2.4"),
+        ("newer", "9.0.1", "8.1.2"),
+        ("grew", "1.2", "1.2.1"),
+        ("letters", "2026c", "2026d"),
+        ("candidate", "1.2", "1.2rc1"),
+    ] {
+        offer(&repo, n, ours);
+        aport(&root, "main", n, &format!("pkgver={theirs}\n"));
+    }
+
+    let said = ahead_of(&root);
+    for (n, status) in [
+        ("level", "ok"),
+        ("padded", "ok"),
+        ("trailing", "ok"),
+        ("older", "behind"),
+        ("newer", "ahead"),
+        ("grew", "behind"),
+        ("letters", "unknown"),
+        ("candidate", "unknown"),
+    ] {
+        let line = said
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(n))
+            .unwrap_or_else(|| panic!("no row for {n}: {said}"));
+        assert_eq!(line.split_whitespace().nth(3), Some(status), "{line}");
+    }
+    assert!(said.contains("8 recipes  2 behind  1 ahead  3 ok  2 unknown"), "{said}");
+    // the version it could not order is still printed, because that is the thing a
+    // scheme has to be written against
+    assert!(said.contains("2026d aports/main unordered"), "{said}");
+}
+
+// main before community before testing, which is how aports promotes
+#[test]
+fn ahead_takes_the_first_aports_repo_that_carries_the_name() {
+    let (root, repo) = tree("aheadrepo");
+    offer(&repo, "both", "1.0");
+    aport(&root, "main", "both", "pkgver=2.0\n");
+    aport(&root, "community", "both", "pkgver=3.0\n");
+
+    let said = ahead_of(&root);
+    assert!(said.contains("2.0 aports/main"), "{said}");
+    assert!(!said.contains("3.0"), "{said}");
+}
+
+// a pkgver naming a variable needs the shell to resolve, and a literal $pkgver in the
+// note would read as a version nobody can act on
+#[test]
+fn ahead_leaves_a_pkgver_it_cannot_read_alone() {
+    let (root, repo) = tree("aheadvar");
+    offer(&repo, "computed", "1.0");
+    aport(&root, "main", "computed", "_x=3\npkgver=1.$_x\n");
+    offer(&repo, "quoted", "1.0");
+    aport(&root, "main", "quoted", "pkgver=\"1.4\"\n");
+
+    let said = ahead_of(&root);
+    assert!(said.contains("computed"), "{said}");
+    assert!(!said.contains("$_x"), "{said}");
+    assert!(said.contains("1.4 aports/main"), "{said}");
+}
+
+// local/ is for what alpine does not carry. once it does, somebody else is maintaining
+// it for you and nothing else in the tree would ever mention it
+#[test]
+fn ahead_says_when_a_local_recipe_turned_up_in_aports() {
+    let at = scratch("aheaddrop");
+    let root = at.join("root");
+    let repo = at.join("local");
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+    offer(&repo, "mine", "1.0");
+    aport(&root, "community", "mine", "pkgver=1.0\n");
+
+    let said = ahead_of(&root);
+    assert!(said.contains("now in aports"), "{said}");
+}
+
+// a tracker is a fetch, so a report that did not ask for the network has to say it did
+// not look rather than report the package as having no upstream at all
+#[test]
+fn ahead_does_not_read_a_tracker_unless_asked() {
+    let (root, repo) = tree("aheadtracker");
+    offer(&repo, "tracked", "1.0");
+    fs::write(repo.join("tracked/tracker"), "https://example.invalid/v\n").unwrap();
+
+    let said = ahead_of(&root);
+    assert!(said.contains("tracker not read"), "{said}");
+}
+
+#[test]
+fn sync_lists_only_what_moved_and_refuses_to_write() {
+    let (root, repo) = tree("syncplan");
+    offer(&repo, "moved", "1.0");
+    aport(&root, "main", "moved", "pkgver=1.1\n");
+    offer(&repo, "level", "2.0");
+    aport(&root, "main", "level", "pkgver=2.0\n");
+
+    let o = kiry(&["sync", "-n", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("moved 1.0 -> 1.1"), "{said}");
+    assert!(said.contains("testing/moved"), "{said}");
+    assert!(said.contains("aports/main/moved/APKBUILD"), "{said}");
+    assert!(!said.contains("level"), "{said}");
+    assert!(said.contains("1 would be re-converted"), "{said}");
+
+    let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
+    assert!(!o.status.success(), "sync wrote something");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("-n"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

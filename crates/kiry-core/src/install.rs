@@ -156,7 +156,7 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
         for (path, seen) in scan(root, &manifest)? {
             let Seen::Elf(o) = seen else { continue };
             let Some(soname) = o.soname else { continue };
-            if let Some(old) = before[i].get(&path) {
+            if let Some(old) = baseline(&before[i], &path, &soname) {
                 // a target decides this, not the library: a musl loader ignores versions
                 // even where one carries them, so keying on them there invents breaks
                 let changed = elf::compare(&old.exports, &o.exports, j.target.ends_with("gnu"));
@@ -193,6 +193,24 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
     dispossess(root, jobs)?;
     prune(root, &was, &kept)?;
     Ok(Applied { broke, edits })
+}
+
+// the real file carries the full version and the soname is a symlink onto it, so a bump
+// renames the thing being compared. the soname is the part that did not move, and keying
+// on the path alone skipped every library shaped that way
+fn baseline<'a>(
+    before: &'a HashMap<String, elf::Elf>,
+    path: &str,
+    soname: &str,
+) -> Option<&'a elf::Elf> {
+    if let Some(o) = before.get(path) {
+        return Some(o);
+    }
+    // two old files under one soname and nothing says which of them this one replaced,
+    // so the answer is no comparison rather than an arbitrary pair
+    let mut same = before.values().filter(|o| o.soname.as_deref() == Some(soname));
+    let one = same.next()?;
+    same.next().is_none().then_some(one)
 }
 
 fn edited(root: &Path, manifest: &[db::Entry]) -> Result<Vec<String>, Error> {

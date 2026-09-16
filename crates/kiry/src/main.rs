@@ -8,7 +8,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use kiry_core::pkg::{Dep, Package};
 use kiry_core::{db, elf, install, pkg};
@@ -37,6 +37,8 @@ fn main() {
         Some("why") => why_cmd(&args[1..]),
         Some("ahead") => ahead_cmd(&args[1..]),
         Some("sync") => sync_cmd(&args[1..]),
+        Some("promote") => promote_cmd(&args[1..]),
+        Some("gc") => gc_cmd(&args[1..]),
         Some("search") => search_cmd(&args[1..]),
         Some("log") => log_cmd(&args[1..]),
         Some("stats") => stats_cmd(&args[1..]),
@@ -55,23 +57,44 @@ fn main() {
 }
 
 fn usage() {
-    say!("usage: kiry b [--root DIR] [--target T] [-v] [--recover] <pkg>...");
-    say!("       kiry i [--root DIR] [--force] <archive>...");
-    say!("       kiry r [--root DIR] [--force] <pkg>...");
-    say!("       kiry l [--root DIR]");
-    say!("       kiry doctor [--root DIR] [--files] [--orphans]");
-    say!("       kiry owns [--root DIR] <path>...");
-    say!("       kiry rebuild [--root DIR] [-n]");
-    say!("       kiry flags [--root DIR] <pkg> | [--queue]");
-    say!("       kiry why [--root DIR] <pkg>     what pulls it in");
-    say!("       kiry ahead [--root DIR] [--net] [pkg]...  versions upstream moved");
-    say!("       kiry sync -n [--root DIR] [--net]         what a bump would do");
-    say!("       kiry search [--root DIR] [term] recipes on offer");
-    say!("       kiry log [--root DIR] <pkg>     the last build log");
-    say!("       kiry stats [--root DIR]");
-    say!("       kiry convert [-n] <APKBUILD>... <into DIR>");
-    say!("       kiry sandbox                    internal: build inside its closure");
-    say!("       kiry <pkg>                      name, repo/name or a path");
+    say!("usage: kiry <command> [args]");
+    say!("");
+    say!("  i <pkg>...    build what is missing, then install");
+    say!("  b <pkg>...    build only, into the cache");
+    say!("  r <pkg>...    remove");
+    say!("  l             what is installed");
+    say!("");
+    say!("i is enough on its own. it builds the package and everything under it, in");
+    say!("order, then installs. use b when you want the build without the install, or");
+    say!("when you want to force one: b always compiles, i takes what is in the cache.");
+    say!("so `i foo` installs foo, and `b foo` then `i foo` rebuilds it.");
+    say!("");
+    say!("a package is named rather than pointed at: mesa, core/mesa, or a path to a");
+    say!("recipe. b and i take --target T, -v to stream the build, --recover to let the");
+    say!("failure table retry, and --force to override a conflict.");
+    say!("");
+    say!("keeping up");
+    say!("  ahead [--net] [pkg]...  which versions upstream moved past");
+    say!("  sync [-n] [--net]       bump those into testing/");
+    say!("  promote <pkg>...        testing/ into the tree");
+    say!("  rebuild [-n]            drain the soname rebuild queue");
+    say!("");
+    say!("looking around");
+    say!("  owns <path>...          which package owns a file");
+    say!("  why <pkg>               what pulls it in");
+    say!("  flags <pkg> | --queue   resolved flags and where they came from");
+    say!("  log <pkg>               the last build log");
+    say!("  search [term]           recipes on offer");
+    say!("  doctor [--files] [--orphans]   every installed ELF resolves");
+    say!("  stats");
+    say!("  <pkg>                   what a recipe says");
+    say!("");
+    say!("housekeeping");
+    say!("  gc [-n]                 drop what /var/kiry no longer needs");
+    say!("  convert [-n] <APKBUILD>... <dir>");
+    say!("");
+    say!("--root DIR applies to anything that touches the installed tree and defaults to");
+    say!("/; KIRY_ROOT is the environment form. --version prints the version alone.");
 }
 
 fn die(msg: String) -> ! {
@@ -139,6 +162,10 @@ fn build_cmd(args: &[String]) {
         die("nothing to build".into());
     }
 
+    // loaded up front so the whole batch can be estimated before any of it starts, and
+    // so a name that is nowhere is said before an hour of building rather than after
+    let mut recipes: HashMap<String, Package> = HashMap::new();
+    let mut todo: Vec<(String, Vec<String>)> = Vec::new();
     for d in &dirs {
         let at = match resolve(&root, d) {
             Ok(at) => at,
@@ -153,13 +180,39 @@ fn build_cmd(args: &[String]) {
             Some(t) => vec![t.clone()],
             None => p.targets.clone(),
         };
-        if fix {
-            for t in &targets {
-                if let Err(e) = recover(&root, &p, t, verbose) {
-                    die(e);
+        todo.push((p.name.clone(), targets));
+        recipes.insert(p.name.clone(), p);
+    }
+
+    // b always builds, so what is in the cache does not shorten the estimate
+    let past = history(&root);
+    let builds: usize = todo.iter().map(|(_, ts)| ts.len()).sum();
+    if builds > 1 {
+        let (mut secs, mut new) = (0u64, 0);
+        for (name, ts) in &todo {
+            for t in ts {
+                match past.get(&(name.clone(), t.clone())) {
+                    Some(s) => secs += s,
+                    None => new += 1,
                 }
             }
-        } else if let Err(e) = build(&root, &p, &targets, verbose, false, false) {
+        }
+        let note = match new {
+            0 => String::new(),
+            u => format!("  {u} never built here"),
+        };
+        say!("{builds} builds  ~{}{note}", clock(secs));
+    }
+
+    // every target of a package at once. a target that packed while a later one was
+    // still to fail is the drift a multi-target recipe exists to prevent
+    for (name, targets) in &todo {
+        let p = &recipes[name];
+        let r = match fix {
+            true => targets.iter().try_for_each(|t| recover(&root, p, t, verbose)),
+            false => build(&root, p, targets, verbose, false, false).map(|_| ()),
+        };
+        if let Err(e) = r {
             die(e);
         }
     }
@@ -180,11 +233,19 @@ fn build(
     let mut f = flags(root, &p.name, Some(&p.dir))?;
     f.reuse = reuse;
 
+    let past = history(root);
     let mut built = Vec::new();
     for t in targets {
+        let eta = match past.get(&(p.name.clone(), t.clone())) {
+            Some(s) => format!("~{}", clock(*s)),
+            None => "-".to_string(),
+        };
+        say!("{} {} {t} building {eta}", p.name, p.version.upstream);
         let start = Instant::now();
         let work = compile(root, p, t, &srcs, &f, verbose, boot)?;
-        say!("{} {} {t} ok {}", p.name, p.version.upstream, took(start));
+        let secs = start.elapsed().as_secs();
+        say!("{} {} {t} ok {}", p.name, p.version.upstream, clock(secs));
+        keep_time(root, p, t, secs);
         built.push((t.clone(), work));
     }
 
@@ -2065,27 +2126,272 @@ fn put(p: &Path, s: &str) -> Result<(), String> {
     fs::write(p, s).map_err(|e| format!("{}: {e}", p.display()))
 }
 
-fn took(start: Instant) -> String {
-    let s = start.elapsed().as_secs();
-    if s < 60 {
-        format!("{s}s")
-    } else {
-        format!("{}m{:02}s", s / 60, s % 60)
+fn clock(s: u64) -> String {
+    match s {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
     }
 }
 
+fn times(root: &Path) -> PathBuf {
+    root.join("var/kiry/times")
+}
+
+// appended rather than rewritten, so a batch that dies partway through has still
+// recorded what it finished. a line per build rather than per package keeps it honest
+// about what a package used to cost, and a few thousand of them is a hundred kilobytes
+fn keep_time(root: &Path, p: &Package, t: &str, secs: u64) {
+    let at = times(root);
+    let Some(up) = at.parent() else { return };
+    if mkdirs(up).is_err() {
+        return;
+    }
+    let line = format!("{} {} {t} {secs} {}\n", p.name, p.version.upstream, today());
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&at)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+}
+
+// what each package and target took the last time it was built. later lines win, which
+// is what lets the file be appended to
+fn history(root: &Path) -> HashMap<(String, String), u64> {
+    let mut out = HashMap::new();
+    for l in plain(&times(root)) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if let [name, _, target, secs, ..] = f[..] {
+            if let Ok(s) = secs.parse() {
+                out.insert((name.to_string(), target.to_string()), s);
+            }
+        }
+    }
+    out
+}
+
+// said before any of it starts, because the whole value of an estimate is deciding
+// whether to wait, and that is a decision made at the beginning
+fn forecast(root: &Path, todo: &[(String, String)], recipes: &HashMap<String, Package>) {
+    let past = history(root);
+    let (mut n, mut secs, mut new) = (0, 0u64, 0);
+    for (name, t) in todo {
+        let Some(p) = recipes.get(name) else { continue };
+        if cached(root, p, t).is_some() {
+            continue;
+        }
+        n += 1;
+        match past.get(&(name.clone(), t.clone())) {
+            Some(s) => secs += s,
+            None => new += 1,
+        }
+    }
+    if n < 2 {
+        return;
+    }
+    let note = match new {
+        0 => String::new(),
+        u => format!("  {u} never built here"),
+    };
+    say!("{n} builds  ~{}{note}", clock(secs));
+}
+
 fn install_cmd(args: &[String]) {
-    let (root, force, names) = opts(args);
+    let mut want = None;
+    let mut verbose = false;
+    let mut fix = false;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-v" => verbose = true,
+            "--recover" => fix = true,
+            "--target" => match it.next() {
+                Some(t) => want = Some(t.clone()),
+                None => die("--target wants a name".into()),
+            },
+            _ => rest.push(a.clone()),
+        }
+    }
+
+    let (root, force, names) = opts(&rest);
     writes(&root);
-    let archives: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
-    if archives.is_empty() {
+    if names.is_empty() {
         die("nothing to install".into());
     }
-    let jobs = match install::plan(&root, &archives, force) {
+
+    // an archive or a package. told apart by the suffix a built artifact always carries,
+    // which no recipe directory is named after
+    let (archives, asked): (Vec<String>, Vec<String>) =
+        names.into_iter().partition(|n| n.ends_with(".tar.zst"));
+    if asked.is_empty() {
+        apply_batch(&root, &archives.iter().map(PathBuf::from).collect::<Vec<_>>(), force);
+        return;
+    }
+    if !archives.is_empty() {
+        die("install takes archives or package names, not both at once".into());
+    }
+
+    let mut recipes: HashMap<String, Package> = HashMap::new();
+    let mut seeds: Vec<(String, String)> = Vec::new();
+    for n in &asked {
+        let at = match resolve(&root, n) {
+            Ok(at) => at,
+            Err(e) => die(e),
+        };
+        let p = match pkg::load(&at) {
+            Ok(p) => p,
+            Err(e) => die(e.to_string()),
+        };
+        let targets = match &want {
+            Some(t) if !p.targets.contains(t) => die(format!("{} does not build for {t}", p.name)),
+            Some(t) => vec![t.clone()],
+            None => p.targets.clone(),
+        };
+        for t in targets {
+            // the same version already in is the question answered. reinstalling over
+            // it is a repair, which is b and the artifact and a different thing to ask
+            match db::read(&root, &t, &p.name) {
+                Ok(r) if r.version == p.version => {
+                    say!("{} {} {t} already installed", p.name, p.version.upstream);
+                }
+                _ => seeds.push((p.name.clone(), t)),
+            }
+        }
+        recipes.insert(p.name.clone(), p);
+    }
+    if seeds.is_empty() {
+        return;
+    }
+
+    let set = wanted(&root, &seeds, &mut recipes);
+    forecast(&root, &set, &recipes);
+
+    // a level has to be in place before the one above it can build against it, which is
+    // what forces the install to happen a level at a time. when every member is already
+    // built that ordering buys nothing, so the set goes in as one transaction instead
+    let ready: Option<Vec<PathBuf>> = set
+        .iter()
+        .map(|(n, t)| cached(&root, &recipes[n], t))
+        .collect();
+    if let Some(all) = ready {
+        for (n, t) in &set {
+            say!("{n} {} {t} cached", recipes[n].version.upstream);
+        }
+        apply_batch(&root, &all, force);
+        return;
+    }
+
+    for level in levels(&set, &recipes) {
+        // grouped by package, because every target of one builds before any of it is
+        // packed. a musl mesa installed beside a gnu mesa that failed is exactly the
+        // drift a multi-target recipe exists to prevent
+        let mut order: Vec<&String> = Vec::new();
+        for (i, _) in &level {
+            let name = &set[*i].0;
+            if !order.contains(&name) {
+                order.push(name);
+            }
+        }
+
+        let mut made = Vec::new();
+        for name in order {
+            let p = &recipes[name];
+            let mine: Vec<&(usize, bool)> = level.iter().filter(|(i, _)| set[*i].0 == *name).collect();
+            let boot = mine.iter().any(|(_, b)| *b);
+            let targets: Vec<String> = mine.iter().map(|(i, _)| set[*i].1.clone()).collect();
+
+            let need: Vec<String> = targets
+                .iter()
+                .filter(|t| match cached(&root, p, t) {
+                    Some(_) => {
+                        say!("{} {} {t} cached", p.name, p.version.upstream);
+                        false
+                    }
+                    None => true,
+                })
+                .cloned()
+                .collect();
+            if !need.is_empty() {
+                let r = match (boot, fix) {
+                    (true, _) => build(&root, p, &need, verbose, false, true).map(|_| ()),
+                    (false, true) => need.iter().try_for_each(|t| recover(&root, p, t, verbose)),
+                    (false, false) => build(&root, p, &need, verbose, false, false).map(|_| ()),
+                };
+                if let Err(e) = r {
+                    die(e);
+                }
+            }
+            for t in &targets {
+                match cached(&root, p, t) {
+                    Some(a) => made.push(a),
+                    None => die(format!("{} {t}: built nothing", p.name)),
+                }
+            }
+        }
+        apply_batch(&root, &made, force);
+    }
+}
+
+// everything that has to be present before the named packages can go in. a dep already
+// installed stops the walk there: install refuses a job whose dep is missing, so what is
+// under an installed package is installed too, and depends carry no version constraint
+// so there is nothing further to compare
+//
+// make deps come along rather than being skipped. a build assembles its closure out of
+// the installed database, so a tool that is not installed is one the sandbox has nothing
+// to hand the build
+fn wanted(
+    root: &Path,
+    seeds: &[(String, String)],
+    recipes: &mut HashMap<String, Package>,
+) -> Vec<(String, String)> {
+    let host = sandbox::host();
+    let mut out = seeds.to_vec();
+    let mut seen: HashSet<(String, String)> = seeds.iter().cloned().collect();
+    let mut i = 0;
+    while i < out.len() {
+        let (name, t) = out[i].clone();
+        i += 1;
+        if !recipes.contains_key(&name) {
+            let at = match resolve(root, &name) {
+                Ok(at) => at,
+                Err(e) => die(e),
+            };
+            match pkg::load(&at) {
+                Ok(p) => recipes.insert(name.clone(), p),
+                Err(e) => die(e.to_string()),
+            };
+        }
+        let p = &recipes[&name];
+        if !p.targets.contains(&t) {
+            die(format!("{name} is wanted for {t} and does not build for it"));
+        }
+        let next: Vec<(String, String)> = p
+            .depends
+            .iter()
+            .filter(|d| d.applies(&t))
+            .map(|d| {
+                let dt = if d.host { host.clone() } else { t.clone() };
+                (d.name.clone(), dt)
+            })
+            .collect();
+        for d in next {
+            if db::read(root, &d.1, &d.0).is_ok() || !seen.insert(d.clone()) {
+                continue;
+            }
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
+    let jobs = match install::plan(root, archives, force) {
         Ok(j) => j,
         Err(e) => die(e.to_string()),
     };
-    let done = match install::apply(&root, &jobs) {
+    let done = match install::apply(root, &jobs) {
         Ok(b) => b,
         Err(e) => die(e.to_string()),
     };
@@ -2096,8 +2402,8 @@ fn install_cmd(args: &[String]) {
     for p in &done.edits {
         say!("kept /{p}, edited since it was installed");
     }
-    enqueue(&root, &done.broke, &named(&jobs));
-    hooks(&root, jobs.iter().map(|j| j.target.clone()).collect());
+    enqueue(root, &done.broke, &named(&jobs));
+    hooks(root, jobs.iter().map(|j| j.target.clone()).collect());
 }
 
 // a generated file that has to be rebuilt whenever a target's tree changes, and the
@@ -2746,12 +3052,44 @@ fn pkgver(text: &str) -> Option<String> {
     Some(v.to_string())
 }
 
-// main before community before testing, which is the order a pin would name them in and
-// the order aports itself promotes through
-fn from_aports(root: &Path, name: &str) -> Option<Up> {
+// which upstream a recipe tracks, where its own name does not say. one line: none, or
+// alpine/<repo>, or alpine/<repo>/<name>. none is the only way a hand written package
+// stops being reported as one kiry could not identify
+fn pinned(dir: &Path) -> Option<String> {
+    plain(&dir.join("pin")).into_iter().next()
+}
+
+// the shape every one-value-per-line recipe file has. absent reads as empty, which is
+// what optional means for all of them
+fn plain(at: &Path) -> Vec<String> {
+    fs::read_to_string(at)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+// main before community before testing, which is the order a pin names them in and the
+// order aports itself promotes through. a pin narrows it to one repo, and carries the
+// name too where alpine spells it differently -- our wlroots is their wlroots0.19 and
+// our llvm their llvm20, and neither is derivable from the other
+fn from_aports(root: &Path, name: &str, pin: Option<&str>) -> Option<Up> {
     let at = root.join("var/kiry/aports");
-    for repo in ["main", "community", "testing"] {
-        let f = at.join(repo).join(name).join("APKBUILD");
+    let (repos, name) = match pin.and_then(|p| p.strip_prefix("alpine/")) {
+        Some(p) => {
+            let mut f = p.split('/');
+            let repo = f.next().unwrap_or_default().to_string();
+            (vec![repo], f.next().unwrap_or(name).to_string())
+        }
+        None => (
+            ["main", "community", "testing"].map(String::from).to_vec(),
+            name.to_string(),
+        ),
+    };
+    for repo in &repos {
+        let f = at.join(repo).join(&name).join("APKBUILD");
         let Ok(text) = fs::read_to_string(&f) else {
             continue;
         };
@@ -2760,7 +3098,7 @@ fn from_aports(root: &Path, name: &str) -> Option<Up> {
         };
         return Some(Up {
             version,
-            from: format!("aports/{repo}"),
+            from: format!("aports/{repo}/{name}"),
         });
     }
     None
@@ -2820,7 +3158,12 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
                 continue;
             }
 
-            let aport = from_aports(root, &p.name);
+            let pin = pinned(&d);
+            let none = pin.as_deref() == Some("none");
+            let aport = match none {
+                true => None,
+                false => from_aports(root, &p.name, pin.as_deref()),
+            };
             // a local/ recipe the aports clone now carries is one somebody else maintains
             // for you, and nothing else in the tree would ever say so
             let dropped = repo == "local" && aport.is_some();
@@ -2829,6 +3172,14 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
             let mut why = "no source";
             let up = match aport {
                 Some(u) => Some(u),
+                // a pin is a statement about where to look, so falling back to looking
+                // everywhere would answer a question the recipe did not ask. none is the
+                // exception: it says alpine is not the place, and a tracker is free to
+                // be the place instead
+                None if pin.is_some() && !none => {
+                    why = "pin names no aport";
+                    None
+                }
                 None if tracked && !net => {
                     why = "tracker not read, pass --net";
                     None
@@ -2844,13 +3195,16 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
             };
 
             let (status, mut note) = match &up {
-                None => ("unknown", why.to_string()),
                 Some(u) => match compare(&p.version.upstream, &u.version) {
                     Some(std::cmp::Ordering::Equal) => ("ok", String::new()),
                     Some(std::cmp::Ordering::Less) => ("behind", String::new()),
                     Some(std::cmp::Ordering::Greater) => ("ahead", String::new()),
                     None => ("unknown", "unordered".to_string()),
                 },
+                // said out loud rather than not known. these never move, and a report
+                // that repeats the same non-answer every run stops being read
+                None if none && !tracked => ("untracked", String::new()),
+                None => ("unknown", why.to_string()),
             };
             if dropped {
                 note = format!("{note} now in aports");
@@ -2900,24 +3254,29 @@ fn ahead_cmd(args: &[String]) {
 
     let count = |s: &str| rows.iter().filter(|r| r.status == s).count();
     say!(
-        "{} recipes  {} behind  {} ahead  {} ok  {} unknown",
+        "{} recipes  {} behind  {} ahead  {} ok  {} untracked  {} unknown",
         rows.len(),
         count("behind"),
         count("ahead"),
         count("ok"),
+        count("untracked"),
         count("unknown")
     );
 }
 
-// what a bump would do, which is not what ahead prints: this names the APKBUILD a recipe
-// would be re-converted from and the testing/ entry it would land in
+// what a bump does. -n names the APKBUILD each one would be re-converted from and the
+// entry it would land in; without it the conversion happens, into testing/, where it
+// sits until promote moves it across
 fn sync_cmd(args: &[String]) {
     let (root, _, rest) = opts(args);
-    if !rest.iter().any(|a| a == "-n") {
-        die("sync wants -n. writing testing/ is not built".into());
-    }
+    let dry = rest.iter().any(|a| a == "-n");
     let net = rest.iter().any(|a| a == "--net");
     let want: Vec<String> = rest.into_iter().filter(|a| !a.starts_with('-')).collect();
+    if !dry {
+        writes(&root);
+    }
+    let list = repos(&root);
+    let into = named_repo(&list, "testing");
 
     let rows: Vec<Row> = survey(&root, &want, net)
         .into_iter()
@@ -2930,27 +3289,155 @@ fn sync_cmd(args: &[String]) {
         .filter_map(|r| r.up.as_ref().map(|u| u.version.len()))
         .max()
         .unwrap_or(0);
+
+    let alias = convert::aliases(&list);
+    let mut failed = 0;
     for r in &rows {
         let Some(up) = &r.up else { continue };
         let at = match up.from.strip_prefix("aports/") {
-            Some(repo) => root
-                .join("var/kiry/aports")
-                .join(repo)
-                .join(&r.name)
-                .join("APKBUILD")
-                .display()
-                .to_string(),
-            None => up.from.clone(),
+            Some(rel) => root.join("var/kiry/aports").join(rel).join("APKBUILD"),
+            None => PathBuf::from(&up.from),
         };
+        let fresh = into.join(&r.name);
         say!(
-            "{:w$} {:v$} -> {:u$}  testing/{}  {at}",
+            "{:w$} {:v$} -> {:u$}  {}",
             r.name,
             r.ours,
             up.version,
-            r.name
+            fresh.display()
         );
+        if dry {
+            say!("  {}", at.display());
+            continue;
+        }
+
+        let report = match convert::recipe(&at, &into, true, &alias, &list) {
+            Ok(rep) => rep,
+            Err(e) => {
+                say!("  failed {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        for n in &report.notes {
+            say!("  {n}");
+        }
+        // the recipe being replaced, which is whichever repo already holds that name
+        // a bump of something only testing/ has is its own predecessor and carries
+        // nothing, since there is nothing older to carry from
+        match recipe(&root, &r.name).filter(|d| *d != fresh) {
+            None => say!("  new, nothing to carry"),
+            Some(old) => match carry(&old, &fresh) {
+                Err(e) => {
+                    say!("  carried nothing {e}");
+                    failed += 1;
+                }
+                Ok((carried, differ)) => {
+                    if !carried.is_empty() {
+                        say!("  carried {}", carried.join(" "));
+                    }
+                    for f in differ {
+                        say!("  {f} differs from {}", old.join(&f).display());
+                    }
+                }
+            },
+        }
     }
-    say!("{} would be re-converted", rows.len());
+
+    match dry {
+        true => say!("{} would be re-converted", rows.len()),
+        false => say!("{} bumped {failed} failed", rows.len() - failed),
+    }
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
+// convert writes what an apkbuild says and no more: version, sources, checksums,
+// depends, targets, build. everything else in a recipe this tree wrote itself -- a
+// filter, a pin, the gentoo entry, a patch -- so it is copied across rather than lost
+// targets goes with them, because a conversion always writes x86_64-musl and the recipe
+// being bumped is the one that knows
+//
+// that leaves build and depends, which a bump is entitled to change and a hand may also
+// have edited. named rather than merged: which of the two is right is not kiry's to say
+fn carry(old: &Path, fresh: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+    let rd = fs::read_dir(old).map_err(|e| format!("{}: {e}", old.display()))?;
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .collect();
+    names.sort();
+
+    let (mut carried, mut differ) = (Vec::new(), Vec::new());
+    for n in names {
+        let (from, to) = (old.join(&n), fresh.join(&n));
+        if !to.is_file() || n == "targets" {
+            fs::copy(&from, &to).map_err(|e| format!("{n}: {e}"))?;
+            carried.push(n);
+            continue;
+        }
+        if matches!(n.as_str(), "version" | "sources" | "checksums") {
+            continue;
+        }
+        match (fs::read(&from), fs::read(&to)) {
+            (Ok(a), Ok(b)) if a == b => {}
+            _ => differ.push(n),
+        }
+    }
+    Ok((carried, differ))
+}
+
+fn named_repo(list: &[PathBuf], want: &str) -> PathBuf {
+    match list.iter().find(|r| r.file_name().is_some_and(|f| f == want)) {
+        Some(d) => d.clone(),
+        None => die(format!("no {want} repo in the repo list")),
+    }
+}
+
+// testing/ to wherever the tree already keeps that recipe, or extra/ when the name is
+// new. the news gate the design asks for has nothing to read yet -- news is not built --
+// so what is enforced here is the group rule, a set that moves together not moving in
+// halves
+fn promote_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    writes(&root);
+    if rest.is_empty() {
+        die("promote wants a package".into());
+    }
+    let list = repos(&root);
+    let testing = named_repo(&list, "testing");
+    let extra = named_repo(&list, "extra");
+
+    for n in &rest {
+        let from = testing.join(n);
+        if !from.join("build").is_file() {
+            die(format!("nothing to promote at {}", from.display()));
+        }
+        for m in plain(&from.join("group")) {
+            if m != *n && !testing.join(&m).join("build").is_file() {
+                die(format!("{n} moves with {m} and {m} is not in testing"));
+            }
+        }
+        let to = recipe(&root, n)
+            .filter(|d| *d != from)
+            .unwrap_or_else(|| extra.join(n));
+        if let Some(up) = to.parent() {
+            if let Err(e) = mkdirs(up) {
+                die(e);
+            }
+        }
+        if to.exists() {
+            if let Err(e) = fs::remove_dir_all(&to) {
+                die(format!("{}: {e}", to.display()));
+            }
+        }
+        if let Err(e) = fs::rename(&from, &to) {
+            die(format!("{} to {}: {e}", from.display(), to.display()));
+        }
+        say!("{n} {}", to.display());
+    }
 }
 
 // the recipes on offer, which nothing else answers: l lists what is installed and a
@@ -3043,16 +3530,225 @@ fn stats_cmd(args: &[String]) {
     say!("recipes total {recipes}");
 
     let (mut arts, mut bytes) = (0u64, 0u64);
-    if let Ok(rd) = fs::read_dir(root.join("var/kiry/cache")) {
-        for e in rd.flatten() {
-            if e.file_name().to_string_lossy().ends_with(".tar.zst") {
-                arts += 1;
-                bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+    for a in listing(&root.join("var/kiry/cache")) {
+        if a.extension().is_some_and(|x| x == "zst") {
+            arts += 1;
+            bytes += weigh(&a);
+        }
+    }
+    say!("cache {arts} artifacts {}", size(bytes));
+    // the three that answer where the disk went, which one number over the cache
+    // directory did not: the tarballs under it outweigh the artifacts in it
+    for (what, at) in [
+        ("sources", "var/kiry/cache/sources"),
+        ("stage", "var/kiry/stage"),
+        ("log", "var/kiry/log"),
+    ] {
+        say!("{what} {}", size(weigh(&root.join(at))));
+    }
+    let past = history(&root);
+    if !past.is_empty() {
+        let mut rows: Vec<(&(String, String), &u64)> = past.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        // the sum of everything's last build, which is what building it all again costs
+        say!("world ~{}", clock(rows.iter().map(|(_, s)| **s).sum()));
+        for ((n, t), s) in rows.iter().take(3) {
+            say!("slowest {n} {t} {}", clock(**s));
+        }
+    }
+    say!("queued {}", db::read_queue(&root).unwrap_or_default().len());
+}
+
+// the only thing that deletes anything. everything under /var/kiry is regenerable by
+// construction, which is what the invariant claims, so the question here is never
+// whether something can be lost -- only which of it is still worth the disk
+fn gc_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    let dry = rest.iter().any(|a| a == "-n");
+    if !dry {
+        writes(&root);
+    }
+    let var = root.join("var/kiry");
+    let sweep = |what: &str, doomed: Vec<PathBuf>, skipped: usize| {
+        let mut bytes = 0;
+        for at in &doomed {
+            bytes += weigh(at);
+            if dry {
+                continue;
+            }
+            let r = match at.is_dir() {
+                true => fs::remove_dir_all(at),
+                false => fs::remove_file(at),
+            };
+            if let Err(e) = r {
+                say!("{}: {e}", at.display());
+            }
+        }
+        let verb = if dry { "would free" } else { "freed" };
+        let note = match skipped {
+            0 => String::new(),
+            n => format!("  {n} kept back"),
+        };
+        say!("{what} {} {verb} {}{note}", doomed.len(), size(bytes));
+    };
+
+    // a work directory is removed by the build that finishes with it, so every one still
+    // here belongs to a build that failed or was killed -- or to one running right now,
+    // which looks identical. kiry takes no lock, so the only thing separating the two is
+    // how recently something was written, and llvm takes three hours
+    let now = SystemTime::now();
+    let (mut stale, mut busy) = (Vec::new(), 0);
+    for e in listing(&var.join("stage")) {
+        match touched(&e, now).is_some_and(|d| d.as_secs() > 6 * 3600) {
+            true => stale.push(e),
+            false => busy += 1,
+        }
+    }
+    sweep("stage", stale, busy);
+
+    // what is installed now, the two newest of everything else so a bad bump has
+    // something to go back to, and both libcs always -- the repair case is putting a
+    // working libc back on a machine with no network
+    let mut arts: Vec<(String, String, String, PathBuf, SystemTime)> = Vec::new();
+    for a in listing(&var.join("cache")) {
+        let Some(n) = a.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !n.ends_with(".tar.zst") {
+            continue;
+        }
+        let meta = PathBuf::from(format!("{}.meta", a.display()));
+        let one = |f: &str| plain(&meta.join(f)).into_iter().next();
+        // no sidecar is an artifact from before they were written, and nothing can say
+        // what it is. left alone rather than guessed at from the file name
+        let (Some(name), Some(target), Some(version)) = (one("name"), one("targets"), one("version"))
+        else {
+            continue;
+        };
+        let when = fs::metadata(&a)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        arts.push((name, target, version, a, when));
+    }
+
+    let mut keep: HashSet<usize> = HashSet::new();
+    let mut by: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (i, a) in arts.iter().enumerate() {
+        by.entry((a.0.clone(), a.1.clone())).or_default().push(i);
+    }
+    for ((name, target), mut idx) in by {
+        idx.sort_by_key(|i| std::cmp::Reverse(arts[*i].4));
+        // musl, and glibc for the gnu tier
+        let pinned = matches!(name.as_str(), "musl" | "glibc");
+        let on = db::read(&root, &target, &name).ok().map(|r| r.version.to_string());
+        for (n, i) in idx.into_iter().enumerate() {
+            if pinned || n < 2 || on.as_deref() == Some(arts[i].2.as_str()) {
+                keep.insert(i);
             }
         }
     }
-    say!("cache {arts} artifacts {} MiB", bytes / (1024 * 1024));
-    say!("queued {}", db::read_queue(&root).unwrap_or_default().len());
+    let mut doomed = Vec::new();
+    for (i, a) in arts.iter().enumerate() {
+        if keep.contains(&i) {
+            continue;
+        }
+        doomed.push(a.3.clone());
+        doomed.push(PathBuf::from(format!("{}.meta", a.3.display())));
+    }
+    sweep("cache", doomed, keep.len());
+
+    // a tarball no recipe names any more. the recipes are the only thing that decides
+    // this, which is why sources is a cache and not a store
+    let mut live: HashSet<String> = HashSet::new();
+    let mut recipes = 0;
+    for r in repos(&root) {
+        for d in listing(&r) {
+            let Ok(p) = pkg::load(&d) else { continue };
+            recipes += 1;
+            for line in &p.sources {
+                if let Ok((name, _)) = filename(line) {
+                    live.insert(name.to_string());
+                }
+            }
+        }
+    }
+    // with no recipe in reach nothing names a source or a log and every one of them
+    // looks dead. that is a mistyped --root, not an empty tree
+    if recipes == 0 {
+        die("no recipes in reach, so nothing can say which sources are still live".into());
+    }
+    let gone: Vec<PathBuf> = listing(&var.join("cache/sources"))
+        .into_iter()
+        .filter(|f| {
+            f.file_name()
+                .and_then(|n| n.to_str())
+                .is_none_or(|n| !live.contains(n))
+        })
+        .collect();
+    sweep("sources", gone, live.len());
+
+    // a log for a version no recipe builds any more. kiry log answers for the current
+    // one, and nothing reads the others
+    let mut now_building: HashSet<String> = HashSet::new();
+    for r in repos(&root) {
+        for d in listing(&r) {
+            if let Ok(p) = pkg::load(&d) {
+                now_building.insert(format!(
+                    "{}-{}-{}.",
+                    p.name, p.version.upstream, p.version.rev
+                ));
+            }
+        }
+    }
+    let old: Vec<PathBuf> = listing(&var.join("log"))
+        .into_iter()
+        .filter(|f| {
+            f.file_name().and_then(|n| n.to_str()).is_none_or(|n| {
+                !now_building.iter().any(|pre| n.starts_with(pre.as_str()))
+            })
+        })
+        .collect();
+    sweep("log", old, recipes);
+}
+
+fn listing(at: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = match fs::read_dir(at) {
+        Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+        Err(_) => Vec::new(),
+    };
+    out.sort();
+    out
+}
+
+// how long since anything directly in it changed. a directory's own mtime moves only
+// when its entries do, so a build three levels down leaves the top looking untouched --
+// the children are what say whether anything is happening
+fn touched(at: &Path, now: SystemTime) -> Option<std::time::Duration> {
+    let mut newest = fs::metadata(at).and_then(|m| m.modified()).ok()?;
+    for e in listing(at) {
+        if let Ok(m) = fs::metadata(&e).and_then(|m| m.modified()) {
+            newest = newest.max(m);
+        }
+    }
+    now.duration_since(newest).ok()
+}
+
+fn weigh(at: &Path) -> u64 {
+    let Ok(md) = fs::symlink_metadata(at) else {
+        return 0;
+    };
+    if !md.is_dir() {
+        return md.len();
+    }
+    listing(at).iter().map(|e| weigh(e)).sum()
+}
+
+fn size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{} MiB", b / (1 << 20)),
+        b => format!("{} KiB", b / 1024),
+    }
 }
 
 fn convert_cmd(args: &[String]) {

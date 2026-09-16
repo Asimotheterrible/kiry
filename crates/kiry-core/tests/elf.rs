@@ -234,8 +234,26 @@ struct RSym {
     default: bool,
     weak: bool,
     object: bool,
+    // st_info's low nibble, which is what decides a retype. object above is derived
+    // from it, so checking only that would leave func against notype unread
+    kind: u8,
     size: u64,
     undefined: bool,
+}
+
+// the numbers st_info carries, spelled the way readelf prints them
+fn st_type(word: &str) -> u8 {
+    match word {
+        "NOTYPE" => 0,
+        "OBJECT" => 1,
+        "FUNC" => 2,
+        "SECTION" => 3,
+        "FILE" => 4,
+        "COMMON" => 5,
+        "TLS" => 6,
+        "IFUNC" | "GNU_IFUNC" => 10,
+        other => panic!("readelf printed an unknown symbol type {other}"),
+    }
 }
 
 // Num: Value Size Type Bind Vis Ndx Name[@ver|@@ver][ (n)]
@@ -298,7 +316,10 @@ fn read_dyn_syms(text: &str, paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>>
             version,
             default,
             weak: bind == "WEAK",
-            object: kind == "OBJECT",
+            // a thread-local is storage with a real st_size, which is the property the
+            // flag stands for -- readelf just spells the two types apart
+            object: kind == "OBJECT" || kind == "TLS",
+            kind: st_type(kind),
             size,
             undefined: ndx == "UND",
         };
@@ -334,6 +355,7 @@ fn mine(e: &elf::Elf) -> Vec<RSym> {
         default: s.default,
         weak: s.weak,
         object: s.object,
+        kind: s.kind,
         size: s.size,
         undefined,
     };
@@ -349,6 +371,13 @@ const ALWAYS: &[&str] = &["libc.so.6", "libm.so.6"];
 // hashing the path keeps a file in or out for good. an index into a directory
 // listing would re-roll the whole sample every time a package lands
 fn sampled(p: &Path) -> bool {
+    // the sample is a speed compromise and KIRY_SWEEP is how the compromise gets
+    // checked. it found a defined symbol taking its version from verneed, which one
+    // file in 1272 does and the sample had never drawn
+    if std::env::var("KIRY_SWEEP").is_ok() {
+        let _ = p;
+        return true;
+    }
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     if ALWAYS.contains(&name) {
         return true;
@@ -408,6 +437,9 @@ fn agrees_with_readelf_on_dynamic_symbols() {
             .count();
     }
 
+    if std::env::var("KIRY_SWEEP").is_ok() {
+        eprintln!("swept {compared} symbols over {} files", sample.len());
+    }
     assert!(compared > 5000, "only compared {compared} symbols");
     assert!(versioned > 100, "only {versioned} versioned symbols");
     assert!(
@@ -643,4 +675,141 @@ fn moving_the_default_version_is_a_change_on_gnu_and_not_on_musl() {
     // musl's loader ignores versions, so the same two builds changed nothing it can see
     let musl = elf::compare(&old.exports, &new.exports, false);
     assert!(musl.is_empty(), "{musl:?}");
+}
+
+// same name, and it stopped being a function. c mangles nothing, so a caller that used
+// to reach code now reaches storage and the linker has nothing to object to
+#[test]
+fn a_symbol_that_changed_type_is_a_change() {
+    let Some((old, new)) = pair("retype", "void p(void){}\n", "char p[8];\n", None) else {
+        return;
+    };
+    let seen = elf::compare(&old.exports, &new.exports, false);
+    assert!(seen.contains(&elf::Change::Retyped("p".into())), "{seen:?}");
+}
+
+// a thread-local's st_size is the object's size the same way a plain one's is, and a
+// consumer that took sizeof of it baked the old number in
+#[test]
+fn a_thread_local_that_grew_is_a_change() {
+    let Some((old, new)) = pair(
+        "tls",
+        "__thread char t[8];\n",
+        "__thread char t[16];\n",
+        None,
+    ) else {
+        return;
+    };
+    let seen = elf::compare(&old.exports, &new.exports, false);
+    assert!(seen.contains(&elf::Change::Grew("t".into())), "{seen:?}");
+}
+
+// a copy relocation puts the definition in the executable and keeps the version of the
+// libc object it was copied out of, so the version comes from verneed while the symbol
+// is defined. being default is a thing only a verdef can say, and reading the hidden bit
+// alone calls this one default -- /usr/bin/getconf is shaped this way and one file in
+// 1272 being enough to find it is why the sweep exists
+#[test]
+fn a_definition_versioned_through_verneed_is_not_default() {
+    let dir = std::env::temp_dir().join(format!("kiry-copyreloc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let build = |args: &[&str], out: &str, src: &str, body: &str| -> bool {
+        let s = dir.join(src);
+        std::fs::write(&s, body).unwrap();
+        Command::new("cc")
+            .args(args)
+            .arg("-o")
+            .arg(dir.join(out))
+            .arg(&s)
+            .current_dir(&dir)
+            .status()
+            .is_ok_and(|st| st.success())
+    };
+
+    std::fs::write(dir.join("v.map"), "V1 { global: d; local: *; };\n").unwrap();
+    let lib = build(
+        &[
+            "-shared",
+            "-fPIC",
+            "-nostdlib",
+            "-Wl,-soname,libv.so.1",
+            "-Wl,--version-script,v.map",
+        ],
+        "libv.so.1",
+        "lib.c",
+        "char d[8];\n",
+    );
+    // non-pic is what makes the linker copy the object in rather than point at it
+    let app = lib
+        && build(
+            &[
+                "-fno-pic",
+                "-fno-pie",
+                "-nostdlib",
+                "-no-pie",
+                "-Wl,-z,notext",
+                "libv.so.1",
+            ],
+            "app",
+            "app.c",
+            "extern char d[8];\nvoid _start(void){ d[0]=1; }\n",
+        );
+    if !app {
+        assert!(
+            std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+            "cc cannot build a copy relocation here"
+        );
+        return;
+    }
+
+    let e = elf::parse(&std::fs::read(dir.join("app")).unwrap()).unwrap();
+    let d = e
+        .exports
+        .iter()
+        .find(|s| s.name == "d")
+        .expect("d is defined in the executable, not undefined");
+    assert_eq!(d.version.as_deref(), Some("V1"));
+    assert!(!d.default, "a verneed version is not one this file defaults");
+}
+
+fn sym(name: &str, kind: u8, size: u64) -> elf::Sym {
+    elf::Sym {
+        name: name.to_string(),
+        version: None,
+        default: true,
+        weak: false,
+        object: kind == 1 || kind == 6,
+        size,
+        kind,
+    }
+}
+
+// glibc does this the moment a symbol gains a cpu-dispatched variant, and the call site
+// is unchanged: the same plt entry, resolved once at load. calling it a change rebuilds
+// everything that links libc for nothing
+#[test]
+fn a_function_that_became_an_ifunc_is_not_a_change() {
+    let old = [sym("memcpy", 2, 0)];
+    let new = [sym("memcpy", 10, 0)];
+    assert!(elf::compare(&old, &new, false).is_empty());
+}
+
+// notype is the linker saying it does not know, so neither direction claims anything
+#[test]
+fn a_symbol_the_linker_never_typed_is_not_a_change() {
+    let old = [sym("p", 0, 0)];
+    let new = [sym("p", 2, 0)];
+    assert!(elf::compare(&old, &new, false).is_empty());
+    assert!(elf::compare(&new, &old, false).is_empty());
+}
+
+// storage against a thread-local is a different access model at every call site, even
+// though both are objects with a size
+#[test]
+fn an_object_that_became_a_thread_local_is_a_change() {
+    let old = [sym("t", 1, 8)];
+    let new = [sym("t", 6, 8)];
+    assert!(elf::compare(&old, &new, false).contains(&elf::Change::Retyped("t".into())));
 }

@@ -218,6 +218,16 @@ pub fn targets(root: &Path) -> Result<Vec<String>, Error> {
 }
 
 pub fn forget(root: &Path, target: &str, name: &str) -> Result<(), Error> {
+    // provides is derived from the manifest and belongs to the same record, so leaving
+    // it behind leaves a package that is gone still claiming the sonames it used to
+    // carry -- invisible to anything that walks installed names, and a phantom to the
+    // first thing that walks the provides directory instead
+    let p = provides(root, target, name);
+    match fs::remove_file(&p) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(p, e)),
+    }
     let d = dir(root, target, name);
     fs::remove_dir_all(&d).map_err(|e| Error::Io(d, e))
 }
@@ -583,5 +593,44 @@ mod tests {
 
         assert!(matches!(write(&root, &rec), Err(Error::BadPath(_))));
         assert!(!dir(&root, "x86_64-musl", "bad").exists());
+    }
+
+    // every package ever removed from this machine had left one of these behind, so the
+    // provides directory held 46 names for packages that were not installed
+    #[test]
+    fn forgetting_a_package_takes_its_provides_with_it() {
+        let root = scratch("forget-provides");
+        write(
+            &root,
+            &Installed {
+                name: "gone".into(),
+                target: "x86_64-musl".into(),
+                version: Version::parse("1.0 1").unwrap(),
+                depends: Vec::new(),
+                manifest: Vec::new(),
+                hash: String::new(),
+                users: Vec::new(),
+                flags: Vec::new(),
+            },
+        )
+        .unwrap();
+        write_provides(
+            &root,
+            "x86_64-musl",
+            "gone",
+            &[Provide {
+                soname: "libgone.so.1".into(),
+                versioned: false,
+                path: "usr/lib/libgone.so.1".into(),
+            }],
+        )
+        .unwrap();
+        assert!(provides(&root, "x86_64-musl", "gone").is_file());
+
+        forget(&root, "x86_64-musl", "gone").unwrap();
+        assert!(
+            !provides(&root, "x86_64-musl", "gone").exists(),
+            "the record went and the sonames it claimed stayed"
+        );
     }
 }

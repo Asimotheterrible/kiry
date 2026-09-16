@@ -36,6 +36,9 @@ const VERSYM_HIDDEN: u16 = 0x8000;
 const VER_FLG_BASE: u16 = 1;
 const STB_WEAK: u8 = 2;
 const STT_OBJECT: u8 = 1;
+const STT_FUNC: u8 = 2;
+const STT_TLS: u8 = 6;
+const STT_GNU_IFUNC: u8 = 10;
 const SHN_UNDEF: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,8 +50,12 @@ pub struct Sym {
     pub default: bool,
     pub weak: bool,
     // st_size is the object's size here, and code size on a function, too noisy to diff
+    // a thread-local is storage the same way one that is not is
     pub object: bool,
     pub size: u64,
+    // st_info's low nibble. a name that kept its version and stopped being a function
+    // still resolves, and c mangles nothing that would say so
+    pub kind: u8,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -239,6 +246,9 @@ pub enum Change {
     // an exported object's size is the object's size. a class gaining a virtual method
     // grows its vtable, which is the classic c++ break where every name stays identical
     Grew(String),
+    // function to object, or either of them to a thread-local. the caller reaches the
+    // same address and what is there is a different kind of thing
+    Retyped(String),
     // gnu only: new links bind to the default version, so moving which one is default
     // changes what everything built afterwards gets
     Undefaulted(String),
@@ -247,7 +257,11 @@ pub enum Change {
 impl Change {
     pub fn symbol(&self) -> &str {
         match self {
-            Change::Gone(s) | Change::Weakened(s) | Change::Grew(s) | Change::Undefaulted(s) => s,
+            Change::Gone(s)
+            | Change::Weakened(s)
+            | Change::Grew(s)
+            | Change::Retyped(s)
+            | Change::Undefaulted(s) => s,
         }
     }
 }
@@ -277,11 +291,28 @@ pub fn compare(old: &[Sym], new: &[Sym], versions: bool) -> Vec<Change> {
         if was.object && is.object && was.size != is.size {
             out.push(Change::Grew(k.clone()));
         }
+        if let (Some(a), Some(b)) = (class(was.kind), class(is.kind)) {
+            if a != b {
+                out.push(Change::Retyped(k.clone()));
+            }
+        }
         if versions && was.default && !is.default {
             out.push(Change::Undefaulted(k));
         }
     }
     out
+}
+
+// what a caller has to do to reach the symbol, which is the part of st_info that is abi
+// func against ifunc is the same call through the same plt, and notype states nothing,
+// so neither is a change anyone can observe
+fn class(kind: u8) -> Option<u8> {
+    match kind {
+        STT_OBJECT => Some(1),
+        STT_TLS => Some(2),
+        STT_FUNC | STT_GNU_IFUNC => Some(3),
+        _ => None,
+    }
 }
 
 // there is no DT_SYMSZ. the count comes out of whichever hash table the linker
@@ -394,7 +425,7 @@ fn versions(
     verdefnum: u64,
     verneed: Option<u64>,
     verneednum: u64,
-) -> Result<Vec<(u16, String)>, &'static str> {
+) -> Result<Vec<(u16, String, bool)>, &'static str> {
     let mut out = Vec::new();
 
     if let Some(addr) = verdef {
@@ -410,7 +441,7 @@ fn versions(
 
             if flags & VER_FLG_BASE == 0 {
                 let name = u32at(t, at_ + aux).ok_or("short verdaux")?;
-                out.push((ndx, string(strs, name.into())?));
+                out.push((ndx, string(strs, name.into())?, true));
             }
             if next == 0 {
                 break;
@@ -434,7 +465,7 @@ fn versions(
                 let other = u16at(t, a + 6).ok_or("short vernaux")?;
                 let name = u32at(t, a + 8).ok_or("short vernaux")?;
                 let anext = at(u32at(t, a + 12).ok_or("short vernaux")?.into())?;
-                out.push((other, string(strs, name.into())?));
+                out.push((other, string(strs, name.into())?, false));
                 if anext == 0 {
                     break;
                 }
@@ -455,7 +486,7 @@ fn symbols(
     b: &[u8],
     loads: &[(u64, u64, u64)],
     strs: &[u8],
-    names: &[(u16, String)],
+    names: &[(u16, String, bool)],
     symtab: Option<u64>,
     syment: Option<u64>,
     hash: Option<u64>,
@@ -510,27 +541,31 @@ fn symbols(
                 if ndx <= 1 {
                     (None, true)
                 } else {
-                    let found = names
-                        .iter()
-                        .find(|(k, _)| *k == ndx)
-                        .map(|(_, s)| s.clone());
-                    (found, raw & VERSYM_HIDDEN == 0)
+                    // only a verdef says which version a new link binds to. one that
+                    // came from verneed is a version this file asks of somebody else,
+                    // and default is not a thing it can be -- every undefined symbol,
+                    // and a copy relocation, whose definition sits here and keeps the
+                    // version of the libc object it was copied out of
+                    match names.iter().find(|(k, _, _)| *k == ndx) {
+                        Some((_, v, mine)) => {
+                            (Some(v.clone()), *mine && raw & VERSYM_HIDDEN == 0)
+                        }
+                        None => (None, raw & VERSYM_HIDDEN == 0),
+                    }
                 }
             }
             None => (None, true),
         };
 
-        // a versioned undefined symbol names the version it wants, not one it defines,
-        // so there is no default for it to be -- readelf writes those with one @ for the
-        // same reason. an unversioned one has no @ at all and stays
-        let default = default && (version.is_none() || shndx != SHN_UNDEF);
+        let kind = info & 0xf;
         let sym = Sym {
             name: string(strs, name.into())?,
             version,
             default,
             weak: info >> 4 == STB_WEAK,
-            object: info & 0xf == STT_OBJECT,
+            object: kind == STT_OBJECT || kind == STT_TLS,
             size,
+            kind,
         };
         if shndx == SHN_UNDEF {
             undefined.push(sym);

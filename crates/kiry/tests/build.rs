@@ -2487,13 +2487,18 @@ fn offer(repo: &Path, name: &str, version: &str) {
     fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
 }
 
-fn tree(name: &str) -> (PathBuf, PathBuf) {
+fn tree(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     let at = scratch(name);
     let root = at.join("root");
-    let repo = at.join("extra");
+    let (repo, testing) = (at.join("extra"), at.join("testing"));
     fs::create_dir_all(root.join("etc/kiry")).unwrap();
-    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
-    (root, repo)
+    fs::create_dir_all(&testing).unwrap();
+    fs::write(
+        root.join("etc/kiry/repos"),
+        format!("{}\n{}\n", repo.display(), testing.display()),
+    )
+    .unwrap();
+    (root, repo, testing)
 }
 
 fn ahead_of(root: &Path) -> String {
@@ -2504,7 +2509,7 @@ fn ahead_of(root: &Path) -> String {
 
 #[test]
 fn ahead_orders_what_it_can_and_says_nothing_where_it_cannot() {
-    let (root, repo) = tree("ahead");
+    let (root, repo, _) = tree("ahead");
     // a digit run is a number, so 08 and 8 are the same release and a trailing zero
     // is not a bump. rc and a letter suffix are what scheme will have to describe
     for (n, ours, theirs) in [
@@ -2538,16 +2543,19 @@ fn ahead_orders_what_it_can_and_says_nothing_where_it_cannot() {
             .unwrap_or_else(|| panic!("no row for {n}: {said}"));
         assert_eq!(line.split_whitespace().nth(3), Some(status), "{line}");
     }
-    assert!(said.contains("8 recipes  2 behind  1 ahead  3 ok  2 unknown"), "{said}");
+    assert!(
+        said.contains("8 recipes  2 behind  1 ahead  3 ok  0 untracked  2 unknown"),
+        "{said}"
+    );
     // the version it could not order is still printed, because that is the thing a
     // scheme has to be written against
-    assert!(said.contains("2026d aports/main unordered"), "{said}");
+    assert!(said.contains("2026d aports/main/letters unordered"), "{said}");
 }
 
 // main before community before testing, which is how aports promotes
 #[test]
 fn ahead_takes_the_first_aports_repo_that_carries_the_name() {
-    let (root, repo) = tree("aheadrepo");
+    let (root, repo, _) = tree("aheadrepo");
     offer(&repo, "both", "1.0");
     aport(&root, "main", "both", "pkgver=2.0\n");
     aport(&root, "community", "both", "pkgver=3.0\n");
@@ -2561,7 +2569,7 @@ fn ahead_takes_the_first_aports_repo_that_carries_the_name() {
 // note would read as a version nobody can act on
 #[test]
 fn ahead_leaves_a_pkgver_it_cannot_read_alone() {
-    let (root, repo) = tree("aheadvar");
+    let (root, repo, _) = tree("aheadvar");
     offer(&repo, "computed", "1.0");
     aport(&root, "main", "computed", "_x=3\npkgver=1.$_x\n");
     offer(&repo, "quoted", "1.0");
@@ -2593,7 +2601,7 @@ fn ahead_says_when_a_local_recipe_turned_up_in_aports() {
 // not look rather than report the package as having no upstream at all
 #[test]
 fn ahead_does_not_read_a_tracker_unless_asked() {
-    let (root, repo) = tree("aheadtracker");
+    let (root, repo, _) = tree("aheadtracker");
     offer(&repo, "tracked", "1.0");
     fs::write(repo.join("tracked/tracker"), "https://example.invalid/v\n").unwrap();
 
@@ -2601,9 +2609,22 @@ fn ahead_does_not_read_a_tracker_unless_asked() {
     assert!(said.contains("tracker not read"), "{said}");
 }
 
+// an apkbuild is sourced, not parsed, so the shell abuild uses is not optional for
+// anything that writes a bump
+fn have_busybox() -> bool {
+    if Command::new("busybox").arg("true").status().is_ok() {
+        return true;
+    }
+    assert!(
+        std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+        "no busybox, and a bump cannot be read out of an apkbuild without ash"
+    );
+    false
+}
+
 #[test]
-fn sync_lists_only_what_moved_and_refuses_to_write() {
-    let (root, repo) = tree("syncplan");
+fn sync_names_what_moved_and_where_it_would_land() {
+    let (root, repo, testing) = tree("syncplan");
     offer(&repo, "moved", "1.0");
     aport(&root, "main", "moved", "pkgver=1.1\n");
     offer(&repo, "level", "2.0");
@@ -2613,22 +2634,175 @@ fn sync_lists_only_what_moved_and_refuses_to_write() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(said.contains("moved 1.0 -> 1.1"), "{said}");
-    assert!(said.contains("testing/moved"), "{said}");
+    assert!(
+        said.contains(testing.join("moved").to_str().unwrap()),
+        "{said}"
+    );
     assert!(said.contains("aports/main/moved/APKBUILD"), "{said}");
     assert!(!said.contains("level"), "{said}");
     assert!(said.contains("1 would be re-converted"), "{said}");
-
-    let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
-    assert!(!o.status.success(), "sync wrote something");
-    assert!(
-        String::from_utf8_lossy(&o.stderr).contains("-n"),
-        "{}",
-        String::from_utf8_lossy(&o.stderr)
-    );
+    assert!(!testing.join("moved").exists(), "-n wrote something");
 }
 
-// a package manager that wants a directory is a package manager you cannot use from
-// anywhere but the repo. these four spellings all have to reach the same recipe
+// the recipe in the tree has been edited since it was converted -- a filter, a pin, a
+// target list that is not the one a conversion writes. a bump that dropped those would
+// quietly undo every fix the package ever needed
+#[test]
+fn sync_writes_the_bump_and_carries_what_the_tree_added() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncwrite");
+    offer(&repo, "moved", "1.0");
+    fs::write(repo.join("moved/targets"), "x86_64-musl x86_64-gnu\n").unwrap();
+    fs::write(repo.join("moved/filter"), "filter-lto\n").unwrap();
+    fs::write(repo.join("moved/pin"), "alpine/main\n").unwrap();
+    aport(&root, "main", "moved", "pkgname=moved\npkgver=1.1\npkgrel=0\npackage() {\n\t:\n}\n");
+
+    let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    let at = testing.join("moved");
+
+    assert_eq!(fs::read_to_string(at.join("version")).unwrap(), "1.1 0\n");
+    // a conversion always says x86_64-musl, so the recipe being bumped is the one that
+    // knows what it builds for
+    assert_eq!(
+        fs::read_to_string(at.join("targets")).unwrap(),
+        "x86_64-musl x86_64-gnu\n"
+    );
+    assert_eq!(fs::read_to_string(at.join("filter")).unwrap(), "filter-lto\n");
+    assert_eq!(fs::read_to_string(at.join("pin")).unwrap(), "alpine/main\n");
+    assert!(said.contains("carried"), "{said}");
+    assert!(said.contains("1 bumped 0 failed"), "{said}");
+}
+
+// build is the one file a bump is entitled to rewrite and a hand is entitled to have
+// edited. merging them is not kiry's call, so it says which and stops there
+#[test]
+fn sync_names_a_file_the_bump_and_a_hand_both_wrote() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, _) = tree("syncdiff");
+    offer(&repo, "moved", "1.0");
+    fs::write(repo.join("moved/build"), "# hand written\nmake\n").unwrap();
+    aport(&root, "main", "moved", "pkgname=moved\npkgver=1.1\npkgrel=0\npackage() {\n\t:\n}\n");
+
+    let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("build differs from"), "{said}");
+    assert!(said.contains("moved/build"), "{said}");
+}
+
+#[test]
+fn promote_moves_testing_over_the_recipe_it_replaces() {
+    let (root, repo, testing) = tree("promote");
+    offer(&repo, "moved", "1.0");
+    offer(&testing, "moved", "1.1");
+
+    let o = kiry(&["promote", "--root", root.to_str().unwrap(), "moved"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        fs::read_to_string(repo.join("moved/version")).unwrap(),
+        "1.1 1\n"
+    );
+    assert!(!testing.join("moved").exists(), "testing kept a copy");
+}
+
+// a name testing is the first to carry has nowhere it came from, so it lands in extra
+#[test]
+fn promote_puts_a_new_name_in_extra() {
+    let (root, repo, testing) = tree("promotenew");
+    offer(&testing, "fresh", "1.0");
+
+    let o = kiry(&["promote", "--root", root.to_str().unwrap(), "fresh"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(repo.join("fresh/version").is_file(), "not in extra");
+}
+
+// a toolchain set that moved halfway is broken before it ever reaches a boot
+#[test]
+fn promote_will_not_move_half_a_group() {
+    let (root, repo, testing) = tree("promotegroup");
+    offer(&repo, "one", "1.0");
+    offer(&repo, "two", "1.0");
+    offer(&testing, "one", "1.1");
+    fs::write(testing.join("one/group"), "one\ntwo\n").unwrap();
+
+    let o = kiry(&["promote", "--root", root.to_str().unwrap(), "one"]);
+    assert!(!o.status.success(), "half a group moved");
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("two is not in testing"), "{said}");
+    assert!(testing.join("one").exists(), "it moved anyway");
+}
+
+// nineteen recipes in the tree have no upstream and never will. reporting them as
+// something kiry could not identify is a non-answer repeated every run
+#[test]
+fn a_pin_of_none_is_an_answer_rather_than_a_shrug() {
+    let (root, repo, _) = tree("pinnone");
+    offer(&repo, "mine", "1.0");
+    fs::write(repo.join("mine/pin"), "none\n").unwrap();
+    // in aports under that very name, and still not tracked: the recipe said so
+    aport(&root, "main", "mine", "pkgver=9.9\n");
+
+    let said = ahead_of(&root);
+    let line = said.lines().find(|l| l.starts_with("mine ")).unwrap();
+    assert_eq!(line.split_whitespace().nth(3), Some("untracked"), "{line}");
+    assert!(!line.contains("9.9"), "{line}");
+    assert!(said.contains("1 untracked  0 unknown"), "{said}");
+}
+
+// pin says which alpine repo, so none says alpine is not where this comes from -- not
+// that nothing does. a recipe carrying both is answered by the tracker
+#[test]
+fn a_tracker_outlives_a_pin_of_none() {
+    let (root, repo, _) = tree("pintracker");
+    offer(&repo, "tracked", "1.0");
+    fs::write(repo.join("tracked/pin"), "none\n").unwrap();
+    fs::write(repo.join("tracked/tracker"), "https://example.invalid/v\n").unwrap();
+
+    let said = ahead_of(&root);
+    let line = said.lines().find(|l| l.starts_with("tracked ")).unwrap();
+    assert_eq!(line.split_whitespace().nth(3), Some("unknown"), "{line}");
+    assert!(line.contains("tracker not read"), "{line}");
+}
+
+// alpine carries wlroots0.19 and wlroots0.20 side by side, and its llvm is a meta
+// package pointing at whichever llvm is current rather than at ours. neither name is
+// derivable from the one this tree uses
+#[test]
+fn a_pin_names_the_aport_where_alpine_spells_it_differently() {
+    let (root, repo, _) = tree("pinname");
+    offer(&repo, "wlroots", "0.19.3");
+    fs::write(repo.join("wlroots/pin"), "alpine/testing/wlroots0.19\n").unwrap();
+    aport(&root, "testing", "wlroots0.19", "pkgver=0.19.3\n");
+    aport(&root, "community", "wlroots0.20", "pkgver=0.20.1\n");
+
+    let said = ahead_of(&root);
+    let line = said.lines().find(|l| l.starts_with("wlroots ")).unwrap();
+    assert_eq!(line.split_whitespace().nth(3), Some("ok"), "{line}");
+    assert!(line.contains("aports/testing/wlroots0.19"), "{line}");
+}
+
+// a pin is a statement about where to look. looking everywhere else after it misses
+// would answer a question the recipe did not ask
+#[test]
+fn a_pin_that_finds_nothing_does_not_go_looking_elsewhere() {
+    let (root, repo, _) = tree("pinmiss");
+    offer(&repo, "thing", "1.0");
+    fs::write(repo.join("thing/pin"), "alpine/main/thing99\n").unwrap();
+    aport(&root, "community", "thing", "pkgver=2.0\n");
+
+    let said = ahead_of(&root);
+    let line = said.lines().find(|l| l.starts_with("thing ")).unwrap();
+    assert_eq!(line.split_whitespace().nth(3), Some("unknown"), "{line}");
+    assert!(line.contains("pin names no aport"), "{line}");
+    assert!(!line.contains("2.0"), "{line}");
+}
+
 #[test]
 fn a_recipe_is_reached_by_name_by_repo_and_by_path() {
     let at = scratch("resolve");
@@ -2693,4 +2867,293 @@ fn the_built_in_repos_are_in_precedence_order() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(said.contains("both 9.9 1"), "{said}");
+}
+
+// a root that can actually build, with a repo its recipes are reached by name through
+fn workshop(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let at = scratch(name);
+    let (root, repo) = (at.join("root"), at.join("extra"));
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return None;
+    }
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+    Some((at, root, repo))
+}
+
+// each one installs a file named after itself, so what actually landed can be told apart
+fn buildable(at: &Path, repo: &Path, name: &str, deps: &str) {
+    let arc = at.join("hello-1.0.tar");
+    if !arc.is_file() {
+        tarball(at);
+    }
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+    let d = repo.join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("version"), "1.0 1\n").unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(d.join("sources"), format!("{}\n", arc.display())).unwrap();
+    fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+    fs::write(d.join("depends"), deps).unwrap();
+    fs::write(
+        d.join("build"),
+        format!("mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/{name}\"\n"),
+    )
+    .unwrap();
+}
+
+// b took a name and i took a path, so installing anything meant walking the dependency
+// tree by hand and pasting cache paths into it one at a time
+#[test]
+fn install_by_name_builds_the_closure_in_order() {
+    let Some((at, root, repo)) = workshop("byname") else {
+        return;
+    };
+    // named in the order that comes out wrong if nothing sorts them
+    buildable(&at, &repo, "top", "mid\n");
+    buildable(&at, &repo, "mid", "base\n");
+    buildable(&at, &repo, "base", "");
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "top"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    for n in ["base", "mid", "top"] {
+        assert!(root.join("usr/bin").join(n).is_file(), "{n} did not land");
+    }
+
+    // and in that order. mid builds against an installed base, so a level that went in
+    // late is one the level above it could not have linked to
+    let said = String::from_utf8_lossy(&o.stdout);
+    let seen = |n: &str| said.find(n).unwrap_or_else(|| panic!("no {n}: {said}"));
+    assert!(seen("base") < seen("mid"), "{said}");
+    assert!(seen("mid") < seen("top"), "{said}");
+}
+
+// b always builds and i takes what is there, which is the split that keeps i from
+// spending fifty minutes on llvm because a comment moved
+#[test]
+fn install_by_name_takes_what_is_already_built() {
+    let Some((at, root, repo)) = workshop("bycache") else {
+        return;
+    };
+    buildable(&at, &repo, "base", "");
+    let r = root.to_str().unwrap();
+
+    let o = kiry(&["b", "--root", r, "base"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let o = kiry(&["i", "--root", r, "base"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("base 1.0 x86_64-musl cached"), "{said}");
+    assert!(root.join("usr/bin/base").is_file());
+
+    let o = kiry(&["i", "--root", r, "base"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        said.contains("base 1.0 x86_64-musl already installed"),
+        "{said}"
+    );
+}
+
+// the walk stops at what is in. depends carry no version constraint, so an installed
+// package satisfies the edge and there is nothing under it left to plan
+#[test]
+fn install_by_name_leaves_an_installed_dependency_alone() {
+    let Some((at, root, repo)) = workshop("byinstalled") else {
+        return;
+    };
+    buildable(&at, &repo, "top", "base\n");
+    buildable(&at, &repo, "base", "");
+    let r = root.to_str().unwrap();
+    assert!(kiry(&["i", "--root", r, "base"]).status.success());
+
+    let o = kiry(&["i", "--root", r, "top"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(!said.contains("base"), "base was planned again: {said}");
+}
+
+// identity comes out of the sidecar. the file name is a display name and a version can
+// contain the same - that would separate its fields
+fn artifact(root: &Path, name: &str, up: &str, rev: u32) {
+    let c = root.join("var/kiry/cache");
+    fs::create_dir_all(&c).unwrap();
+    let at = c.join(format!("{name}-{up}-{rev}.x86_64-musl.tar.zst"));
+    fs::write(&at, "x").unwrap();
+    let m = PathBuf::from(format!("{}.meta", at.display()));
+    fs::create_dir_all(&m).unwrap();
+    fs::write(m.join("name"), format!("{name}\n")).unwrap();
+    fs::write(m.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(m.join("version"), format!("{up} {rev}\n")).unwrap();
+    // written in order and read back by mtime, so two landing in the same tick would
+    // make which of them is newest a coin toss
+    std::thread::sleep(std::time::Duration::from_millis(5));
+}
+
+// nothing else in kiry deletes anything, so what this has to get right is not what it
+// removes but what it does not
+#[test]
+fn gc_keeps_what_is_installed_the_two_newest_and_both_libcs() {
+    let (root, repo, _) = tree("gckeep");
+    offer(&repo, "foo", "4.0");
+    for v in ["1.0", "2.0", "3.0", "4.0"] {
+        artifact(&root, "foo", v, 1);
+    }
+    for v in ["1.0", "2.0", "3.0"] {
+        artifact(&root, "musl", v, 1);
+    }
+    // installed at 1.0, which is nowhere near the two newest
+    bare(&root, "foo", &[]);
+    let r = root.to_str().unwrap();
+    let cache = root.join("var/kiry/cache");
+    let there = |n: &str| cache.join(n).exists();
+
+    let o = kiry(&["gc", "-n", "--root", r]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(there("foo-2.0-1.x86_64-musl.tar.zst"), "-n removed it");
+
+    let o = kiry(&["gc", "--root", r]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    for n in ["foo-4.0-1", "foo-3.0-1", "foo-1.0-1"] {
+        let f = format!("{n}.x86_64-musl.tar.zst");
+        assert!(there(&f), "{f} was collected");
+        assert!(there(&format!("{f}.meta")), "{f} lost its sidecar");
+    }
+    assert!(!there("foo-2.0-1.x86_64-musl.tar.zst"), "2.0 stayed");
+    assert!(!there("foo-2.0-1.x86_64-musl.tar.zst.meta"), "2.0 meta stayed");
+    // the repair case is putting a working libc back with no network
+    for v in ["1.0", "2.0", "3.0"] {
+        let f = format!("musl-{v}-1.x86_64-musl.tar.zst");
+        assert!(there(&f), "{f} was collected");
+    }
+}
+
+#[test]
+fn gc_drops_a_tarball_no_recipe_names() {
+    let (root, repo, _) = tree("gcsrc");
+    offer(&repo, "foo", "1.0");
+    fs::write(
+        repo.join("foo/sources"),
+        "https://example.invalid/foo-1.0.tar.gz\n",
+    )
+    .unwrap();
+    let src = root.join("var/kiry/cache/sources");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("foo-1.0.tar.gz"), "keep").unwrap();
+    fs::write(src.join("foo-0.9.tar.gz"), "drop").unwrap();
+
+    let o = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(src.join("foo-1.0.tar.gz").is_file(), "the live one went");
+    assert!(!src.join("foo-0.9.tar.gz").exists(), "the dead one stayed");
+}
+
+// kiry takes no lock, so a work directory being written right now and one abandoned an
+// hour ago look identical. how recently something changed is the only thing between them
+#[test]
+fn gc_leaves_a_stage_directory_that_is_still_being_written() {
+    let (root, repo, _) = tree("gcstage");
+    offer(&repo, "foo", "1.0");
+    let stage = root.join("var/kiry/stage/foo-1.0-1.x86_64-musl");
+    fs::create_dir_all(stage.join("src")).unwrap();
+
+    let o = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(stage.is_dir(), "a live build was collected");
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("1 kept back"), "{said}");
+}
+
+// a --root with a typo in it reaches no repo at all, and every source and log under it
+// then looks like something nothing names
+#[test]
+fn gc_will_not_decide_anything_with_no_recipes_in_reach() {
+    let at = scratch("gcempty");
+    let root = at.join("root");
+    fs::create_dir_all(root.join("var/kiry/cache/sources")).unwrap();
+    fs::write(root.join("var/kiry/cache/sources/keep.tar"), "x").unwrap();
+
+    let o = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    assert!(!o.status.success(), "it decided anyway");
+    assert!(root.join("var/kiry/cache/sources/keep.tar").is_file());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("no recipes in reach"), "{said}");
+}
+
+// the same rule as one_target_failing_cancels_the_other, reached through i rather than
+// b. it broke here first: i plans one (name, target) at a time, so musl packed and
+// installed before gnu was ever tried
+#[test]
+fn install_by_name_will_not_install_one_target_without_the_other() {
+    let Some((at, root, repo)) = workshop("byatomic") else {
+        return;
+    };
+    buildable(&at, &repo, "two", "");
+    fs::write(repo.join("two/targets"), "x86_64-musl x86_64-gnu\n").unwrap();
+    fs::write(
+        repo.join("two/build"),
+        "[ \"$KIRY_TARGET\" = x86_64-musl ] || exit 1\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/two\"\n",
+    )
+    .unwrap();
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "two"]);
+    assert!(!o.status.success(), "it installed anyway");
+    assert!(artifacts(&root).is_empty(), "{:?}", artifacts(&root));
+    assert!(!root.join("usr/bin/two").exists(), "musl landed on its own");
+}
+
+// knowing whether to wait or walk away is the whole reason to record a duration, and it
+// is a decision made before the build starts rather than after
+#[test]
+fn a_build_says_what_it_took_and_remembers_for_next_time() {
+    let Some((at, root, repo)) = workshop("eta") else {
+        return;
+    };
+    buildable(&at, &repo, "base", "");
+    let r = root.to_str().unwrap();
+
+    let o = kiry(&["b", "--root", r, "base"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    // nothing known yet, so it says so instead of inventing a number
+    assert!(said.contains("base 1.0 x86_64-musl building -"), "{said}");
+
+    let kept = fs::read_to_string(root.join("var/kiry/times")).unwrap();
+    assert!(kept.starts_with("base 1.0 x86_64-musl "), "{kept}");
+
+    let o = kiry(&["b", "--root", r, "base"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("base 1.0 x86_64-musl building ~"), "{said}");
+
+    let o = kiry(&["stats", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("world ~"), "{said}");
+    assert!(said.contains("slowest base x86_64-musl"), "{said}");
+}
+
+#[test]
+fn a_batch_says_what_it_will_cost_before_it_starts() {
+    let Some((at, root, repo)) = workshop("forecast") else {
+        return;
+    };
+    buildable(&at, &repo, "top", "mid\n");
+    buildable(&at, &repo, "mid", "base\n");
+    buildable(&at, &repo, "base", "");
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "top"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    let line = said
+        .lines()
+        .find(|l| l.contains(" builds  ~"))
+        .unwrap_or_else(|| panic!("no forecast: {said}"));
+    assert!(line.starts_with("3 builds"), "{line}");
+    assert!(line.contains("3 never built here"), "{line}");
+    // and before any of them, or it is a report rather than an estimate
+    let (f, b) = (said.find("builds  ~"), said.find("base 1.0"));
+    assert!(f < b, "{said}");
 }

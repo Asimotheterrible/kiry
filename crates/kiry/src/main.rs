@@ -2840,12 +2840,14 @@ fn settle(root: &Path, going: &[(String, String)], levels: usize, live: bool) ->
     let (ab, why) = route(root, going);
     if !ab {
         say!("route live  {why}");
+        say_unkept(root);
         return root.to_path_buf();
     }
     // overruled rather than reconsidered, and the reason is still printed. what is worth
     // having in a log six months later is which answer was set aside, not that one was
     if live {
         say!("route live  --live over A/B: {why}");
+        say_unkept(root);
         return root.to_path_buf();
     }
     say!("route A/B  {why}");
@@ -2872,6 +2874,31 @@ fn sidecar(art: &Path) -> Option<(String, String)> {
 // the kernel and the two libcs. what breaks when one of these is replaced under a running
 // system is not the file, which the loader already has open, but the next boot
 const SUBSTRATE: &[&str] = &["linux", "musl", "glibc"];
+
+// the root that is running is what a live install writes to, and BootOrder is what
+// decides which root comes back. the two are allowed to disagree, and when they do the
+// install is gone at the next reboot with nothing having failed and nothing having said
+// so. that is how a vulkan-tools bump and a day of database corrections went missing
+fn unkept(mounts: &str, seen: &str) -> Option<String> {
+    let (_, now, _) = pair(mounts).ok()?;
+    let num = entry_for(seen, &now)?;
+    match order(seen).first() {
+        Some(f) if *f == num => None,
+        _ => Some(now),
+    }
+}
+
+fn say_unkept(root: &Path) {
+    if root.canonicalize().as_deref().unwrap_or(root) != Path::new("/") {
+        return;
+    }
+    let (Ok(mounts), Ok(seen)) = (fs::read_to_string("/proc/mounts"), efi()) else {
+        return;
+    };
+    if let Some(now) = unkept(&mounts, &seen) {
+        say!("            {now} is running and the firmware boots another root first, so this goes at the next reboot. kiry commit keeps it");
+    }
+}
 
 // which root a transaction belongs in. routing every install through the inactive
 // subvolume is right for a libc and absurd for a new cli tool, and it is decidable rather
@@ -3947,10 +3974,8 @@ fn sync_cmd(args: &[String]) {
     let list = repos(&root);
     let into = named_repo(&list, "testing");
 
-    let rows: Vec<Row> = survey(&root, &want, net)
-        .into_iter()
-        .filter(|r| r.status == "behind")
-        .collect();
+    let all = survey(&root, &want, net);
+    let rows: Vec<&Row> = all.iter().filter(|r| r.status == "behind").collect();
     let w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
     let v = rows.iter().map(|r| r.ours.len()).max().unwrap_or(0);
     let u = rows
@@ -3960,6 +3985,12 @@ fn sync_cmd(args: &[String]) {
         .unwrap_or(0);
 
     let alias = convert::aliases(&list);
+    if !dry {
+        match seed(&root, &all, &alias, &list) {
+            0 => {}
+            n => say!("{n} measured against what alpine has now"),
+        }
+    }
     let mut failed = 0;
     for r in &rows {
         let Some(up) = &r.up else { continue };
@@ -3968,14 +3999,14 @@ fn sync_cmd(args: &[String]) {
             None => PathBuf::from(&up.from),
         };
         let fresh = into.join(&r.name);
-        say!(
-            "{:w$} {:v$} -> {:u$}  {}",
-            r.name,
-            r.ours,
-            up.version,
-            fresh.display()
-        );
         if dry {
+            say!(
+                "{:w$} {:v$} -> {:u$}  {}",
+                r.name,
+                r.ours,
+                up.version,
+                fresh.display()
+            );
             say!("  {}", at.display());
             continue;
         }
@@ -3986,39 +4017,78 @@ fn sync_cmd(args: &[String]) {
             }
         }
 
-        let report = match convert::recipe(&at, &into, true, &alias, &list) {
-            Ok(rep) => rep,
+        let mut notes = match convert::recipe(&at, &into, true, &alias, &list) {
+            Ok(rep) => rep.notes,
             Err(e) => {
-                say!("  failed {e}");
+                say!("{} {} -> {}  failed {e}", r.name, r.ours, up.version);
                 failed += 1;
                 continue;
             }
         };
-        for n in &report.notes {
-            say!("  {n}");
+        // carry rewrites this in place, and it is what the next bump gets measured
+        // against, so it is read before anything touches it
+        let generated = fs::read_to_string(fresh.join("build")).unwrap_or_default();
+        let conv = converted(&root, &r.name);
+        let mut outcome = format!("held      {}", fresh.display());
+        if let Err(e) = mkdirs(&conv)
+            .and_then(|()| fs::write(conv.join("pending"), &generated).map_err(|e| e.to_string()))
+        {
+            notes.push(format!("nothing recorded to measure the next bump against {e}"));
         }
+
         // the recipe being replaced, which is whichever repo already holds that name
         // a bump of something only testing/ has is its own predecessor and carries
         // nothing, since there is nothing older to carry from
         match recipe(&root, &r.name).filter(|d| *d != fresh) {
-            None => say!("  new, nothing to carry"),
-            Some(old) => match carry(&old, &fresh) {
-                Err(e) => {
-                    say!("  carried nothing {e}");
-                    failed += 1;
+            None => notes.push("new, nothing to carry".into()),
+            Some(old) => {
+                let base = conv.join("build");
+                match carry(&old, &fresh, Some(base.as_path()).filter(|b| b.is_file())) {
+                    Err(e) => {
+                        notes.push(format!("carried nothing {e}"));
+                        failed += 1;
+                    }
+                    Ok(b) => {
+                        if !b.carried.is_empty() {
+                            notes.push(format!("carried {}", b.carried.join(" ")));
+                        }
+                        for f in &b.differ {
+                            match f.as_str() {
+                                "build" if b.carried.iter().any(|c| c == "build") => notes
+                                    .push(format!(
+                                        "build is this tree's, alpine's is at {}",
+                                        conv.join("pending").display()
+                                    )),
+                                _ => notes
+                                    .push(format!("{f} differs from {}", old.join(f).display())),
+                            }
+                        }
+                        notes.extend(b.moved);
+                        if !b.upstream.is_empty() {
+                            notes.push("alpine changed build()".into());
+                            notes.extend(b.upstream.iter().map(|l| format!("  {l}")));
+                        }
+                        // nothing alpine wrote moved and nothing else needs a decision,
+                        // so there is no reading to do and no reason to make you do it
+                        if b.settled && b.differ.is_empty() {
+                            match promote_one(&root, &list, &r.name) {
+                                Ok(to) => outcome = format!("promoted  {}", to.display()),
+                                Err(e) => notes.push(format!("not promoted {e}")),
+                            }
+                        }
+                    }
                 }
-                Ok((carried, differ, moved)) => {
-                    if !carried.is_empty() {
-                        say!("  carried {}", carried.join(" "));
-                    }
-                    for f in differ {
-                        say!("  {f} differs from {}", old.join(&f).display());
-                    }
-                    for m in moved {
-                        say!("  {m}");
-                    }
-                }
-            },
+            }
+        }
+        say!(
+            "{:w$} {:v$} -> {:u$}  {}",
+            r.name,
+            r.ours,
+            up.version,
+            outcome
+        );
+        for n in notes {
+            say!("  {n}");
         }
     }
 
@@ -4055,33 +4125,155 @@ fn materialise(aports: &Path, rel: &str) -> Result<(), String> {
     )
 }
 
+// the four assignments a version bump moves. one line each at the top of a build, which
+// is the shape convert writes and the shape every recipe here inherited from it
+const HEADER: [&str; 4] = ["pkgver=", "pkgrel=", "source=", "builddir="];
+
+fn heading(line: &str) -> Option<&'static str> {
+    HEADER.iter().copied().find(|h| line.starts_with(h))
+}
+
+// a build with the version assignments reduced to their names, which is what two
+// versions of one recipe have in common. blank lines go too, since a bump that moves a
+// paragraph break has not moved a decision
+fn undated(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(|l| heading(l).unwrap_or(l))
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+// the new version's assignments written into the build this tree already has, so a bump
+// keeps every decision the recipe accumulated rather than proposing them all for
+// deletion. none when the two disagree about which assignments exist at all, which is a
+// shape change and wants reading
+fn reheaded(ours: &str, fresh: &str) -> Option<String> {
+    for h in HEADER {
+        if ours.lines().any(|l| l.starts_with(h)) != fresh.lines().any(|l| l.starts_with(h)) {
+            return None;
+        }
+    }
+    let mut out = String::new();
+    for l in ours.lines() {
+        match heading(l) {
+            None => out.push_str(l),
+            Some(h) => out.push_str(fresh.lines().find(|f| f.starts_with(h))?),
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
+// what alpine moved between the last conversion and this one. lines rather than hunks:
+// the question a bump has to answer is which decision changed, and a diff that walks
+// position would call a reordered configure list a change
+fn moved_upstream(was: &str, is: &str) -> Vec<String> {
+    let (a, b) = (undated(was), undated(is));
+    let mut out: Vec<String> = b
+        .iter()
+        .filter(|l| !a.contains(l))
+        .map(|l| format!("+ {}", l.trim()))
+        .collect();
+    out.extend(
+        a.iter()
+            .filter(|l| !b.contains(l))
+            .map(|l| format!("- {}", l.trim())),
+    );
+    out
+}
+
+// the generated build from the last time this package was converted. a bump has to say
+// whether alpine moved, and the recipe in the tree cannot answer that: it holds this
+// tree's own build, so diffing against it re-asks every decision ever made here
+fn converted(root: &Path, name: &str) -> PathBuf {
+    root.join("var/kiry/converted").join(name)
+}
+
+// a bump can only say what alpine changed if there is a conversion to measure it
+// against, and nothing has one yet. every package already sitting at alpine's version
+// has one available for the asking, so it is taken now rather than making the first bump
+// of each one re-ask every decision this tree ever made
+fn seed(root: &Path, rows: &[Row], alias: &HashMap<String, String>, list: &[PathBuf]) -> usize {
+    // survey walks every repo, so a bump already waiting in testing/ turns up as a
+    // second row for the same name at alpine's version. seeding from that one measures
+    // the bump against itself, finds nothing moved, and promotes it unread
+    let pending: BTreeSet<&str> = rows
+        .iter()
+        .filter(|r| r.status == "behind")
+        .map(|r| r.name.as_str())
+        .collect();
+    let scratch = root.join("var/kiry/converted/.seed");
+    let mut done = 0;
+    for r in rows {
+        let conv = converted(root, &r.name);
+        if r.status != "ok" || pending.contains(r.name.as_str()) || conv.join("build").is_file() {
+            continue;
+        }
+        let Some(rel) = r.up.as_ref().and_then(|u| u.from.strip_prefix("aports/")) else {
+            continue;
+        };
+        let at = root.join("var/kiry/aports").join(rel).join("APKBUILD");
+        if !at.is_file() {
+            continue;
+        }
+        let _ = fs::remove_dir_all(&scratch);
+        // no fetch: the only part kept is the build, and what a checksum decides is
+        // which source entries survive, which is a line the comparison masks anyway
+        let Ok(rep) = convert::recipe(&at, &scratch, false, alias, list) else {
+            continue;
+        };
+        if mkdirs(&conv).is_ok()
+            && fs::copy(scratch.join(&rep.name).join("build"), conv.join("build")).is_ok()
+        {
+            done += 1;
+        }
+    }
+    let _ = fs::remove_dir_all(&scratch);
+    done
+}
+
+// what a bump did, and whether any of it wants reading
+struct Bump {
+    carried: Vec<String>,
+    differ: Vec<String>,
+    moved: Vec<String>,
+    upstream: Vec<String>,
+    settled: bool,
+}
+
 // convert writes what an apkbuild says and no more: version, sources, checksums,
 // depends, targets, build. everything else in a recipe this tree wrote itself -- a
 // filter, a pin, the gentoo entry, a patch -- so it is copied across rather than lost
 // targets goes with them, because a conversion always writes x86_64-musl and the recipe
 // being bumped is the one that knows
 //
-// that leaves build and depends. build is named rather than merged, because which of the
-// two is right is not kiry's to say
+// that leaves build and depends. build keeps this tree's own body with the bump's
+// assignments written into it, and what alpine changed since the last conversion is
+// reported beside it rather than applied. the generated build is right about the version
+// and wrong about everything this recipe was corrected for
 //
 // depends is not the same question. an apkbuild cannot express the distinctions this file
 // makes in it -- a runtime edge against a tool, a header set against either, a target a
 // line is restricted to -- so alpine's answer is lossy by construction and regenerating
 // one throws away every correction the recipe ever accumulated. the recipe's own wins and
 // what alpine moved is reported instead
-fn carry(
-    old: &Path,
-    fresh: &Path,
-) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> {
     let rd = fs::read_dir(old).map_err(|e| format!("{}: {e}", old.display()))?;
-    let mut names: Vec<String> = rd
-        .flatten()
-        .filter(|e| e.path().is_file())
-        .filter_map(|e| e.file_name().to_str().map(String::from))
-        .collect();
+    let (mut names, mut dirs): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for e in rd.flatten() {
+        let Some(n) = e.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        match e.path().is_dir() {
+            true => dirs.push(n),
+            false => names.push(n),
+        }
+    }
     names.sort();
+    dirs.sort();
 
     let (mut carried, mut differ, mut moved) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut upstream, mut settled) = (Vec::new(), false);
     for n in names {
         let (from, to) = (old.join(&n), fresh.join(&n));
         if !to.is_file() || n == "targets" {
@@ -4107,12 +4299,71 @@ fn carry(
             carried.push(n);
             continue;
         }
+        if n == "build" {
+            let ours = fs::read_to_string(&from).map_err(|e| format!("{n}: {e}"))?;
+            let made = fs::read_to_string(&to).map_err(|e| format!("{n}: {e}"))?;
+            let was = base.and_then(|b| fs::read_to_string(b).ok());
+            match reheaded(&ours, &made) {
+                // the two disagree about which assignments exist at all, so the bump is
+                // a shape change and the conversion stands as written
+                None => {
+                    if ours != made {
+                        differ.push(n);
+                    }
+                }
+                Some(next) => {
+                    fs::write(&to, next).map_err(|e| format!("{n}: {e}"))?;
+                    carried.push(n.clone());
+                    match was {
+                        // no conversion to measure against, so whether alpine moved is
+                        // not answerable yet and this one wants reading. what is waiting
+                        // is still this tree's build: promoting it can fail a build,
+                        // where promoting alpine's throws the recipe away and says
+                        // nothing
+                        None => {
+                            if undated(&ours) != undated(&made) {
+                                differ.push(n);
+                            }
+                        }
+                        Some(was) => {
+                            upstream = moved_upstream(&was, &made);
+                            settled = upstream.is_empty();
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         match (fs::read(&from), fs::read(&to)) {
             (Ok(a), Ok(b)) if a == b => {}
             _ => differ.push(n),
         }
     }
-    Ok((carried, differ, moved))
+    // a recipe's own files sit in a subdirectory and a conversion never writes one, so
+    // without this the promotion is what deletes them. openntpd's nitro-run went that way
+    for d in dirs {
+        if fresh.join(&d).exists() {
+            continue;
+        }
+        tree_copy(&old.join(&d), &fresh.join(&d))?;
+        carried.push(d);
+    }
+    Ok(Bump { carried, differ, moved, upstream, settled })
+}
+
+fn tree_copy(from: &Path, to: &Path) -> Result<(), String> {
+    mkdirs(to)?;
+    let rd = fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    for e in rd.flatten() {
+        let (a, b) = (e.path(), to.join(e.file_name()));
+        match a.is_dir() {
+            true => tree_copy(&a, &b)?,
+            false => {
+                fs::copy(&a, &b).map_err(|e| format!("{}: {e}", a.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 // the name a depends line starts with, which is the part two versions of a recipe can be
@@ -4145,37 +4396,40 @@ fn promote_cmd(args: &[String]) {
         die("promote wants a package".into());
     }
     let list = repos(&root);
-    let testing = named_repo(&list, "testing");
-    let extra = named_repo(&list, "extra");
-
     for n in &rest {
-        let from = testing.join(n);
-        if !from.join("build").is_file() {
-            die(format!("nothing to promote at {}", from.display()));
+        match promote_one(&root, &list, n) {
+            Ok(to) => say!("{n} {}", to.display()),
+            Err(e) => die(e),
         }
-        for m in plain(&from.join("group")) {
-            if m != *n && !testing.join(&m).join("build").is_file() {
-                die(format!("{n} moves with {m} and {m} is not in testing"));
-            }
-        }
-        let to = recipe(&root, n)
-            .filter(|d| *d != from)
-            .unwrap_or_else(|| extra.join(n));
-        if let Some(up) = to.parent() {
-            if let Err(e) = mkdirs(up) {
-                die(e);
-            }
-        }
-        if to.exists() {
-            if let Err(e) = fs::remove_dir_all(&to) {
-                die(format!("{}: {e}", to.display()));
-            }
-        }
-        if let Err(e) = fs::rename(&from, &to) {
-            die(format!("{} to {}: {e}", from.display(), to.display()));
-        }
-        say!("{n} {}", to.display());
     }
+}
+
+fn promote_one(root: &Path, list: &[PathBuf], n: &str) -> Result<PathBuf, String> {
+    let testing = named_repo(list, "testing");
+    let from = testing.join(n);
+    if !from.join("build").is_file() {
+        return Err(format!("nothing to promote at {}", from.display()));
+    }
+    for m in plain(&from.join("group")) {
+        if m != n && !testing.join(&m).join("build").is_file() {
+            return Err(format!("{n} moves with {m} and {m} is not in testing"));
+        }
+    }
+    let to = recipe(root, n)
+        .filter(|d| *d != from)
+        .unwrap_or_else(|| named_repo(list, "extra").join(n));
+    if let Some(up) = to.parent() {
+        mkdirs(up)?;
+    }
+    if to.exists() {
+        fs::remove_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+    }
+    fs::rename(&from, &to).map_err(|e| format!("{} to {}: {e}", from.display(), to.display()))?;
+    // the conversion this promotion accepted is what the next bump gets measured
+    // against, so a decision taken here is not asked about a second time
+    let conv = converted(root, n);
+    let _ = fs::rename(conv.join("pending"), conv.join("build"));
+    Ok(to)
 }
 
 // the two halves of the a/b pair, said from the machine they belong to. --root names a
@@ -5527,6 +5781,18 @@ Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.e
     fn a_header_that_starts_with_boot_is_not_an_entry() {
         let got: Vec<&str> = EFI.lines().filter_map(entry).map(|(n, _)| n).collect();
         assert_eq!(got, ["0000", "0001", "0002"]);
+    }
+
+    // a live install onto a root the firmware does not boot first is undone by the next
+    // reboot, and the only thing that notices is the person wondering where it went
+    #[test]
+    fn a_root_the_firmware_does_not_boot_first_is_named() {
+        assert_eq!(unkept(REAL, EFI), None);
+        let other = REAL.replace("subvol=/@root-a", "subvol=/@root-b");
+        assert_eq!(unkept(&other, EFI).as_deref(), Some("@root-b"));
+        // an entry the firmware has never heard of is not a claim this can make
+        let third = REAL.replace("subvol=/@root-a", "subvol=/@root-c");
+        assert_eq!(unkept(&third, EFI), None);
     }
 
     #[test]

@@ -74,6 +74,10 @@ fn usage() {
     say!("when you want to force one: b always compiles, i takes what is in the cache.");
     say!("so `i foo` installs foo, and `b foo` then `i foo` rebuilds it.");
     say!("");
+    say!("b and i also take a set: @outdated is everything installed at a version the");
+    say!("tree has since moved past, which is the upgrade, and @world is everything");
+    say!("installed. `i @outdated` is the whole of it -- one batch, in order, or none.");
+    say!("");
     say!("a package is named rather than pointed at: mesa, core/mesa, or a path to a");
     say!("recipe. b and i take --target T, -v to stream the build, --recover to let the");
     say!("failure table retry, and --force to override a conflict.");
@@ -169,6 +173,10 @@ fn build_cmd(args: &[String]) {
     writes(&root);
     if dirs.is_empty() {
         die("nothing to build".into());
+    }
+    let dirs = expand(&root, dirs);
+    if dirs.is_empty() {
+        return;
     }
 
     // loaded up front so the whole batch can be estimated before any of it starts, and
@@ -2393,6 +2401,10 @@ fn install_cmd(args: &[String]) {
     if names.is_empty() {
         die("nothing to install".into());
     }
+    let names = expand(&root, names);
+    if names.is_empty() {
+        return;
+    }
 
     // an archive or a package. told apart by the suffix a built artifact always carries,
     // which no recipe directory is named after
@@ -3142,6 +3154,68 @@ fn repos(root: &Path) -> Vec<PathBuf> {
     }
     let at = root.join(REPOS_AT);
     REPOS.iter().map(|r| at.join(r)).collect()
+}
+
+// a set stands for a list of names the tree can work out for itself. @world is every
+// installed package and @outdated the ones a recipe has since moved past, which is the
+// upgrade: i already plans a batch in dependency order and refuses it whole, so naming
+// the set is all an upgrade needs to be
+fn expand(root: &Path, names: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in names {
+        let add = match n.as_str() {
+            "@world" => world(root).unwrap_or_else(|e| die(e)),
+            "@outdated" => {
+                let moved = outdated(root).unwrap_or_else(|e| die(e));
+                let w = moved.iter().map(|(n, ..)| n.len()).max().unwrap_or(0);
+                let v = moved.iter().map(|(_, is, _)| is.len()).max().unwrap_or(0);
+                for (n, is, want) in &moved {
+                    say!("{n:w$} {is:v$} -> {want}");
+                }
+                moved.into_iter().map(|(n, ..)| n).collect()
+            }
+            _ if n.starts_with('@') => die(format!("no set called {n}")),
+            _ => vec![n],
+        };
+        for a in add {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
+// one list with no target on it. which targets a name is built for is the recipe's own
+// answer and is decided further in
+fn world(root: &Path) -> Result<Vec<String>, String> {
+    let mut out = BTreeSet::new();
+    for t in db::targets(root).map_err(|e| e.to_string())? {
+        out.extend(db::installed(root, &t).map_err(|e| e.to_string())?);
+    }
+    Ok(out.into_iter().collect())
+}
+
+// installed at one version while the tree holds another. not "older": a recipe that went
+// backwards is still the version the tree asks for, and the printed line says which way
+// it moved rather than leaving it to the word
+fn outdated(root: &Path) -> Result<Vec<(String, String, String)>, String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for t in db::targets(root).map_err(|e| e.to_string())? {
+        for n in db::installed(root, &t).map_err(|e| e.to_string())? {
+            let (Ok(rec), Some(at)) = (db::read(root, &t, &n), recipe(root, &n)) else {
+                continue;
+            };
+            let Ok(p) = pkg::load(&at) else { continue };
+            let (is, want) = (rec.version.to_string(), p.version.to_string());
+            if is != want && seen.insert(n.clone()) {
+                out.push((n, is, want));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
@@ -3906,6 +3980,12 @@ fn sync_cmd(args: &[String]) {
             continue;
         }
 
+        if let Some(rel) = up.from.strip_prefix("aports/") {
+            if let Err(e) = materialise(&root.join("var/kiry/aports"), rel) {
+                say!("  {e}");
+            }
+        }
+
         let report = match convert::recipe(&at, &into, true, &alias, &list) {
             Ok(rep) => rep,
             Err(e) => {
@@ -3927,12 +4007,15 @@ fn sync_cmd(args: &[String]) {
                     say!("  carried nothing {e}");
                     failed += 1;
                 }
-                Ok((carried, differ)) => {
+                Ok((carried, differ, moved)) => {
                     if !carried.is_empty() {
                         say!("  carried {}", carried.join(" "));
                     }
                     for f in differ {
                         say!("  {f} differs from {}", old.join(&f).display());
+                    }
+                    for m in moved {
+                        say!("  {m}");
                     }
                 }
             },
@@ -3948,15 +4031,48 @@ fn sync_cmd(args: &[String]) {
     }
 }
 
+// the aports clone is blobless and checks out apkbuilds alone, so every patch and config
+// a source line names is missing until something asks for it. one package at a time
+// rather than the whole tree: the feed stays a feed, and a conversion still gets the
+// files its recipe is about to name
+fn materialise(aports: &Path, rel: &str) -> Result<(), String> {
+    if !aports.join(rel).join("APKBUILD").is_file() {
+        return Ok(());
+    }
+    // sync runs as root and the clone is not root's, which git refuses to touch by
+    // default. the path is the one kiry was going to read either way
+    let mut safe = std::ffi::OsString::from("safe.directory=");
+    safe.push(aports);
+    run(
+        Command::new("git")
+            .arg("-c")
+            .arg(safe)
+            .arg("-C")
+            .arg(aports)
+            .args(["sparse-checkout", "add", rel])
+            .stdout(Stdio::null()),
+        "git sparse-checkout",
+    )
+}
+
 // convert writes what an apkbuild says and no more: version, sources, checksums,
 // depends, targets, build. everything else in a recipe this tree wrote itself -- a
 // filter, a pin, the gentoo entry, a patch -- so it is copied across rather than lost
 // targets goes with them, because a conversion always writes x86_64-musl and the recipe
 // being bumped is the one that knows
 //
-// that leaves build and depends, which a bump is entitled to change and a hand may also
-// have edited. named rather than merged: which of the two is right is not kiry's to say
-fn carry(old: &Path, fresh: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+// that leaves build and depends. build is named rather than merged, because which of the
+// two is right is not kiry's to say
+//
+// depends is not the same question. an apkbuild cannot express the distinctions this file
+// makes in it -- a runtime edge against a tool, a header set against either, a target a
+// line is restricted to -- so alpine's answer is lossy by construction and regenerating
+// one throws away every correction the recipe ever accumulated. the recipe's own wins and
+// what alpine moved is reported instead
+fn carry(
+    old: &Path,
+    fresh: &Path,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
     let rd = fs::read_dir(old).map_err(|e| format!("{}: {e}", old.display()))?;
     let mut names: Vec<String> = rd
         .flatten()
@@ -3965,7 +4081,7 @@ fn carry(old: &Path, fresh: &Path) -> Result<(Vec<String>, Vec<String>), String>
         .collect();
     names.sort();
 
-    let (mut carried, mut differ) = (Vec::new(), Vec::new());
+    let (mut carried, mut differ, mut moved) = (Vec::new(), Vec::new(), Vec::new());
     for n in names {
         let (from, to) = (old.join(&n), fresh.join(&n));
         if !to.is_file() || n == "targets" {
@@ -3976,12 +4092,39 @@ fn carry(old: &Path, fresh: &Path) -> Result<(Vec<String>, Vec<String>), String>
         if matches!(n.as_str(), "version" | "sources" | "checksums") {
             continue;
         }
+        if n == "depends" {
+            // one direction only. alpine derives a runtime dep by scanning the built
+            // elf and never writes it in an apkbuild, so nearly everything this recipe
+            // carries is missing from alpine's list and always was -- reading that as
+            // alpine having dropped it is eighty lines of saying nothing
+            let (ours, theirs) = (dep_names(&from)?, dep_names(&to)?);
+            moved.extend(
+                theirs
+                    .difference(&ours)
+                    .map(|d| format!("alpine now wants {d}")),
+            );
+            fs::copy(&from, &to).map_err(|e| format!("{n}: {e}"))?;
+            carried.push(n);
+            continue;
+        }
         match (fs::read(&from), fs::read(&to)) {
             (Ok(a), Ok(b)) if a == b => {}
             _ => differ.push(n),
         }
     }
-    Ok((carried, differ))
+    Ok((carried, differ, moved))
+}
+
+// the name a depends line starts with, which is the part two versions of a recipe can be
+// compared on. what follows it is the distinction alpine does not carry
+fn dep_names(p: &Path) -> Result<BTreeSet<String>, String> {
+    let text = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    Ok(text
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| !w.starts_with('#'))
+        .map(String::from)
+        .collect())
 }
 
 fn named_repo(list: &[PathBuf], want: &str) -> PathBuf {

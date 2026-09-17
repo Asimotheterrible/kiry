@@ -84,6 +84,7 @@ pub fn recipe(
 
     let sums = sha512sums(v.get("sha512sums").map(String::as_str).unwrap_or(""));
     let mut sources = Vec::new();
+    let mut absent: Vec<String> = Vec::new();
     let mut checksums = Vec::new();
     let mut files = Vec::new();
     let d = out.join(&name);
@@ -119,8 +120,12 @@ pub fn recipe(
             sources.push(file.to_string());
             d.join(file)
         } else {
-            notes.push(format!("{file} is named by source and is not here"));
-            sources.push(file.to_string());
+            // sources and checksums pair by position, so an entry recorded without a
+            // checksum writes a recipe that cannot be read back. left out instead, and
+            // counted rather than named one line at a time -- an apkbuild carrying
+            // forty patches otherwise buries every other note under them
+            absent.push(file.to_string());
+            files.pop();
             continue;
         };
 
@@ -284,6 +289,13 @@ pub fn recipe(
     )?;
     put(&d.join("build"), &script)?;
 
+    if !absent.is_empty() {
+        notes.push(format!(
+            "{} sources the apkbuild names are not in the tree and were left out: {}",
+            absent.len(),
+            absent.join(" ")
+        ));
+    }
     Ok(Report { name, notes })
 }
 

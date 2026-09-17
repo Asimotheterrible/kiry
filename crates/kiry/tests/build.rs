@@ -3533,3 +3533,202 @@ fn a_set_that_is_not_one_is_refused() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+// a recipe shaped the way a conversion writes one, which is the shape every recipe in
+// this tree has and the shape a bump can write its assignments back into
+fn converted_offer(repo: &Path, name: &str, version: &str, body: &str) {
+    let d = repo.join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(
+        d.join("build"),
+        format!(
+            ". /usr/share/kiry/lib.sh\nsrcdir=/src\npkgname=\"{name}\"\npkgver=\"{version}\"\n\
+             pkgrel=\"0\"\nsource=\"\"\nbuilddir=\"/src/{name}-{version}\"\n\n\
+             build() {{\n{body}}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(d.join("version"), format!("{version} 0\n")).unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+}
+
+fn upstream_at(root: &Path, name: &str, version: &str, body: &str) {
+    aport(
+        root,
+        "main",
+        name,
+        &format!("pkgname={name}\npkgver={version}\npkgrel=0\nbuild() {{\n{body}}}\npackage() {{\n\t:\n}}\n"),
+    );
+}
+
+fn sync_at(root: &Path) -> String {
+    let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+// the common bump moves a version and nothing else, and the old answer was to hand back
+// the whole recipe regenerated so that every decision this tree ever made read as a
+// deletion. what alpine changed is the question, and it is answerable
+#[test]
+fn a_bump_alpine_did_not_touch_promotes_itself() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncquiet");
+    converted_offer(&repo, "quiet", "1.0", "\t./configure --without-the-thing\n");
+    upstream_at(&root, "quiet", "1.0", "\tmake\n");
+
+    let first = sync_at(&root);
+    assert!(first.contains("measured against what alpine has now"), "{first}");
+
+    upstream_at(&root, "quiet", "1.1", "\tmake\n");
+    let said = sync_at(&root);
+    assert!(said.contains("quiet 1.0 -> 1.1"), "{said}");
+    assert!(said.contains("promoted"), "{said}");
+    assert!(!testing.join("quiet").exists(), "{said}");
+
+    let build = fs::read_to_string(repo.join("quiet/build")).unwrap();
+    assert!(build.contains("--without-the-thing"), "{build}");
+    assert!(build.contains("pkgver=\"1.1\""), "{build}");
+    assert!(build.contains("builddir=\"/src/quiet-1.1\""), "{build}");
+    assert!(!build.contains("make"), "the conversion's body won: {build}");
+    assert_eq!(
+        fs::read_to_string(repo.join("quiet/version")).unwrap(),
+        "1.1 0\n"
+    );
+}
+
+// and when alpine did move, the bump waits and says which line. the recipe sitting in
+// testing is still this tree's own, so promoting it is never the thing that breaks
+#[test]
+fn a_bump_alpine_moved_is_held_and_names_the_line() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncmoved");
+    converted_offer(&repo, "loud", "1.0", "\t./configure --without-the-thing\n");
+    upstream_at(&root, "loud", "1.0", "\tmake\n");
+    sync_at(&root);
+
+    upstream_at(&root, "loud", "1.1", "\tautoreconf -fi\n\tmake\n");
+    let said = sync_at(&root);
+    assert!(said.contains("held"), "{said}");
+    assert!(said.contains("alpine changed build()"), "{said}");
+    assert!(said.contains("+ autoreconf -fi"), "{said}");
+    assert!(testing.join("loud").exists(), "{said}");
+    assert_eq!(
+        fs::read_to_string(repo.join("loud/version")).unwrap(),
+        "1.0 0\n"
+    );
+    // held is about reading, not about the recipe being unusable. what is waiting is
+    // this tree's build with the new version in it
+    let waiting = fs::read_to_string(testing.join("loud/build")).unwrap();
+    assert!(waiting.contains("--without-the-thing"), "{waiting}");
+    assert!(waiting.contains("pkgver=\"1.1\""), "{waiting}");
+}
+
+// a decision costs one reading, not one per bump forever. promoting is what says the
+// conversion was looked at, so the next bump is measured from there
+#[test]
+fn promoting_a_held_bump_stops_it_being_asked_again() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, _) = tree("syncagain");
+    converted_offer(&repo, "twice", "1.0", "\t./configure --without-the-thing\n");
+    upstream_at(&root, "twice", "1.0", "\tmake\n");
+    sync_at(&root);
+
+    upstream_at(&root, "twice", "1.1", "\tautoreconf -fi\n\tmake\n");
+    assert!(sync_at(&root).contains("held"));
+    let o = kiry(&["promote", "--root", root.to_str().unwrap(), "twice"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    upstream_at(&root, "twice", "1.2", "\tautoreconf -fi\n\tmake\n");
+    let said = sync_at(&root);
+    assert!(said.contains("promoted"), "{said}");
+    assert!(!said.contains("autoreconf"), "it asked twice: {said}");
+    assert_eq!(
+        fs::read_to_string(repo.join("twice/version")).unwrap(),
+        "1.2 0\n"
+    );
+}
+
+// a bump waiting in testing is the same package at the version alpine has, so a survey
+// that walks every repo sees it twice. measuring the bump against its own conversion
+// says nothing moved, and promotes something nobody read
+#[test]
+fn a_bump_already_waiting_does_not_become_its_own_measure() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncself");
+    converted_offer(&repo, "twin", "1.0", "\t./configure --without-the-thing\n");
+    upstream_at(&root, "twin", "1.1", "\tautoreconf -fi\n\tmake\n");
+
+    assert!(sync_at(&root).contains("held"));
+    assert!(testing.join("twin").exists());
+
+    let said = sync_at(&root);
+    assert!(said.contains("held"), "it promoted itself unread: {said}");
+    assert_eq!(
+        fs::read_to_string(repo.join("twin/version")).unwrap(),
+        "1.0 0\n"
+    );
+}
+
+// a recipe's own files live in a subdirectory, a conversion never writes one, and a
+// promotion replaces the recipe wholesale. openntpd's nitro-run went that way
+#[test]
+fn a_recipe_subdirectory_comes_across_a_bump() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncfiles");
+    converted_offer(&repo, "served", "1.0", "\tmake\n");
+    fs::create_dir_all(repo.join("served/files")).unwrap();
+    fs::write(repo.join("served/files/nitro-run"), "#!/bin/sh\nexec served\n").unwrap();
+    upstream_at(&root, "served", "1.1", "\tmake\n");
+
+    sync_at(&root);
+    // what is waiting in testing is what a promotion moves over the recipe, so a file
+    // missing from it is a file the promotion deletes
+    let landed = testing.join("served/files/nitro-run");
+    assert!(landed.exists(), "the subdirectory was dropped");
+    assert_eq!(
+        fs::read_to_string(landed).unwrap(),
+        "#!/bin/sh\nexec served\n"
+    );
+
+    let o = kiry(&["promote", "--root", root.to_str().unwrap(), "served"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        repo.join("served/files/nitro-run").exists(),
+        "the promotion deleted it"
+    );
+}
+
+// the first bump of a package has nothing to measure against, so it wants reading. what
+// waits in testing is still this tree's build: promoting it can fail a build, where
+// promoting the conversion throws the recipe away and says nothing
+#[test]
+fn a_first_bump_keeps_this_trees_build_and_says_where_alpines_is() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncfirst");
+    converted_offer(&repo, "fresh", "1.0", "\t./configure --without-the-thing\n");
+    upstream_at(&root, "fresh", "1.1", "\tmake\n");
+
+    let said = sync_at(&root);
+    assert!(said.contains("held"), "{said}");
+    assert!(said.contains("build is this tree's"), "{said}");
+    assert!(said.contains("converted/fresh/pending"), "{said}");
+
+    let waiting = fs::read_to_string(testing.join("fresh/build")).unwrap();
+    assert!(waiting.contains("--without-the-thing"), "{waiting}");
+    assert!(waiting.contains("pkgver=\"1.1\""), "{waiting}");
+    assert!(!waiting.contains("make"), "the conversion's body won: {waiting}");
+    let _ = repo;
+}

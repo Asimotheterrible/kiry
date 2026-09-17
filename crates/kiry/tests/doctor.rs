@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use kiry_core::pkg::Version;
+use kiry_core::pkg::{Dep, Version};
 use kiry_core::{db, install};
 
 const KIRY: &str = env!("CARGO_BIN_EXE_kiry");
@@ -140,6 +140,22 @@ fn install(root: &Path, name: &str, files: &[(&str, &Path)]) {
     installed(root, name, files, &[])
 }
 
+// what these fixtures are about is linkage, and a package that links a library while its
+// depends names nothing is a second finding on top. so they declare what they link
+fn needs(root: &Path, name: &str, deps: &[&str]) {
+    let mut rec = db::read(root, TARGET, name).unwrap();
+    rec.depends = deps
+        .iter()
+        .map(|d| Dep {
+            name: (*d).to_string(),
+            make: false,
+            host: false,
+            only: None,
+        })
+        .collect();
+    db::write(root, &rec).unwrap();
+}
+
 fn installed(root: &Path, name: &str, files: &[(&str, &Path)], links: &[(&str, &str)]) {
     let mut manifest = Vec::new();
     for (path, from) in files {
@@ -252,6 +268,7 @@ fn a_root_whose_linkage_resolves_says_nothing() {
     install(&root, "libp", &[("usr/lib64/libp.so.1", &l)]);
     install(&root, "app", &[("usr/bin/app", &b)]);
 
+    needs(&root, "app", &["libp"]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "expected silence, got {out:?}");
 }
@@ -366,6 +383,7 @@ fn the_usrmerge_spelling_of_a_directory_is_the_same_directory() {
     install(&root, "libp", &[("usr/lib64/priv/libp.so.1", &l)]);
     install(&root, "app", &[("usr/bin/app", &b)]);
 
+    needs(&root, "app", &["libp"]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "{out}");
     assert!(ldd_finds(&root.join("usr/bin/app"), "libp.so.1"));
@@ -411,6 +429,7 @@ fn dt_rpath_resolves_when_there_is_no_runpath() {
         "the linker emitted RUNPATH, so this fixture no longer reaches the rpath branch"
     );
 
+    needs(&root, "app", &["libp"]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "{out}");
     assert!(ldd_finds(&root.join("usr/bin/app"), "libp.so.1"));
@@ -430,6 +449,7 @@ fn origin_names_the_directory_the_binary_is_in() {
     install(&root, "libp", &[("usr/bin/libp.so.1", &l)]);
     install(&root, "app", &[("usr/bin/app", &b)]);
 
+    needs(&root, "app", &["libp"]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "{out}");
     assert!(ldd_finds(&root.join("usr/bin/app"), "libp.so.1"));
@@ -496,6 +516,7 @@ fn a_weak_undefined_symbol_is_not_a_finding() {
     install(&root, "libt", &[("usr/lib64/libt.so.1", &l)]);
     install(&root, "app", &[("usr/bin/app", &app)]);
 
+    needs(&root, "app", &["libt"]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "expected silence, got {out:?}");
 }
@@ -566,6 +587,7 @@ fn a_library_with_no_soname_resolves_by_the_name_asked_for() {
     install(&root, "libt", &[("usr/lib64/libt.so.1", &l)]);
     install(&root, "app", &[("usr/bin/app", &app)]);
 
+    needs(&root, "app", &["libt"]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "expected silence, got {out:?}");
     assert!(ldd_finds(&root.join("usr/bin/app"), "libt.so.1"));
@@ -590,6 +612,7 @@ fn a_library_reached_through_a_symlink_resolves() {
         &[("usr/lib64/libt.so.1", "libreal.so.1")],
     );
 
+    needs(&root, "app", &["libt"]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "expected silence, got {out:?}");
 }
@@ -964,6 +987,8 @@ fn the_names_every_object_carries_are_not_a_clash() {
     install(&root, "ua", &[("usr/bin/ua", &ua)]);
     install(&root, "ub", &[("usr/bin/ub", &ub)]);
 
+    needs(&root, "ua", &["one"]);
+    needs(&root, "ub", &["two"]);
     let (ok, out) = doctor(&root);
     assert!(!out.contains("duplicate-symbols"), "{out}");
     assert!(ok, "{out}");
@@ -996,6 +1021,7 @@ fn one_library_exporting_a_name_at_two_versions_is_not_a_clash() {
     install(&root, "v", &[("usr/lib64/libv.so.1", &lib)]);
     install(&root, "app", &[("usr/bin/app", &app)]);
 
+    needs(&root, "app", &["v"]);
     let (ok, out) = doctor(&root);
     assert!(!out.contains("duplicate-symbols"), "{out}");
     assert!(ok, "{out}");
@@ -1034,6 +1060,8 @@ fn a_weak_export_in_two_libraries_is_not_a_clash() {
     install(&root, "ua", &[("usr/bin/ua", &ua)]);
     install(&root, "ub", &[("usr/bin/ub", &ub)]);
 
+    needs(&root, "ua", &["one"]);
+    needs(&root, "ub", &["two"]);
     let (ok, out) = doctor(&root);
     assert!(!out.contains("duplicate-symbols"), "{out}");
     assert!(ok, "{out}");
@@ -1082,6 +1110,8 @@ fn a_version_label_in_two_libraries_is_not_a_clash() {
     install(&root, "ua", &[("usr/bin/ua", &ua)]);
     install(&root, "ub", &[("usr/bin/ub", &ub)]);
 
+    needs(&root, "ua", &["one"]);
+    needs(&root, "ub", &["two"]);
     let (ok, out) = doctor(&root);
     assert!(!out.contains("duplicate-symbols"), "{out}");
     assert!(ok, "{out}");
@@ -1111,6 +1141,53 @@ fn a_gnu_binary_reaching_into_the_musl_tree_is_flagged() {
         out.contains(&format!(
             "usr/bin/app {TARGET} cross-tier usr/lib/libp.so.1"
         )),
+        "{out}"
+    );
+}
+
+// nothing in app's depends reaches libp, so this root works and a root built from the
+// recipes does not
+#[test]
+fn a_package_linking_a_library_its_depends_cannot_reach_is_reported() {
+    if skip("undeclared") {
+        return;
+    }
+    let at = scratch("undeclared");
+    let root = at.join("root");
+    let l = lib(&at, "libp.so.1");
+    let b = bin(&at, "app", &l, None);
+    install(&root, "libp", &[("usr/lib64/libp.so.1", &l)]);
+    install(&root, "app", &[("usr/bin/app", &b)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!ok, "doctor passed a package that declares nothing it links");
+    assert!(
+        out.contains("app x86_64-gnu build-only libp libp.so.1"),
+        "{out}"
+    );
+}
+
+// app declares mid, mid declares libp, and app links libp itself. it resolves today
+// because mid asks for it, which is not the same as app saying so
+#[test]
+fn a_library_reached_only_through_another_dep_is_undeclared() {
+    if skip("undeclared via") {
+        return;
+    }
+    let at = scratch("undeclared-via");
+    let root = at.join("root");
+    let l = lib(&at, "libp.so.1");
+    let b = bin(&at, "app", &l, None);
+    install(&root, "libp", &[("usr/lib64/libp.so.1", &l)]);
+    install(&root, "mid", &[]);
+    install(&root, "app", &[("usr/bin/app", &b)]);
+    needs(&root, "mid", &["libp"]);
+    needs(&root, "app", &["mid"]);
+
+    let (ok, out) = doctor(&root);
+    assert!(!ok, "doctor passed a dep reached only through another one");
+    assert!(
+        out.contains("app x86_64-gnu undeclared libp libp.so.1"),
         "{out}"
     );
 }

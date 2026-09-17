@@ -3157,3 +3157,308 @@ fn a_batch_says_what_it_will_cost_before_it_starts() {
     let (f, b) = (said.find("builds  ~"), said.find("base 1.0"));
     assert!(f < b, "{said}");
 }
+
+// routing every install through the inactive subvolume is right for a libc and absurd
+// for a new cli tool. the rule is what decides, and it has to be said either way
+#[test]
+fn a_new_package_nothing_has_open_goes_live() {
+    let Some((at, root, repo)) = workshop("routelive") else {
+        return;
+    };
+    buildable(&at, &repo, "base", "");
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "base"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    let line = said
+        .lines()
+        .find(|l| l.starts_with("route "))
+        .unwrap_or_else(|| panic!("nothing said which root: {said}"));
+    assert!(line.starts_with("route live"), "{line}");
+    // a staging root is not the running one, and /proc answers only for /
+    assert!(line.contains("not the running root"), "{line}");
+}
+
+// asking whether something needs a reboot should not be the same act as rebooting for it
+#[test]
+fn install_dash_n_says_the_plan_and_writes_nothing() {
+    let Some((at, root, repo)) = workshop("drynstall") else {
+        return;
+    };
+    buildable(&at, &repo, "top", "base\n");
+    buildable(&at, &repo, "base", "");
+
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), "top"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("top 1.0 x86_64-musl builds"), "{said}");
+    assert!(said.contains("base 1.0 x86_64-musl builds"), "{said}");
+    assert!(said.contains("route "), "{said}");
+    assert!(artifacts(&root).is_empty(), "{:?}", artifacts(&root));
+    assert!(!root.join("usr/bin/top").exists(), "it installed anyway");
+}
+
+// every core package wants a reboot now, and sometimes you know better. the answer it
+// overrules is still printed, because what is worth having in a log later is which one
+// was set aside
+#[test]
+fn dash_live_overrules_the_other_root_and_says_what_it_overruled() {
+    let at = scratch("liveover");
+    let (root, core) = (at.join("root"), at.join("core"));
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    fs::create_dir_all(&core).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", core.display())).unwrap();
+    buildable(&at, &core, "deep", "");
+    let r = root.to_str().unwrap();
+
+    // a fixture root is never A/B in the first place, so the override has to be visible
+    // on the answer rather than on where the files went
+    let o = kiry(&["i", "-n", "--live", "--root", r, "deep"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    let line = said.lines().find(|l| l.starts_with("route ")).unwrap();
+    assert!(line.starts_with("route live"), "{line}");
+
+    let o = kiry(&["i", "--live", "--root", r, "deep"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(root.join("usr/bin/deep").is_file(), "it did not install");
+}
+
+#[test]
+fn the_word_help_reaches_the_usage_and_not_the_recipe_lookup() {
+    for w in ["help", "-h", "--help"] {
+        let out = kiry(&[w]);
+        assert!(out.status.success(), "{w} exited {:?}", out.status.code());
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.starts_with("usage: kiry"), "{w} printed {text}");
+        assert!(text.contains("build what is missing, then install"));
+    }
+}
+
+// the real file almost always carries the full version and the soname is a symlink onto
+// it, so a bump renames the thing being compared. 356 of the libraries installed here are
+// shaped that way, and keying the baseline on the path skipped every one of them
+#[test]
+fn a_library_whose_file_was_renamed_is_still_compared() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-renamed");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let both = lib_with(
+        &at.join("v1"),
+        "libp.so.1",
+        "void p(void){}\nvoid q(void){}\n",
+    );
+    let gone = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
+
+    let first = archive(&at, "ren-1", &[("usr/lib64/libp.so.1.2.3", &both)]);
+    let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    place(
+        &root,
+        "useq",
+        &[(
+            "usr/bin/useq",
+            &app_calling(&at.join("b"), "useq", "q", &both),
+        )],
+    );
+
+    let second = archive(&at, "ren-2", &[("usr/lib64/libp.so.1.2.4", &gone)]);
+    let o = kiry(&["i", "--root", r, second.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let q = queued(&root);
+    assert!(
+        q.iter().any(|l| queued_pkg(l) == "useq"),
+        "the file moved from libp.so.1.2.3 to libp.so.1.2.4 and q leaving went unseen: {q:?}"
+    );
+}
+
+// one soname on two files is what a private copy beside a public one looks like. the
+// soname cannot tell them apart, so the path is what pairs each build with its own
+// predecessor and picking either one would queue a rebuild nothing asked for
+#[test]
+fn two_libraries_under_one_soname_are_each_compared_against_themselves() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-twosome");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let both = lib_with(
+        &at.join("v1"),
+        "libp.so.1",
+        "void p(void){}\nvoid q(void){}\n",
+    );
+    let only = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
+
+    let first = archive(
+        &at,
+        "two-1",
+        &[
+            ("usr/lib64/a/libp.so.1", &both),
+            ("usr/lib64/b/libp.so.1", &only),
+        ],
+    );
+    let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    place(
+        &root,
+        "useq",
+        &[(
+            "usr/bin/useq",
+            &app_calling(&at.join("c"), "useq", "q", &both),
+        )],
+    );
+
+    // a loses q, b never had it. only the a comparison can say anything happened
+    let second = archive(
+        &at,
+        "two-2",
+        &[
+            ("usr/lib64/a/libp.so.1", &only),
+            ("usr/lib64/b/libp.so.1", &only),
+        ],
+    );
+    let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let q = queued(&root);
+    assert!(
+        q.iter().any(|l| queued_pkg(l) == "useq"),
+        "a dropped q and the two sonames were not told apart: {q:?}"
+    );
+}
+
+fn lib_versioned(at: &Path, soname: &str, ver: &str) -> PathBuf {
+    fs::create_dir_all(at).unwrap();
+    let src = at.join(format!("{soname}.c"));
+    fs::write(
+        &src,
+        format!("void p_impl(void){{}}\n__asm__(\".symver p_impl,p@@{ver}\");\n"),
+    )
+    .unwrap();
+    let map = at.join("v.map");
+    fs::write(&map, format!("{ver} {{ global: p; local: *; }};\n")).unwrap();
+    let out = at.join(soname);
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-nostdlib"])
+        .arg(format!("-Wl,-soname,{soname}"))
+        .arg(format!("-Wl,--version-script,{}", map.display()))
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap()
+        .success());
+    out
+}
+
+// the design's own example: a binary wanting foo@GLIBC_2.40 against a substrate that
+// provides 2.38. both halves were indexed the whole time and nothing compared them until
+// doctor was run by hand, so the first thing to notice was the program failing to start
+#[test]
+fn installing_a_binary_that_wants_a_version_nothing_provides_says_so() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("skew");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let two = lib_versioned(&at.join("v2"), "libp.so.1", "V2");
+    let one = lib_versioned(&at.join("v1"), "libp.so.1", "V1");
+    let app = app_calling(&at.join("app"), "useskew", "p", &two);
+
+    // linked against the one that has V2, installed beside the one that has only V1
+    let arc = archive(
+        &at,
+        "skew",
+        &[("usr/lib64/libp.so.1", &one), ("usr/bin/useskew", &app)],
+    );
+    let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        text.contains("missing-symbol p@V2"),
+        "install said nothing about the version skew it just laid down: {text}"
+    );
+}
+
+// the file name carries version and rev, and neither of those moves when the thing that
+// actually decides the build does. an artifact compiled with the old flags kept being
+// handed back as a hit, and kiry flags noticing afterwards was the only thing that did
+#[test]
+fn a_flag_change_takes_the_cached_artifact_out_of_play() {
+    let at = scratch("cache-flags");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let r = root.to_str().unwrap();
+    let dir = d.to_str().unwrap();
+
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let o = kiry(&["i", "--root", r, "-n", dir]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("hello 1.0 x86_64-musl cached"), "{said}");
+
+    fs::create_dir_all(root.join("etc/kiry/pkg")).unwrap();
+    fs::write(root.join("etc/kiry/pkg/hello"), "CFLAGS -O1\n").unwrap();
+
+    let o = kiry(&["i", "--root", r, "-n", dir]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        said.contains("rebuilding  flags changed"),
+        "the artifact was compiled with other flags and is still on offer: {said}"
+    );
+}
+
+// editing a recipe without bumping rev is what writing one looks like all day, and the
+// artifact from the previous edit sat there under a name that still fit
+#[test]
+fn an_edited_recipe_takes_the_cached_artifact_out_of_play() {
+    let at = scratch("cache-recipe");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let r = root.to_str().unwrap();
+    let dir = d.to_str().unwrap();
+
+    assert!(kiry(&["b", "--root", r, dir]).status.success());
+    let o = kiry(&["i", "--root", r, "-n", dir]);
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("cached"),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+
+    fs::write(d.join("build"), format!("{GOOD}echo second thoughts\n")).unwrap();
+
+    let o = kiry(&["i", "--root", r, "-n", dir]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        said.contains("rebuilding  recipe changed"),
+        "the build script moved and the old artifact is still on offer: {said}"
+    );
+}

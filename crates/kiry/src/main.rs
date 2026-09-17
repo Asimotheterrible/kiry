@@ -8,6 +8,8 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Instant, SystemTime};
 
 use kiry_core::pkg::{Dep, Package};
@@ -24,7 +26,7 @@ macro_rules! say {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("-h") | Some("--help") => usage(),
+        Some("-h") | Some("--help") | Some("help") => usage(),
         Some("--version") => say!("kiry {}", env!("CARGO_PKG_VERSION")),
         Some("b") => build_cmd(&args[1..]),
         Some("i") => install_cmd(&args[1..]),
@@ -38,6 +40,8 @@ fn main() {
         Some("ahead") => ahead_cmd(&args[1..]),
         Some("sync") => sync_cmd(&args[1..]),
         Some("promote") => promote_cmd(&args[1..]),
+        Some("commit") => commit_cmd(&args[1..]),
+        Some("rollback") => rollback_cmd(&args[1..]),
         Some("gc") => gc_cmd(&args[1..]),
         Some("search") => search_cmd(&args[1..]),
         Some("log") => log_cmd(&args[1..]),
@@ -59,7 +63,8 @@ fn main() {
 fn usage() {
     say!("usage: kiry <command> [args]");
     say!("");
-    say!("  i <pkg>...    build what is missing, then install");
+    say!("  i <pkg>...    build what is missing, then install (-n to just say what)");
+    say!("                  --live forces / when it would have used the other root");
     say!("  b <pkg>...    build only, into the cache");
     say!("  r <pkg>...    remove");
     say!("  l             what is installed");
@@ -78,6 +83,10 @@ fn usage() {
     say!("  sync [-n] [--net]       bump those into testing/");
     say!("  promote <pkg>...        testing/ into the tree");
     say!("  rebuild [-n]            drain the soname rebuild queue");
+    say!("");
+    say!("the other root");
+    say!("  commit                  keep the root that is running");
+    say!("  rollback                go back to the one before it");
     say!("");
     say!("looking around");
     say!("  owns <path>...          which package owns a file");
@@ -264,6 +273,106 @@ fn build(
         let _ = fs::remove_dir_all(work);
     }
     Ok(ready.into_iter().map(|(_, (art, _))| art).collect())
+}
+
+// what the build linked against, set beside what the recipe declared. a transitive
+// member's shared libraries are in the namespace because link resolution needs them, so
+// a direct dependency nobody wrote down links fine and nothing says a word. the header
+// rule catches the ones that need a header to compile; this is the rest of them
+//
+// reported, not refused. the answer is a line in a depends file and it is his to write,
+// and a build that just took twenty minutes is the wrong place to find that out fatally
+fn undeclared(
+    root: &Path,
+    members: &[sandbox::Member],
+    deps: &[Dep],
+    target: &str,
+    dest: &Path,
+) -> Vec<(String, String, &'static str)> {
+    let mut owner: HashMap<String, String> = HashMap::new();
+    for m in members {
+        let Ok(ps) = db::read_provides(root, &m.target, &m.name) else {
+            continue;
+        };
+        for pv in ps {
+            owner.entry(pv.soname).or_insert(m.name.clone());
+        }
+    }
+
+    // what will still be there once the build is over. a make dep is a tool, and nothing
+    // installs one on the strength of something linking it -- so a shipped file linking
+    // a make dep's library is a package that works here and not on a clean root
+    let mut declared: HashSet<String> = deps
+        .iter()
+        .filter(|d| !d.make && d.applies(target))
+        .map(|d| d.name.clone())
+        .collect();
+    declared.extend(
+        sandbox::substrate(target)
+            .iter()
+            .filter(|(_, make)| !make)
+            .map(|(n, _)| (*n).to_string()),
+    );
+
+    let mut runtime: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = declared.iter().cloned().collect();
+    while let Some(n) = queue.pop() {
+        if !runtime.insert(n.clone()) {
+            continue;
+        }
+        if let Ok(rec) = db::read(root, target, &n) {
+            queue.extend(
+                rec.depends
+                    .iter()
+                    .filter(|d| !d.make && d.applies(target))
+                    .map(|d| d.name.clone()),
+            );
+        }
+    }
+
+    let mut files = Vec::new();
+    under(dest, &mut files);
+    let mut mine: HashSet<String> = HashSet::new();
+    let mut want: BTreeSet<String> = BTreeSet::new();
+    for f in &files {
+        let Ok(o) = elf::read(f) else { continue };
+        if let Some(s) = &o.soname {
+            mine.insert(s.clone());
+        }
+        want.extend(o.needed.iter().cloned());
+    }
+
+    want.into_iter()
+        // a package linking what it just built itself declares nothing
+        .filter(|w| !mine.contains(w))
+        .filter_map(|w| {
+            let who = owner.get(&w)?;
+            if declared.contains(who) {
+                return None;
+            }
+            // reachable through a declared dep's own deps, so it is there today and
+            // nothing wrote down that it has to be
+            let kind = if runtime.contains(who) {
+                "undeclared"
+            } else {
+                "build-only"
+            };
+            Some((w, who.clone(), kind))
+        })
+        .collect()
+}
+
+fn under(at: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(at) else { return };
+    for e in rd.flatten() {
+        match e.file_type() {
+            // a symlink is the same file under a second name and its target is walked
+            // anyway, so following one only reads everything twice
+            Ok(ft) if ft.is_dir() => under(&e.path(), out),
+            Ok(ft) if ft.is_file() => out.push(e.path()),
+            _ => {}
+        }
+    }
 }
 
 // the gnu tier is a library layer. its recipes are the same ones the musl target uses,
@@ -559,7 +668,50 @@ fn cached(root: &Path, p: &Package, t: &str) -> Option<PathBuf> {
         "{}-{}-{}.{t}.tar.zst",
         p.name, p.version.upstream, p.version.rev
     ));
-    a.is_file().then_some(a)
+    if !a.is_file() {
+        return None;
+    }
+    match stale(root, p, &a) {
+        None => Some(a),
+        // an artifact whose name still fits and whose key no longer does is news. the
+        // version did not move and the thing that decides the build did
+        Some(why) => {
+            say!("{} {} {t} rebuilding  {why}", p.name, p.version.upstream);
+            None
+        }
+    }
+}
+
+// the file name carries name, version and rev, so what is left to decide is everything
+// that changes a build without moving any of them: the recipe, and the flags it compiles
+// with. the dependency closure is deliberately not in here -- see TODO
+//
+// a sidecar written before kiry recorded one of these says nothing rather than no. the
+// check would otherwise throw away a cache that is mostly still good on the day it lands
+fn stale(root: &Path, p: &Package, art: &Path) -> Option<&'static str> {
+    let mut d = art.as_os_str().to_owned();
+    d.push(".meta");
+    let d = PathBuf::from(d);
+
+    if let Ok(was) = fs::read_to_string(d.join("recipe")) {
+        match dir_hash(p) {
+            Ok(now) if now == was.trim() => {}
+            _ => return Some("recipe changed"),
+        }
+    }
+    if let Ok(was) = fs::read_to_string(d.join("flags")) {
+        let had: Vec<String> = was
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        match flags(root, &p.name, Some(&p.dir)) {
+            Ok(f) if f.record() == had => {}
+            _ => return Some("flags changed"),
+        }
+    }
+    None
 }
 
 // the attempt that started a recovery, kept beside the log the retries keep overwriting
@@ -815,6 +967,10 @@ fn compile(
     match c.status() {
         Ok(s) if s.success() => {
             trim(&dest, t, &p.name)?;
+            // after trim, so a gnu binary that gets dropped does not argue for a dep
+            for (soname, who, kind) in undeclared(root, &members, &deps, t, &dest) {
+                say!("{} {t} {kind} {who}  {soname}", p.name);
+            }
             Ok(work)
         }
         Ok(_) if verbose => Err(format!("{} {t}: build failed", p.name)),
@@ -1262,6 +1418,7 @@ fn meta(p: &Package, t: &str, hash: &str, f: &Flags, art: &Path) -> Result<(), S
     put(&d.join("version"), &format!("{}\n", p.version))?;
     put(&d.join("targets"), &format!("{t}\n"))?;
     put(&d.join("hash"), &format!("{hash}\n"))?;
+    put(&d.join("recipe"), &format!("{}\n", dir_hash(p)?))?;
     put(&d.join("users"), &format!("{}\n", p.users.join("\n")))?;
     put(&d.join("flags"), &format!("{}\n", f.record().join("\n")))?;
 
@@ -1278,6 +1435,23 @@ fn meta(p: &Package, t: &str, hash: &str, f: &Flags, art: &Path) -> Result<(), S
 // no target in here on purpose. every target of a package has to come out with the
 // same hash, which is the whole check
 fn recipe_hash(p: &Package, srcs: &[(String, PathBuf, String)]) -> Result<String, String> {
+    let mut blob = dir_blob(p)?;
+    // anything the build reads is either one of those files or a listed source
+    for (_, _, sum) in srcs {
+        blob.extend_from_slice(sum.as_bytes());
+        blob.push(b'\n');
+    }
+    kiry_core::sha256(&blob[..]).map_err(|e| e.to_string())
+}
+
+// the recipe half of the cache key, and no sources in it on purpose: a source that
+// changed is a checksums line that changed, and checksums is one of these files. that is
+// what lets a cache hit be decided without fetching anything or rehashing a tarball
+fn dir_hash(p: &Package) -> Result<String, String> {
+    kiry_core::sha256(&dir_blob(p)?[..]).map_err(|e| e.to_string())
+}
+
+fn dir_blob(p: &Package) -> Result<Vec<u8>, String> {
     let rd = fs::read_dir(&p.dir).map_err(|e| format!("{}: {e}", p.dir.display()))?;
     let mut names: Vec<String> = rd
         .flatten()
@@ -1292,13 +1466,7 @@ fn recipe_hash(p: &Package, srcs: &[(String, PathBuf, String)]) -> Result<String
         blob.extend_from_slice(format!("{n} {}\n", body.len()).as_bytes());
         blob.extend_from_slice(&body);
     }
-    // anything the build reads is either one of those files or a listed source
-    for (_, _, sum) in srcs {
-        blob.extend_from_slice(sum.as_bytes());
-        blob.push(b'\n');
-    }
-
-    kiry_core::sha256(&blob[..]).map_err(|e| e.to_string())
+    Ok(blob)
 }
 
 // what a build compiles with. /etc/kiry/config first, then /etc/kiry/pkg/<name>, and
@@ -2200,11 +2368,15 @@ fn install_cmd(args: &[String]) {
     let mut want = None;
     let mut verbose = false;
     let mut fix = false;
+    let mut dry = false;
+    let mut live = false;
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-v" => verbose = true,
+            "-n" => dry = true,
+            "--live" => live = true,
             "--recover" => fix = true,
             "--target" => match it.next() {
                 Some(t) => want = Some(t.clone()),
@@ -2215,7 +2387,9 @@ fn install_cmd(args: &[String]) {
     }
 
     let (root, force, names) = opts(&rest);
-    writes(&root);
+    if !dry {
+        writes(&root);
+    }
     if names.is_empty() {
         die("nothing to install".into());
     }
@@ -2225,7 +2399,11 @@ fn install_cmd(args: &[String]) {
     let (archives, asked): (Vec<String>, Vec<String>) =
         names.into_iter().partition(|n| n.ends_with(".tar.zst"));
     if asked.is_empty() {
-        apply_batch(&root, &archives.iter().map(PathBuf::from).collect::<Vec<_>>(), force);
+        let paths: Vec<PathBuf> = archives.iter().map(PathBuf::from).collect();
+        let going: Vec<(String, String)> = paths.iter().filter_map(|a| sidecar(a)).collect();
+        let dest = settle(&root, &going, 1, live);
+        apply_batch(&dest, &paths, force);
+        landed(&root, &dest);
         return;
     }
     if !archives.is_empty() {
@@ -2265,6 +2443,26 @@ fn install_cmd(args: &[String]) {
     }
 
     let set = wanted(&root, &seeds, &mut recipes);
+    let plan = levels(&set, &recipes);
+    if dry {
+        for (n, t) in &set {
+            let how = match cached(&root, &recipes[n], t) {
+                Some(_) => "cached",
+                None => "builds",
+            };
+            say!("{n} {} {t} {how}", recipes[n].version.upstream);
+        }
+        // the same answer the real run would get, override included
+        let (ab, why) = route(&root, &set);
+        match (ab, live) {
+            (true, true) => say!("route live  --live over A/B: {why}"),
+            (true, false) => say!("route A/B  {why}"),
+            (false, _) => say!("route live  {why}"),
+        }
+        return;
+    }
+    // decided once, before any of it is built, so a batch cannot change its mind halfway
+    let dest = settle(&root, &set, plan.len(), live);
     forecast(&root, &set, &recipes);
 
     // a level has to be in place before the one above it can build against it, which is
@@ -2278,11 +2476,12 @@ fn install_cmd(args: &[String]) {
         for (n, t) in &set {
             say!("{n} {} {t} cached", recipes[n].version.upstream);
         }
-        apply_batch(&root, &all, force);
+        apply_batch(&dest, &all, force);
+        landed(&root, &dest);
         return;
     }
 
-    for level in levels(&set, &recipes) {
+    for level in plan {
         // grouped by package, because every target of one builds before any of it is
         // packed. a musl mesa installed beside a gnu mesa that failed is exactly the
         // drift a multi-target recipe exists to prevent
@@ -2329,7 +2528,44 @@ fn install_cmd(args: &[String]) {
                 }
             }
         }
-        apply_batch(&root, &made, force);
+        apply_batch(&dest, &made, force);
+    }
+    landed(&root, &dest);
+}
+
+// the resolve every consumer does at load, run against what just landed instead of left
+// for the first time something runs it. a gnu binary wanting foo@GLIBC_2.40 against a
+// substrate providing 2.38 installs quietly and both sides of that are already indexed
+//
+// not an exit code. a soname bump leaves its consumers unresolved on purpose and the
+// queue is what fixes them, so saying so is the point and failing the install is not
+fn skew(root: &Path) {
+    let hurt = broken(root);
+    if hurt.is_empty() {
+        return;
+    }
+    let queued: HashSet<String> = db::read_queue(root)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|q| q.name)
+        .collect();
+    for (t, f) in &hurt {
+        let note = if queued.contains(&f.pkg) { "  queued" } else { "" };
+        say!("{} {t} {}{note}", f.path, f.what);
+    }
+}
+
+// the mount is transient and nothing should be left holding it. what boots the result is
+// not built yet, so the last word is where it went rather than what to do about it
+fn landed(root: &Path, dest: &Path) {
+    skew(dest);
+    if dest == root {
+        return;
+    }
+    let _ = run(Command::new("umount").arg(dest), "umount");
+    match arm() {
+        Ok((sub, num)) => say!("{sub} boots next  Boot{num}  reboot to try it, kiry commit to keep it"),
+        Err(e) => say!("staged in the inactive root, and nothing boots it: {e}"),
     }
 }
 
@@ -2384,6 +2620,363 @@ fn wanted(
         }
     }
     out
+}
+
+// the pair of root subvolumes. a transaction that cannot go live goes to whichever of
+// them is not mounted at /, as a fresh snapshot of the running one rather than a tree
+// maintained beside it: /etc, the service definitions and every config file come along by
+// copy on write and cost nothing, where two independent roots would mean an edit to
+// /etc/kiry/config vanishing the moment you booted the other one
+const ROOTS: &[&str] = &["@root-a", "@root-b"];
+
+// on /run, so a mount point left behind by a crash is gone at the next boot
+const TOP: &str = "/run/kiry/top";
+const DEST: &str = "/run/kiry/root";
+
+// the device and subvolume behind a mount point, read out of the options field
+fn mounted_at<'a>(text: &'a str, at: &str) -> Option<(&'a str, &'a str)> {
+    text.lines().find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let [dev, on, _fs, opts, ..] = f[..] else {
+            return None;
+        };
+        if on != at {
+            return None;
+        }
+        let sub = opts.split(',').find_map(|o| o.strip_prefix("subvol="))?;
+        Some((dev, sub.trim_start_matches('/')))
+    })
+}
+
+// which of the pair is running and which is not, and the device they share
+fn pair(text: &str) -> Result<(String, String, String), String> {
+    let (dev, now) =
+        mounted_at(text, "/").ok_or("nothing in /proc/mounts says which subvolume / is on")?;
+    // a root that is not one of the pair has no other half, and guessing one would name
+    // a subvolume that means nothing on this machine
+    if !ROOTS.contains(&now) {
+        return Err(format!(
+            "/ is on {now} and the a/b roots are {}",
+            ROOTS.join(" and ")
+        ));
+    }
+    let other = ROOTS
+        .iter()
+        .find(|r| **r != now)
+        .ok_or("there is only one root subvolume")?;
+    Ok((dev.to_string(), now.to_string(), (*other).to_string()))
+}
+
+// a fresh snapshot of the running root, mounted and ready to be installed into. whatever
+// the inactive subvolume held is the last cycle's tree and is replaced rather than
+// updated, because a transaction applies to what is running now
+fn inactive() -> Result<PathBuf, String> {
+    let text = fs::read_to_string("/proc/mounts").map_err(|e| format!("/proc/mounts: {e}"))?;
+    let (dev, now, other) = pair(&text)?;
+    let (top, dest) = (PathBuf::from(TOP), PathBuf::from(DEST));
+    mkdirs(&top)?;
+    mkdirs(&dest)?;
+
+    // the subvolumes sit at the top of the filesystem and nothing mounts that, so it has
+    // to be reachable before one of them can be replaced
+    run(
+        Command::new("mount")
+            .args(["-o", "subvolid=5"])
+            .arg(&dev)
+            .arg(&top),
+        "mount subvolid=5",
+    )?;
+    let made = snapshot(&top, &now, &other);
+    let _ = run(Command::new("umount").arg(&top), "umount");
+    made?;
+
+    run(
+        Command::new("mount")
+            .args(["-o", &format!("subvol={other}")])
+            .arg(&dev)
+            .arg(&dest),
+        &format!("mount {other}"),
+    )?;
+    say!("root {other} is a fresh snapshot of {now}");
+    Ok(dest)
+}
+
+fn snapshot(top: &Path, now: &str, other: &str) -> Result<(), String> {
+    let at = top.join(other);
+    if at.exists() {
+        run(
+            Command::new("btrfs").args(["subvolume", "delete"]).arg(&at),
+            &format!("btrfs subvolume delete {other}"),
+        )?;
+    }
+    run(
+        Command::new("btrfs")
+            .args(["subvolume", "snapshot"])
+            .arg(top.join(now))
+            .arg(&at),
+        &format!("btrfs subvolume snapshot {now} {other}"),
+    )
+}
+
+// the uefi entry that boots one of the pair. the label names the subvolume and the image
+// name carries no kernel version, so a kernel bump rewrites both files and leaves the two
+// entries alone -- an entry whose device path has to be rewritten every bump is one that
+// is wrong for the hours between the bump and the rewrite
+fn label(sub: &str) -> String {
+    format!("kiry {sub}")
+}
+
+fn efi() -> Result<String, String> {
+    let out = Command::new("efibootmgr")
+        .output()
+        .map_err(|e| format!("efibootmgr: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("efibootmgr: {}", out.status));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("efibootmgr: {e}"))
+}
+
+// BootCurrent, BootOrder and BootNext all start with Boot too, so four hex digits and the
+// active marker are what separates an entry line from a header
+fn entry(l: &str) -> Option<(&str, &str)> {
+    let rest = l.strip_prefix("Boot")?;
+    if rest.len() < 5 {
+        return None;
+    }
+    let (num, tail) = rest.split_at(4);
+    if !num.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // the device path follows the label after a tab whether or not -v was asked for, so
+    // the label is what comes before the first one
+    let text = tail.strip_prefix('*').unwrap_or(tail);
+    Some((num, text.split('\t').next().unwrap_or(text).trim()))
+}
+
+fn entry_for(text: &str, sub: &str) -> Option<String> {
+    let want = label(sub);
+    text.lines()
+        .find_map(|l| entry(l).filter(|(_, n)| *n == want).map(|(n, _)| n.to_string()))
+}
+
+fn current(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("BootCurrent:"))
+        .map(|n| n.trim().to_string())
+}
+
+fn order(text: &str) -> Vec<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("BootOrder:"))
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+// first in BootOrder is the whole of what committed means. a marker file beside it could
+// disagree with the firmware, and the firmware is the one that decides
+fn reorder(num: &str, was: &[String]) -> Vec<String> {
+    let mut now = vec![num.to_string()];
+    now.extend(was.iter().filter(|n| *n != num).cloned());
+    now
+}
+
+fn commits(num: &str, was: &[String]) -> Result<(), String> {
+    run(
+        Command::new("efibootmgr").args(["-o", &reorder(num, was).join(",")]),
+        "efibootmgr -o",
+    )
+}
+
+// the inactive root gets one boot to prove itself. BootNext is one shot in the firmware,
+// so a root that never reaches kiry commit is left behind by the boot after it with
+// nothing to undo and nothing to time out
+fn arm() -> Result<(String, String), String> {
+    let text = fs::read_to_string("/proc/mounts").map_err(|e| format!("/proc/mounts: {e}"))?;
+    let (_, _, other) = pair(&text)?;
+    let seen = efi()?;
+    let num = entry_for(&seen, &other).ok_or(format!("no uefi entry named {}", label(&other)))?;
+    run(
+        Command::new("efibootmgr").args(["-n", &num]),
+        "efibootmgr -n",
+    )?;
+    Ok((other, num))
+}
+
+// what says an installed elf cannot run, which is the question a trial boot has to answer
+// before it is allowed to become the one that boots. the rest of what doctor reports is
+// worth reading and is not worth refusing a commit over: duplicate symbols across two
+// libraries that genuinely both export a name is a standing condition, not a regression
+fn broken(root: &Path) -> Vec<(String, Finding)> {
+    let mut out = Vec::new();
+    let world = everywhere(root);
+    for t in db::targets(root).unwrap_or_default() {
+        for f in check(root, &t, &world) {
+            if f.what.breaks() {
+                out.push((t.clone(), f));
+            }
+        }
+    }
+    out
+}
+
+// where the transaction lands, said whichever way it goes
+fn settle(root: &Path, going: &[(String, String)], levels: usize, live: bool) -> PathBuf {
+    let (ab, why) = route(root, going);
+    if !ab {
+        say!("route live  {why}");
+        return root.to_path_buf();
+    }
+    // overruled rather than reconsidered, and the reason is still printed. what is worth
+    // having in a log six months later is which answer was set aside, not that one was
+    if live {
+        say!("route live  --live over A/B: {why}");
+        return root.to_path_buf();
+    }
+    say!("route A/B  {why}");
+    // level N has to be installed before N+1 can build against it, and under A/B the
+    // levels land in a root the build cannot see. one level is what this handles, and
+    // the rest is refused rather than got quietly wrong
+    if levels > 1 {
+        die("this needs levels built in order, which the inactive root cannot do yet. install what it depends on first".into());
+    }
+    match inactive() {
+        Ok(d) => d,
+        Err(e) => die(e),
+    }
+}
+
+// name and target out of a built artifact's sidecar, which is where identity lives -- the
+// file name is a display name and a version can contain the - that separates its fields
+fn sidecar(art: &Path) -> Option<(String, String)> {
+    let d = PathBuf::from(format!("{}.meta", art.display()));
+    let one = |f: &str| plain(&d.join(f)).into_iter().next();
+    Some((one("name")?, one("targets")?))
+}
+
+// the kernel and the two libcs. what breaks when one of these is replaced under a running
+// system is not the file, which the loader already has open, but the next boot
+const SUBSTRATE: &[&str] = &["linux", "musl", "glibc"];
+
+// which root a transaction belongs in. routing every install through the inactive
+// subvolume is right for a libc and absurd for a new cli tool, and it is decidable rather
+// than a question worth asking: kiry knows every file the batch replaces, and /proc says
+// which of them something running still has mapped
+fn route(root: &Path, going: &[(String, String)]) -> (bool, String) {
+    // first, and not one of the reasons below. a/b means snapshotting the subvolume the
+    // machine is running from, so it is a property of / and of nothing else -- a staging
+    // root asked about a libc must not reach anything that touches the real filesystem
+    let at = root.canonicalize();
+    if at.as_deref().unwrap_or(root) != Path::new("/") {
+        return (false, "not the running root".to_string());
+    }
+    match why_ab(root, going) {
+        Some(w) => (true, w),
+        None => (false, nothing_open(root, going)),
+    }
+}
+
+// what the transaction touches that a live install cannot answer for
+fn why_ab(root: &Path, going: &[(String, String)]) -> Option<String> {
+    for (name, _) in going {
+        if SUBSTRATE.contains(&name.as_str()) {
+            return Some(format!("{name} is a libc or the kernel"));
+        }
+        // core is the base and the toolchain that builds it. a package there is under
+        // enough of the system that "nothing has it open" is not the question
+        if repo_of(root, name).as_deref() == Some("core") {
+            return Some(format!("{name} is in core"));
+        }
+    }
+    let (open, blind) = mapped();
+    let mut worst: Option<(usize, String, String)> = None;
+    for (name, target) in going {
+        // what a job replaces is what the version going out already owns. a package
+        // arriving for the first time replaces nothing
+        let Ok(old) = db::read(root, target, name) else {
+            continue;
+        };
+        for e in &old.manifest {
+            if matches!(e.kind, db::Kind::Dir) {
+                continue;
+            }
+            let Some(n) = open.get(&e.path) else { continue };
+            if worst.as_ref().is_none_or(|(w, _, _)| n > w) {
+                worst = Some((*n, name.clone(), e.path.clone()));
+            }
+        }
+    }
+    let (n, pkg, path) = worst?;
+    Some(format!(
+        "{pkg} replaces /{path}, mapped by {n} running {}{}",
+        if n == 1 { "process" } else { "processes" },
+        unsure(blind)
+    ))
+}
+
+fn nothing_open(_root: &Path, _going: &[(String, String)]) -> String {
+    format!("nothing a running process has mapped{}", unsure(mapped().1))
+}
+
+// a maps file that would not open is a process this cannot answer for, and saying so
+// beats reporting live on the strength of what could not be read
+fn unsure(blind: usize) -> String {
+    match blind {
+        0 => String::new(),
+        n => format!(", {n} could not be read"),
+    }
+}
+
+// which repo holds the recipe for a name, or nothing when no repo does
+fn repo_of(root: &Path, name: &str) -> Option<String> {
+    let d = recipe(root, name)?;
+    let up = d.parent()?;
+    Some(up.file_name()?.to_string_lossy().into_owned())
+}
+
+// every file a running process has mapped, and how many of them have it, with a count of
+// the processes that could not be read. none of the five fields before the path contains
+// a slash, so the path is everything from the first one to the end of the line -- which
+// is also what keeps a path with a space in it whole
+fn mapped() -> (HashMap<String, usize>, usize) {
+    let mut out: HashMap<String, usize> = HashMap::new();
+    let mut blind = 0;
+    let Ok(rd) = fs::read_dir("/proc") else {
+        return (out, 1);
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str() else { continue };
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let text = match fs::read_to_string(e.path().join("maps")) {
+            Ok(t) => t,
+            // exited between the readdir and the open, which is not a blind spot
+            Err(x) if x.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                blind += 1;
+                continue;
+            }
+        };
+        // one process maps a library in several segments and is still one process
+        let mut mine: BTreeSet<&str> = BTreeSet::new();
+        for l in text.lines() {
+            let Some(at) = l.find('/') else { continue };
+            // a file that has been deleted is still mapped, and /proc keeps its name
+            let path = l[at + 1..].trim_end().trim_end_matches("(deleted)").trim_end();
+            if !path.is_empty() {
+                mine.insert(path);
+            }
+        }
+        for path in mine {
+            *out.entry(path.to_string()).or_insert(0) += 1;
+        }
+    }
+    (out, blind)
 }
 
 fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
@@ -2674,8 +3267,9 @@ fn rebuild_cmd(args: &[String]) {
             want.push((q.name, q.target));
         }
     }
+    let world = everywhere(&root);
     for t in &targets {
-        for f in check(&root, t) {
+        for f in check(&root, t, &world) {
             if f.what.rebuilds() && !want.contains(&(f.pkg.clone(), t.clone())) {
                 want.push((f.pkg.clone(), t.clone()));
             }
@@ -2762,8 +3356,9 @@ fn rebuild_cmd(args: &[String]) {
     }
 
     let mut left = 0;
+    let world = everywhere(&root);
     for t in &targets {
-        for f in check(&root, t) {
+        for f in check(&root, t, &world) {
             if f.what.rebuilds() {
                 say!("{} {t} {}", f.path, f.what);
                 left += 1;
@@ -3440,6 +4035,86 @@ fn promote_cmd(args: &[String]) {
     }
 }
 
+// the two halves of the a/b pair, said from the machine they belong to. --root names a
+// tree and a boot entry is not in one, so anything but / here is a question the firmware
+// cannot be asked
+fn roots(args: &[String], what: &str) -> Result<(String, String), String> {
+    let (root, _, rest) = opts(args);
+    if let Some(a) = rest.first() {
+        die(format!("{what} takes no arguments, got {a}"));
+    }
+    let at = root.canonicalize();
+    if at.as_deref().unwrap_or(&root) != Path::new("/") {
+        die(format!("{what} is about this machine's own roots, and --root names a tree"));
+    }
+    let text = fs::read_to_string("/proc/mounts").map_err(|e| format!("/proc/mounts: {e}"))?;
+    let (_, now, other) = pair(&text)?;
+    Ok((now, other))
+}
+
+fn commit_cmd(args: &[String]) {
+    let (now, _) = match roots(args, "commit") {
+        Ok(r) => r,
+        Err(e) => die(e),
+    };
+    let seen = match efi() {
+        Ok(t) => t,
+        Err(e) => die(e),
+    };
+    let Some(num) = entry_for(&seen, &now) else {
+        die(format!("no uefi entry named {}", label(&now)));
+    };
+    // the entry that was booted, not the one that matches the subvolume. they differ when
+    // some third entry reaches the same root, and an entry that has not been through a
+    // boot is one nothing has proved
+    match current(&seen) {
+        Some(c) if c == num => {}
+        Some(c) => die(format!(
+            "this boot came from Boot{c} and {now} is Boot{num}, so there is nothing here to keep"
+        )),
+        None => die("efibootmgr says nothing about BootCurrent".into()),
+    }
+    let was = order(&seen);
+    if was.first() == Some(&num) {
+        say!("{now} is already what boots");
+        return;
+    }
+
+    // the whole point of the gate. a root that will not boot is caught by never reaching
+    // here at all; this is for the one that boots and is wrong
+    let bad = broken(Path::new("/"));
+    if !bad.is_empty() {
+        for (t, f) in &bad {
+            say!("{} {t} {}", f.path, f.what);
+        }
+        die(format!("{} of those, so {now} stays a trial", bad.len()));
+    }
+    if let Err(e) = commits(&num, &was) {
+        die(e);
+    }
+    say!("{now} boots from now on  Boot{num}");
+}
+
+fn rollback_cmd(args: &[String]) {
+    let (now, other) = match roots(args, "rollback") {
+        Ok(r) => r,
+        Err(e) => die(e),
+    };
+    let seen = match efi() {
+        Ok(t) => t,
+        Err(e) => die(e),
+    };
+    let Some(num) = entry_for(&seen, &other) else {
+        die(format!("no uefi entry named {}", label(&other)));
+    };
+    // no gate going this way. back to the root that was booting before is the direction
+    // that needs no permission, and the tree being left is the one under suspicion
+    if let Err(e) = commits(&num, &order(&seen)) {
+        die(e);
+    }
+    say!("{other} boots from now on  reboot to leave {now}");
+}
+
 // the recipes on offer, which nothing else answers: l lists what is installed and a
 // package that is not cannot be found at all otherwise
 fn search_cmd(args: &[String]) {
@@ -3858,8 +4533,9 @@ fn doctor_cmd(args: &[String]) {
     };
 
     let mut found = 0;
+    let world = everywhere(&root);
     for t in &targets {
-        for f in check(&root, t) {
+        for f in check(&root, t, &world) {
             say!("{} {t} {}", f.path, f.what);
             found += 1;
         }
@@ -4049,6 +4725,7 @@ enum What {
     Duplicate(usize, String),
     MissingUser(String),
     TargetDrift(String),
+    Undeclared(&'static str, String, String, String),
     Modified,
     Unowned,
 }
@@ -4066,6 +4743,7 @@ impl fmt::Display for What {
             What::Duplicate(n, p) => write!(f, "duplicate-symbols {n} {p}"),
             What::MissingUser(u) => write!(f, "missing-user {u}"),
             What::TargetDrift(o) => write!(f, "target-drift {o}"),
+            What::Undeclared(k, who, s, at) => write!(f, "{k} {who} {s} {at}"),
             What::Modified => write!(f, "modified"),
             What::Unowned => write!(f, "unowned"),
         }
@@ -4076,9 +4754,138 @@ impl What {
     fn rebuilds(&self) -> bool {
         matches!(self, What::Unresolved(_) | What::MissingSymbol(_))
     }
+
+    // the three that mean a file on disk will not run, as against the ones worth reading
+    fn breaks(&self) -> bool {
+        matches!(
+            self,
+            What::Unresolved(_) | What::MissingSymbol(_) | What::NoInterpreter(_)
+        )
+    }
 }
 
-fn check(root: &Path, target: &str) -> Vec<Finding> {
+type Scan = Result<(db::Installed, Vec<(String, install::Seen)>), String>;
+
+// reading one package's files says nothing about any other package's, and the box has
+// sixteen threads. everything after this is an index, which is order-dependent, so the
+// results come back in the order the names were in
+fn scans(root: &Path, target: &str, names: &[String]) -> Vec<Scan> {
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|s| {
+        for _ in 0..jobs().min(names.len()) {
+            let tx = tx.clone();
+            let next = &next;
+            s.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(name) = names.get(i) else { return };
+                let one = db::read(root, target, name)
+                    .map_err(|e| e.to_string())
+                    .and_then(|rec| {
+                        install::scan(root, &rec.manifest)
+                            .map_err(|e| e.to_string())
+                            .map(|seen| (rec, seen))
+                    });
+                let _ = tx.send((i, one));
+            });
+        }
+    });
+    drop(tx);
+    let mut out: Vec<Option<Scan>> = (0..names.len()).map(|_| None).collect();
+    for (i, one) in rx {
+        out[i] = Some(one);
+    }
+    out.into_iter().flatten().collect()
+}
+
+// a package linking a library that nothing in its own depends can account for. it
+// resolves today because something else dragged the owner in, and it stops resolving the
+// day that something else stops asking -- with nothing written down that says why
+//
+// build-only is the worse half: the owner is reachable as a tool and not as a runtime
+// edge, so this works here and not on a root built from the recipes
+fn accounted(
+    target: &str,
+    deps: &HashMap<String, Vec<Dep>>,
+    elves: &[(String, elf::Elf)],
+    owners: &[String],
+    needs: &[Vec<usize>],
+) -> Vec<Finding> {
+    let mut edges: HashMap<&str, (HashSet<String>, HashSet<String>)> = HashMap::new();
+    let mut uniq: Vec<&str> = owners.iter().map(String::as_str).collect();
+    uniq.sort_unstable();
+    uniq.dedup();
+    for name in uniq {
+        let Some(own) = deps.get(name) else {
+            continue;
+        };
+        let mut direct: HashSet<String> = own
+            .iter()
+            .filter(|d| !d.make && d.applies(target))
+            .map(|d| d.name.clone())
+            .collect();
+        direct.extend(
+            sandbox::substrate(target)
+                .iter()
+                .filter(|(_, make)| !make)
+                .map(|(n, _)| (*n).to_string()),
+        );
+        let mut reach: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = direct.iter().cloned().collect();
+        while let Some(n) = queue.pop() {
+            if !reach.insert(n.clone()) {
+                continue;
+            }
+            if let Some(r) = deps.get(&n) {
+                queue.extend(
+                    r.iter()
+                        .filter(|d| !d.make && d.applies(target))
+                        .map(|d| d.name.clone()),
+                );
+            }
+        }
+        edges.insert(name, (direct, reach));
+    }
+
+    let mut said: HashSet<(&str, &str, &str)> = HashSet::new();
+    let mut out = Vec::new();
+    for (i, providers) in needs.iter().enumerate() {
+        let me = owners[i].as_str();
+        let Some((direct, reach)) = edges.get(me) else {
+            continue;
+        };
+        for &j in providers {
+            let who = owners[j].as_str();
+            if who == me || direct.contains(who) {
+                continue;
+            }
+            let soname = elves[j].1.soname.as_deref().unwrap_or(&elves[j].0);
+            if !said.insert((me, who, soname)) {
+                continue;
+            }
+            let kind = if reach.contains(who) {
+                "undeclared"
+            } else {
+                "build-only"
+            };
+            // the package, not the file: the fix is a line in its depends, and every
+            // other file of it linking the same library is the same missing line
+            out.push(Finding {
+                pkg: me.to_string(),
+                path: me.to_string(),
+                what: What::Undeclared(
+                    kind,
+                    who.to_string(),
+                    soname.to_string(),
+                    elves[i].0.clone(),
+                ),
+            });
+        }
+    }
+    out
+}
+
+fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
     let Some(dirs) = defaults(target) else {
         return vec![Finding {
             pkg: "-".into(),
@@ -4103,21 +4910,20 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
     // ships /usr/bin/perl beside perl5.44.0
     let mut present: HashSet<String> = HashSet::new();
     let mut out: Vec<Finding> = Vec::new();
+    // every installed name of this target is in names, so this is the whole graph and
+    // nothing has to go back to disk for a depends the scan already read
+    let mut deps: HashMap<String, Vec<Dep>> = HashMap::new();
 
-    for name in &names {
-        let rec = match db::read(root, target, name) {
-            Ok(r) => r,
-            Err(e) => die(e.to_string()),
+    for (name, one) in names.iter().zip(scans(root, target, &names)) {
+        let (mut rec, seen) = match one {
+            Ok(x) => x,
+            Err(e) => die(e),
         };
+        deps.insert(name.clone(), std::mem::take(&mut rec.depends));
         // the loader opens a path, so a symlink on the way to a library is part of
         // resolution. musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1
         // points at the loader itself
         index(&rec.manifest, &mut present, &mut links);
-
-        let seen = match install::scan(root, &rec.manifest) {
-            Ok(s) => s,
-            Err(e) => die(e.to_string()),
-        };
 
         let mut mine = Vec::new();
         for (path, what) in seen {
@@ -4198,9 +5004,11 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
         }
     }
 
+    out.extend(accounted(target, &deps, &elves, &owners, &needs));
+
     // the kernel will not start a script whose interpreter is not there, which is the
     // same failure DT_NEEDED describes and nothing was checking it
-    let (anywhere, anylinks) = everywhere(root);
+    let (anywhere, anylinks) = world;
     for (pkg, path, words) in &shebangs {
         let mut want = words[0].trim_start_matches('/').to_string();
         // env looks the real one up on PATH, so that is the name that has to exist
@@ -4216,11 +5024,11 @@ fn check(root: &Path, target: &str) -> Vec<Finding> {
             }
         }
         let there = if want.contains('/') {
-            exists(&anywhere, &anylinks, &want)
+            exists(anywhere, anylinks, &want)
         } else {
             ["usr/bin", "usr/sbin"]
                 .iter()
-                .any(|d| exists(&anywhere, &anylinks, &format!("{d}/{want}")))
+                .any(|d| exists(anywhere, anylinks, &format!("{d}/{want}")))
         };
         if !there {
             out.push(Finding {
@@ -4349,7 +5157,11 @@ fn index(
 // a shebang names a path and a path has no tier. /bin/sh runs whatever libc built it,
 // so glibc's own scripts reach the busybox sh the musl side owns. linkage stays inside
 // one target -- that is what cross-tier exists to catch -- but this does not
-fn everywhere(root: &Path) -> (HashSet<String>, HashMap<String, String>) {
+type World = (HashSet<String>, HashMap<String, String>);
+
+// every path either target installs, for the interpreter check: a script names one file
+// and nothing says which target owns it
+fn everywhere(root: &Path) -> World {
     let mut present = HashSet::new();
     let mut links = HashMap::new();
     let Ok(targets) = db::targets(root) else {
@@ -4541,6 +5353,171 @@ fn show(args: &[String]) {
             .and_then(|s| s.get(..8))
             .unwrap_or("--------");
         say!("src {sum} {src}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod mounts {
+    use super::*;
+
+    const REAL: &str = "\
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+/dev/mapper/cryptroot / btrfs rw,noatime,compress=zstd:1,ssd,subvolid=256,subvol=/@root-a 0 0
+/dev/mapper/cryptroot /var btrfs rw,noatime,compress=zstd:1,ssd,subvolid=259,subvol=/@var 0 0
+/dev/nvme0n1p1 /efi vfat rw,noatime,fmask=0077 0 0
+";
+
+    // efibootmgr with no -v, copied off this machine. the two headers start with Boot as
+    // well, an entry that is not active prints a space where the star goes, and the device
+    // path comes after the label separated by a tab even though -v was not asked for
+    const EFI: &str = "\
+BootCurrent: 0002
+Timeout: 1 seconds
+BootOrder: 0001,0000,0002
+Boot0000* kiry 7.2.3\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-7.2.3.efi
+Boot0001* kiry @root-a\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-a.efi
+Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.efi
+";
+
+    #[test]
+    fn a_header_that_starts_with_boot_is_not_an_entry() {
+        let got: Vec<&str> = EFI.lines().filter_map(entry).map(|(n, _)| n).collect();
+        assert_eq!(got, ["0000", "0001", "0002"]);
+    }
+
+    #[test]
+    fn an_entry_is_found_by_the_subvolume_its_label_names() {
+        assert_eq!(entry_for(EFI, "@root-a").as_deref(), Some("0001"));
+        assert_eq!(entry_for(EFI, "@root-b").as_deref(), Some("0002"));
+        assert_eq!(entry_for(EFI, "@root-c"), None);
+    }
+
+    #[test]
+    fn an_inactive_entry_is_still_found() {
+        let (num, name) = entry("Boot0002  kiry @root-b\tHD(1,GPT,x)/File").unwrap();
+        assert_eq!((num, name), ("0002", "kiry @root-b"));
+    }
+
+    #[test]
+    fn the_label_stops_at_the_device_path() {
+        let (_, name) = entry(EFI.lines().nth(4).unwrap()).unwrap();
+        assert_eq!(name, "kiry @root-a");
+    }
+
+    #[test]
+    fn the_order_is_read_and_the_entry_moves_to_the_front_of_it_once() {
+        let was = order(EFI);
+        assert_eq!(was, ["0001", "0000", "0002"]);
+        assert_eq!(reorder("0002", &was), ["0002", "0001", "0000"]);
+        // already first, and the one that is already there does not get a second place
+        assert_eq!(reorder("0001", &was), ["0001", "0000", "0002"]);
+    }
+
+    #[test]
+    fn the_entry_that_was_booted_is_read_and_is_not_the_one_the_subvolume_names() {
+        assert_eq!(current(EFI).as_deref(), Some("0002"));
+        // / is on @root-a in REAL, whose entry is 0001, and this boot came from 0002
+        let (_, now, _) = pair(REAL).unwrap();
+        assert_eq!(entry_for(EFI, &now).as_deref(), Some("0001"));
+        assert_ne!(current(EFI), entry_for(EFI, &now));
+    }
+
+    #[test]
+    fn a_root_already_at_the_front_is_already_committed() {
+        assert_eq!(order(EFI).first().map(String::as_str), Some("0001"));
+        assert_eq!(entry_for(EFI, "@root-a").as_deref(), Some("0001"));
+    }
+
+    #[test]
+    fn only_what_stops_an_elf_running_refuses_a_commit() {
+        assert!(What::Unresolved("libfoo.so.1".into()).breaks());
+        assert!(What::MissingSymbol("foo".into()).breaks());
+        assert!(What::NoInterpreter("x".into()).breaks());
+        assert!(!What::Duplicate(3, "usr/lib/libbar.so".into()).breaks());
+        assert!(!What::Unowned.breaks());
+        assert!(!What::Modified.breaks());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("kiry-m-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // a/b is decided for / and these rules never fire anywhere else, so they are reached
+    // directly rather than through a command that would refuse first
+    #[test]
+    fn a_libc_or_the_kernel_is_reason_enough() {
+        let at = scratch("substrate");
+        for n in ["musl", "glibc", "linux"] {
+            let why = why_ab(&at, &[(n.to_string(), "x86_64-musl".into())]);
+            assert_eq!(why.as_deref(), Some(&*format!("{n} is a libc or the kernel")));
+        }
+        assert!(why_ab(&at, &[("foot".to_string(), "x86_64-musl".into())]).is_none());
+    }
+
+    // core is the base and the toolchain that builds it, so a package there is under
+    // enough of the system that "nothing has it open" is not the question
+    #[test]
+    fn a_recipe_in_core_is_reason_enough() {
+        let at = scratch("incore");
+        let core = at.join("var/db/kiry/core/deep");
+        let extra = at.join("var/db/kiry/extra/shallow");
+        for d in [&core, &extra] {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("build"), ":\n").unwrap();
+        }
+        let one = |n: &str| why_ab(&at, &[(n.to_string(), "x86_64-musl".into())]);
+        assert_eq!(one("deep").as_deref(), Some("deep is in core"));
+        assert!(one("shallow").is_none(), "extra is not core");
+        assert!(one("nowhere").is_none(), "a name no repo has is not core");
+    }
+
+    #[test]
+    fn the_running_root_comes_out_of_its_mount_options() {
+        let (dev, sub) = mounted_at(REAL, "/").unwrap();
+        assert_eq!(dev, "/dev/mapper/cryptroot");
+        // subvol= carries a leading slash and a subvolume name does not
+        assert_eq!(sub, "@root-a");
+        assert_eq!(mounted_at(REAL, "/var").unwrap().1, "@var");
+        assert!(mounted_at(REAL, "/nowhere").is_none());
+    }
+
+    // /proc is first in the file and is not btrfs, so a parser that took the first line
+    // or the first field would answer with it
+    #[test]
+    fn a_mount_that_is_not_the_one_asked_for_is_skipped() {
+        assert!(mounted_at("proc /proc proc rw 0 0\n", "/").is_none());
+        assert!(mounted_at("/dev/sda1 / ext4 rw 0 0\n", "/").is_none());
+    }
+
+    #[test]
+    fn the_other_half_of_the_pair_is_the_one_not_running() {
+        let (dev, now, other) = pair(REAL).unwrap();
+        assert_eq!(dev, "/dev/mapper/cryptroot");
+        assert_eq!(now, "@root-a");
+        assert_eq!(other, "@root-b");
+
+        let flipped = REAL.replace("subvol=/@root-a", "subvol=/@root-b");
+        let (_, now, other) = pair(&flipped).unwrap();
+        assert_eq!((now.as_str(), other.as_str()), ("@root-b", "@root-a"));
+    }
+
+    // a root outside the pair has no other half, and naming one would name a subvolume
+    // that means nothing on this machine
+    #[test]
+    fn a_root_outside_the_pair_is_refused_by_name() {
+        let odd = REAL.replace("subvol=/@root-a", "subvol=/@something");
+        let e = pair(&odd).unwrap_err();
+        assert!(e.contains("@something"), "{e}");
+        assert!(e.contains("@root-a") && e.contains("@root-b"), "{e}");
+
+        let e = pair("proc /proc proc rw 0 0\n").unwrap_err();
+        assert!(e.contains("which subvolume"), "{e}");
     }
 }
 
@@ -4762,5 +5739,110 @@ mod tests {
             .output()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod deps {
+    use super::*;
+
+    const T: &str = "x86_64-musl";
+
+    fn rec(root: &Path, name: &str, deps: &[Dep]) {
+        db::write(
+            root,
+            &db::Installed {
+                name: name.into(),
+                target: T.into(),
+                version: pkg::Version::parse("1.0 1").unwrap(),
+                depends: deps.to_vec(),
+                manifest: Vec::new(),
+                hash: String::new(),
+                users: Vec::new(),
+                flags: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn dep(name: &str, make: bool) -> Dep {
+        Dep {
+            name: name.into(),
+            make,
+            host: make,
+            only: None,
+        }
+    }
+
+    // a real binary with real DT_NEEDED entries, so what gets tested is the walk from a
+    // soname to the member carrying it rather than a fixture's idea of what one is
+    fn fixture(name: &str) -> (PathBuf, Vec<sandbox::Member>, PathBuf, String) {
+        let d = std::env::temp_dir()
+            .join(format!("kiry-undecl-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&d);
+        let (root, dest) = (d.join("root"), d.join("dest"));
+        fs::create_dir_all(&dest).unwrap();
+
+        let me = std::env::current_exe().unwrap();
+        fs::copy(&me, dest.join("thing")).unwrap();
+        let want = elf::read(&me).unwrap().needed.first().cloned().unwrap();
+
+        rec(&root, "carrier", &[]);
+        db::write_provides(
+            &root,
+            T,
+            "carrier",
+            &[db::Provide {
+                soname: want.clone(),
+                versioned: false,
+                path: "usr/lib/carrier.so".into(),
+            }],
+        )
+        .unwrap();
+
+        let members = vec![sandbox::Member {
+            name: "carrier".into(),
+            direct: false,
+            target: T.into(),
+        }];
+        (root, members, dest, want)
+    }
+
+    #[test]
+    fn a_library_a_declared_dep_carries_is_not_reported() {
+        let (root, members, dest, _) = fixture("direct");
+        let deps = [dep("carrier", false)];
+        assert!(undeclared(&root, &members, &deps, T, &dest).is_empty());
+    }
+
+    // it is there because something else asked for it, and the day that something stops
+    // asking this package stops linking with no line anywhere explaining why
+    #[test]
+    fn a_library_reached_through_a_declared_deps_own_deps_is_undeclared() {
+        let (root, members, dest, want) = fixture("indirect");
+        rec(&root, "parent", &[dep("carrier", false)]);
+        let deps = [dep("parent", false)];
+        let got = undeclared(&root, &members, &deps, T, &dest);
+        assert!(
+            got.iter()
+                .any(|(s, who, k)| *s == want && who == "carrier" && *k == "undeclared"),
+            "{got:?}"
+        );
+    }
+
+    // the worse one. nothing installs a make dep because something links it, so this
+    // builds here and the package does not run on a root that never built it
+    #[test]
+    fn a_library_only_a_make_dep_carries_is_build_only() {
+        let (root, members, dest, want) = fixture("makeonly");
+        let deps = [dep("carrier", true)];
+        let got = undeclared(&root, &members, &deps, T, &dest);
+        assert!(
+            got.iter()
+                .any(|(s, who, k)| *s == want && who == "carrier" && *k == "build-only"),
+            "{got:?}"
+        );
     }
 }

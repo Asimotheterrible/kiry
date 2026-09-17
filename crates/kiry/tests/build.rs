@@ -3462,3 +3462,74 @@ fn an_edited_recipe_takes_the_cached_artifact_out_of_play() {
         "the build script moved and the old artifact is still on offer: {said}"
     );
 }
+
+// a root holding one recipe and one installed record of it, with no artifact anywhere:
+// what the sets are read off is the db and the tree, and neither needs a build
+fn set_root(at: &Path, installed: &str, in_tree: &str) -> PathBuf {
+    let root = at.join("root");
+    let d = root.join("var/db/kiry/core/hello");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("version"), format!("{in_tree}\n")).unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(d.join("sources"), "").unwrap();
+    fs::write(d.join("checksums"), "").unwrap();
+    fs::write(d.join("build"), "true\n").unwrap();
+    db::write(
+        &root,
+        &db::Installed {
+            name: "hello".into(),
+            target: "x86_64-musl".into(),
+            version: Version::parse(installed).unwrap(),
+            depends: Vec::new(),
+            manifest: Vec::new(),
+            hash: String::new(),
+            users: Vec::new(),
+            flags: Vec::new(),
+        },
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn outdated_names_what_the_tree_has_moved_past() {
+    let at = scratch("outdated");
+    let root = set_root(&at, "1.0 1", "2.0 1");
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), "@outdated"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("hello 1.0 1 -> 2.0 1"), "{out}");
+}
+
+// the same version in both places is not an upgrade, and a set that came back empty is
+// nothing to do rather than an error
+#[test]
+fn outdated_says_nothing_when_the_tree_agrees() {
+    let at = scratch("uptodate");
+    let root = set_root(&at, "1.0 1", "1.0 1");
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), "@outdated"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!out.contains("hello"), "{out}");
+}
+
+#[test]
+fn world_names_everything_installed() {
+    let at = scratch("world");
+    let root = set_root(&at, "1.0 1", "1.0 1");
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), "@world"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("hello"), "{out}");
+}
+
+#[test]
+fn a_set_that_is_not_one_is_refused() {
+    let at = scratch("noset");
+    let root = set_root(&at, "1.0 1", "1.0 1");
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), "@nope"]);
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("no set called @nope"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

@@ -4089,6 +4089,14 @@ fn sync_cmd(args: &[String]) {
                                     .push(format!("{f} differs from {}", old.join(f).display())),
                             }
                         }
+                        // the note above says where alpine's build is. this says what
+                        // is in it, which is the part that predicts a broken build: a
+                        // recipe kept from before alpine moved to a git archive calls
+                        // configure on a tree that has none
+                        if !b.missing.is_empty() {
+                            notes.push("alpine's prepare does what ours does not".into());
+                            notes.extend(b.missing.iter().map(|l| format!("  {l}")));
+                        }
                         notes.extend(b.moved);
                         if !b.upstream.is_empty() {
                             notes.push("alpine changed build()".into());
@@ -4203,6 +4211,111 @@ fn moved_upstream(was: &str, is: &str) -> Vec<String> {
             .map(|l| format!("- {}", l.trim())),
     );
     out
+}
+
+// prepare runs against whatever sources fetched, so the two move together and carry
+// splits them: sources comes from the conversion and build stays this tree's. alpine
+// swapping a release tarball for a git archive puts the bootstrap step in their prepare
+// and leaves ours calling configure on a tree that has none. libfm, xz and libtool all
+// went that way
+fn prepared(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for l in text.lines() {
+        if l.starts_with("prepare()") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if l.starts_with('}') {
+            break;
+        }
+        let t = l.trim();
+        // a comment is alpine's reasoning about their own tree, and default_prepare
+        // heads every converted prepare there is. neither is a step this one is missing
+        if t.is_empty() || t.starts_with('#') || t == "default_prepare" {
+            continue;
+        }
+        out.push(t);
+    }
+    out
+}
+
+// what alpine's prepare does that ours does not. one direction only, for the same reason
+// depends is: ours drops their test-suite surgery and bundled-library removal on purpose,
+// and reading that back as a finding is a page of saying nothing
+fn unprepared(ours: &str, fresh: &str) -> Vec<String> {
+    let mine = prepared(ours);
+    prepared(fresh)
+        .into_iter()
+        .filter(|l| !mine.contains(l))
+        .map(|l| format!("+ {l}"))
+        .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod bumps {
+    use super::*;
+
+    const ALPINE: &str = "\
+pkgver=1.4.0
+source=\"https://github.com/lxde/libfm/archive/$pkgver.tar.gz\"
+
+prepare() {
+\tdefault_prepare
+\t# needs regenerating, the archive is a git tag
+\t./autogen.sh
+}
+
+build() {
+\t./configure --prefix=/usr
+\tmake
+}
+";
+
+    // the shape that shipped a broken libfm: ours predates alpine moving to a git
+    // archive, so it configures a tree that has no configure in it
+    const OURS: &str = "\
+pkgver=1.3.2
+source=\"https://downloads.sourceforge.net/libfm/libfm-$pkgver.tar.xz\"
+
+build() {
+\t./configure --prefix=/usr --disable-old-actions
+\tmake
+}
+";
+
+    #[test]
+    fn a_prepare_step_alpine_has_and_ours_lacks_is_named() {
+        assert_eq!(unprepared(OURS, ALPINE), vec!["+ ./autogen.sh"]);
+    }
+
+    // ours drops their test surgery and unbundling deliberately, and every converted
+    // prepare opens with default_prepare. neither is this recipe missing something
+    #[test]
+    fn what_ours_does_alone_is_not_a_finding() {
+        let mine = "prepare() {\n\tdefault_prepare\n\t./autogen.sh\n\trm -rf tests\n}\n";
+        let theirs = "prepare() {\n\tdefault_prepare\n\t./autogen.sh\n}\n";
+        assert!(unprepared(mine, theirs).is_empty());
+    }
+
+    // a build with no prepare at all is the common case and answers the question with
+    // everything alpine's does, not with a parse that runs off the end
+    #[test]
+    fn a_build_with_no_prepare_reads_as_doing_none_of_it() {
+        assert!(prepared("build() {\n\tmake\n}\n").is_empty());
+        assert_eq!(prepared(ALPINE), vec!["./autogen.sh"]);
+    }
+
+    // the body stops at its own closing brace. without that, build() below it reads as
+    // more of prepare and every configure line becomes a missing step
+    #[test]
+    fn the_body_ends_at_the_brace_and_does_not_run_into_build() {
+        assert!(!prepared(ALPINE).iter().any(|l| l.contains("configure")));
+    }
 }
 
 // the generated build from the last time this package was converted. a bump has to say
@@ -4334,6 +4447,7 @@ struct Bump {
     differ: Vec<String>,
     moved: Vec<String>,
     upstream: Vec<String>,
+    missing: Vec<String>,
     settled: bool,
 }
 
@@ -4372,7 +4486,7 @@ fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> 
     dirs.sort();
 
     let (mut carried, mut differ, mut moved) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut upstream, mut settled) = (Vec::new(), false);
+    let (mut upstream, mut missing, mut settled) = (Vec::new(), Vec::new(), false);
     for n in names {
         let (from, to) = (old.join(&n), fresh.join(&n));
         if !to.is_file() || n == "targets" {
@@ -4413,6 +4527,9 @@ fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> 
                 Some(next) => {
                     fs::write(&to, next).map_err(|e| format!("{n}: {e}"))?;
                     carried.push(n.clone());
+                    // whether there is a baseline or not: the build being kept is ours,
+                    // and what it does not do is the same question either way
+                    missing = unprepared(&ours, &made);
                     match was {
                         // no conversion to measure against, so whether alpine moved is
                         // not answerable yet and this one wants reading. what is waiting
@@ -4447,7 +4564,7 @@ fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> 
         tree_copy(&old.join(&d), &fresh.join(&d))?;
         carried.push(d);
     }
-    Ok(Bump { carried, kept, differ, moved, upstream, settled })
+    Ok(Bump { carried, kept, differ, moved, upstream, missing, settled })
 }
 
 fn tree_copy(from: &Path, to: &Path) -> Result<(), String> {

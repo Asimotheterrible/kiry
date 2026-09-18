@@ -2706,6 +2706,37 @@ fn sync_names_a_file_the_bump_and_a_hand_both_wrote() {
     assert_eq!(build, "# hand written\nmake\n");
 }
 
+// carry keeps this tree's build and takes alpine's sources, so a release tarball becoming
+// a git archive leaves ours configuring a tree that has no configure in it. naming the
+// file alpine's build is in is not enough -- libfm was held with the file named and
+// promoted anyway, and the step it was missing was one line
+#[test]
+fn a_bump_names_the_prepare_step_ours_does_not_do() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, _) = tree("syncprep");
+    offer(&repo, "boot", "1.0");
+    fs::write(repo.join("boot/build"), "build() {\n\t./configure\n\tmake\n}\n").unwrap();
+    aport(
+        &root,
+        "main",
+        "boot",
+        "pkgname=boot\npkgver=1.1\npkgrel=0\nprepare() {\n\tdefault_prepare\n\tautoreconf -fi\n}\nbuild() {\n\t./configure\n\tmake\n}\npackage() {\n\t:\n}\n",
+    );
+
+    let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        said.contains("alpine's prepare does what ours does not"),
+        "{said}"
+    );
+    assert!(said.contains("+ autoreconf -fi"), "{said}");
+    // it heads every converted prepare there is, so reading it back is noise
+    assert!(!said.contains("+ default_prepare"), "{said}");
+}
+
 #[test]
 fn promote_moves_testing_over_the_recipe_it_replaces() {
     let (root, repo, testing) = tree("promote");

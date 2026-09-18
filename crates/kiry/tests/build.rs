@@ -2983,6 +2983,36 @@ fn buildable(at: &Path, repo: &Path, name: &str, deps: &str) {
     .unwrap();
 }
 
+// die prefixes every line it is handed, so an error carrying two findings is two lines
+// that grep rather than one prefixed and one loose
+#[test]
+fn a_batch_missing_two_dependencies_prints_both_prefixed() {
+    let Some((at, root, repo)) = workshop("twodeps") else {
+        return;
+    };
+    buildable(&at, &repo, "solo", "alpha\nbeta\n");
+    // b wants them present too, so they are recorded for the build and taken away again
+    bare(&root, "alpha", &[]);
+    bare(&root, "beta", &[]);
+    let r = root.to_str().unwrap();
+    let o = kiry(&["b", "--root", r, "solo"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let db = root.join("usr/lib/kiry/db/installed/x86_64-musl");
+    for n in ["alpha", "beta"] {
+        fs::remove_dir_all(db.join(n)).unwrap();
+    }
+
+    let arc = root.join("var/kiry/cache/solo-1.0-1.x86_64-musl.tar.zst");
+    let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
+    assert!(!o.status.success(), "it installed with both deps missing");
+    let said = String::from_utf8_lossy(&o.stderr);
+    let got: Vec<&str> = said
+        .lines()
+        .filter(|l| l.starts_with("kiry: solo needs"))
+        .collect();
+    assert_eq!(got, ["kiry: solo needs alpha", "kiry: solo needs beta"], "{said}");
+}
+
 // b took a name and i took a path, so installing anything meant walking the dependency
 // tree by hand and pasting cache paths into it one at a time
 #[test]

@@ -4019,6 +4019,7 @@ fn sync_cmd(args: &[String]) {
         }
     }
     let mut failed = 0;
+    let mut holds = 0;
     for r in &rows {
         let Some(up) = &r.up else { continue };
         let at = match up.from.strip_prefix("aports/") {
@@ -4026,6 +4027,21 @@ fn sync_cmd(args: &[String]) {
             None => PathBuf::from(&up.from),
         };
         let fresh = into.join(&r.name);
+        if let Some(why) = held(&root, &r.name, &fresh, &up.version) {
+            say!(
+                "{:w$} {:v$} -> {:u$}  held",
+                r.name,
+                r.ours,
+                up.version
+            );
+            match why.is_empty() {
+                true => say!("  hold {}", up.version),
+                false => say!("  hold {}  {why}", up.version),
+            }
+            holds += 1;
+            continue;
+        }
+
         if dry {
             say!(
                 "{:w$} {:v$} -> {:u$}  {}",
@@ -4130,9 +4146,12 @@ fn sync_cmd(args: &[String]) {
         }
     }
 
-    match dry {
-        true => say!("{} would be re-converted", rows.len()),
-        false => say!("{} bumped {failed} failed", rows.len() - failed),
+    let moving = rows.len() - holds;
+    match (dry, holds) {
+        (true, 0) => say!("{moving} would be re-converted"),
+        (true, _) => say!("{moving} would be re-converted {holds} held"),
+        (false, 0) => say!("{} bumped {failed} failed", moving - failed),
+        (false, _) => say!("{} bumped {failed} failed {holds} held", moving - failed),
     }
     if failed > 0 {
         std::process::exit(1);
@@ -4320,6 +4339,25 @@ build() {
     fn the_body_ends_at_the_brace_and_does_not_run_into_build() {
         assert!(!prepared(ALPINE).iter().any(|l| l.contains("configure")));
     }
+}
+
+// a bump already decided about, and the version it was decided against. scoped to that
+// version because a reason recorded for 1.98.1 is not evidence about 1.99, and because a
+// hold that never lapses is one nobody remembers setting. the line still prints: an
+// answer you cannot see from the output is how a held recipe gets promoted unread
+fn held(root: &Path, name: &str, at: &Path, version: &str) -> Option<String> {
+    let text = fs::read_to_string(recipe(root, name).filter(|d| d != at)?.join("hold")).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim() != version {
+        return None;
+    }
+    Some(
+        lines
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 // the generated build from the last time this package was converted. a bump has to say

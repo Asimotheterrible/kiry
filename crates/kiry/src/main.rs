@@ -111,7 +111,11 @@ fn usage() {
 }
 
 fn die(msg: String) -> ! {
-    eprintln!("kiry: {msg}");
+    // an error carrying several findings writes one per line, and a line without the
+    // prefix is a line that does not grep
+    for l in msg.lines() {
+        eprintln!("kiry: {l}");
+    }
     std::process::exit(1);
 }
 

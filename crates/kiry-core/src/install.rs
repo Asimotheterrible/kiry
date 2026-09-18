@@ -72,24 +72,28 @@ fn paths(root: &Path, jobs: &[Job]) -> Result<(), Error> {
         }
     }
 
+    let mut at = Vec::new();
     for j in jobs {
         for m in &j.members {
             if m.what == archive::What::Dir {
                 continue;
             }
-            if let Some(who) = owner.get(&m.path) {
-                return Err(Error::Conflict {
-                    path: m.path.clone(),
-                    owner: who.clone(),
-                });
+            match owner.get(&m.path) {
+                Some(who) => at.push((m.path.clone(), who.clone())),
+                None => {
+                    owner.insert(m.path.clone(), j.name.clone());
+                }
             }
-            owner.insert(m.path.clone(), j.name.clone());
         }
     }
-    Ok(())
+    match at.is_empty() {
+        true => Ok(()),
+        false => Err(Error::Conflict { at }),
+    }
 }
 
 fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
+    let mut at = Vec::new();
     for j in jobs {
         let have = db::installed(root, &j.target)?;
         for d in &j.depends {
@@ -99,13 +103,13 @@ fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
             if have.contains(&d.name) || jobs.iter().any(|o| o.name == d.name) {
                 continue;
             }
-            return Err(Error::MissingDep {
-                pkg: j.name.clone(),
-                dep: d.name.clone(),
-            });
+            at.push((j.name.clone(), d.name.clone()));
         }
     }
-    Ok(())
+    match at.is_empty() {
+        true => Ok(()),
+        false => Err(Error::MissingDep { at }),
+    }
 }
 
 // TODO: a failure partway through leaves the earlier jobs applied
@@ -537,10 +541,10 @@ mod tests {
         record(&root, "foo", &["usr/bin/x"]);
 
         match paths(&root, &[job("bar", &[], &["usr/bin/x"])]) {
-            Err(Error::Conflict { path, owner }) => {
-                assert_eq!(path, "usr/bin/x");
-                assert_eq!(owner, "foo");
-            }
+            Err(Error::Conflict { at }) => assert_eq!(
+                at,
+                vec![("usr/bin/x".to_string(), "foo".to_string())]
+            ),
             other => panic!("wanted Conflict, got {other:?}"),
         }
     }
@@ -555,10 +559,10 @@ mod tests {
         let mut j = job("glibc", &[], &["usr/include/stdio.h"]);
         j.target = "x86_64-gnu".to_string();
         match paths(&root, &[j]) {
-            Err(Error::Conflict { path, owner }) => {
-                assert_eq!(path, "usr/include/stdio.h");
-                assert_eq!(owner, "musl");
-            }
+            Err(Error::Conflict { at }) => assert_eq!(
+                at,
+                vec![("usr/include/stdio.h".to_string(), "musl".to_string())]
+            ),
             other => panic!("wanted Conflict, got {other:?}"),
         }
     }
@@ -600,8 +604,63 @@ mod tests {
         let root = scratch("dep");
 
         match deps(&root, &[job("foo", &["libbar"], &["usr/bin/foo"])]) {
-            Err(Error::MissingDep { pkg, dep }) => {
-                assert_eq!((pkg.as_str(), dep.as_str()), ("foo", "libbar"));
+            Err(Error::MissingDep { at }) => assert_eq!(
+                at,
+                vec![("foo".to_string(), "libbar".to_string())]
+            ),
+            other => panic!("wanted MissingDep, got {other:?}"),
+        }
+    }
+
+    // busybox took vmstat, top and free from procps-ng and the batch named vmstat, so
+    // the other two arrived one rebuild apart. a check that stops at the first finding
+    // costs a build per finding
+    #[test]
+    fn every_collision_is_named_at_once() {
+        let root = scratch("allowned");
+        record(&root, "procps-ng", &["usr/bin/vmstat", "usr/bin/top", "usr/bin/free"]);
+
+        let taking = job(
+            "busybox",
+            &[],
+            &["usr/bin/vmstat", "usr/bin/sh", "usr/bin/top", "usr/bin/free"],
+        );
+        match paths(&root, &[taking]) {
+            Err(Error::Conflict { at }) => {
+                let took: Vec<&str> = at.iter().map(|(p, _)| p.as_str()).collect();
+                assert_eq!(took, ["usr/bin/vmstat", "usr/bin/top", "usr/bin/free"]);
+                assert!(at.iter().all(|(_, o)| o == "procps-ng"), "{at:?}");
+            }
+            other => panic!("wanted Conflict, got {other:?}"),
+        }
+    }
+
+    // and they print one per line, since die prefixes each and a run of them is what
+    // gets grepped
+    #[test]
+    fn several_findings_are_a_line_each() {
+        let e = Error::Conflict {
+            at: vec![
+                ("usr/bin/vmstat".to_string(), "procps-ng".to_string()),
+                ("usr/bin/top".to_string(), "procps-ng".to_string()),
+            ],
+        };
+        assert_eq!(
+            e.to_string(),
+            "usr/bin/vmstat is owned by procps-ng\nusr/bin/top is owned by procps-ng"
+        );
+    }
+
+    #[test]
+    fn every_missing_dependency_is_named_at_once() {
+        let root = scratch("alldeps");
+        let one = job("foo", &["libbar", "libbaz"], &["usr/bin/foo"]);
+        let two = job("qux", &["libquux"], &["usr/bin/qux"]);
+
+        match deps(&root, &[one, two]) {
+            Err(Error::MissingDep { at }) => {
+                let want: Vec<&str> = at.iter().map(|(_, d)| d.as_str()).collect();
+                assert_eq!(want, ["libbar", "libbaz", "libquux"]);
             }
             other => panic!("wanted MissingDep, got {other:?}"),
         }

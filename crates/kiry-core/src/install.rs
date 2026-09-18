@@ -120,7 +120,15 @@ pub struct Broke {
 
 pub struct Applied {
     pub broke: Vec<Broke>,
-    pub edits: Vec<String>,
+    pub edits: Vec<Kept>,
+}
+
+// a config this root edited is never written over again, so the version the package
+// wanted is one nobody ever sees. the artifact is where that copy is, and naming it is
+// the whole of what it takes to be able to go and look
+pub struct Kept {
+    pub path: String,
+    pub from: PathBuf,
 }
 
 pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
@@ -149,7 +157,10 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
             None => Vec::new(),
         };
         let manifest = archive::extract(root, &j.archive, &skip)?;
-        edits.extend(skip);
+        edits.extend(skip.into_iter().map(|path| Kept {
+            path,
+            from: j.archive.clone(),
+        }));
         kept.extend(manifest.iter().map(|e| e.path.clone()));
 
         let mut provides = Vec::new();

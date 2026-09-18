@@ -2684,7 +2684,8 @@ fn sync_writes_the_bump_and_carries_what_the_tree_added() {
 }
 
 // build is the one file a bump is entitled to rewrite and a hand is entitled to have
-// edited. merging them is not kiry's call, so it says which and stops there
+// edited. merging them is not kiry's call, so the tree's own stands, alpine's is put
+// somewhere nameable and the bump waits
 #[test]
 fn sync_names_a_file_the_bump_and_a_hand_both_wrote() {
     if !have_busybox() {
@@ -2698,8 +2699,11 @@ fn sync_names_a_file_the_bump_and_a_hand_both_wrote() {
     let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
-    assert!(said.contains("build differs from"), "{said}");
-    assert!(said.contains("moved/build"), "{said}");
+    assert!(said.contains("held"), "{said}");
+    assert!(said.contains("build is this tree's"), "{said}");
+    assert!(said.contains("converted/moved/pending"), "{said}");
+    let build = fs::read_to_string(repo.join("moved/build")).unwrap();
+    assert_eq!(build, "# hand written\nmake\n");
 }
 
 #[test]
@@ -3685,6 +3689,101 @@ fn a_bump_already_waiting_does_not_become_its_own_measure() {
 }
 
 // a recipe's own files live in a subdirectory, a conversion never writes one, and a
+// a recipe names its own patches in sources and nowhere else, so a conversion writing
+// that file fresh is what unlists them. the build stops being able to fetch what it
+// installs and says so only once it runs
+#[test]
+fn a_local_source_entry_survives_a_bump() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, _testing) = tree("synclocal");
+
+    let up = root.join("var/kiry/aports/main/served");
+    fs::create_dir_all(&up).unwrap();
+    fs::write(up.join("up.patch"), "--- a\n+++ b\n").unwrap();
+    let apk = |v: &str| {
+        fs::write(
+            up.join("APKBUILD"),
+            format!(
+                "pkgname=served\npkgver={v}\npkgrel=0\nsource=\"up.patch\"\n\
+                 build() {{\n\tmake\n}}\npackage() {{\n\t:\n}}\n"
+            ),
+        )
+        .unwrap();
+    };
+    apk("1.0");
+
+    let d = repo.join("served");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("ours.patch"), "--- c\n+++ d\n").unwrap();
+    fs::write(
+        d.join("build"),
+        ". /usr/share/kiry/lib.sh\nsrcdir=/src\npkgname=\"served\"\npkgver=\"1.0\"\n\
+         pkgrel=\"0\"\nsource=\"up.patch ours.patch\"\nbuilddir=\"/src/served-1.0\"\n\n\
+         build() {\n\tmake\n}\n",
+    )
+    .unwrap();
+    fs::write(d.join("sources"), "up.patch\nours.patch\n").unwrap();
+    fs::write(
+        d.join("checksums"),
+        "1111111111111111111111111111111111111111111111111111111111111111\n\
+         2222222222222222222222222222222222222222222222222222222222222222\n",
+    )
+    .unwrap();
+    fs::write(d.join("version"), "1.0 0\n").unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+
+    sync_at(&root);
+    apk("1.1");
+    let said = sync_at(&root);
+
+    // alpine's build body did not move, so the bump promoted itself and the recipe is
+    // back in the repo it came from
+    let at = repo.join("served");
+    let src = fs::read_to_string(at.join("sources")).unwrap();
+    assert!(src.contains("ours.patch"), "{src}\n{said}");
+    let sums = fs::read_to_string(at.join("checksums")).unwrap();
+    assert_eq!(src.lines().count(), sums.lines().count(), "{src}\n{sums}");
+    assert!(sums.contains("22222222"), "{sums}");
+    // default_prepare walks the build's own variable, so a sources file naming a patch
+    // the assignment does not is a patch that is fetched and never applied
+    let build = fs::read_to_string(at.join("build")).unwrap();
+    assert!(build.contains("ours.patch"), "{build}");
+    assert!(said.contains("kept ours.patch"), "{said}");
+}
+
+// a core recipe is written by hand and carries none of the assignments a conversion
+// opens with. reading that as a shape change handed the whole recipe to alpine, and
+// busybox's defconfig edits and pkgconf's pkg-config symlink went with it
+#[test]
+fn a_hand_written_build_is_not_replaced_by_the_conversion() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, _testing) = tree("synchand");
+    let d = repo.join("served");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("build"), "make defconfig\nmake install\n").unwrap();
+    fs::write(d.join("version"), "1.0 0\n").unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    upstream_at(&root, "served", "1.0", "\t./configure\n");
+
+    sync_at(&root);
+    upstream_at(&root, "served", "1.1", "\t./configure\n");
+    let said = sync_at(&root);
+
+    // the version has to have moved, or this passes on a held bump having simply left
+    // the repo copy alone
+    assert!(said.contains("promoted"), "{said}");
+    let at = repo.join("served");
+    assert_eq!(fs::read_to_string(at.join("version")).unwrap(), "1.1 0\n");
+    let build = fs::read_to_string(at.join("build")).unwrap();
+    assert!(build.contains("make defconfig"), "{build}\n{said}");
+    assert!(!build.contains("./configure"), "{build}\n{said}");
+    assert!(!build.contains("pkgver="), "{build}");
+}
+
 // promotion replaces the recipe wholesale. openntpd's nitro-run went that way
 #[test]
 fn a_recipe_subdirectory_comes_across_a_bump() {

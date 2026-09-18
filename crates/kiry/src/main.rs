@@ -4060,6 +4060,9 @@ fn sync_cmd(args: &[String]) {
                         if !b.carried.is_empty() {
                             notes.push(format!("carried {}", b.carried.join(" ")));
                         }
+                        for k in &b.kept {
+                            notes.push(format!("kept {k} in sources, alpine no longer lists it"));
+                        }
                         for f in &b.differ {
                             match f.as_str() {
                                 "build" if b.carried.iter().any(|c| c == "build") => notes
@@ -4153,14 +4156,11 @@ fn undated(text: &str) -> Vec<&str> {
 
 // the new version's assignments written into the build this tree already has, so a bump
 // keeps every decision the recipe accumulated rather than proposing them all for
-// deletion. none when the two disagree about which assignments exist at all, which is a
-// shape change and wants reading
+// deletion. a build carrying none of them is hand-written and comes across untouched,
+// which is the whole of what it needs: there is no version inside it to move. none only
+// when ours names an assignment the conversion does not, since there is nothing to
+// write there
 fn reheaded(ours: &str, fresh: &str) -> Option<String> {
-    for h in HEADER {
-        if ours.lines().any(|l| l.starts_with(h)) != fresh.lines().any(|l| l.starts_with(h)) {
-            return None;
-        }
-    }
     let mut out = String::new();
     for l in ours.lines() {
         match heading(l) {
@@ -4240,9 +4240,82 @@ fn seed(root: &Path, rows: &[Row], alias: &HashMap<String, String>, list: &[Path
     done
 }
 
+// a source entry is either a url alpine owns or a file sitting beside the recipe, and
+// only the first kind moves with a version. a patch or a service file this tree added is
+// named here and nowhere else, so a conversion writing sources fresh is what drops it --
+// openntpd's nitro-run went that way and took its package step with it. the build's own
+// $source is rewritten to match, because default_prepare walks that and not the file
+fn keep_local(old: &Path, fresh: &Path) -> Result<Vec<String>, String> {
+    let rows = |d: &Path| -> Result<Vec<(String, String)>, String> {
+        let read = |n: &str| -> Result<Vec<String>, String> {
+            Ok(fs::read_to_string(d.join(n))
+                .map_err(|e| format!("{n}: {e}"))?
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect())
+        };
+        let (s, c) = (read("sources")?, read("checksums")?);
+        // they pair by position, so an entry that brought only one of its two lines
+        // would check every entry after it against the wrong hash
+        match s.len() == c.len() {
+            true => Ok(s.into_iter().zip(c).collect()),
+            false => Err(format!("{}: sources and checksums are different lengths", d.display())),
+        }
+    };
+    for d in [old, fresh] {
+        if !d.join("sources").is_file() || !d.join("checksums").is_file() {
+            return Ok(Vec::new());
+        }
+    }
+    let (was, mut now) = (rows(old)?, rows(fresh)?);
+    let mut kept = Vec::new();
+    for (s, c) in was {
+        if s.contains("://") || now.iter().any(|(n, _)| *n == s) {
+            continue;
+        }
+        kept.push(s.clone());
+        now.push((s, c));
+    }
+    if kept.is_empty() {
+        return Ok(kept);
+    }
+    let column = |pick: fn(&(String, String)) -> &String| -> String {
+        now.iter().map(|r| pick(r).clone() + "\n").collect()
+    };
+    fs::write(fresh.join("sources"), column(|r| &r.0)).map_err(|e| format!("sources: {e}"))?;
+    fs::write(fresh.join("checksums"), column(|r| &r.1)).map_err(|e| format!("checksums: {e}"))?;
+    resource(&fresh.join("build"), &now)?;
+    Ok(kept)
+}
+
+// the source assignment inside a converted build, rewritten to name what sources now
+// holds. a hand-written build carries no such line and wants none
+fn resource(build: &Path, now: &[(String, String)]) -> Result<(), String> {
+    let Ok(text) = fs::read_to_string(build) else {
+        return Ok(());
+    };
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let at: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("source="))
+        .map(|(i, _)| i)
+        .collect();
+    // convert writes the whole list on one line. anything else is a shape this cannot
+    // rewrite without guessing where the assignment ends
+    if at.len() != 1 || !lines[at[0]].ends_with('"') {
+        return Ok(());
+    }
+    let one: Vec<&str> = now.iter().map(|(s, _)| s.as_str()).collect();
+    lines[at[0]] = format!("source=\"{}\"", one.join(" "));
+    fs::write(build, lines.join("\n") + "\n").map_err(|e| format!("build: {e}"))
+}
+
 // what a bump did, and whether any of it wants reading
 struct Bump {
     carried: Vec<String>,
+    kept: Vec<String>,
     differ: Vec<String>,
     moved: Vec<String>,
     upstream: Vec<String>,
@@ -4266,6 +4339,9 @@ struct Bump {
 // one throws away every correction the recipe ever accumulated. the recipe's own wins and
 // what alpine moved is reported instead
 fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> {
+    // before the walk, so the build arm below reheads against a source assignment that
+    // already names everything sources holds
+    let kept = keep_local(old, fresh)?;
     let rd = fs::read_dir(old).map_err(|e| format!("{}: {e}", old.display()))?;
     let (mut names, mut dirs): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     for e in rd.flatten() {
@@ -4356,7 +4432,7 @@ fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> 
         tree_copy(&old.join(&d), &fresh.join(&d))?;
         carried.push(d);
     }
-    Ok(Bump { carried, differ, moved, upstream, settled })
+    Ok(Bump { carried, kept, differ, moved, upstream, settled })
 }
 
 fn tree_copy(from: &Path, to: &Path) -> Result<(), String> {

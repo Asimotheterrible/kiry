@@ -2737,6 +2737,45 @@ fn a_bump_names_the_prepare_step_ours_does_not_do() {
     assert!(!said.contains("+ default_prepare"), "{said}");
 }
 
+// four bumps sat in testing with reasons that were not going to change, and every sync
+// re-offered all of them. output you scroll past is output you stop reading
+#[test]
+fn a_held_version_is_not_re_offered() {
+    let (root, repo, testing) = tree("syncheld");
+    offer(&repo, "rust", "1.95.0");
+    fs::write(repo.join("rust/hold"), "1.98.1\nblocked on llvm 21\n").unwrap();
+    aport(&root, "main", "rust", "pkgname=rust\npkgver=1.98.1\npkgrel=0\npackage() {\n\t:\n}\n");
+
+    let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("hold 1.98.1  blocked on llvm 21"), "{said}");
+    assert!(said.contains("1 held"), "{said}");
+    // nothing was converted, so testing never got a copy to promote
+    assert!(!testing.join("rust").exists(), "{said}");
+}
+
+// the reason was recorded against one version and says nothing about the next, so the
+// hold lapses rather than freezing the package for good
+#[test]
+fn a_hold_lapses_when_upstream_moves_past_it() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncheldpast");
+    offer(&repo, "rust", "1.95.0");
+    fs::write(repo.join("rust/hold"), "1.98.1\nblocked on llvm 21\n").unwrap();
+    aport(&root, "main", "rust", "pkgname=rust\npkgver=1.99.0\npkgrel=0\npackage() {\n\t:\n}\n");
+
+    let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    // the note the hold prints, whichever version it names
+    assert!(!said.contains("  hold "), "{said}");
+    // and the bump actually ran rather than being skipped
+    assert!(testing.join("rust/version").is_file(), "{said}");
+}
+
 #[test]
 fn promote_moves_testing_over_the_recipe_it_replaces() {
     let (root, repo, testing) = tree("promote");

@@ -2660,6 +2660,13 @@ fn mounted_at<'a>(text: &'a str, at: &str) -> Option<(&'a str, &'a str)> {
     })
 }
 
+// whether anything is mounted here at all, which mounted_at cannot answer: a mount whose
+// subvolume was deleted under it keeps subvolid= and loses subvol= entirely
+fn is_mounted(text: &str, at: &str) -> bool {
+    text.lines()
+        .any(|l| l.split_whitespace().nth(1) == Some(at))
+}
+
 // which of the pair is running and which is not, and the device they share
 fn pair(text: &str) -> Result<(String, String, String), String> {
     let (dev, now) =
@@ -2688,6 +2695,14 @@ fn inactive() -> Result<PathBuf, String> {
     let (top, dest) = (PathBuf::from(TOP), PathBuf::from(DEST));
     mkdirs(&top)?;
     mkdirs(&dest)?;
+
+    // a transaction leaves the inactive root mounted here, so a second one in the same
+    // boot would snapshot over a subvolume this still points at. what is left then is a
+    // mount of something that no longer exists, which is neither a directory nor a usable
+    // mount point, and the mount below fails move_mount with ENOENT
+    if is_mounted(&text, DEST) {
+        run(Command::new("umount").arg(&dest), "umount the last root")?;
+    }
 
     // the subvolumes sit at the top of the filesystem and nothing mounts that, so it has
     // to be reachable before one of them can be replaced
@@ -5865,6 +5880,21 @@ Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.e
     fn a_header_that_starts_with_boot_is_not_an_entry() {
         let got: Vec<&str> = EFI.lines().filter_map(entry).map(|(n, _)| n).collect();
         assert_eq!(got, ["0000", "0001", "0002"]);
+    }
+
+    // the line a deleted subvolume leaves behind, copied from the machine this bit on
+    // it carries no subvol=, so the reader that looks for one says nothing is mounted and
+    // the snapshot goes over a subvolume the last transaction still has open
+    #[test]
+    fn a_root_left_mounted_from_the_last_transaction_is_seen() {
+        let stale = "/dev/mapper/cryptroot /run/kiry/root btrfs \
+rw,relatime,compress=zstd:1,ssd,space_cache=v2,subvolid=267 0 0\n";
+        assert_eq!(mounted_at(stale, "/run/kiry/root"), None);
+        assert!(is_mounted(stale, "/run/kiry/root"));
+        assert!(!is_mounted(REAL, "/run/kiry/root"));
+        // a path that is only a prefix of a real mount point is not that mount point
+        assert!(!is_mounted(REAL, "/va"));
+        assert!(is_mounted(REAL, "/var"));
     }
 
     // a live install onto a root the firmware does not boot first is undone by the next

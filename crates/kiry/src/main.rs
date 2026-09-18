@@ -3031,8 +3031,12 @@ fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
     for j in &jobs {
         say!("{} {} {} ok", j.name, j.version.upstream, j.target);
     }
-    for p in &done.edits {
-        say!("kept /{p}, edited since it was installed");
+    for k in &done.edits {
+        say!(
+            "kept /{}, edited since it was installed. the package's is in {}",
+            k.path,
+            k.from.display()
+        );
     }
     enqueue(root, &done.broke, &named(&jobs));
     hooks(root, jobs.iter().map(|j| j.target.clone()).collect());
@@ -3435,8 +3439,12 @@ fn rebuild_cmd(args: &[String]) {
             Err(e) => die(e.to_string()),
         };
         let broke = done.broke;
-        for p in &done.edits {
-            say!("kept /{p}, edited since it was installed");
+        for k in &done.edits {
+            say!(
+                "kept /{}, edited since it was installed. the package's is in {}",
+                k.path,
+                k.from.display()
+            );
         }
         for j in &jobs {
             say!("{} {} {} rebuilt", j.name, j.version.upstream, j.target);

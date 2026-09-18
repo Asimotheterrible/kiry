@@ -1576,6 +1576,12 @@ fn an_edited_config_survives_and_a_library_does_not() {
         b"two\n",
         "a library was kept instead of replaced"
     );
+
+    // the config that was not written is the one nobody can see, and a line that only
+    // says it was kept leaves you to go and find the artifact yourself
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("kept /etc/thing.conf"), "{said}");
+    assert!(said.contains(two.to_str().unwrap()), "{said}");
 }
 
 // putting the symbol back is the other way a break ends, and the entry has to go with it

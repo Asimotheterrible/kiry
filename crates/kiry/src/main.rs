@@ -138,6 +138,25 @@ fn opts(args: &[String]) -> (PathBuf, bool, Vec<String>) {
     (PathBuf::from(root), force, rest)
 }
 
+// what opts left behind, minus the flags the command knows. a leftover flag is refused
+// rather than filtered out: --dry is not -n, and dropping it silently is how a sync that
+// was asked to describe itself went and did the work instead
+fn asked(rest: Vec<String>, known: &[&str]) -> Vec<String> {
+    let mut bad = Vec::new();
+    let mut want = Vec::new();
+    for a in rest {
+        match a.starts_with('-') {
+            true if !known.contains(&a.as_str()) => bad.push(format!("no such flag: {a}")),
+            true => {}
+            false => want.push(a),
+        }
+    }
+    if !bad.is_empty() {
+        die(bad.join("\n"));
+    }
+    want
+}
+
 // --root defaults to / and most of these commands write. checked only where one
 // mutates, so l and doctor still answer for the running system
 //
@@ -3953,7 +3972,7 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
 fn ahead_cmd(args: &[String]) {
     let (root, _, rest) = opts(args);
     let net = rest.iter().any(|a| a == "--net");
-    let want: Vec<String> = rest.into_iter().filter(|a| !a.starts_with('-')).collect();
+    let want = asked(rest, &["--net"]);
 
     let rows = survey(&root, &want, net);
     let w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
@@ -3994,7 +4013,7 @@ fn sync_cmd(args: &[String]) {
     let (root, _, rest) = opts(args);
     let dry = rest.iter().any(|a| a == "-n");
     let net = rest.iter().any(|a| a == "--net");
-    let want: Vec<String> = rest.into_iter().filter(|a| !a.starts_with('-')).collect();
+    let want = asked(rest, &["-n", "--net"]);
     if !dry {
         writes(&root);
     }

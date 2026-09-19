@@ -2755,6 +2755,22 @@ fn a_held_version_is_not_re_offered() {
     assert!(!testing.join("rust").exists(), "{said}");
 }
 
+// a misspelled flag that filters out silently is a flag that did nothing, and the one
+// that does nothing here is the one asking for a description instead of the work
+#[test]
+fn a_flag_the_command_does_not_know_is_refused() {
+    let (root, repo, testing) = tree("syncflag");
+    offer(&repo, "rust", "1.95.0");
+    aport(&root, "main", "rust", "pkgname=rust\npkgver=1.98.1\npkgrel=0\npackage() {\n\t:\n}\n");
+
+    let o = kiry(&["sync", "--root", root.to_str().unwrap(), "--dry"]);
+    assert!(!o.status.success(), "--dry was taken for a package name");
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("kiry: no such flag: --dry"), "{said}");
+    // the whole point: refusing it means the sync it was meant to describe never ran
+    assert!(!testing.join("rust").exists(), "{said}");
+}
+
 // the reason was recorded against one version and says nothing about the next, so the
 // hold lapses rather than freezing the package for good
 #[test]

@@ -5779,6 +5779,12 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
     let mut dupes: Vec<((usize, usize), usize)> = pairs.into_iter().collect();
     dupes.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
     for ((a, b), n) in dupes {
+        // two libraries out of one package sharing names is how that package was built,
+        // not two answers to the same question. readline ships libhistory, nspr ships
+        // three of them, and no one can act on being told so
+        if owners[a] == owners[b] {
+            continue;
+        }
         out.push(Finding {
             pkg: owners[a].clone(),
             path: elves[a].0.clone(),

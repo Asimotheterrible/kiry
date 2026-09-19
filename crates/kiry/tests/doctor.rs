@@ -953,6 +953,53 @@ fn two_libraries_exporting_one_name_are_reported() {
     );
 }
 
+// a package shipping two libraries that share a name chose that: readline ships
+// libhistory, nspr ships three of them. reporting it asks the reader to act on how a
+// package is built, which is not a repair they can make
+#[test]
+fn two_libraries_out_of_one_package_are_not_a_clash() {
+    if skip("duplicate symbols") {
+        return;
+    }
+    let at = scratch("dupesame");
+    let root = at.join("root");
+    let one = libsrc(
+        &at.join("one"),
+        "libone.so.1",
+        "void p(void){}\nvoid q(void){}\n",
+    );
+    let two = libsrc(&at.join("two"), "libtwo.so.1", "void p(void){}\n");
+    let app = binsrc(
+        &at,
+        "app",
+        "void p(void);\nvoid q(void);\nvoid _start(void){p();q();}\n",
+        &one,
+        Some("$ORIGIN/../lib64"),
+    );
+    let both = binsrc(
+        &at.join("both"),
+        "both",
+        "void p(void);\nvoid _start(void){p();}\n",
+        &two,
+        Some("$ORIGIN/../lib64"),
+    );
+    // one owner for both libraries, which is the only thing that differs from the
+    // pair above that is reported
+    install(
+        &root,
+        "pair",
+        &[
+            ("usr/lib64/libone.so.1", &one),
+            ("usr/lib64/libtwo.so.1", &two),
+        ],
+    );
+    install(&root, "app", &[("usr/bin/app", &app)]);
+    install(&root, "both", &[("usr/bin/both", &both)]);
+
+    let (_, out) = doctor(&root);
+    assert!(!out.contains("duplicate-symbols"), "{out}");
+}
+
 // alpine's toolchain leaves _init and _fini in the dynamic symbol table of every object
 // it links, so a plain group-by over exports pairs off every library on the system. the
 // fixtures here are -nostdlib and carry nothing, which is why the storm only showed up

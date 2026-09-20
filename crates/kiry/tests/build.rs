@@ -3953,3 +3953,165 @@ fn a_first_bump_keeps_this_trees_build_and_says_where_alpines_is() {
     assert!(!waiting.contains("make"), "the conversion's body won: {waiting}");
     let _ = repo;
 }
+
+// what install keeps back when a soname moves, written the way install writes it
+fn preserve_record(root: &Path, name: &str, files: &[(&str, &Path)]) {
+    let mut manifest = Vec::new();
+    for (path, from) in files {
+        let dst = root.join(path);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let _ = fs::remove_file(&dst);
+        fs::copy(from, &dst).unwrap();
+        manifest.push(db::Entry {
+            mode: 0o755,
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(&dst).unwrap()).unwrap()),
+            path: (*path).to_string(),
+        });
+    }
+    db::write_preserved(root, "x86_64-gnu", name, &manifest).unwrap();
+}
+
+// gc refuses to decide anything with no recipe in reach, which is a mistyped --root
+// rather than an empty tree
+fn with_repo(at: &Path, root: &Path) {
+    let repo = at.join("repo");
+    recipe(&repo, "x86_64-gnu", GOOD);
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(
+        root.join("etc/kiry/repos"),
+        format!("{}\n", repo.display()),
+    )
+    .unwrap();
+}
+
+// the whole point of keeping it: the consumer goes on naming the soname that left until
+// something rebuilds it, and until then the library has to be there
+#[test]
+fn a_preserved_library_something_still_links_is_not_released() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("gc-keep");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    with_repo(&at, &root);
+
+    let old = lib(&at, "libp.so.1");
+    let now = lib(&at, "libp.so.2");
+    let b = app(&at, "app", &old);
+    place(&root, "libp", &[("usr/lib64/libp.so.2", &now)]);
+    place(&root, "app", &[("usr/bin/app", &b)]);
+    preserve_record(&root, "libp", &[("usr/lib64/libp.so.1", &old)]);
+
+    let out = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("released"), "{text}");
+    assert!(root.join("usr/lib64/libp.so.1").is_file(), "{text}");
+    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp")
+        .unwrap()
+        .is_empty());
+}
+
+// and once nothing names it, carrying it forever is how a root fills up with libraries
+// no loader will ever open again
+#[test]
+fn a_preserved_library_nothing_links_is_released() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("gc-release");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    with_repo(&at, &root);
+
+    let old = lib(&at, "libp.so.1");
+    let now = lib(&at, "libp.so.2");
+    // the consumer has been rebuilt and names the new soname, which is the drain having
+    // done its job
+    let b = app(&at, "app", &now);
+    place(&root, "libp", &[("usr/lib64/libp.so.2", &now)]);
+    place(&root, "app", &[("usr/bin/app", &b)]);
+    preserve_record(&root, "libp", &[("usr/lib64/libp.so.1", &old)]);
+
+    let out = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("libp x86_64-gnu libp.so.1 released"), "{text}");
+    assert!(!root.join("usr/lib64/libp.so.1").exists(), "{text}");
+    assert!(db::read_preserved(&root, "x86_64-gnu", "libp")
+        .unwrap()
+        .is_empty());
+    assert!(root.join("usr/lib64/libp.so.2").is_file());
+}
+
+// -n is a question, and one that deletes what it is asked about is not
+#[test]
+fn gc_dash_n_releases_nothing() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("gc-dry");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    with_repo(&at, &root);
+
+    let old = lib(&at, "libp.so.1");
+    let now = lib(&at, "libp.so.2");
+    place(&root, "libp", &[("usr/lib64/libp.so.2", &now)]);
+    preserve_record(&root, "libp", &[("usr/lib64/libp.so.1", &old)]);
+
+    kiry(&["gc", "-n", "--root", root.to_str().unwrap()]);
+    assert!(root.join("usr/lib64/libp.so.1").is_file());
+    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp")
+        .unwrap()
+        .is_empty());
+}
+
+// same soname, different bytes, so it is still an elf gc can group and still not the
+// file the record wrote down
+fn relib(at: &Path, soname: &str, body: &str) -> PathBuf {
+    let d = at.join("other");
+    fs::create_dir_all(&d).unwrap();
+    let src = d.join(format!("{soname}.c"));
+    fs::write(&src, body).unwrap();
+    let out = d.join(soname);
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-nostdlib"])
+        .arg(format!("-Wl,-soname,{soname}"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .unwrap()
+        .success());
+    out
+}
+
+// the same rule removal uses. a file that no longer hashes to what was written down was
+// put there by hand, and gc deleting it would be gc deleting somebody's repair
+#[test]
+fn a_preserved_library_edited_by_hand_is_left_alone() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("gc-edited");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    with_repo(&at, &root);
+
+    let old = lib(&at, "libp.so.1");
+    let now = lib(&at, "libp.so.2");
+    place(&root, "libp", &[("usr/lib64/libp.so.2", &now)]);
+    preserve_record(&root, "libp", &[("usr/lib64/libp.so.1", &old)]);
+
+    // nothing links libp.so.1, so the only thing between it and gc is the hash
+    let swapped = relib(&at, "libp.so.1", "void p(void){}\nvoid q(void){}\n");
+    fs::copy(&swapped, root.join("usr/lib64/libp.so.1")).unwrap();
+
+    let out = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("released"), "{text}");
+    assert!(root.join("usr/lib64/libp.so.1").is_file());
+    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp")
+        .unwrap()
+        .is_empty());
+}

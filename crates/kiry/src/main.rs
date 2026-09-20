@@ -3076,6 +3076,9 @@ fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
             k.from.display()
         );
     }
+    for so in &done.preserved {
+        say!("preserved {so}, still named by what has not rebuilt yet");
+    }
     enqueue(root, &done.broke, &named(&jobs));
     hooks(root, jobs.iter().map(|j| j.target.clone()).collect());
 }
@@ -3486,6 +3489,9 @@ fn rebuild_cmd(args: &[String]) {
         }
         for j in &jobs {
             say!("{} {} {} rebuilt", j.name, j.version.upstream, j.target);
+        }
+        for so in &done.preserved {
+            say!("preserved {so}, still named by what has not rebuilt yet");
         }
         enqueue(&root, &broke, &named(&jobs));
         hooks(&root, jobs.iter().map(|j| j.target.clone()).collect());
@@ -5058,6 +5064,95 @@ fn gc_cmd(args: &[String]) {
         })
         .collect();
     sweep("log", old, recipes);
+
+    // a preserved library goes when nothing names its soname any more and nothing
+    // running still has it open. either alone is the wrong answer: a library no
+    // installed elf references can be mapped by a process using it right now, and one
+    // nothing has mapped is still what the next start of that program will open
+    let live = root.canonicalize().as_deref().unwrap_or(&root) == Path::new("/");
+    // nothing runs out of a staging root, so there is nothing there to be blind about
+    let (open, blind) = if live { mapped() } else { (HashMap::new(), 0) };
+    let mut doomed = Vec::new();
+    let mut kept_back = 0;
+    for t in db::targets(&root).unwrap_or_default() {
+        // dt_needed is recorded nowhere, so the only way to know a soname is still
+        // wanted is to go and read every elf that could want it
+        let mut wanted: HashSet<String> = HashSet::new();
+        for name in db::installed(&root, &t).unwrap_or_default() {
+            let Ok(rec) = db::read(&root, &t, &name) else {
+                continue;
+            };
+            for (_, what) in install::scan(&root, &rec.manifest).unwrap_or_default() {
+                if let install::Seen::Elf(o) = what {
+                    wanted.extend(o.needed);
+                }
+            }
+        }
+        for name in db::preserving(&root, &t).unwrap_or_default() {
+            let Ok(m) = db::read_preserved(&root, &t, &name) else {
+                continue;
+            };
+            // the same rule removal uses: a file that no longer hashes to what was
+            // written down was touched by hand and is not ours to delete
+            let edited: HashSet<String> =
+                install::modified(&root, &m).unwrap_or_default().into_iter().collect();
+            let groups = generations(&root, &m);
+            // an entry no library in the record answers for is left standing rather than
+            // guessed at, which is also what stops the record being dropped early
+            let grouped: HashSet<&String> = groups.iter().flat_map(|(_, e)| e).map(|e| &e.path).collect();
+            let mut stay: Vec<db::Entry> =
+                m.iter().filter(|e| !grouped.contains(&e.path)).cloned().collect();
+            for (soname, entries) in groups {
+                let busy = entries.iter().any(|e| open.contains_key(&e.path));
+                let touched = entries.iter().any(|e| edited.contains(&e.path));
+                if blind > 0 || busy || touched || wanted.contains(&soname) {
+                    kept_back += 1;
+                    stay.extend(entries);
+                    continue;
+                }
+                say!("{name} {t} {soname} released");
+                doomed.extend(entries.iter().map(|e| root.join(&e.path)));
+            }
+            if !dry && stay.len() != m.len() {
+                stay.sort_by(|a, b| a.path.cmp(&b.path));
+                if let Err(e) = db::write_preserved(&root, &t, &name, &stay) {
+                    die(e.to_string());
+                }
+            }
+        }
+    }
+    if blind > 0 {
+        say!("{blind} processes could not be read, so nothing preserved was released");
+    }
+    sweep("preserved", doomed, kept_back);
+}
+
+// a record holds two generations when a second soname bump lands before the queue
+// drains, so what gets released is one soname and not everything it ever kept
+fn generations(root: &Path, m: &[db::Entry]) -> Vec<(String, Vec<db::Entry>)> {
+    let mut of: HashMap<String, String> = HashMap::new();
+    for (path, what) in install::scan(root, m).unwrap_or_default() {
+        if let install::Seen::Elf(o) = what {
+            if let Some(so) = o.soname {
+                of.insert(path, so);
+            }
+        }
+    }
+    // one hop, which is the shape a soname link has. a longer chain leaves its links
+    // ungrouped and they stay, which is the safe direction to be wrong in
+    let mut by: HashMap<String, Vec<db::Entry>> = HashMap::new();
+    for e in m {
+        let who = match &e.kind {
+            db::Kind::Link(t) => install::beside(&e.path, t).and_then(|p| of.get(&p).cloned()),
+            _ => of.get(&e.path).cloned(),
+        };
+        if let Some(so) = who {
+            by.entry(so).or_default().push(e.clone());
+        }
+    }
+    let mut out: Vec<(String, Vec<db::Entry>)> = by.into_iter().collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 fn listing(at: &Path) -> Vec<PathBuf> {
@@ -5234,6 +5329,19 @@ fn doctor_cmd(args: &[String]) {
             say!("{ignored} more matched /etc/kiry/unowned");
         }
     }
+    // not a fault and not counted as one, but an ignore list that hides things is worse
+    // than the noise it removes. these are libraries the tree has moved past and is
+    // carrying until their consumers rebuild
+    let held: usize = targets
+        .iter()
+        .flat_map(|t| db::preserving(&root, t).unwrap_or_default().into_iter().map(move |n| (t, n)))
+        .filter_map(|(t, n)| db::read_preserved(&root, t, &n).ok())
+        .flatten()
+        .filter(|e| matches!(e.kind, db::Kind::File(_)))
+        .count();
+    if held > 0 {
+        say!("{held} preserved, waiting on a rebuild. kiry gc takes them when nothing asks");
+    }
     if found > 0 {
         std::process::exit(1);
     }
@@ -5244,6 +5352,18 @@ fn doctor_cmd(args: &[String]) {
 fn changed(root: &Path, targets: &[String]) -> Vec<Finding> {
     let mut out = Vec::new();
     for t in targets {
+        for name in db::preserving(root, t).unwrap_or_default() {
+            let Ok(m) = db::read_preserved(root, t, &name) else {
+                continue;
+            };
+            for p in install::modified(root, &m).unwrap_or_default() {
+                out.push(Finding {
+                    pkg: name.clone(),
+                    path: p,
+                    what: What::Modified,
+                });
+            }
+        }
         for name in db::installed(root, t).unwrap_or_default() {
             let Ok(rec) = db::read(root, t, &name) else {
                 continue;
@@ -5265,6 +5385,13 @@ fn changed(root: &Path, targets: &[String]) -> Vec<Finding> {
 fn unowned(root: &Path, targets: &[String]) -> (Vec<Finding>, usize) {
     let mut owned: HashSet<String> = HashSet::new();
     for t in targets {
+        // kiry put these here and kiry will take them away again, so an orphan is what
+        // they are not
+        for name in db::preserving(root, t).unwrap_or_default() {
+            if let Ok(m) = db::read_preserved(root, t, &name) {
+                owned.extend(m.into_iter().map(|e| e.path));
+            }
+        }
         for name in db::installed(root, t).unwrap_or_default() {
             if let Ok(rec) = db::read(root, t, &name) {
                 owned.extend(rec.manifest.into_iter().map(|e| e.path));
@@ -5645,6 +5772,26 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
                 }
             }
             Err(e) => die(e.to_string()),
+        }
+    }
+
+    // a preserved library belongs to no installed record, and doctor builds its index
+    // out of what records claim. without this every consumer of a soname the tree has
+    // moved past reads unresolved and every symbol behind it reads missing -- 47 rows
+    // against electron that were one fact
+    for name in db::preserving(root, target).unwrap_or_default() {
+        let Ok(m) = db::read_preserved(root, target, &name) else {
+            continue;
+        };
+        index(&m, &mut present, &mut links);
+        let Ok(seen) = install::scan(root, &m) else {
+            continue;
+        };
+        for (path, what) in seen {
+            let install::Seen::Elf(o) = what else { continue };
+            here.insert(fold(&path), elves.len());
+            owners.push(name.clone());
+            elves.push((path, o));
         }
     }
 

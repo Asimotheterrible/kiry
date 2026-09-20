@@ -634,3 +634,142 @@ fn forcing_a_path_takes_it_out_of_provides_as_well() {
     let paths: Vec<&str> = left.iter().map(|p| p.path.as_str()).collect();
     assert_eq!(paths, vec!["usr/lib/libkept.so.1"], "{paths:?}");
 }
+
+// a package holding one shared library under a versioned file name with the soname link
+// beside it, which is the shape every real library on the system has. None when this
+// machine has no cc that can link one
+fn shipped(at: &Path, pkg: &str, ver: &str, soname: &str, real: &str) -> Option<PathBuf> {
+    let src = at.join(format!("{pkg}-{ver}.c"));
+    fs::write(&src, "int greet(int x){return x+1;}\n").unwrap();
+    let stage = at.join(format!("{pkg}-{ver}-stage"));
+    let lib = stage.join("usr/lib");
+    fs::create_dir_all(&lib).unwrap();
+
+    let built = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", &format!("-Wl,-soname,{soname}"), "-o"])
+        .arg(lib.join(real))
+        .arg(&src)
+        .status();
+    match built {
+        Ok(s) if s.success() => {}
+        _ => return None,
+    }
+    std::os::unix::fs::symlink(real, lib.join(soname)).unwrap();
+
+    let arc = at.join(format!("{pkg}-{ver}.tar.zst"));
+    let sh = format!(
+        "cd {} && tar cf - . | zstd -q -o {}",
+        stage.display(),
+        arc.display()
+    );
+    assert!(std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&sh)
+        .status()
+        .unwrap()
+        .success());
+
+    let meta = PathBuf::from(format!("{}.meta", arc.display()));
+    fs::create_dir_all(&meta).unwrap();
+    fs::write(meta.join("name"), format!("{pkg}\n")).unwrap();
+    fs::write(meta.join("version"), format!("{ver} 1\n")).unwrap();
+    fs::write(meta.join("targets"), "x86_64-musl\n").unwrap();
+    Some(arc)
+}
+
+fn no_cc() -> bool {
+    assert!(
+        std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+        "cc cannot build a shared library"
+    );
+    true
+}
+
+// the window between replacing a library and rebuilding what links it is hours long, and
+// for that whole time the consumers still name the soname that left
+#[test]
+fn a_library_whose_soname_moved_is_kept_back() {
+    let (at, root) = rooted("preserve");
+    let (Some(one), Some(two)) = (
+        shipped(&at, "foo", "1.0", "libfoo.so.1", "libfoo.so.1.0.0"),
+        shipped(&at, "foo", "2.0", "libfoo.so.2", "libfoo.so.2.0.0"),
+    ) else {
+        assert!(no_cc());
+        return;
+    };
+
+    run(&root, &[one], false).unwrap();
+    let jobs = install::plan(&root, &[two], false).unwrap();
+    let done = install::apply(&root, &jobs).unwrap();
+
+    assert_eq!(done.preserved, ["libfoo.so.1"]);
+    assert!(
+        root.join("usr/lib/libfoo.so.1.0.0").is_file(),
+        "the file every consumer still resolves to was pruned"
+    );
+    assert!(
+        root.join("usr/lib/libfoo.so.1").is_symlink(),
+        "the soname link is the only name a consumer knows it by"
+    );
+    assert!(root.join("usr/lib/libfoo.so.2.0.0").is_file());
+
+    let held = db::read_preserved(&root, "x86_64-musl", "foo").unwrap();
+    let mut paths: Vec<&str> = held.iter().map(|e| e.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, ["usr/lib/libfoo.so.1", "usr/lib/libfoo.so.1.0.0"]);
+}
+
+// the version in the file name moves on nearly every bump and the soname does not. the
+// link every consumer opens lands on the new file, so keeping the old one keeps a file
+// nothing will ever open again
+#[test]
+fn a_bump_that_keeps_its_soname_keeps_nothing_back() {
+    let (at, root) = rooted("preserve-same");
+    let (Some(one), Some(two)) = (
+        shipped(&at, "foo", "1.0", "libfoo.so.1", "libfoo.so.1.0.0"),
+        shipped(&at, "foo", "1.1", "libfoo.so.1", "libfoo.so.1.1.0"),
+    ) else {
+        assert!(no_cc());
+        return;
+    };
+
+    run(&root, &[one], false).unwrap();
+    let jobs = install::plan(&root, &[two], false).unwrap();
+    let done = install::apply(&root, &jobs).unwrap();
+
+    assert!(done.preserved.is_empty(), "{:?}", done.preserved);
+    assert!(!root.join("usr/lib/libfoo.so.1.0.0").exists());
+    assert!(db::read_preserved(&root, "x86_64-musl", "foo")
+        .unwrap()
+        .is_empty());
+}
+
+// a bump back to a soname that is being carried takes its own path back, and a record
+// still claiming it would have gc deleting the live library
+#[test]
+fn a_version_that_takes_the_path_back_clears_the_record() {
+    let (at, root) = rooted("preserve-back");
+    let (Some(one), Some(two), Some(three)) = (
+        shipped(&at, "foo", "1.0", "libfoo.so.1", "libfoo.so.1.0.0"),
+        shipped(&at, "foo", "2.0", "libfoo.so.2", "libfoo.so.2.0.0"),
+        shipped(&at, "foo", "3.0", "libfoo.so.1", "libfoo.so.1.0.0"),
+    ) else {
+        assert!(no_cc());
+        return;
+    };
+
+    run(&root, &[one], false).unwrap();
+    run(&root, &[two], false).unwrap();
+    assert_eq!(
+        db::read_preserved(&root, "x86_64-musl", "foo").unwrap().len(),
+        2
+    );
+
+    run(&root, &[three], false).unwrap();
+    let held = db::read_preserved(&root, "x86_64-musl", "foo").unwrap();
+    assert!(
+        !held.iter().any(|e| e.path == "usr/lib/libfoo.so.1.0.0"),
+        "the record still claims a file the package owns again: {held:?}"
+    );
+    assert!(root.join("usr/lib/libfoo.so.1.0.0").is_file());
+}

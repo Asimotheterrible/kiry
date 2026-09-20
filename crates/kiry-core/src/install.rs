@@ -125,6 +125,8 @@ pub struct Broke {
 pub struct Applied {
     pub broke: Vec<Broke>,
     pub edits: Vec<Kept>,
+    // the sonames kept back, not their files
+    pub preserved: Vec<String>,
 }
 
 // a config this root edited is never written over again, so the version the package
@@ -155,6 +157,8 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
     let mut broke = Vec::new();
     let mut edits = Vec::new();
     let mut kept: HashSet<String> = HashSet::new();
+    // what each version coming in carries, set against what the one going out did
+    let mut carried: Vec<Vec<db::Provide>> = Vec::new();
     for (i, j) in jobs.iter().enumerate() {
         let skip = match &was[i] {
             Some(o) => edited(root, &o.manifest)?,
@@ -204,10 +208,87 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
             },
         )?;
         db::write_provides(root, &j.target, &j.name, &provides)?;
+        carried.push(provides);
+    }
+
+    let mut stayed = Vec::new();
+    for (i, j) in jobs.iter().enumerate() {
+        let m = preserve(was[i].as_ref(), &before[i], &carried[i], &kept);
+        // a version that takes a path back owns it again, so the record stops claiming
+        // it rather than going on pointing at somebody else's file
+        let mut all: Vec<db::Entry> = db::read_preserved(root, &j.target, &j.name)?
+            .into_iter()
+            .filter(|e| !kept.contains(&e.path))
+            .collect();
+        let had = all.len();
+        all.extend(m.iter().cloned());
+        all.sort_by(|a, b| a.path.cmp(&b.path));
+        all.dedup_by(|a, b| a.path == b.path);
+        if had != all.len() {
+            db::write_preserved(root, &j.target, &j.name, &all)?;
+        }
+        for (path, o) in &before[i] {
+            if m.iter().any(|e| &e.path == path) {
+                stayed.extend(o.soname.clone());
+            }
+        }
+        kept.extend(m.into_iter().map(|e| e.path));
     }
     dispossess(root, jobs)?;
     prune(root, &was, &kept)?;
-    Ok(Applied { broke, edits })
+    Ok(Applied {
+        broke,
+        edits,
+        preserved: stayed,
+    })
+}
+
+// the file the old record pointed at is about to be pruned and there is nowhere else a
+// consumer would look for it, so it stays. only where the soname moved: a patch bump
+// renames libz.so.1.3.1 to libz.so.1.3.2 and the link every consumer opens still lands
+// on a whole library, so there is nothing there to keep back
+fn preserve(
+    old: Option<&db::Installed>,
+    before: &HashMap<String, elf::Elf>,
+    now: &[db::Provide],
+    kept: &HashSet<String>,
+) -> Vec<db::Entry> {
+    let Some(old) = old else {
+        return Vec::new();
+    };
+    let carried: HashSet<&str> = now.iter().map(|p| p.soname.as_str()).collect();
+    let stay: HashSet<&str> = before
+        .iter()
+        .filter(|(path, o)| {
+            !kept.contains(path.as_str())
+                && o.soname.as_deref().is_some_and(|s| !carried.contains(s))
+        })
+        .map(|(path, _)| path.as_str())
+        .collect();
+    if stay.is_empty() {
+        return Vec::new();
+    }
+    old.manifest
+        .iter()
+        .filter(|e| !kept.contains(&e.path))
+        .filter(|e| match &e.kind {
+            // the soname link is how a consumer reaches the file at all, so one without
+            // the other keeps nothing
+            db::Kind::Link(t) => beside(&e.path, t).is_some_and(|p| stay.contains(p.as_str())),
+            _ => stay.contains(e.path.as_str()),
+        })
+        .cloned()
+        .collect()
+}
+
+// a soname link sits beside the file it names, so its target resolves against the link's
+// own directory. one with a slash in it is left alone rather than guessed at
+pub fn beside(path: &str, target: &str) -> Option<String> {
+    if target.contains('/') {
+        return None;
+    }
+    let dir = path.rfind('/').map_or("", |i| &path[..=i]);
+    Some(format!("{dir}{target}"))
 }
 
 // the real file carries the full version and the soname is a symlink onto it, so a bump

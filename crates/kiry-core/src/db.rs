@@ -209,6 +209,43 @@ pub fn read_provides(root: &Path, target: &str, name: &str) -> Result<Vec<Provid
     }
 }
 
+// a library whose soname the new version stopped carrying. once the old record is
+// overwritten nothing owns it, and doctor indexes only what records claim, so this gives
+// it an owner and gc something to decide about. in the db so it rolls back with it
+pub fn preserved(root: &Path, target: &str, name: &str) -> PathBuf {
+    root.join(DB).join("preserved").join(target).join(name)
+}
+
+pub fn write_preserved(root: &Path, target: &str, name: &str, m: &[Entry]) -> Result<(), Error> {
+    let p = preserved(root, target, name);
+    if m.is_empty() {
+        return match fs::remove_file(&p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(p, e)),
+        };
+    }
+    let text = format_manifest(m)?;
+    let parent = p.parent().unwrap_or(&p);
+    fs::create_dir_all(parent).map_err(|e| Error::Io(parent.to_path_buf(), e))?;
+    put(&p, &text)
+}
+
+pub fn read_preserved(root: &Path, target: &str, name: &str) -> Result<Vec<Entry>, Error> {
+    let p = preserved(root, target, name);
+    match fs::read_to_string(&p) {
+        Ok(t) => parse_manifest(&t),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(Error::Io(p, e)),
+    }
+}
+
+// a package that has been removed still leaves its preserved libraries standing, so
+// this walks the records rather than the installed names
+pub fn preserving(root: &Path, target: &str) -> Result<Vec<String>, Error> {
+    names(&root.join(DB).join("preserved").join(target))
+}
+
 pub fn dir(root: &Path, target: &str, name: &str) -> PathBuf {
     root.join(DB).join("installed").join(target).join(name)
 }

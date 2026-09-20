@@ -1238,3 +1238,69 @@ fn a_library_reached_only_through_another_dep_is_undeclared() {
         "{out}"
     );
 }
+
+// what install keeps back when a soname moves, placed the way install places it
+fn preserving(root: &Path, name: &str, files: &[(&str, &Path)]) {
+    let mut manifest = Vec::new();
+    for (path, from) in files {
+        let dst = root.join(path);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::copy(from, &dst).unwrap();
+        manifest.push(db::Entry {
+            mode: 0o755,
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(&dst).unwrap()).unwrap()),
+            path: (*path).to_string(),
+        });
+    }
+    db::write_preserved(root, TARGET, name, &manifest).unwrap();
+}
+
+// a preserved library belongs to no installed record, and doctor builds its index out of
+// what records claim. the ffmpeg soname bump put 47 rows against electron that were all
+// this one fact: with the provider missing from the index, every symbol wanted from it
+// is missing too
+#[test]
+fn a_preserved_library_still_answers_for_its_soname() {
+    if skip("preserved library") {
+        return;
+    }
+    let at = scratch("preserved");
+    let root = at.join("root");
+    let old = lib(&at, "libp.so.1");
+    let new = lib(&at, "libp.so.2");
+    let b = bin(&at, "app", &old, None);
+
+    install(&root, "libp", &[("usr/lib64/libp.so.2", &new)]);
+    install(&root, "app", &[("usr/bin/app", &b)]);
+    needs(&root, "app", &["libp"]);
+    preserving(&root, "libp", &[("usr/lib64/libp.so.1", &old)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(ok, "{out}");
+    assert!(!out.contains("unresolved"), "{out}");
+    assert!(!out.contains("missing-symbol"), "{out}");
+    // reported rather than silent: a library the tree has moved past is something to
+    // know about, it is just not a fault
+    assert!(out.contains("1 preserved"), "{out}");
+}
+
+// an orphan is what these are not. kiry put them there and kiry takes them away
+#[test]
+fn a_preserved_library_is_not_an_orphan() {
+    if skip("preserved orphan") {
+        return;
+    }
+    let at = scratch("preserved-orphan");
+    let root = at.join("root");
+    let old = lib(&at, "libp.so.1");
+    let new = lib(&at, "libp.so.2");
+    install(&root, "libp", &[("usr/lib64/libp.so.2", &new)]);
+    preserving(&root, "libp", &[("usr/lib64/libp.so.1", &old)]);
+
+    let o = Command::new(KIRY)
+        .args(["doctor", "--orphans", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(!out.contains("usr/lib64/libp.so.1 unowned"), "{out}");
+}

@@ -2478,7 +2478,8 @@ fn install_cmd(args: &[String]) {
     }
 
     let set = wanted(&root, &seeds, &mut recipes);
-    let plan = levels(&set, &recipes);
+    let mut plan = levels(&set, &recipes);
+    longest_first(&mut plan, &set, &history(&root));
     if dry {
         for (n, t) in &set {
             let how = match cached(&root, &recipes[n], t) {
@@ -3374,6 +3375,60 @@ fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<
     out
 }
 
+// within a level nothing depends on anything else, so the order is free, and a level
+// takes as long as its slowest member wherever that one starts. longest first is what
+// leaves the short tail at the end
+fn longest_first(
+    plan: &mut [Vec<(usize, bool)>],
+    want: &[(String, String)],
+    past: &HashMap<(String, String), u64>,
+) {
+    for level in plan.iter_mut() {
+        // never built here goes first. an unknown cost is the one worth starting early
+        // and it is the only guess on offer
+        level.sort_by_key(|(i, _)| {
+            (
+                std::cmp::Reverse(past.get(&want[*i]).copied().unwrap_or(u64::MAX)),
+                want[*i].clone(),
+            )
+        });
+    }
+}
+
+#[cfg(test)]
+mod order {
+    use super::*;
+
+    fn three() -> Vec<(String, String)> {
+        ["quick", "slow", "new"]
+            .iter()
+            .map(|n| ((*n).to_string(), "x86_64-musl".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_level_starts_with_the_one_that_takes_longest() {
+        let want = three();
+        let past = HashMap::from([(want[0].clone(), 30u64), (want[1].clone(), 3000u64)]);
+        let mut plan = vec![vec![(0, false), (1, false), (2, false)]];
+        longest_first(&mut plan, &want, &past);
+        let names: Vec<&str> = plan[0].iter().map(|(i, _)| want[*i].0.as_str()).collect();
+        assert_eq!(names, ["new", "slow", "quick"]);
+    }
+
+    #[test]
+    fn the_levels_themselves_do_not_move() {
+        let want = three();
+        let past = HashMap::from([(want[2].clone(), 9000u64)]);
+        let mut plan = vec![vec![(0, false)], vec![(2, false)], vec![(1, false)]];
+        longest_first(&mut plan, &want, &past);
+        // a level is a dependency step. reordering those builds something against what
+        // is not installed yet, which is the one thing this is not allowed to touch
+        let order: Vec<&str> = plan.iter().map(|l| want[l[0].0].0.as_str()).collect();
+        assert_eq!(order, ["quick", "new", "slow"]);
+    }
+}
+
 fn rebuild_cmd(args: &[String]) {
     let mut dry = false;
     let mut rest = Vec::new();
@@ -3441,7 +3496,8 @@ fn rebuild_cmd(args: &[String]) {
         };
     }
 
-    let plan = levels(&want, &recipes);
+    let mut plan = levels(&want, &recipes);
+    longest_first(&mut plan, &want, &history(&root));
     if dry {
         for (i, boot) in plan.into_iter().flatten() {
             let how = if boot { "would bootstrap" } else { "would rebuild" };

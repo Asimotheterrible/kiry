@@ -510,3 +510,47 @@ fn the_split_makedepends_forms_are_dependencies_too() {
     got.sort_unstable();
     assert_eq!(got, ["flex make", "ncurses make"], "{deps}");
 }
+
+// sources and checksums pair by position. offline there is no fetching a tarball, so the
+// patches beside the apkbuild get checksums and the tarball does not, and a recipe with
+// 73 sources against 72 checksums does not load at all
+#[test]
+fn a_recipe_converted_offline_still_loads() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("offline-counts");
+    let d = at.join("aports/thing");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("fix.patch"), "--- a\n+++ b\n").unwrap();
+    fs::write(
+        d.join("APKBUILD"),
+        "pkgname=thing\npkgver=1.0\npkgrel=0\n\
+         source=\"https://example.invalid/thing-1.0.tar.gz\n\tfix.patch\"\n\
+         build() {\n\tmake\n}\n\
+         package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
+    )
+    .unwrap();
+    let out = at.join("out");
+    let o = kiry(&[
+        "convert",
+        "-n",
+        d.join("APKBUILD").to_str().unwrap(),
+        out.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let made = out.join("thing");
+    let sources = fs::read_to_string(made.join("sources")).unwrap();
+    assert_eq!(sources.lines().count(), 2, "{sources}");
+    // nothing rather than half an answer. the sha256 lands when something fetches
+    assert!(
+        fs::read_to_string(made.join("checksums")).unwrap().trim().is_empty(),
+        "a partial checksums file is one the recipe cannot be read back with"
+    );
+
+    let shown = kiry(&[made.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&shown.stderr);
+    assert!(shown.status.success(), "{text}");
+    assert!(!text.contains("but"), "{text}");
+}

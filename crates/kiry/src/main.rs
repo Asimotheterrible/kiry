@@ -5268,7 +5268,30 @@ fn convert_cmd(args: &[String]) {
     };
 
     let repos = repos(&root);
-    let alias = convert::aliases(&repos);
+    // what this batch derives outranks what an earlier one wrote, and neither outranks a
+    // pair somebody kept by hand. so the file convert wrote is read apart from the others
+    let table = out.join("aliases");
+    let hand_kept: Vec<PathBuf> = repos
+        .iter()
+        .filter(|r| !convert::generated(&r.join("aliases")))
+        .cloned()
+        .collect();
+    let hand = convert::aliases(&hand_kept);
+    let before = match convert::generated(&table) {
+        true => convert::aliases(std::slice::from_ref(&out)),
+        false => HashMap::new(),
+    };
+    let files: Vec<&Path> = names.iter().map(Path::new).collect();
+    let derived = convert::merged(&hand, &convert::parents(&files), &before);
+    let mut alias = derived.clone();
+    alias.extend(hand);
+    if table.exists() && !convert::generated(&table) {
+        say!("{} is kept by hand, so the subpackage table was not written", table.display());
+    } else if !derived.is_empty() {
+        if let Err(e) = mkdirs(&out).and_then(|_| convert::write_parents(&table, &derived)) {
+            die(e);
+        }
+    }
     // the run is the survey, so an apkbuild that will not read is a line in it
     let mut failed = 0;
     for n in names {

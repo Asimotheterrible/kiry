@@ -544,8 +544,11 @@ fn filename(s: &str) -> Result<(&str, &str), String> {
 }
 
 fn grab(url: &str, dst: &Path) -> Result<(), String> {
+    // one partial file per fetch. two builds of a level can go after the same tarball at
+    // once, and a shared .part is two downloads interleaved into one file
+    static FETCH: AtomicUsize = AtomicUsize::new(0);
     let mut part = dst.as_os_str().to_owned();
-    part.push(".part");
+    part.push(format!(".part{}", FETCH.fetch_add(1, Ordering::Relaxed)));
     let part = PathBuf::from(part);
 
     run(&mut fetcher(url, &part)?, url)?;
@@ -941,7 +944,7 @@ fn compile(
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("DESTDIR", "/dest")
         // every apkbuild build() leans on abuild exporting this and never says -j itself
-        .env("MAKEFLAGS", format!("-j{}", jobs()))
+        .env("MAKEFLAGS", makeflags(jobs(), width()))
         // build is this machine, host is what the output has to run on. they are the
         // same triple for a musl package built on musl and they are not for a gnu one,
         // which is the only cross this tree does. told they matched, gcc's configure
@@ -1316,6 +1319,60 @@ fn triple(t: &str) -> &'static str {
         "x86_64-unknown-linux-gnu"
     } else {
         "x86_64-unknown-linux-musl"
+    }
+}
+
+// how many builds of one level run at once. each is already at -j nproc, so what this
+// buys is the serial stretches -- configure, the final link, one slow codegen unit --
+// where a single build leaves most of the machine idle. KIRY_PARALLEL=1 is one at a time
+fn width() -> usize {
+    match std::env::var("KIRY_PARALLEL").ok().and_then(|v| v.parse().ok()) {
+        Some(n) if n > 0 => n,
+        _ => 2,
+    }
+}
+
+// with company, make stops starting jobs once the load says the machine is full. samu
+// has no such option -- it refuses -l outright -- so a ninja build just shares the cpu
+fn makeflags(jobs: usize, width: usize) -> String {
+    match width {
+        1 => format!("-j{jobs}"),
+        _ => format!("-j{jobs} -l{jobs}"),
+    }
+}
+
+// f over items, width at a time, started in the order given -- longest first by the time
+// a level gets here, which is the first point that ordering changes anything. the first
+// failure stops anything new starting and waits out what is already running, because a
+// build killed halfway leaves a stage directory behind that nothing claims
+fn parallel<T: Sync>(
+    items: &[T],
+    width: usize,
+    f: impl Fn(&T) -> Result<(), String> + Sync,
+) -> Result<(), String> {
+    let next = AtomicUsize::new(0);
+    let failed: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..width.clamp(1, items.len().max(1)) {
+            s.spawn(|| loop {
+                if failed.lock().map_or(true, |g| g.is_some()) {
+                    return;
+                }
+                let Some(it) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                    return;
+                };
+                if let Err(e) = f(it) {
+                    if let Ok(mut g) = failed.lock() {
+                        g.get_or_insert(e);
+                    }
+                    return;
+                }
+            });
+        }
+    });
+    match failed.into_inner() {
+        Ok(Some(e)) => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -2540,12 +2597,18 @@ fn install_cmd(args: &[String]) {
             }
         }
 
-        let mut made = Vec::new();
-        for name in order {
-            let p = &recipes[name];
+        // one package is the unit, so its targets still build together and a level
+        // runs width packages at a time. -v streams a build to the terminal, and two
+        // streams at once are one unreadable one
+        let targets_of = |name: &String| -> (bool, Vec<String>) {
             let mine: Vec<&(usize, bool)> = level.iter().filter(|(i, _)| set[*i].0 == *name).collect();
             let boot = mine.iter().any(|(_, b)| *b);
-            let targets: Vec<String> = mine.iter().map(|(i, _)| set[*i].1.clone()).collect();
+            (boot, mine.iter().map(|(i, _)| set[*i].1.clone()).collect())
+        };
+        let w = if verbose { 1 } else { width() };
+        let built = parallel(&order, w, |name| {
+            let p = &recipes[*name];
+            let (boot, targets) = targets_of(name);
 
             let need: Vec<String> = targets
                 .iter()
@@ -2558,16 +2621,23 @@ fn install_cmd(args: &[String]) {
                 })
                 .cloned()
                 .collect();
-            if !need.is_empty() {
-                let r = match (boot, fix) {
-                    (true, _) => build(&root, p, &need, verbose, false, true).map(|_| ()),
-                    (false, true) => need.iter().try_for_each(|t| recover(&root, p, t, verbose)),
-                    (false, false) => build(&root, p, &need, verbose, false, false).map(|_| ()),
-                };
-                if let Err(e) = r {
-                    die(e);
-                }
+            if need.is_empty() {
+                return Ok(());
             }
+            match (boot, fix) {
+                (true, _) => build(&root, p, &need, verbose, false, true).map(|_| ()),
+                (false, true) => need.iter().try_for_each(|t| recover(&root, p, t, verbose)),
+                (false, false) => build(&root, p, &need, verbose, false, false).map(|_| ()),
+            }
+        });
+        if let Err(e) = built {
+            die(e);
+        }
+
+        let mut made = Vec::new();
+        for name in order {
+            let p = &recipes[name];
+            let (_, targets) = targets_of(name);
             for t in &targets {
                 match cached(&root, p, t) {
                     Some(a) => made.push(a),
@@ -3427,6 +3497,69 @@ mod order {
         assert_eq!(names, ["new", "slow", "quick"]);
     }
 
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    // each item waits to see the other running. one at a time, nobody ever does
+    fn overlapped(width: usize) -> usize {
+        let running = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let _ = parallel(&[0, 1], width, |_| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            for _ in 0..100 {
+                if running.load(Ordering::SeqCst) == 2 {
+                    peak.store(2, Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            running.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        });
+        peak.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_level_two_wide_runs_two_at_once() {
+        assert_eq!(overlapped(2), 2);
+        assert_eq!(overlapped(1), 1);
+    }
+
+    #[test]
+    fn a_failure_starts_nothing_new_and_waits_for_what_runs() {
+        let ran = Mutex::new(Vec::new());
+        let r = parallel(&[0, 1, 2, 3], 2, |i| {
+            if *i == 0 {
+                std::thread::sleep(Duration::from_millis(30));
+                return Err("zero broke".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(120));
+            ran.lock().unwrap().push(*i);
+            Ok(())
+        });
+        assert_eq!(r, Err("zero broke".to_string()));
+        // one was already running beside the failure and finished. nothing after it began
+        assert_eq!(*ran.lock().unwrap(), [1]);
+    }
+
+    #[test]
+    fn a_level_starts_its_builds_in_the_order_given() {
+        let seen = Mutex::new(Vec::new());
+        parallel(&["slow", "mid", "quick"], 1, |n| {
+            seen.lock().unwrap().push(*n);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["slow", "mid", "quick"]);
+    }
+
+    #[test]
+    fn make_is_capped_by_load_only_with_company() {
+        assert_eq!(makeflags(16, 1), "-j16");
+        assert_eq!(makeflags(16, 2), "-j16 -l16");
+    }
+
     #[test]
     fn the_levels_themselves_do_not_move() {
         let want = three();
@@ -3520,19 +3653,34 @@ fn rebuild_cmd(args: &[String]) {
     for level in plan {
         // every member of a level compiles before any of it is installed, and the level
         // below it is already in place, so each one links against what it will run with
+        // a package at a time, its targets one after another: a recovery rewrites the
+        // package's filter file, and two targets doing that at once lose a line
+        let mut names: Vec<&String> = Vec::new();
+        for (i, _) in &level {
+            if !names.contains(&&want[*i].0) {
+                names.push(&want[*i].0);
+            }
+        }
+        let built = parallel(&names, width(), |name| {
+            let p = &recipes[*name];
+            for (i, boot) in level.iter().filter(|(i, _)| want[*i].0 == **name) {
+                let target = &want[*i].1;
+                // a bootstrap pass is a stand-in that exists to be replaced, so it is
+                // built straight rather than put through the recovery loop
+                match boot {
+                    true => build(&root, p, std::slice::from_ref(target), false, false, true).map(|_| ())?,
+                    false => recover(&root, p, target, false)?,
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = built {
+            die(e);
+        }
         let mut made = Vec::new();
-        for (i, boot) in &level {
+        for (i, _) in &level {
             let (name, target) = &want[*i];
             let p = &recipes[name];
-            // a bootstrap pass is a stand-in that exists to be replaced, so it is built
-            // straight rather than put through the recovery loop
-            let r = match boot {
-                true => build(&root, p, std::slice::from_ref(target), false, false, true).map(|_| ()),
-                false => recover(&root, p, target, false),
-            };
-            if let Err(e) = r {
-                die(e);
-            }
             match cached(&root, p, target) {
                 Some(a) => made.push(a),
                 None => die(format!("{} {target}: built nothing", p.name)),

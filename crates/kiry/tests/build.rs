@@ -4193,3 +4193,53 @@ fn a_wrong_sha512_stops_the_build() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("recipe says"));
     assert!(artifacts(&root).is_empty());
 }
+
+// two packages nothing orders between build side by side, and both want the same
+// tarball. a shared partial file is two downloads written into one, and the second
+// rename finds the file already gone
+#[test]
+fn two_packages_in_one_level_build_side_by_side() {
+    let one = scratch("wide-one");
+    let two = scratch("wide-two");
+    let a = recipe(&one, "x86_64-musl", GOOD);
+    let b = recipe(&two, "x86_64-musl", GOOD);
+    let b2 = two.join("hullo");
+    fs::rename(&b, &b2).unwrap();
+    fs::write(
+        b2.join("build"),
+        "mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hullo\"\n",
+    )
+    .unwrap();
+    for d in [&a, &b2] {
+        fs::write(d.join("sources"), "hello-1.0.tar::https://example.invalid/hello-1.0.tar\n").unwrap();
+    }
+    // slow enough that both fetches are in flight before either one renames
+    let fetch = one.join("fetch.sh");
+    fs::write(
+        &fetch,
+        format!("#!/bin/sh\nsleep 0.5\ncp {} \"$1\"\n", one.join("hello-1.0.tar").display()),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&fetch).status().unwrap();
+
+    let root = one.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = Command::new(KIRY)
+        .args(["i", "--root", root.to_str().unwrap(), a.to_str().unwrap(), b2.to_str().unwrap()])
+        .env("KIRY_PARALLEL", "2")
+        .env("KIRY_FETCH", format!("{} %o %u", fetch.display()))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(root.join("usr/bin/hello")).unwrap(), "hi\n");
+    assert_eq!(fs::read_to_string(root.join("usr/bin/hullo")).unwrap(), "hi\n");
+    let parts = fs::read_dir(root.join("var/kiry/cache/sources"))
+        .map(|rd| rd.flatten().filter(|e| e.file_name().to_string_lossy().contains(".part")).count())
+        .unwrap_or(0);
+    assert_eq!(parts, 0);
+}

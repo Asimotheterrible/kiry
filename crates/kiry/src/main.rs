@@ -2497,10 +2497,6 @@ fn install_cmd(args: &[String]) {
         }
         return;
     }
-    // decided once, before any of it is built, so a batch cannot change its mind halfway
-    let dest = settle(&root, &set, plan.len(), live);
-    forecast(&root, &set, &recipes);
-
     // a level has to be in place before the one above it can build against it, which is
     // what forces the install to happen a level at a time. when every member is already
     // built that ordering buys nothing, so the set goes in as one transaction instead
@@ -2508,6 +2504,12 @@ fn install_cmd(args: &[String]) {
         .iter()
         .map(|(n, t)| cached(&root, &recipes[n], t))
         .collect();
+    // decided once, before any of it is built, so a batch cannot change its mind halfway
+    // a set that is all built is one transaction however many levels it spans, which is
+    // how llvm and the llvm-runtime it depends on go into the other root together
+    let steps = if ready.is_some() { 1 } else { plan.len() };
+    let dest = settle(&root, &set, steps, live);
+    forecast(&root, &set, &recipes);
     if let Some(all) = ready {
         for (n, t) in &set {
             say!("{n} {} {t} cached", recipes[n].version.upstream);

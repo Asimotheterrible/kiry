@@ -2772,10 +2772,9 @@ fn pair(text: &str) -> Result<(String, String, String), String> {
 // the running root as it was before a risky transaction, in the other half of the pair.
 // once a boot: a tree that booted is the proven one, and a second risky install in the
 // same boot would otherwise swap it for a tree only the first install has touched
-fn fallback() -> Result<(), String> {
-    let text = fs::read_to_string("/proc/mounts").map_err(|e| format!("/proc/mounts: {e}"))?;
-    let (dev, now, other) = pair(&text)?;
-    if Path::new(TAKEN).exists() {
+fn fallback(text: &str, taken: &Path) -> Result<(), String> {
+    let (dev, now, other) = pair(text)?;
+    if taken.exists() {
         say!("            {other} is the fallback, {now} as this boot found it");
         return Ok(());
     }
@@ -2794,16 +2793,20 @@ fn fallback() -> Result<(), String> {
     let made = snapshot(&top, &now, &other);
     let _ = run(Command::new("umount").arg(&top), "umount");
     made?;
-    fs::write(TAKEN, format!("{other}\n")).map_err(|e| format!("{TAKEN}: {e}"))?;
+    put(taken, &format!("{other}\n"))?;
     say!("            {other} is the fallback, a snapshot of {now}. boot {} from the firmware menu if this goes wrong", label(&other));
     Ok(())
 }
 
+// btrfs says what it did on stdout, and the line kiry prints after says it once
 fn snapshot(top: &Path, now: &str, other: &str) -> Result<(), String> {
     let at = top.join(other);
     if at.exists() {
         run(
-            Command::new("btrfs").args(["subvolume", "delete"]).arg(&at),
+            Command::new("btrfs")
+                .args(["subvolume", "delete"])
+                .arg(&at)
+                .stdout(Stdio::null()),
             &format!("btrfs subvolume delete {other}"),
         )?;
     }
@@ -2811,7 +2814,8 @@ fn snapshot(top: &Path, now: &str, other: &str) -> Result<(), String> {
         Command::new("btrfs")
             .args(["subvolume", "snapshot"])
             .arg(top.join(now))
-            .arg(&at),
+            .arg(&at)
+            .stdout(Stdio::null()),
         &format!("btrfs subvolume snapshot {now} {other}"),
     )
 }
@@ -2918,7 +2922,10 @@ fn settle(root: &Path, going: &[(String, String)], live: bool) {
         say!("route live  --live, no fallback: {why}");
     } else {
         say!("route live  fallback first: {why}");
-        if let Err(e) = fallback() {
+        let made = fs::read_to_string("/proc/mounts")
+            .map_err(|e| format!("/proc/mounts: {e}"))
+            .and_then(|text| fallback(&text, Path::new(TAKEN)));
+        if let Err(e) = made {
             die(e);
         }
     }
@@ -6396,6 +6403,23 @@ Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.e
     fn a_header_that_starts_with_boot_is_not_an_entry() {
         let got: Vec<&str> = EFI.lines().filter_map(entry).map(|(n, _)| n).collect();
         assert_eq!(got, ["0000", "0001", "0002"]);
+    }
+
+    // the second risky install in a boot keeps the fallback the first one took. the
+    // device does not exist, so reaching for the snapshot at all fails even as root and
+    // the test says so, and never gets near a real subvolume
+    #[test]
+    fn a_fallback_is_taken_once_a_boot() {
+        let fake = REAL.replace("/dev/mapper/cryptroot", "/dev/kiry-test-none");
+        let at = std::env::temp_dir().join(format!("kiry-taken-{}", std::process::id()));
+        let _ = fs::remove_file(&at);
+        assert!(fallback(&fake, &at).is_err(), "it did not try to snapshot");
+        fs::write(&at, "@root-b\n").unwrap();
+        assert_eq!(fallback(&fake, &at), Ok(()));
+        // a root outside the pair has no other half to hold a fallback, marker or not
+        let third = fake.replace("subvol=/@root-a", "subvol=/@root-c");
+        assert!(fallback(&third, &at).is_err());
+        let _ = fs::remove_file(&at);
     }
 
     // a live install onto a root the firmware does not boot first is undone by the next

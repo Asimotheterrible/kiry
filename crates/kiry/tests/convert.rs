@@ -554,3 +554,107 @@ fn a_recipe_converted_offline_still_loads() {
     assert!(shown.status.success(), "{text}");
     assert!(!text.contains("but"), "{text}");
 }
+
+fn apkbuild(at: &Path, name: &str, extra: &str) -> PathBuf {
+    let d = at.join("aports").join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(
+        d.join("APKBUILD"),
+        format!(
+            "pkgname={name}\npkgver=1.0\npkgrel=0\n{extra}\n\
+             build() {{\n\tmake\n}}\n\
+             package() {{\n\tmake install DESTDIR=\"$pkgdir\"\n}}\n"
+        ),
+    )
+    .unwrap();
+    d.join("APKBUILD")
+}
+
+fn deps(d: &Path) -> Vec<String> {
+    fs::read_to_string(d.join("depends"))
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.split_whitespace().next().map(String::from))
+        .collect()
+}
+
+// a subpackage is folded into the recipe that builds it, so naming one is naming its
+// parent. 1788 of the imported recipes name one
+#[test]
+fn a_dependency_on_a_subpackage_is_a_dependency_on_its_parent() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("parents");
+    let a = apkbuild(&at, "db", "subpackages=\"$pkgname-doc $pkgname-client:client libdb:libs\"");
+    // lua is a name two apkbuilds claim, and picking one is a decision
+    let l1 = apkbuild(&at, "lua5.3", "provides=\"lua\"");
+    let l2 = apkbuild(&at, "lua5.4", "provides=\"lua\"");
+    let b = apkbuild(
+        &at,
+        "app",
+        "depends=\"db-client libdb lua\"\nmakedepends=\"db-dev\"",
+    );
+    let out = at.join("out");
+    let o = kiry(&[
+        "convert",
+        "-n",
+        a.to_str().unwrap(),
+        l1.to_str().unwrap(),
+        l2.to_str().unwrap(),
+        b.to_str().unwrap(),
+        out.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let got = deps(&out.join("app"));
+    assert!(!got.contains(&"db-client".to_string()), "{got:?}");
+    assert!(!got.contains(&"libdb".to_string()), "{got:?}");
+    assert!(got.contains(&"db".to_string()), "{got:?}");
+    assert!(got.contains(&"lua".to_string()), "an ambiguous name got resolved: {got:?}");
+
+    // written where the next single conversion can read it, and marked as convert's own
+    let table = fs::read_to_string(out.join("aliases")).unwrap();
+    assert!(table.starts_with("# written by kiry convert"), "{table}");
+    assert!(table.contains("db-client\tdb"), "{table}");
+    assert!(!table.lines().any(|l| l.starts_with("lua\t")), "{table}");
+}
+
+// a hand-kept pair outranks anything derived, and a parent that is itself aliased is
+// chased -- so alpine's clang lands on this tree's llvm and not on a second llvm
+#[test]
+fn a_hand_kept_alias_wins_over_a_derived_one() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("parents-hand");
+    let repo = at.join("core");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("aliases"), "clang23\tllvm\nclang23-extra\t-\n").unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+
+    let c = apkbuild(&at, "clang23", "subpackages=\"clang23-extra:extra clang:clang_link\"");
+    let b = apkbuild(&at, "app", "makedepends=\"clang\"");
+    // its own subpackage is something the one recipe already builds
+    let s = apkbuild(&at, "self", "subpackages=\"self-tools:tools\"\ndepends=\"self-tools\"");
+    let out = at.join("out");
+    let o = kiry(&[
+        "convert",
+        "-n",
+        "--root",
+        root.to_str().unwrap(),
+        c.to_str().unwrap(),
+        b.to_str().unwrap(),
+        s.to_str().unwrap(),
+        out.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(deps(&out.join("app")), ["llvm"]);
+    assert!(deps(&out.join("self")).is_empty(), "{:?}", deps(&out.join("self")));
+    // what a hand-kept file already answers is not written again, or the derived copy
+    // outlives the day somebody changes the hand-kept one
+    let table = fs::read_to_string(out.join("aliases")).unwrap();
+    assert!(!table.contains("clang23-extra"), "{table}");
+}

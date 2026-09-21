@@ -31,6 +31,8 @@ const WANT: &[&str] = &[
     "patch_args",
     // options_has reads it, and abuild keeps .la files only when it names libtool
     "options",
+    // the other names a recipe answers to, which is what parents() reads
+    "provides",
 ];
 
 // what could not be carried across, reported rather than guessed at
@@ -61,6 +63,81 @@ pub fn aliases(repos: &[PathBuf]) -> HashMap<String, String> {
         }
     }
     out
+}
+
+// the first line of an aliases file convert wrote, which is how it knows the file is its
+// own to rewrite and not somebody's hand-kept table
+pub const GENERATED: &str =
+    "# written by kiry convert from each apkbuild's subpackages and provides. hand-kept pairs go in another repo's aliases, which win";
+
+pub fn generated(file: &Path) -> bool {
+    fs::read_to_string(file).is_ok_and(|t| t.lines().next() == Some(GENERATED))
+}
+
+// a subpackage is folded into the recipe that builds it, so a dependency on libpq is a
+// dependency on postgresql. read out of the apkbuilds rather than typed in: 1788 of 9535
+// imported recipes named one, and nobody is writing that table by hand
+//
+// a name two apkbuilds both claim is left out rather than handed to whichever came first
+// -- lua is provided by five lua versions and luajit, and picking one is a decision
+pub fn parents(apkbuilds: &[&Path]) -> HashMap<String, String> {
+    let mut claims: HashMap<String, Vec<String>> = HashMap::new();
+    let mut names = std::collections::HashSet::new();
+    for a in apkbuilds {
+        let Ok((v, _)) = variables(a) else { continue };
+        let Some(me) = v.get("pkgname").filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        names.insert(me.clone());
+        let listed = [v.get("subpackages"), v.get("provides")];
+        for entry in listed.into_iter().flatten().flat_map(|s| s.split_whitespace()) {
+            // name:function:arch in subpackages. the name is the part before the first colon
+            let head = entry.split(':').next().unwrap_or("");
+            let Some(n) = dep(head) else { continue };
+            if n != *me {
+                let who = claims.entry(n).or_default();
+                if !who.contains(me) {
+                    who.push(me.clone());
+                }
+            }
+        }
+    }
+    claims
+        .into_iter()
+        .filter(|(n, who)| who.len() == 1 && !names.contains(n))
+        .map(|(n, mut who)| (n, who.remove(0)))
+        .collect()
+}
+
+// hand-kept pairs first, then this batch's parents, then whatever an earlier batch
+// wrote. a parent that is itself aliased is chased one step, so clang lands on this
+// tree's llvm and not on alpine's clang23
+pub fn merged(
+    hand: &HashMap<String, String>,
+    fresh: &HashMap<String, String>,
+    before: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut out = before.clone();
+    for (n, p) in fresh {
+        out.insert(n.clone(), p.clone());
+    }
+    for to in out.values_mut() {
+        if let Some(t) = hand.get(to.as_str()) {
+            to.clone_from(t);
+        }
+    }
+    out.retain(|n, _| !hand.contains_key(n));
+    out
+}
+
+pub fn write_parents(file: &Path, m: &HashMap<String, String>) -> Result<(), String> {
+    let mut rows: Vec<(&String, &String)> = m.iter().collect();
+    rows.sort();
+    let mut body = format!("{GENERATED}\n\n");
+    for (n, p) in rows {
+        body.push_str(&format!("{n}\t{p}\n"));
+    }
+    put(file, &body)
 }
 
 pub fn recipe(
@@ -171,6 +248,8 @@ pub fn recipe(
             };
             match alias.get(&n).map(String::as_str) {
                 Some("-") => notes.push(format!("{raw} has no equivalent here")),
+                // its own subpackage, which the one recipe already builds
+                Some(to) if to == name => {}
                 // an apkbuild makedepends is a tool alpine runs during the build, so
                 // it converts to " make". a header-only one wants " build" instead and
                 // the apkbuild does not say which it is -- corrected by hand when a

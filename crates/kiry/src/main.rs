@@ -3949,6 +3949,14 @@ struct Row {
 
 fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
     let mut rows = Vec::new();
+    // extra carries all of aports, which makes it a catalogue rather than a list of what
+    // this machine keeps. asked about nothing in particular, only what is installed from
+    // it is worth an answer -- the rest is a bump nobody would build, fetched for nothing
+    let kept: HashSet<String> = db::targets(root)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|t| db::installed(root, t).unwrap_or_default())
+        .collect();
     for r in repos(root) {
         let repo = r
             .file_name()
@@ -3959,6 +3967,9 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
         for d in dirs {
             let Ok(p) = pkg::load(&d) else { continue };
             if !want.is_empty() && !want.contains(&p.name) {
+                continue;
+            }
+            if want.is_empty() && repo == "extra" && !kept.contains(&p.name) {
                 continue;
             }
 

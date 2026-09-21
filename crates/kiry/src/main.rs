@@ -64,7 +64,7 @@ fn usage() {
     say!("usage: kiry <command> [args]");
     say!("");
     say!("  i <pkg>...    build what is missing, then install (-n to just say what)");
-    say!("                  --live forces / when it would have used the other root");
+    say!("                  --live skips the fallback snapshot a risky install takes first");
     say!("  b <pkg>...    build only, into the cache");
     say!("  r <pkg>...    remove");
     say!("  l             what is installed");
@@ -2502,9 +2502,9 @@ fn install_cmd(args: &[String]) {
     if asked.is_empty() {
         let paths: Vec<PathBuf> = archives.iter().map(PathBuf::from).collect();
         let going: Vec<(String, String)> = paths.iter().filter_map(|a| sidecar(a)).collect();
-        let dest = settle(&root, &going, 1, live);
-        apply_batch(&dest, &paths, force);
-        landed(&root, &dest);
+        settle(&root, &going, live);
+        apply_batch(&root, &paths, force);
+        skew(&root);
         return;
     }
     if !archives.is_empty() {
@@ -2555,10 +2555,10 @@ fn install_cmd(args: &[String]) {
             say!("{n} {} {t} {how}", recipes[n].version.upstream);
         }
         // the same answer the real run would get, override included
-        let (ab, why) = route(&root, &set);
-        match (ab, live) {
-            (true, true) => say!("route live  --live over A/B: {why}"),
-            (true, false) => say!("route A/B  {why}"),
+        let (risky, why) = route(&root, &set);
+        match (risky, live) {
+            (true, true) => say!("route live  --live, no fallback: {why}"),
+            (true, false) => say!("route live  fallback first: {why}"),
             (false, _) => say!("route live  {why}"),
         }
         return;
@@ -2571,17 +2571,14 @@ fn install_cmd(args: &[String]) {
         .map(|(n, t)| cached(&root, &recipes[n], t))
         .collect();
     // decided once, before any of it is built, so a batch cannot change its mind halfway
-    // a set that is all built is one transaction however many levels it spans, which is
-    // how llvm and the llvm-runtime it depends on go into the other root together
-    let steps = if ready.is_some() { 1 } else { plan.len() };
-    let dest = settle(&root, &set, steps, live);
+    settle(&root, &set, live);
     forecast(&root, &set, &recipes);
     if let Some(all) = ready {
         for (n, t) in &set {
             say!("{n} {} {t} cached", recipes[n].version.upstream);
         }
-        apply_batch(&dest, &all, force);
-        landed(&root, &dest);
+        apply_batch(&root, &all, force);
+        skew(&root);
         return;
     }
 
@@ -2645,9 +2642,9 @@ fn install_cmd(args: &[String]) {
                 }
             }
         }
-        apply_batch(&dest, &made, force);
+        apply_batch(&root, &made, force);
     }
-    landed(&root, &dest);
+    skew(&root);
 }
 
 // the resolve every consumer does at load, run against what just landed instead of left
@@ -2669,20 +2666,6 @@ fn skew(root: &Path) {
     for (t, f) in &hurt {
         let note = if queued.contains(&f.pkg) { "  queued" } else { "" };
         say!("{} {t} {}{note}", f.path, f.what);
-    }
-}
-
-// the mount is transient and nothing should be left holding it. what boots the result is
-// not built yet, so the last word is where it went rather than what to do about it
-fn landed(root: &Path, dest: &Path) {
-    skew(dest);
-    if dest == root {
-        return;
-    }
-    let _ = run(Command::new("umount").arg(dest), "umount");
-    match arm() {
-        Ok((sub, num)) => say!("{sub} boots next  Boot{num}  reboot to try it, kiry commit to keep it"),
-        Err(e) => say!("staged in the inactive root, and nothing boots it: {e}"),
     }
 }
 
@@ -2739,16 +2722,18 @@ fn wanted(
     out
 }
 
-// the pair of root subvolumes. a transaction that cannot go live goes to whichever of
-// them is not mounted at /, as a fresh snapshot of the running one rather than a tree
-// maintained beside it: /etc, the service definitions and every config file come along by
-// copy on write and cost nothing, where two independent roots would mean an edit to
-// /etc/kiry/config vanishing the moment you booted the other one
+// the pair of root subvolumes. the one mounted at / is the one the machine lives on and
+// every install goes into it. the other is its fallback, a snapshot taken before a risky
+// transaction and never installed into -- installing into the other half and booting it
+// is what lost work here three ways: whatever was done on the running root after the
+// snapshot, whatever was only in the other half when the next snapshot replaced it, and
+// everything on a new root when a boot that never committed bounced back to the old one
 const ROOTS: &[&str] = &["@root-a", "@root-b"];
 
-// on /run, so a mount point left behind by a crash is gone at the next boot
+// on /run, so a mount point left behind by a crash is gone at the next boot, and so is
+// the marker that says this boot already took its fallback
 const TOP: &str = "/run/kiry/top";
-const DEST: &str = "/run/kiry/root";
+const TAKEN: &str = "/run/kiry/fallback";
 
 // the device and subvolume behind a mount point, read out of the options field
 fn mounted_at<'a>(text: &'a str, at: &str) -> Option<(&'a str, &'a str)> {
@@ -2765,13 +2750,6 @@ fn mounted_at<'a>(text: &'a str, at: &str) -> Option<(&'a str, &'a str)> {
     })
 }
 
-// whether anything is mounted here at all, which mounted_at cannot answer: a mount whose
-// subvolume was deleted under it keeps subvolid= and loses subvol= entirely
-fn is_mounted(text: &str, at: &str) -> bool {
-    text.lines()
-        .any(|l| l.split_whitespace().nth(1) == Some(at))
-}
-
 // which of the pair is running and which is not, and the device they share
 fn pair(text: &str) -> Result<(String, String, String), String> {
     let (dev, now) =
@@ -2780,7 +2758,7 @@ fn pair(text: &str) -> Result<(String, String, String), String> {
     // a subvolume that means nothing on this machine
     if !ROOTS.contains(&now) {
         return Err(format!(
-            "/ is on {now} and the a/b roots are {}",
+            "/ is on {now} and the two roots are {}",
             ROOTS.join(" and ")
         ));
     }
@@ -2791,23 +2769,18 @@ fn pair(text: &str) -> Result<(String, String, String), String> {
     Ok((dev.to_string(), now.to_string(), (*other).to_string()))
 }
 
-// a fresh snapshot of the running root, mounted and ready to be installed into. whatever
-// the inactive subvolume held is the last cycle's tree and is replaced rather than
-// updated, because a transaction applies to what is running now
-fn inactive() -> Result<PathBuf, String> {
+// the running root as it was before a risky transaction, in the other half of the pair.
+// once a boot: a tree that booted is the proven one, and a second risky install in the
+// same boot would otherwise swap it for a tree only the first install has touched
+fn fallback() -> Result<(), String> {
     let text = fs::read_to_string("/proc/mounts").map_err(|e| format!("/proc/mounts: {e}"))?;
     let (dev, now, other) = pair(&text)?;
-    let (top, dest) = (PathBuf::from(TOP), PathBuf::from(DEST));
-    mkdirs(&top)?;
-    mkdirs(&dest)?;
-
-    // a transaction leaves the inactive root mounted here, so a second one in the same
-    // boot would snapshot over a subvolume this still points at. what is left then is a
-    // mount of something that no longer exists, which is neither a directory nor a usable
-    // mount point, and the mount below fails move_mount with ENOENT
-    if is_mounted(&text, DEST) {
-        run(Command::new("umount").arg(&dest), "umount the last root")?;
+    if Path::new(TAKEN).exists() {
+        say!("            {other} is the fallback, {now} as this boot found it");
+        return Ok(());
     }
+    let top = PathBuf::from(TOP);
+    mkdirs(&top)?;
 
     // the subvolumes sit at the top of the filesystem and nothing mounts that, so it has
     // to be reachable before one of them can be replaced
@@ -2821,16 +2794,9 @@ fn inactive() -> Result<PathBuf, String> {
     let made = snapshot(&top, &now, &other);
     let _ = run(Command::new("umount").arg(&top), "umount");
     made?;
-
-    run(
-        Command::new("mount")
-            .args(["-o", &format!("subvol={other}")])
-            .arg(&dev)
-            .arg(&dest),
-        &format!("mount {other}"),
-    )?;
-    say!("root {other} is a fresh snapshot of {now}");
-    Ok(dest)
+    fs::write(TAKEN, format!("{other}\n")).map_err(|e| format!("{TAKEN}: {e}"))?;
+    say!("            {other} is the fallback, a snapshot of {now}. boot {} from the firmware menu if this goes wrong", label(&other));
+    Ok(())
 }
 
 fn snapshot(top: &Path, now: &str, other: &str) -> Result<(), String> {
@@ -2923,25 +2889,10 @@ fn commits(num: &str, was: &[String]) -> Result<(), String> {
     )
 }
 
-// the inactive root gets one boot to prove itself. BootNext is one shot in the firmware,
-// so a root that never reaches kiry commit is left behind by the boot after it with
-// nothing to undo and nothing to time out
-fn arm() -> Result<(String, String), String> {
-    let text = fs::read_to_string("/proc/mounts").map_err(|e| format!("/proc/mounts: {e}"))?;
-    let (_, _, other) = pair(&text)?;
-    let seen = efi()?;
-    let num = entry_for(&seen, &other).ok_or(format!("no uefi entry named {}", label(&other)))?;
-    run(
-        Command::new("efibootmgr").args(["-n", &num]),
-        "efibootmgr -n",
-    )?;
-    Ok((other, num))
-}
-
-// what says an installed elf cannot run, which is the question a trial boot has to answer
-// before it is allowed to become the one that boots. the rest of what doctor reports is
-// worth reading and is not worth refusing a commit over: duplicate symbols across two
-// libraries that genuinely both export a name is a standing condition, not a regression
+// what says an installed elf cannot run, which is what an install has to say about the
+// tree it just wrote. the rest of what doctor reports is worth reading and not worth
+// shouting after every install: duplicate symbols across two libraries that genuinely both
+// export a name is a standing condition, not a regression
 fn broken(root: &Path) -> Vec<(String, Finding)> {
     let mut out = Vec::new();
     let world = everywhere(root);
@@ -2955,32 +2906,23 @@ fn broken(root: &Path) -> Vec<(String, Finding)> {
     out
 }
 
-// where the transaction lands, said whichever way it goes
-fn settle(root: &Path, going: &[(String, String)], levels: usize, live: bool) -> PathBuf {
-    let (ab, why) = route(root, going);
-    if !ab {
+// the transaction lands on the running root either way. what a risky one gets first is
+// a fallback, and which of the two happened is said rather than left to be guessed at
+fn settle(root: &Path, going: &[(String, String)], live: bool) {
+    let (risky, why) = route(root, going);
+    if !risky {
         say!("route live  {why}");
-        say_unkept(root);
-        return root.to_path_buf();
+    } else if live {
+        // overruled rather than reconsidered, and the reason is still printed. what is
+        // worth having in a log six months later is which answer was set aside
+        say!("route live  --live, no fallback: {why}");
+    } else {
+        say!("route live  fallback first: {why}");
+        if let Err(e) = fallback() {
+            die(e);
+        }
     }
-    // overruled rather than reconsidered, and the reason is still printed. what is worth
-    // having in a log six months later is which answer was set aside, not that one was
-    if live {
-        say!("route live  --live over A/B: {why}");
-        say_unkept(root);
-        return root.to_path_buf();
-    }
-    say!("route A/B  {why}");
-    // level N has to be installed before N+1 can build against it, and under A/B the
-    // levels land in a root the build cannot see. one level is what this handles, and
-    // the rest is refused rather than got quietly wrong
-    if levels > 1 {
-        die("this needs levels built in order, which the inactive root cannot do yet. install what it depends on first".into());
-    }
-    match inactive() {
-        Ok(d) => d,
-        Err(e) => die(e),
-    }
+    say_unkept(root);
 }
 
 // name and target out of a built artifact's sidecar, which is where identity lives -- the
@@ -3020,14 +2962,15 @@ fn say_unkept(root: &Path) {
     }
 }
 
-// which root a transaction belongs in. routing every install through the inactive
-// subvolume is right for a libc and absurd for a new cli tool, and it is decidable rather
-// than a question worth asking: kiry knows every file the batch replaces, and /proc says
-// which of them something running still has mapped
+// whether a transaction wants a fallback before it goes in. a snapshot first is right for
+// a libc and pointless for a new cli tool, and it is decidable rather than a question
+// worth asking: kiry knows every file the batch replaces, and /proc says which of them
+// something running still has mapped
 fn route(root: &Path, going: &[(String, String)]) -> (bool, String) {
-    // first, and not one of the reasons below. a/b means snapshotting the subvolume the
-    // machine is running from, so it is a property of / and of nothing else -- a staging
-    // root asked about a libc must not reach anything that touches the real filesystem
+    // first, and not one of the reasons below. a fallback means snapshotting the subvolume
+    // the machine is running from, so it is a property of / and of nothing else -- a
+    // staging root asked about a libc must not reach anything that touches the real
+    // filesystem
     let at = root.canonicalize();
     if at.as_deref().unwrap_or(root) != Path::new("/") {
         return (false, "not the running root".to_string());
@@ -3038,7 +2981,7 @@ fn route(root: &Path, going: &[(String, String)]) -> (bool, String) {
     }
 }
 
-// what the transaction touches that a live install cannot answer for
+// what the transaction touches that is worth a fallback
 fn why_ab(root: &Path, going: &[(String, String)]) -> Option<String> {
     for (name, _) in going {
         if SUBSTRATE.contains(&name.as_str()) {
@@ -4941,7 +4884,7 @@ fn promote_one(root: &Path, list: &[PathBuf], n: &str) -> Result<PathBuf, String
     Ok(to)
 }
 
-// the two halves of the a/b pair, said from the machine they belong to. --root names a
+// the two halves of the root pair, said from the machine they belong to. --root names a
 // tree and a boot entry is not in one, so anything but / here is a question the firmware
 // cannot be asked
 fn roots(args: &[String], what: &str) -> Result<(String, String), String> {
@@ -4959,7 +4902,7 @@ fn roots(args: &[String], what: &str) -> Result<(String, String), String> {
 }
 
 fn commit_cmd(args: &[String]) {
-    let (now, _) = match roots(args, "commit") {
+    let (now, other) = match roots(args, "commit") {
         Ok(r) => r,
         Err(e) => die(e),
     };
@@ -4986,19 +4929,12 @@ fn commit_cmd(args: &[String]) {
         return;
     }
 
-    // the whole point of the gate. a root that will not boot is caught by never reaching
-    // here at all; this is for the one that boots and is wrong
-    let bad = broken(Path::new("/"));
-    if !bad.is_empty() {
-        for (t, f) in &bad {
-            say!("{} {t} {}", f.path, f.what);
-        }
-        die(format!("{} of those, so {now} stays a trial", bad.len()));
-    }
+    // nothing boots a root but the firmware menu, so getting here off the other entry is
+    // someone choosing the fallback. no doctor gate: the root being left is the suspect
     if let Err(e) = commits(&num, &was) {
         die(e);
     }
-    say!("{now} boots from now on  Boot{num}");
+    say!("{now} boots from now on  Boot{num}  {other} is the fallback and the next risky install replaces it");
 }
 
 fn rollback_cmd(args: &[String]) {
@@ -5013,12 +4949,12 @@ fn rollback_cmd(args: &[String]) {
     let Some(num) = entry_for(&seen, &other) else {
         die(format!("no uefi entry named {}", label(&other)));
     };
-    // no gate going this way. back to the root that was booting before is the direction
-    // that needs no permission, and the tree being left is the one under suspicion
+    // no gate going this way. back to the fallback is the direction that needs no
+    // permission, and the tree being left is the one under suspicion
     if let Err(e) = commits(&num, &order(&seen)) {
         die(e);
     }
-    say!("{other} boots from now on  reboot to leave {now}");
+    say!("{other} boots from now on  reboot to leave {now}, which becomes the fallback");
 }
 
 // the recipes on offer, which nothing else answers: l lists what is installed and a
@@ -6462,21 +6398,6 @@ Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.e
         assert_eq!(got, ["0000", "0001", "0002"]);
     }
 
-    // the line a deleted subvolume leaves behind, copied from the machine this bit on
-    // it carries no subvol=, so the reader that looks for one says nothing is mounted and
-    // the snapshot goes over a subvolume the last transaction still has open
-    #[test]
-    fn a_root_left_mounted_from_the_last_transaction_is_seen() {
-        let stale = "/dev/mapper/cryptroot /run/kiry/root btrfs \
-rw,relatime,compress=zstd:1,ssd,space_cache=v2,subvolid=267 0 0\n";
-        assert_eq!(mounted_at(stale, "/run/kiry/root"), None);
-        assert!(is_mounted(stale, "/run/kiry/root"));
-        assert!(!is_mounted(REAL, "/run/kiry/root"));
-        // a path that is only a prefix of a real mount point is not that mount point
-        assert!(!is_mounted(REAL, "/va"));
-        assert!(is_mounted(REAL, "/var"));
-    }
-
     // a live install onto a root the firmware does not boot first is undone by the next
     // reboot, and the only thing that notices is the person wondering where it went
     #[test]
@@ -6551,8 +6472,8 @@ rw,relatime,compress=zstd:1,ssd,space_cache=v2,subvolid=267 0 0\n";
         d
     }
 
-    // a/b is decided for / and these rules never fire anywhere else, so they are reached
-    // directly rather than through a command that would refuse first
+    // a fallback is decided for / and these rules never fire anywhere else, so they are
+    // reached directly rather than through a command that would refuse first
     #[test]
     fn a_libc_or_the_kernel_is_reason_enough() {
         let at = scratch("substrate");

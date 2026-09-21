@@ -2493,15 +2493,24 @@ fn offer(repo: &Path, name: &str, version: &str) {
     fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
 }
 
+// the recipes these ask about are ones the tree keeps whether or not they are installed,
+// which is core. extra is a catalogue and a bare ahead only answers for what is
+// installed out of it -- listed anyway, because a promotion of something new lands there
 fn tree(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     let at = scratch(name);
     let root = at.join("root");
-    let (repo, testing) = (at.join("extra"), at.join("testing"));
+    let (repo, catalogue, testing) = (at.join("core"), at.join("extra"), at.join("testing"));
     fs::create_dir_all(root.join("etc/kiry")).unwrap();
     fs::create_dir_all(&testing).unwrap();
+    fs::create_dir_all(&catalogue).unwrap();
     fs::write(
         root.join("etc/kiry/repos"),
-        format!("{}\n{}\n", repo.display(), testing.display()),
+        format!(
+            "{}\n{}\n{}\n",
+            repo.display(),
+            catalogue.display(),
+            testing.display()
+        ),
     )
     .unwrap();
     (root, repo, testing)
@@ -2815,7 +2824,8 @@ fn promote_puts_a_new_name_in_extra() {
 
     let o = kiry(&["promote", "--root", root.to_str().unwrap(), "fresh"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert!(repo.join("fresh/version").is_file(), "not in extra");
+    let extra = repo.parent().unwrap().join("extra");
+    assert!(extra.join("fresh/version").is_file(), "not in extra");
 }
 
 // a toolchain set that moved halfway is broken before it ever reaches a boot
@@ -4114,4 +4124,33 @@ fn a_preserved_library_edited_by_hand_is_left_alone() {
     assert!(!db::read_preserved(&root, "x86_64-gnu", "libp")
         .unwrap()
         .is_empty());
+}
+
+// extra carries all of aports. asked about nothing in particular, a bump for a recipe
+// nobody installed is a tarball fetched and a conversion written for nothing, and after
+// the import that was nine thousand of them
+#[test]
+fn a_bare_ahead_leaves_out_what_extra_carries_and_nothing_installed() {
+    let (root, repo, _) = tree("catalogue");
+    let extra = repo.parent().unwrap().join("extra");
+    offer(&repo, "kept", "1.0");
+    offer(&extra, "used", "1.0");
+    offer(&extra, "offered", "1.0");
+    for n in ["kept", "used", "offered"] {
+        aport(&root, "main", n, "pkgver=1.1\n");
+    }
+    record(&root, "used", &[], Vec::new());
+
+    let said = ahead_of(&root);
+    let rows: Vec<&str> = said
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|n| ["kept", "used", "offered"].contains(n))
+        .collect();
+    assert_eq!(rows, ["kept", "used"], "{said}");
+
+    // named, it is a question about that recipe and it gets an answer
+    let o = kiry(&["ahead", "--root", root.to_str().unwrap(), "offered"]);
+    let named = String::from_utf8_lossy(&o.stdout);
+    assert!(named.contains("offered 1.0"), "{named}");
 }

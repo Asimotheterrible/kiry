@@ -86,6 +86,7 @@ pub fn recipe(
     let mut sources = Vec::new();
     let mut absent: Vec<String> = Vec::new();
     let mut checksums = Vec::new();
+    let mut unchecked = 0;
     let mut files = Vec::new();
     let d = out.join(&name);
     fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -109,6 +110,7 @@ pub fn recipe(
             if !fetch {
                 notes.push(format!("{file} not fetched, no checksum"));
                 sources.push(entry.to_string());
+                unchecked += 1;
                 continue;
             }
             let dst = d.join(file);
@@ -282,6 +284,12 @@ pub fn recipe(
     put(&d.join("version"), &format!("{ver} {rev}\n"))?;
     put(&d.join("targets"), "x86_64-musl\n")?;
     put(&d.join("sources"), &joined(&sources))?;
+    // sources and checksums pair by position and an empty checksums file is the one
+    // shape that says nothing rather than saying the wrong thing. a converted recipe
+    // that cannot fetch would come out 73 sources to 72 checksums, which does not load
+    // at all -- and the 72 are the patches beside the apkbuild, so the one missing is
+    // the tarball
+    let checksums = if unchecked > 0 { Vec::new() } else { checksums };
     put(&d.join("checksums"), &joined(&checksums))?;
     put(
         &d.join("depends"),

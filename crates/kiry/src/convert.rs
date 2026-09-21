@@ -185,9 +185,15 @@ pub fn recipe(
         let local = dir.join(url);
         let at = if url.contains("://") {
             if !fetch {
-                notes.push(format!("{file} not fetched, no checksum"));
                 sources.push(entry.to_string());
-                unchecked += 1;
+                // alpine's word for what the bytes are, checked by the first fetch
+                match sums.get(file) {
+                    Some(want) => checksums.push(want.clone()),
+                    None => {
+                        notes.push(format!("{file} not fetched and alpine names no sha512"));
+                        unchecked += 1;
+                    }
+                }
                 continue;
             }
             let dst = d.join(file);

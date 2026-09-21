@@ -4154,3 +4154,42 @@ fn a_bare_ahead_leaves_out_what_extra_carries_and_nothing_installed() {
     let named = String::from_utf8_lossy(&o.stdout);
     assert!(named.contains("offered 1.0"), "{named}");
 }
+
+// a recipe converted without fetching carries alpine's sha512, and the first fetch is
+// what checks it. the length says which hash a line is
+#[test]
+fn a_sha512_checksum_is_checked_as_one() {
+    let at = scratch("sha512");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let sum = kiry_core::sha512(fs::File::open(at.join("hello-1.0.tar")).unwrap()).unwrap();
+    assert_eq!(sum.len(), 128);
+    fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(!err.contains("no checksum"), "{err}");
+    assert_eq!(artifacts(&root), ["hello-1.0-1.x86_64-musl.tar.zst"]);
+}
+
+#[test]
+fn a_wrong_sha512_stops_the_build() {
+    let at = scratch("sha512-wrong");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    fs::write(d.join("checksums"), format!("{}\n", "0".repeat(128))).unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("recipe says"));
+    assert!(artifacts(&root).is_empty());
+}

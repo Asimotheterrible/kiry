@@ -506,14 +506,23 @@ fn sources(root: &Path, p: &Package) -> Result<Vec<(String, PathBuf, String)>, S
         };
 
         let sum = sha(&path)?;
+        // the length says which one it is. a converted recipe carries alpine's sha512 for
+        // a tarball it never fetched, and everything kiry hashed itself is sha256
         match p.checksums.get(i) {
-            Some(want) if want != &sum => {
-                return Err(format!(
-                    "{}: checksum is {sum}, recipe says {want}",
-                    path.display()
-                ))
+            Some(want) => {
+                let got = match want.len() {
+                    128 => fs::File::open(&path)
+                        .and_then(kiry_core::sha512)
+                        .map_err(|e| format!("{}: {e}", path.display()))?,
+                    _ => sum.clone(),
+                };
+                if want != &got {
+                    return Err(format!(
+                        "{}: checksum is {got}, recipe says {want}",
+                        path.display()
+                    ));
+                }
             }
-            Some(_) => {}
             None => eprintln!("kiry: {}: no checksum, sha256 is {sum}", path.display()),
         }
         out.push((name.to_string(), path, sum));

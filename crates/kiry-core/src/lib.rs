@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 pub mod archive;
 pub mod db;
@@ -13,8 +13,18 @@ pub mod elf;
 pub mod install;
 pub mod pkg;
 
-pub fn sha256<R: Read>(mut r: R) -> Result<String, io::Error> {
-    let mut h = Sha256::new();
+pub fn sha256<R: Read>(r: R) -> Result<String, io::Error> {
+    digest::<Sha256, R>(r)
+}
+
+// what alpine's sha512sums hold, so a recipe converted without fetching can still say
+// what the tarball has to be instead of saying nothing
+pub fn sha512<R: Read>(r: R) -> Result<String, io::Error> {
+    digest::<Sha512, R>(r)
+}
+
+fn digest<D: Digest, R: Read>(mut r: R) -> Result<String, io::Error> {
+    let mut h = D::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = r.read(&mut buf)?;

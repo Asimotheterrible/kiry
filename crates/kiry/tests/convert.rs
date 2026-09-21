@@ -355,7 +355,9 @@ fn a_renamed_source_keeps_its_name_and_its_checksum() {
         srcs, "thing-1.0.tar.gz::https://example.invalid/download?id=7\n",
         "{srcs}"
     );
-    assert!(said.contains("thing-1.0.tar.gz not fetched"), "{said}");
+    // found under the renamed key, which is the only place alpine files it
+    let sums = fs::read_to_string(d.join("checksums")).unwrap();
+    assert_eq!(sums.trim(), "abc", "{said}");
 
     // a wrong hash under the renamed key has to be caught. keyed by the url's basename
     // it is never looked up, and the recipe comes out with a sha256 nobody vouched for
@@ -657,4 +659,29 @@ fn a_hand_kept_alias_wins_over_a_derived_one() {
     // outlives the day somebody changes the hand-kept one
     let table = fs::read_to_string(out.join("aliases")).unwrap();
     assert!(!table.contains("clang23-extra"), "{table}");
+}
+
+// offline there is no hashing the tarball, but alpine already did. its sha512 goes in,
+// and the first fetch is checked against it rather than trusted
+#[test]
+fn an_offline_conversion_keeps_alpines_sha512() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("offline-sha512");
+    let sum = "ab".repeat(64);
+    let a = apkbuild(
+        &at,
+        "thing",
+        &format!(
+            "source=\"https://example.invalid/thing-1.0.tar.gz\"\nsha512sums=\"{sum}  thing-1.0.tar.gz\""
+        ),
+    );
+    let out = at.join("out");
+    let o = kiry(&["convert", "-n", a.to_str().unwrap(), out.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        fs::read_to_string(out.join("thing/checksums")).unwrap().trim(),
+        sum
+    );
 }

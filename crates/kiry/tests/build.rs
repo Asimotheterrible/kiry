@@ -4243,3 +4243,22 @@ fn two_packages_in_one_level_build_side_by_side() {
         .unwrap_or(0);
     assert_eq!(parts, 0);
 }
+
+// qt marks Gui an optional cmake component, so qt_build_repo() can configure, build
+// nothing and exit 0 -- two seconds and an ok line for a package that installed no files
+#[test]
+fn a_build_that_stages_nothing_is_not_ok() {
+    let at = scratch("empty");
+    let d = recipe(&at, "x86_64-musl", "echo configured\necho built\n");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("staged nothing"), "{said}");
+    assert!(artifacts(&root).is_empty());
+}

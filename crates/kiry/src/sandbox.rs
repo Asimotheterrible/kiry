@@ -164,14 +164,26 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
         .collect();
     let mut todo: Vec<(String, String)> = dev.iter().cloned().collect();
     let mut owners: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut configs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     while let Some((t, name)) = todo.pop() {
         let rec = db::read(root, &t, &name).map_err(|e| e.to_string())?;
-        for pc in rec.manifest.iter().filter(|e| e.path.ends_with(".pc")) {
-            let need = pc_requires(&fs::read_to_string(root.join(&pc.path)).unwrap_or_default());
+        for e in &rec.manifest {
+            let cmake = declares(&e.path);
+            if !cmake && !e.path.ends_with(".pc") {
+                continue;
+            }
+            let text = fs::read_to_string(root.join(&e.path)).unwrap_or_default();
+            let need = match cmake {
+                true => cmake_requires(&text),
+                false => pc_requires(&text),
+            };
             if need.is_empty() {
                 continue;
             }
-            let by = owners.entry(t.clone()).or_insert_with(|| installed_pcs(root, &t));
+            let by = match cmake {
+                true => configs.entry(t.clone()).or_insert_with(|| installed_cmake(root, &t)),
+                false => owners.entry(t.clone()).or_insert_with(|| installed_pcs(root, &t)),
+            };
             for n in need {
                 let Some(owner) = by.get(&n) else { continue };
                 let at = (t.clone(), owner.clone());
@@ -205,6 +217,71 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
         fs::create_dir_all(into.join(d)).map_err(|e| format!("{d}: {e}"))?;
     }
     Ok(())
+}
+
+// where a config file declares what else it needs. ConfigVersion and the Targets files
+// beside it declare nothing, so reading them is only work
+fn declares(path: &str) -> bool {
+    path.ends_with("Config.cmake")
+        || path.ends_with("-config.cmake")
+        || path.ends_with("Dependencies.cmake")
+}
+
+// cmake finds a package by a directory named after it, and loads the one file in there
+// named after the directory in turn -- FooConfig.cmake or foo-config.cmake depending on
+// who generated it. keying on the directory alone gets the wrong owner: qt6-qtwayland
+// drops its plugin configs into Qt6Gui/, which qt6-qtbase is the package for
+fn installed_cmake(root: &Path, t: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for name in db::installed(root, t).unwrap_or_default() {
+        let Ok(rec) = db::read(root, t, &name) else { continue };
+        for e in &rec.manifest {
+            let Some(under) = e.path.split("/cmake/").nth(1) else { continue };
+            let Some((dir, file)) = under.split_once('/') else { continue };
+            let named = file == format!("{dir}Config.cmake")
+                || file.eq_ignore_ascii_case(&format!("{dir}-config.cmake"));
+            if named {
+                out.entry(dir.to_string()).or_insert_with(|| name.clone());
+            }
+        }
+    }
+    out
+}
+
+// the cmake half of Requires. it reaches a config package and stops there: what a name
+// like WrapOpenGL or XKB resolves to is decided inside a find module, which probes for a
+// library or asks pkg-config, and following that is reimplementing cmake. those stay the
+// recipe's to declare
+fn cmake_requires(text: &str) -> Vec<String> {
+    let named = |w: &str| {
+        let w = w.trim_end_matches('\\');
+        w.chars().next().is_some_and(|c| c.is_ascii_alphabetic()).then(|| w.to_string())
+    };
+    let mut out = Vec::new();
+    for l in text.lines() {
+        let l = l.trim();
+        if let Some(rest) = l.strip_prefix("find_dependency(").or_else(|| l.strip_prefix("find_package(")) {
+            // a name held in a variable is cmake's to expand and not something to read
+            // off the text
+            out.extend(rest.split([' ', '\t', ')']).next().and_then(named));
+        }
+        // qt keeps its non-qt dependencies in one string: NAME\;REQUIRED\;VERSION\;
+        // COMPONENTS;NAME2\;... where a plain ; ends an entry and an escaped one a field
+        let list = l
+            .split_once("_third_party_deps \"")
+            .and_then(|(_, r)| r.split_once('"'))
+            .map(|(list, _)| list);
+        if let Some(list) = list {
+            let mut next = true;
+            for tok in list.split(';') {
+                if next {
+                    out.extend(named(tok));
+                }
+                next = !tok.ends_with('\\');
+            }
+        }
+    }
+    out
 }
 
 // a .pc says what it needs by name and not by who ships it, so the answer is the whole
@@ -485,6 +562,21 @@ mod tests {
         }
     }
 
+    // one more file on a package already installed, for the cases where the fixture's
+    // three paths are not the shape under test
+    fn ships(root: &Path, t: &str, name: &str, path: &str, body: &str) {
+        let f = root.join(path);
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(&f, body).unwrap();
+        let mut rec = db::read(root, t, name).unwrap();
+        rec.manifest.push(db::Entry {
+            mode: 0o644,
+            kind: db::Kind::File(SHA.to_string()),
+            path: path.to_string(),
+        });
+        db::write(root, &rec).unwrap();
+    }
+
     // a package with a header, a pkg-config file and a library, all really on disk
     fn install(root: &Path, t: &str, name: &str, deps: &[Dep]) {
         let dir = if t == host() { "usr/lib" } else { "usr/lib64" };
@@ -723,4 +815,84 @@ mod tests {
             "an installed package nobody declared turned up in the sysroot"
         );
     }
+
+    // a config file names another config package the way a .pc names a .pc, and cmake
+    // finds it by a directory of that name. mesa was transitive to qt6-qtbase, so
+    // Qt6Gui's headers never staged and the build that followed installed nothing
+    #[test]
+    fn a_config_a_direct_dep_needs_brings_that_package_headers_along() {
+        let root = root("cmakereq");
+        install(&root, T, "flac", &[dep("ogg", false), dep("openssl", false)]);
+        install(&root, T, "ogg", &[]);
+        install(&root, T, "openssl", &[]);
+        ships(&root, T, "flac", "usr/lib64/cmake/FLAC/flac-config.cmake", "find_dependency(Ogg)\n");
+        ships(&root, T, "ogg", "usr/lib64/cmake/Ogg/OggConfig.cmake", "# nothing\n");
+
+        let c = closure(&root, T, &[dep("flac", false)]).unwrap();
+        let into = root.join("sysroot");
+        assemble(&root, T, &c, &into).unwrap();
+
+        assert!(
+            into.join("usr/lib64/cmake/Ogg/OggConfig.cmake").exists(),
+            "find_dependency(Ogg) has nothing to resolve to"
+        );
+        assert!(into.join("usr/include/ogg.h").exists());
+        assert!(
+            !into.join("usr/include/openssl.h").exists(),
+            "a transitive dep no config names still handed over its header"
+        );
+    }
+
+    // the fields inside one entry are escaped and the entries are not, which is the only
+    // thing telling a package name apart from TRUE or a version
+    #[test]
+    fn qts_third_party_names_are_read_apart_from_its_fields() {
+        let one = cmake_requires(
+            "set(__qt_GuiPrivate_third_party_deps \"XKB\\;FALSE\\;0.9.0\\;\\;\")\n",
+        );
+        assert_eq!(one, vec!["XKB"]);
+
+        let two = cmake_requires(
+            "set(__qt_Gui_third_party_deps \"WrapOpenGL\\;FALSE\\;\\;\\;;WrapVulkanHeaders\\;TRUE\\;\\;\\;\")\n",
+        );
+        assert_eq!(two, vec!["WrapOpenGL", "WrapVulkanHeaders"]);
+    }
+
+    // a version file sits beside a config file and declares nothing
+    #[test]
+    fn only_a_config_file_is_read_for_what_it_needs() {
+        assert!(declares("usr/lib/cmake/FLAC/flac-config.cmake"));
+        assert!(declares("usr/lib/cmake/Qt6Gui/Qt6GuiDependencies.cmake"));
+        assert!(!declares("usr/lib/cmake/Qt6Gui/Qt6GuiConfigVersion.cmake"));
+        assert!(!declares("usr/lib/cmake/Qt6Gui/Qt6GuiTargets.cmake"));
+    }
+
+
+    // qt6-qtwayland drops its plugin configs into Qt6Gui/, which qt6-qtbase is the
+    // package for. a directory somebody put a file in is not a package, and reading it
+    // as one hands the wrong owner's headers over
+    #[test]
+    fn a_config_directory_without_the_file_cmake_loads_is_not_a_package() {
+        let root = root("cmakedir");
+        install(&root, T, "app", &[]);
+        install(&root, T, "plugins", &[]);
+        ships(&root, T, "app", "usr/lib64/cmake/App/AppConfig.cmake", "find_dependency(Qt6Widgets)\n");
+        ships(
+            &root,
+            T,
+            "plugins",
+            "usr/lib64/cmake/Qt6Widgets/Qt6SomePluginConfig.cmake",
+            "# a plugin, not the package\n",
+        );
+
+        let c = closure(&root, T, &[dep("app", false)]).unwrap();
+        let into = root.join("sysroot");
+        assemble(&root, T, &c, &into).unwrap();
+
+        assert!(
+            !into.join("usr/include/plugins.h").exists(),
+            "a directory a plugin wrote into answered for the package"
+        );
+    }
+
 }

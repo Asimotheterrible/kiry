@@ -3,7 +3,7 @@
 // and a makedepends assembled out of three other variables all come out right for free;
 // none of them survive a regex
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,10 +46,20 @@ pub struct Report {
 // local wins, and a name mapped to - is one with no equivalent here at all
 pub fn aliases(repos: &[PathBuf]) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    let mut carried: Option<HashSet<String>> = None;
     for r in repos {
         let Ok(text) = fs::read_to_string(r.join("aliases")) else {
             continue;
         };
+        // a generated pair folds a subpackage into whichever aport builds it, which is
+        // alpine's split and not always the split here. where a repo carries a recipe
+        // under that very name the pair would alias a real package away: extra/libpulse
+        // is the client library on a box whose sound server is pipewire, and the pair
+        // reads it as pulseaudio, the daemon nothing here runs
+        let own = text.lines().next() == Some(GENERATED);
+        if own && carried.is_none() {
+            carried = Some(carries(repos));
+        }
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -57,8 +67,24 @@ pub fn aliases(repos: &[PathBuf]) -> HashMap<String, String> {
             }
             let mut f = line.split_whitespace();
             if let (Some(from), Some(to)) = (f.next(), f.next()) {
+                if own && carried.as_ref().is_some_and(|c| c.contains(from)) {
+                    continue;
+                }
                 out.entry(from.to_string())
                     .or_insert_with(|| to.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn carries(repos: &[PathBuf]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for r in repos {
+        let Ok(rd) = fs::read_dir(r) else { continue };
+        for e in rd.flatten() {
+            if e.file_type().is_ok_and(|k| k.is_dir()) {
+                out.insert(e.file_name().to_string_lossy().into_owned());
             }
         }
     }
@@ -599,5 +625,50 @@ fn grab(url: &str, dst: &Path) -> Result<(), String> {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!("{url}: fetch {s}")),
         Err(e) => Err(format!("{url}: {e}")),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("kiry-cv-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // alpine ships libpulse out of the pulseaudio aport, so convert derives that pair,
+    // but this box runs pipewire and carries a libpulse recipe of its own, and reading the
+    // pair would send a dependency to the daemon nothing here runs
+    #[test]
+    fn a_generated_pair_does_not_shadow_a_recipe_a_repo_carries() {
+        let at = scratch("shadow");
+        fs::create_dir_all(at.join("libpulse")).unwrap();
+        fs::write(
+            at.join("aliases"),
+            format!("{GENERATED}\nlibpulse\tpulseaudio\nlibpq\tpostgresql\n"),
+        )
+        .unwrap();
+
+        let got = aliases(std::slice::from_ref(&at));
+        assert_eq!(got.get("libpulse"), None, "{got:?}");
+        // a pair naming something no repo carries is the whole point of the table
+        assert_eq!(got.get("libpq").map(String::as_str), Some("postgresql"));
+    }
+
+    // a pair somebody typed is their word on it, carried recipe or not
+    #[test]
+    fn a_hand_kept_pair_still_wins_over_a_recipe_of_the_same_name() {
+        let at = scratch("hand");
+        fs::create_dir_all(at.join("pulseaudio")).unwrap();
+        fs::write(at.join("aliases"), "pulseaudio\tlibpulse\n").unwrap();
+
+        let got = aliases(std::slice::from_ref(&at));
+        assert_eq!(got.get("pulseaudio").map(String::as_str), Some("libpulse"));
     }
 }

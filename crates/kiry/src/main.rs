@@ -3399,6 +3399,7 @@ fn resolve(root: &Path, arg: &str) -> Result<PathBuf, String> {
 // stands in for it until the real one can be built. it stays in the plan afterwards,
 // because a first pass is a stand-in and not the article
 fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<Vec<(usize, bool)>> {
+    let host = sandbox::host();
     let mut left: Vec<usize> = (0..want.len()).collect();
     let mut done: Vec<usize> = Vec::new();
     let mut out = Vec::new();
@@ -3413,7 +3414,8 @@ fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<
                         && !done.contains(j)
                         && deps.is_some_and(|d| {
                             d.iter().any(|x| {
-                                !x.make && x.applies(&want[*i].1) && x.name == want[*j].0
+                                let t = if x.host { &host } else { &want[*i].1 };
+                                x.applies(&want[*i].1) && x.name == want[*j].0 && *t == want[*j].1
                             })
                         })
                 })
@@ -3559,6 +3561,33 @@ mod order {
         // is not installed yet, which is the one thing this is not allowed to touch
         let order: Vec<&str> = plan.iter().map(|l| want[l[0].0].0.as_str()).collect();
         assert_eq!(order, ["quick", "new", "slow"]);
+    }
+
+    #[test]
+    fn a_make_dep_is_a_level_below_what_builds_with_it() {
+        let t = sandbox::host();
+        let want = vec![("acl".to_string(), t.clone()), ("attr".to_string(), t.clone())];
+        let pkg = |name: &str, depends: Vec<pkg::Dep>| Package {
+            name: name.to_string(),
+            dir: PathBuf::new(),
+            version: pkg::Version::parse("1 1").unwrap(),
+            sources: Vec::new(),
+            checksums: Vec::new(),
+            depends,
+            targets: vec![t.clone()],
+            users: Vec::new(),
+        };
+        let attr = pkg::Dep { name: "attr".to_string(), make: true, host: true, only: None };
+        let recipes = HashMap::from([
+            ("acl".to_string(), pkg("acl", vec![attr])),
+            ("attr".to_string(), pkg("attr", Vec::new())),
+        ]);
+        let plan = levels(&want, &recipes);
+        let order: Vec<Vec<&str>> = plan
+            .iter()
+            .map(|l| l.iter().map(|(i, _)| want[*i].0.as_str()).collect())
+            .collect();
+        assert_eq!(order, [["attr"], ["acl"]]);
     }
 }
 

@@ -1,7 +1,7 @@
 // a build sees its declared closure and nothing else. the guarantee is the kernel's:
 // a header outside the closure is not hidden, it is not there
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -154,24 +154,85 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
         }
     }
 
+    // pkgconf reads Requires and Requires.private even for --cflags, so a .pc naming one
+    // that is not here fails the dependency that named it rather than itself. what no .pc
+    // names is still absent, which is the closure doing the job it is for
+    let mut dev: BTreeSet<(String, String)> = members
+        .iter()
+        .filter(|m| m.direct)
+        .map(|m| (m.target.clone(), m.name.clone()))
+        .collect();
+    let mut todo: Vec<(String, String)> = dev.iter().cloned().collect();
+    let mut owners: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    while let Some((t, name)) = todo.pop() {
+        let rec = db::read(root, &t, &name).map_err(|e| e.to_string())?;
+        for pc in rec.manifest.iter().filter(|e| e.path.ends_with(".pc")) {
+            let need = pc_requires(&fs::read_to_string(root.join(&pc.path)).unwrap_or_default());
+            if need.is_empty() {
+                continue;
+            }
+            let by = owners.entry(t.clone()).or_insert_with(|| installed_pcs(root, &t));
+            for n in need {
+                let Some(owner) = by.get(&n) else { continue };
+                let at = (t.clone(), owner.clone());
+                if dev.insert(at.clone()) {
+                    todo.push(at);
+                }
+            }
+        }
+    }
+
     for m in members {
         let rec = db::read(root, &m.target, &m.name).map_err(|e| e.to_string())?;
+        let whole = dev.remove(&(m.target.clone(), m.name.clone()));
         for e in &rec.manifest {
-            if !m.direct && builds_against(&e.path) {
+            if !whole && builds_against(&e.path) {
                 continue;
             }
             place(root, into, e)?;
         }
     }
-
+    // whatever is left is named by a .pc and reached by no runtime edge -- x11.pc names
+    // xproto and xorgproto is headers, so nothing in the closure ever links it. it comes
+    // in for what pkgconf reads and nothing else
+    for (t, name) in &dev {
+        let rec = db::read(root, t, name).map_err(|e| e.to_string())?;
+        for e in rec.manifest.iter().filter(|e| builds_against(&e.path)) {
+            place(root, into, e)?;
+        }
+    }
     for d in ["proc", "dev", "tmp", "src", "dest"] {
         fs::create_dir_all(into.join(d)).map_err(|e| format!("{d}: {e}"))?;
     }
     Ok(())
 }
 
-// manifest paths are relative to the root and carry no leading slash, so an absolute
-// link target just loses its slash and a relative one resolves against its own directory
+// a .pc says what it needs by name and not by who ships it, so the answer is the whole
+// installed set for that target rather than the closure
+fn installed_pcs(root: &Path, t: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for name in db::installed(root, t).unwrap_or_default() {
+        let Ok(rec) = db::read(root, t, &name) else { continue };
+        for e in &rec.manifest {
+            let Some(f) = e.path.strip_suffix(".pc") else { continue };
+            out.entry(f.rsplit('/').next().unwrap_or(f).to_string())
+                .or_insert_with(|| name.clone());
+        }
+    }
+    out
+}
+
+// a version constraint is a word too, and the ones that are not names start with a digit
+// or an operator
+fn pc_requires(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("Requires:").or_else(|| l.strip_prefix("Requires.private:")))
+        .flat_map(|l| l.split([',', ' ', '\t']))
+        .filter(|w| w.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
+        .map(str::to_string)
+        .collect()
+}
+
 // what a configure script reads to decide a feature is there. a transitive dependency
 // keeps everything else -- autoconf is not autoconf without the perl that runs it, and
 // perl is three levels of module tree, not one soname
@@ -182,6 +243,8 @@ fn builds_against(path: &str) -> bool {
         || path.ends_with(".cmake")
 }
 
+// manifest paths are relative to the root and carry no leading slash, so an absolute
+// link target just loses its slash and a relative one resolves against its own directory
 fn place(root: &Path, into: &Path, e: &db::Entry) -> Result<(), String> {
     let dst = into.join(&e.path);
     if let Some(p) = dst.parent() {
@@ -597,6 +660,51 @@ mod tests {
              feature turn itself on that nobody asked for"
         );
         assert!(!into.join("usr/lib64/pkgconfig/zlib.pc").exists());
+    }
+
+    #[test]
+    fn a_pc_a_direct_dep_requires_brings_that_package_headers_along() {
+        let root = root("pcreq");
+        install(&root, T, "png", &[dep("zlib", false), dep("jpeg", false)]);
+        install(&root, T, "zlib", &[]);
+        install(&root, T, "jpeg", &[]);
+        fs::write(
+            root.join("usr/lib64/pkgconfig/png.pc"),
+            "Name: png\nRequires.private: zlib >= 1.2\n",
+        )
+        .unwrap();
+
+        let c = closure(&root, T, &[dep("png", false)]).unwrap();
+        let into = root.join("sysroot");
+        assemble(&root, T, &c, &into).unwrap();
+
+        assert!(into.join("usr/lib64/pkgconfig/zlib.pc").exists(), "pkgconf cannot resolve png");
+        assert!(into.join("usr/include/zlib.h").exists());
+        assert!(
+            !into.join("usr/include/jpeg.h").exists(),
+            "a transitive dep no .pc names still handed over its header"
+        );
+    }
+
+    #[test]
+    fn a_pc_nothing_in_the_closure_owns_comes_from_whoever_installed_it() {
+        let root = root("pcout");
+        install(&root, T, "x11", &[]);
+        install(&root, T, "xproto", &[]);
+        install(&root, T, "openssl", &[]);
+        fs::write(root.join("usr/lib64/pkgconfig/x11.pc"), "Requires: xproto\n").unwrap();
+
+        let c = closure(&root, T, &[dep("x11", false)]).unwrap();
+        let into = root.join("sysroot");
+        assemble(&root, T, &c, &into).unwrap();
+
+        assert!(into.join("usr/lib64/pkgconfig/xproto.pc").exists());
+        assert!(into.join("usr/include/xproto.h").exists());
+        assert!(
+            !into.join("usr/lib64/libxproto.so.1").exists(),
+            "a package outside the closure handed over more than pkgconf reads"
+        );
+        assert!(!into.join("usr/lib64/libopenssl.so.1").exists());
     }
 
     #[test]

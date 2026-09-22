@@ -282,28 +282,28 @@ fn build(
         };
         say!("{} {} {t} building {eta}", p.name, p.version.upstream);
         let start = Instant::now();
-        let work = compile(root, p, t, &srcs, &f, verbose, boot)?;
+        let (work, linked) = compile(root, p, t, &srcs, &f, verbose, boot)?;
         let secs = start.elapsed().as_secs();
         say!("{} {} {t} ok {}", p.name, p.version.upstream, clock(secs));
         keep_time(root, p, t, secs);
-        built.push((t.clone(), work));
+        built.push((t.clone(), work, linked));
     }
 
     let mut ready = Vec::new();
-    for (t, work) in &built {
-        ready.push((t.clone(), pack(root, p, t, work)?));
+    for (t, work, linked) in &built {
+        ready.push((t.clone(), pack(root, p, t, work)?, linked.clone()));
     }
 
     // sidecar lands after the rename. ahead of it, a target failing to tar leaves a
     // .meta for an artifact that never arrives
-    for (t, (art, part)) in &ready {
+    for (t, (art, part), linked) in &ready {
         fs::rename(part, art).map_err(|e| format!("{}: {e}", art.display()))?;
-        meta(p, t, &hash, &f, art)?;
+        meta(p, t, &hash, &f, art, linked)?;
     }
-    for (_, work) in &built {
+    for (_, work, _) in &built {
         let _ = fs::remove_dir_all(work);
     }
-    Ok(ready.into_iter().map(|(_, (art, _))| art).collect())
+    Ok(ready.into_iter().map(|(_, (art, _), _)| art).collect())
 }
 
 // what the build linked against, set beside what the recipe declared. a transitive
@@ -780,7 +780,7 @@ fn compile(
     f: &Flags,
     verbose: bool,
     boot: bool,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Vec<String>), String> {
     let work = root.join("var/kiry/stage").join(format!(
         "{}-{}-{}.{t}",
         p.name, p.version.upstream, p.version.rev
@@ -1035,10 +1035,12 @@ fn compile(
             }
             trim(&dest, t, &p.name)?;
             // after trim, so a gnu binary that gets dropped does not argue for a dep
+            let mut linked = BTreeSet::new();
             for (soname, who, kind) in undeclared(root, &members, &deps, t, &dest) {
                 say!("{} {t} {kind} {who}  {soname}", p.name);
+                linked.insert(who);
             }
-            Ok(work)
+            Ok((work, linked.into_iter().collect()))
         }
         Ok(_) if verbose => Err(format!("{} {t}: build failed", p.name)),
         Ok(_) => Err(format!(
@@ -1566,7 +1568,14 @@ fn pack(root: &Path, p: &Package, t: &str, work: &Path) -> Result<(PathBuf, Path
     Ok((art, part))
 }
 
-fn meta(p: &Package, t: &str, hash: &str, f: &Flags, art: &Path) -> Result<(), String> {
+fn meta(
+    p: &Package,
+    t: &str,
+    hash: &str,
+    f: &Flags,
+    art: &Path,
+    linked: &[String],
+) -> Result<(), String> {
     let mut d = art.as_os_str().to_owned();
     d.push(".meta");
     let d = PathBuf::from(d);
@@ -1583,9 +1592,20 @@ fn meta(p: &Package, t: &str, hash: &str, f: &Flags, art: &Path) -> Result<(), S
 
     // one line per dep that applies to this target, the same narrowing targets gets --
     // an artifact is built for one target and carries what that build actually used
+    //
+    // a converted recipe declares what alpine's makedepends said and nothing about what
+    // the result links, because alpine derives that from sonames when it packages. so
+    // does this, at the one moment it is known: a library in DT_NEEDED that the recipe
+    // cannot account for is a runtime edge whether anybody wrote it down or not. the
+    // recipe stays what somebody typed and the sidecar carries what was true
     let mut deps = String::new();
+    let mut said: HashSet<&str> = HashSet::new();
     for x in p.depends.iter().filter(|x| x.applies(t)) {
         deps.push_str(&format!("{x}\n"));
+        said.insert(&x.name);
+    }
+    for n in linked.iter().filter(|n| !said.contains(n.as_str())) {
+        deps.push_str(&format!("{n}\n"));
     }
     put(&d.join("depends"), &deps)?;
     Ok(())
@@ -6878,6 +6898,64 @@ mod tests {
             .output()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod sidecar {
+    use super::*;
+
+    // alpine derives a runtime dep from the sonames its build produced; a converted
+    // recipe carries only what makedepends said. the sidecar is where the two meet, so
+    // a library the build linked lands there whether the recipe named it or not
+    #[test]
+    fn a_library_the_build_linked_lands_in_the_sidecar() {
+        let at = std::env::temp_dir()
+            .join(format!("kiry-meta-{}", std::process::id()))
+            .join("derived");
+        let _ = fs::remove_dir_all(&at);
+        mkdirs(&at).unwrap();
+
+        let declared = pkg::Dep { name: "zlib".into(), make: false, host: false, only: None };
+        let only_gnu = pkg::Dep {
+            name: "argp".into(),
+            make: false,
+            host: false,
+            only: Some("musl".into()),
+        };
+        let recipe = at.join("thing");
+        mkdirs(&recipe).unwrap();
+        fs::write(recipe.join("version"), "1.0 1\n").unwrap();
+        let p = Package {
+            name: "thing".into(),
+            dir: recipe,
+            version: pkg::Version::parse("1.0 1").unwrap(),
+            sources: Vec::new(),
+            checksums: Vec::new(),
+            depends: vec![declared, only_gnu],
+            targets: vec!["x86_64-gnu".into()],
+            users: Vec::new(),
+        };
+
+        let art = at.join("thing-1.0-1.x86_64-gnu.tar.zst");
+        let linked = vec!["libpcre2".to_string(), "zlib".to_string()];
+        let f = Flags {
+            reuse: false,
+            cflags: String::new(),
+            cxxflags: String::new(),
+            ldflags: String::new(),
+            rustflags: String::new(),
+            use_flags: Vec::new(),
+            env: Vec::new(),
+            from: Vec::new(),
+        };
+        meta(&p, "x86_64-gnu", "0", &f, &art, &linked).unwrap();
+
+        let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-gnu.tar.zst.meta/depends")).unwrap();
+        let lines: Vec<&str> = got.lines().collect();
+        // zlib was declared and linked, and is one line either way
+        assert_eq!(lines, vec!["zlib", "libpcre2"], "{got}");
     }
 }
 

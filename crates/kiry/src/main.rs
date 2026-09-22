@@ -2629,13 +2629,45 @@ fn install_cmd(args: &[String]) {
     let mut plan = levels(&set, &recipes);
     longest_first(&mut plan, &set, &history(&root));
     if dry {
+        let mut building = 0;
         for (n, t) in &set {
             let how = match cached(&root, &recipes[n], t) {
                 Some(_) => "cached",
-                None => "builds",
+                None => {
+                    building += 1;
+                    "builds"
+                }
             };
             say!("{n} {} {t} {how}", recipes[n].version.upstream);
         }
+        // the denominator for what follows
+        if set.len() > 1 {
+            say!("{building} builds  {} cached", set.len() - building);
+        }
+        // an inherited makedepends line is a subtree, not a package: an optional vlc
+        // video source took obs from 13 builds to 311, and the number was here to read
+        // before the first one started. what a name costs is what goes away with it,
+        // which is the closure walked again without that edge
+        let mut alone: Vec<(usize, &str)> = Vec::new();
+        for (n, _) in &seeds {
+            for d in &recipes[n].depends {
+                if alone.iter().any(|(_, o)| *o == d.name) {
+                    continue;
+                }
+                // one is a package and it is already a line above. what is worth
+                // reading here is a name that takes others with it
+                match set.len() - without(&root, &seeds, &recipes, &d.name) {
+                    gone if gone > 1 => alone.push((gone, &d.name)),
+                    _ => {}
+                }
+            }
+        }
+        alone.sort_unstable_by(|a, b| b.cmp(a));
+        let w = alone.iter().map(|(_, n)| n.len()).max().unwrap_or(0);
+        for (gone, name) in &alone {
+            say!("only via {name:w$}  {gone} builds");
+        }
+
         // the same answer the real run would get, override included
         let (risky, why) = route(&root, &set);
         match (risky, live) {
@@ -2759,6 +2791,34 @@ fn skew(root: &Path) {
 // make deps come along rather than being skipped. a build assembles its closure out of
 // the installed database, so a tool that is not installed is one the sandbox has nothing
 // to hand the build
+// what the closure would be with one dependency edge cut. the whole of it is loaded by
+// the time this runs, so it walks what wanted() already walked and touches no disk beyond
+// asking what is installed
+fn without(
+    root: &Path,
+    seeds: &[(String, String)],
+    recipes: &HashMap<String, Package>,
+    cut: &str,
+) -> usize {
+    let host = sandbox::host();
+    let mut out: Vec<(String, String)> = seeds.to_vec();
+    let mut seen: HashSet<(String, String)> = seeds.iter().cloned().collect();
+    let mut i = 0;
+    while i < out.len() {
+        let (name, t) = out[i].clone();
+        i += 1;
+        let Some(p) = recipes.get(&name) else { continue };
+        for d in p.depends.iter().filter(|d| d.applies(&t) && d.name != cut) {
+            let at = (d.name.clone(), if d.host { host.clone() } else { t.clone() });
+            if db::read(root, &at.1, &at.0).is_ok() || !seen.insert(at.clone()) {
+                continue;
+            }
+            out.push(at);
+        }
+    }
+    out.len()
+}
+
 fn wanted(
     root: &Path,
     seeds: &[(String, String)],
@@ -3513,6 +3573,43 @@ fn longest_first(
 #[cfg(test)]
 mod order {
     use super::*;
+
+    // the vlc number: one line in a converted makedepends, and what goes away with it is
+    // a subtree rather than a package
+    #[test]
+    fn what_a_dependency_costs_is_what_leaves_with_it() {
+        let t = "x86_64-musl".to_string();
+        let pkg = |name: &str, deps: &[&str]| Package {
+            name: name.to_string(),
+            dir: PathBuf::new(),
+            version: pkg::Version::parse("1 1").unwrap(),
+            sources: Vec::new(),
+            checksums: Vec::new(),
+            depends: deps
+                .iter()
+                .map(|d| pkg::Dep { name: (*d).to_string(), make: false, host: false, only: None })
+                .collect(),
+            targets: vec![t.clone()],
+            users: Vec::new(),
+        };
+        let recipes = HashMap::from([
+            ("app".to_string(), pkg("app", &["vlc", "zlib"])),
+            ("vlc".to_string(), pkg("vlc", &["dvdread", "zlib"])),
+            ("dvdread".to_string(), pkg("dvdread", &["dvdcss"])),
+            ("dvdcss".to_string(), pkg("dvdcss", &[])),
+            ("zlib".to_string(), pkg("zlib", &[])),
+        ]);
+        let seeds = vec![("app".to_string(), t)];
+        // nothing is installed, so the root can be anywhere -- db::read just fails
+        let none = Path::new("/nonexistent-kiry-root");
+
+        // app vlc dvdread dvdcss zlib
+        assert_eq!(without(none, &seeds, &recipes, ""), 5);
+        // zlib is reached around vlc as well, so only the dvd chain leaves with it
+        assert_eq!(without(none, &seeds, &recipes, "vlc"), 2);
+        // and a leaf costs itself alone
+        assert_eq!(without(none, &seeds, &recipes, "zlib"), 4);
+    }
 
     fn three() -> Vec<(String, String)> {
         ["quick", "slow", "new"]

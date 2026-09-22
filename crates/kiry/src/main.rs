@@ -933,9 +933,9 @@ fn compile(
             "meson",
             "#!/bin/sh -e\nexec muon meson \"$@\"\n".to_string(),
         ),
-        ("kiry-cc", cc.replace("@REAL@", "clang")),
+        ("kirycc", cc.replace("@REAL@", "clang")),
         (
-            "kiry-c++",
+            "kiryc++",
             cc.replace("@REAL@", "clang++").replace("\"$@\"", &format!("{cxx_extra} \"$@\"")),
         ),
     ] {
@@ -991,8 +991,8 @@ fn compile(
         )
         // named rather than left to cc, because a configure that goes looking finds
         // clang either way and the point is the flags that come with it
-        .env("CC", "kiry-cc")
-        .env("CXX", "kiry-c++")
+        .env("CC", "kirycc")
+        .env("CXX", "kiryc++")
         .env("KIRY_SRCDIR", "/src")
         .env("KIRY_TARGET", t)
         .env("KIRY_NAME", &p.name)

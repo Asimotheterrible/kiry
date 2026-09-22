@@ -800,15 +800,6 @@ fn compile(
     let _ = fs::remove_dir_all(&dest);
     mkdirs(&dest)?;
 
-    for (name, path, _) in srcs.iter().filter(|_| !again) {
-        let name = name.as_str();
-        if tarball(name) {
-            untar(path, &src, name)?;
-        } else {
-            fs::copy(path, src.join(name)).map_err(|e| format!("{name}: {e}"))?;
-        }
-    }
-
     // a bootstrap file declares that this package is the one that breaks its cycle. with
     // nothing in it that is the whole claim -- the first pass is the ordinary build, run
     // before the rest of the cycle rather than after, which is all some cycles are. one
@@ -830,6 +821,21 @@ fn compile(
         return Err(format!("{}: no build script", p.dir.display()));
     }
 
+    // abuild's split: a recipe with an unpack() of its own is handed the sources as they
+    // arrived and extracts what it wants, which is how libyuv hashes the tree it untars
+    let own_unpack = fs::read_to_string(&script).is_ok_and(|s| s.contains("\nunpack()"));
+    for (name, path, _) in srcs.iter().filter(|_| !again) {
+        let name = name.as_str();
+        if tarball(name) && !own_unpack {
+            untar(path, &src, name)?;
+            continue;
+        }
+        fs::copy(path, src.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        if name.ends_with(".zip") && !own_unpack {
+            run(Command::new("unzip").arg("-qo").arg(path).arg("-d").arg(&src), name)?;
+        }
+    }
+
     let sysroot = work.join("sysroot");
     let deps: Vec<Dep> = p.depends.iter().filter(|d| d.applies(t)).cloned().collect();
     let members = sandbox::closure(root, t, &deps)?;
@@ -839,6 +845,19 @@ fn compile(
     let share = sysroot.join("usr/share/kiry");
     mkdirs(&share)?;
     fs::write(share.join("lib.sh"), LIB_SH).map_err(|e| format!("lib.sh: {e}"))?;
+    // the automake in the root carries the config.sub that knows musl, and staging it
+    // here is what gets it to the callers with no automake dep of their own
+    let automake = fs::read_dir(root.join("usr/share"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|d| d.file_name().is_some_and(|n| n.to_string_lossy().starts_with("automake-")))
+        .map(|d| d.join("config.sub"))
+        .find(|p| p.is_file());
+    if let Some(sub) = automake {
+        fs::copy(&sub, share.join("config.sub")).map_err(|e| format!("config.sub: {e}"))?;
+    }
     // files rather than shell functions because ash refuses a hyphen in a function name,
     // and generated because libdir is the target's
     let bin = sysroot.join("usr/bin");
@@ -1032,6 +1051,7 @@ fn compile(
 // cannot drift from the binary that writes it
 const LIB_SH: &str = "\
 default_prepare() {
+\t[ -d \"$builddir\" ] && cd \"$builddir\"
 \tfor _s in $source; do
 \t\t# name::url says what a source is called, so the name decides both whether
 \t\t# this is a patch and what to look for it under
@@ -1047,14 +1067,33 @@ default_prepare() {
 }
 
 msg() { echo \">>> $*\"; }
+msg2() { echo \"    $*\"; }
 warning() { echo \">>> WARNING: $*\" >&2; }
 error() { echo \">>> ERROR: $*\" >&2; }
 die() { error \"$@\"; exit 1; }
 
-# abuild refreshes config.sub so an old one recognises musl. a tarball new enough to
-# package usually already does, and one that is not says so at configure
-update_config_sub() { :; }
+pkgdir=$DESTDIR
+
+# a tarball's own config.sub is left alone when it already answers to $CHOST -- it can
+# be the newer of the two, and cdparanoia 10.2 is the case where it is not
+update_config_sub() {
+\tfind . -name config.sub | while read -r _f; do
+\t\tsh \"$_f\" \"$CHOST\" >/dev/null 2>&1 && continue
+\t\tcp /usr/share/kiry/config.sub \"$_f\"
+\tdone
+}
 update_config_guess() { :; }
+
+default_unpack() {
+\tfor _s in $source; do
+\t\t_f=${_s%%::*}
+\t\t_f=${_f##*/}
+\t\tcase \"$_f\" in
+\t\t*.tar*|*.tgz|*.tbz2|*.txz|*.tzst) tar -C \"$srcdir\" -xf \"$srcdir/$_f\" || return 1 ;;
+\t\t*.zip) unzip -qo \"$srcdir/$_f\" -d \"$srcdir\" || return 1 ;;
+\t\tesac
+\tdone
+}
 
 # kiry builds one package and does not run upstream test suites, so both are always no
 subpackages_has() { return 1; }

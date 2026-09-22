@@ -344,13 +344,16 @@ pub fn recipe(
         script.push_str("\nprepare() {\n\tdefault_prepare\n}\n");
         wrote.push("prepare".to_string());
     }
-    script.push_str("\ncd \"$builddir\"\n");
+    script.push('\n');
+    if wrote.iter().any(|w| w == "unpack") {
+        script.push_str("cd \"$srcdir\"\nunpack\n");
+    }
 
     let mut had = false;
     for f in PHASES {
         if wrote.iter().any(|w| w == f) {
             had = *f != "prepare" || had;
-            script.push_str(&format!("{f}\n"));
+            script.push_str(&format!("cd \"$builddir\"\n{f}\n"));
         } else {
             notes.push(format!("no {f}() in the apkbuild"));
         }

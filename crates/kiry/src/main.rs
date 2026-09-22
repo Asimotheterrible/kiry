@@ -1028,6 +1028,11 @@ fn compile(
 
     match c.status() {
         Ok(s) if s.success() => {
+            // ahead of trim, which drops on policy rather than on the build having
+            // failed, and would otherwise make the two indistinguishable
+            if staged(&dest) == 0 {
+                return Err(format!("{} {t}: built and staged nothing", p.name));
+            }
             trim(&dest, t, &p.name)?;
             // after trim, so a gnu binary that gets dropped does not argue for a dep
             for (soname, who, kind) in undeclared(root, &members, &deps, t, &dest) {
@@ -1495,6 +1500,24 @@ fn tarball(name: &str) -> bool {
         || name.ends_with(".txz")
         || name.ends_with(".tbz2")
         || name.ends_with(".tzst")
+}
+
+// a build system handed an optional component it cannot satisfy configures, compiles
+// nothing and exits 0. qt marks Gui optional, so qt_build_repo() can stage nothing for
+// qt6-qtwayland and the line says ok in two seconds -- the tar that follows is a valid
+// archive of nothing and the install a no-op nobody hears about
+fn staged(dest: &Path) -> usize {
+    let Ok(rd) = fs::read_dir(dest) else { return 0 };
+    let mut n = 0;
+    for e in rd.flatten() {
+        // a symlink to a directory is content, not somewhere to descend
+        match e.file_type() {
+            Ok(k) if k.is_dir() => n += staged(&e.path()),
+            Ok(_) => n += 1,
+            Err(_) => {}
+        }
+    }
+    n
 }
 
 fn pack(root: &Path, p: &Package, t: &str, work: &Path) -> Result<(PathBuf, PathBuf), String> {

@@ -2251,6 +2251,66 @@ fn a_failure_nothing_matches_walks_down_the_ladder() {
     let pkg = fs::read_to_string(root.join("etc/kiry/pkg/hello")).unwrap();
     assert!(pkg.contains("OPT -O2"), "{pkg}");
     assert!(pkg.contains("rung"), "{pkg}");
+    // the failure goes beside the rung, so it can be judged after the log is gone
+    assert!(pkg.contains("the build is displeased"), "{pkg}");
+}
+
+// a box whose config already says -O2 gets nothing from OPT -O2, and a build spent
+// finding that out is a full build of a result already known -- hours, for mesa
+#[test]
+fn a_rung_that_changes_no_flag_costs_no_build() {
+    let at = scratch("noop-rung");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "case \"$CFLAGS\" in\n\
+         *-march=*) echo 'foo.c:3:9: error: not on this cpu' >&2; exit 1 ;;\n\
+         esac\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    // the first try, filter-lto, then the march rung that fixes it
+    let tries = said.lines().filter(|l| l.contains(" building ")).count();
+    assert_eq!(tries, 3, "{said}");
+    let pkg = fs::read_to_string(root.join("etc/kiry/pkg/hello")).unwrap();
+    assert!(pkg.contains("CFLAGS_MARCH"), "{pkg}");
+    assert!(!pkg.contains("OPT -O2"), "a rung that changed nothing was left behind: {pkg}");
+}
+
+// the ladder ends on the smallest set of flags, not on -pipe, which only moves where the
+// compiler keeps its temporaries and so can only ever spend the build
+#[test]
+fn the_last_rung_is_the_smallest_set_of_flags() {
+    let at = scratch("strip-rung");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "case \"$CFLAGS\" in\n\
+         *-fbad-idea*) echo 'foo.c:3:9: error: that flag again' >&2; exit 1 ;;\n\
+         esac\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nLTO thin\n");
+    config(&root, Some("hello"), "CFLAGS -fbad-idea\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let f = fs::read_to_string(d.join("filter")).unwrap();
+    assert!(f.contains("strip-flags"), "{f}");
 }
 
 // no flag change can reach a portability bug, so it says so instead of burning retries

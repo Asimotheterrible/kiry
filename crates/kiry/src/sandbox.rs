@@ -493,7 +493,10 @@ fn devices(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// half of what the machine has, per process. KIRY_MEM is megabytes and 0 turns it off
+// half of what the machine has, split between the builds running at once. not per
+// process: that lets two builds have the whole machine, and the thinlto oom row in the
+// failure table ends up answering it after the fact. KIRY_MEM is megabytes and stays per
+// process, because setting it is saying so; 0 turns it off
 fn memcap() -> Option<u64> {
     if let Ok(v) = std::env::var("KIRY_MEM") {
         return match v.parse::<u64>() {
@@ -509,7 +512,12 @@ fn memcap() -> Option<u64> {
         .trim_end_matches(" kB")
         .parse::<u64>()
         .ok()?;
-    Some(kb * 1024 / 2)
+    let share = std::env::var("KIRY_SHARE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    Some(kb * 1024 / 2 / share)
 }
 
 fn write(path: &str, body: &str) -> Result<(), String> {

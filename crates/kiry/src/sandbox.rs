@@ -216,6 +216,25 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
     for d in ["proc", "dev", "tmp", "src", "dest"] {
         fs::create_dir_all(into.join(d)).map_err(|e| format!("{d}: {e}"))?;
     }
+
+    // install -o root asks getpwnam, and the file it reads is nobody's dependency:
+    // 15 recipes here install by name and bmake's own makefile is one of them, which
+    // fails on unknown user root after every object has already compiled. uid_map
+    // makes the builder uid 0, so root:0 is what is true inside rather than a
+    // convenience. baselayout owns the real pair and has staged it above when it is in
+    // the closure, so this only writes where nothing did
+    let etc = into.join("etc");
+    fs::create_dir_all(&etc).map_err(|e| format!("etc: {e}"))?;
+    for (n, body) in [
+        ("passwd", "root:x:0:0:root:/root:/bin/sh\n"),
+        ("group", "root:x:0:\n"),
+    ] {
+        let at = etc.join(n);
+        if at.exists() {
+            continue;
+        }
+        fs::write(&at, body).map_err(|e| format!("{}: {e}", at.display()))?;
+    }
     Ok(())
 }
 
@@ -903,4 +922,35 @@ mod tests {
         );
     }
 
+    // bmake's makefile runs install -o root -g root, which is a getpwnam away from a
+    // file no closure has to contain
+    #[test]
+    fn a_build_can_look_up_the_user_it_installs_as() {
+        let root = root("passwd");
+        install(&root, T, "zlib", &[]);
+        let c = closure(&root, T, &[dep("zlib", false)]).unwrap();
+        let into = root.join("sysroot");
+        assemble(&root, T, &c, &into).unwrap();
+
+        let passwd = fs::read_to_string(into.join("etc/passwd")).unwrap_or_default();
+        let group = fs::read_to_string(into.join("etc/group")).unwrap_or_default();
+        assert!(passwd.starts_with("root:x:0:0:"), "no root to install as: {passwd:?}");
+        assert!(group.starts_with("root:x:0:"), "no root group to install as: {group:?}");
+    }
+
+    // the pair is baselayout's file where baselayout is in the closure, and a synthesised
+    // one standing in front of it would be a second answer to who is on this system
+    #[test]
+    fn the_package_that_owns_passwd_is_the_one_that_answers() {
+        let root = root("ownpasswd");
+        install(&root, T, "baselayout", &[]);
+        ships(&root, T, "baselayout", "etc/passwd", "root:x:0:0:the real one:/root:/bin/sh\n");
+
+        let c = closure(&root, T, &[dep("baselayout", false)]).unwrap();
+        let into = root.join("sysroot");
+        assemble(&root, T, &c, &into).unwrap();
+
+        let passwd = fs::read_to_string(into.join("etc/passwd")).unwrap();
+        assert!(passwd.contains("the real one"), "a synthesised passwd won: {passwd:?}");
+    }
 }

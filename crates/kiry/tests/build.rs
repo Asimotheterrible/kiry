@@ -794,6 +794,14 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
             said.contains("set_property(CACHE ${_d} PROPERTY TYPE STRING)"),
             "{target} never settles the type of a -D it was handed: {said}"
         );
+        // cmake gives a shared library -fPIC and the object library beside it nothing,
+        // which is one -fPIE translation unit in a thinlto -shared link. this gives a
+        // library and an object library -fPIC and an executable -fPIE, which is what
+        // -fPIC in the global CFLAGS would not have done
+        assert!(
+            said.contains("set(CMAKE_POSITION_INDEPENDENT_CODE ON CACHE BOOL \"\" FORCE)"),
+            "{target} builds an object library without pic: {said}"
+        );
     }
 }
 

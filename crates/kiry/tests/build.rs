@@ -4315,3 +4315,51 @@ fn the_memory_cap_is_split_between_the_builds_of_a_level() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(fs::read_to_string(root.join("usr/bin/only")).unwrap(), "1");
 }
+
+// bmake reads MAKEFLAGS and has no -l, so a flag only gnu make knows is a lowdown that
+// stops at its usage line. the number moves with the builds of the level, same as the
+// memory share, and neither is the configured width when the level is one package wide
+#[test]
+fn make_is_told_the_jobs_of_a_level_and_nothing_gnu_only() {
+    let one = scratch("mf-one");
+    let two = scratch("mf-two");
+    let say = |f: &str| {
+        format!("mkdir -p \"$DESTDIR/usr/bin\"\nprintf %s \"$MAKEFLAGS\" > \"$DESTDIR/usr/bin/{f}\"\n")
+    };
+    let a = recipe(&one, "x86_64-musl", &say("pair"));
+    let b = recipe(&two, "x86_64-musl", &say("pear"));
+    let b2 = two.join("pear");
+    fs::rename(&b, &b2).unwrap();
+
+    let root = one.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = Command::new(KIRY)
+        .args(["i", "--root", root.to_str().unwrap(), a.to_str().unwrap(), b2.to_str().unwrap()])
+        .env("KIRY_PARALLEL", "2")
+        .env("KIRY_JOBS", "8")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    for f in ["pair", "pear"] {
+        let got = fs::read_to_string(root.join("usr/bin").join(f)).unwrap();
+        assert_eq!(got, "-j4", "two at once split eight jobs wrong");
+    }
+
+    // alone it gets the machine, and still nothing bmake would quit over
+    let solo = scratch("mf-solo");
+    let c = recipe(&solo, "x86_64-musl", &say("plum"));
+    let c2 = solo.join("plum");
+    fs::rename(&c, &c2).unwrap();
+    let o = Command::new(KIRY)
+        .args(["i", "--root", root.to_str().unwrap(), c2.to_str().unwrap()])
+        .env("KIRY_PARALLEL", "2")
+        .env("KIRY_JOBS", "8")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(root.join("usr/bin/plum")).unwrap(), "-j8");
+}

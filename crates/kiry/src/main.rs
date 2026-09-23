@@ -965,7 +965,7 @@ fn compile(
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("DESTDIR", "/dest")
         // every apkbuild build() leans on abuild exporting this and never says -j itself
-        .env("MAKEFLAGS", makeflags(jobs(), width()))
+        .env("MAKEFLAGS", makeflags(jobs(), at_once))
         // build is this machine, host is what the output has to run on. they are the
         // same triple for a musl package built on musl and they are not for a gnu one,
         // which is the only cross this tree does. told they matched, gcc's configure
@@ -1391,13 +1391,13 @@ fn width() -> usize {
     }
 }
 
-// with company, make stops starting jobs once the load says the machine is full. samu
-// has no such option -- it refuses -l outright -- so a ninja build just shares the cpu
-fn makeflags(jobs: usize, width: usize) -> String {
-    match width {
-        1 => format!("-j{jobs}"),
-        _ => format!("-j{jobs} -l{jobs}"),
-    }
+// -j is the whole of what bmake and gnu make both read out of here. bmake has no -l at
+// all and answers one with its usage line, so lowdown dies whenever anything builds
+// beside it -- and samu refuses -l too, it just never reads MAKEFLAGS to find out. what
+// -l would do is arithmetic here: the machine divided by the builds on it, which is the
+// call the memory cap already makes
+fn makeflags(jobs: usize, at_once: usize) -> String {
+    format!("-j{}", (jobs / at_once.max(1)).max(1))
 }
 
 // f over items, width at a time, started in the order given -- longest first by the time
@@ -3699,9 +3699,21 @@ mod order {
     }
 
     #[test]
-    fn make_is_capped_by_load_only_with_company() {
+    fn make_gets_the_machine_divided_by_the_builds_on_it() {
         assert_eq!(makeflags(16, 1), "-j16");
-        assert_eq!(makeflags(16, 2), "-j16 -l16");
+        assert_eq!(makeflags(16, 2), "-j8");
+        // more builds than threads still leaves each of them something to run with
+        assert_eq!(makeflags(4, 8), "-j1");
+    }
+
+    // bmake reads MAKEFLAGS, has no -l in its option set and quits with its usage line
+    // rather than ignoring one, which is lowdown every time it is not building alone
+    #[test]
+    fn nothing_gnu_make_alone_understands_goes_in_makeflags() {
+        for at_once in 1..=8 {
+            let f = makeflags(16, at_once);
+            assert!(!f.contains("-l"), "bmake cannot read {f}");
+        }
     }
 
     #[test]

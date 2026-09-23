@@ -578,12 +578,16 @@ fn fetcher(url: &str, dst: &Path) -> Result<Command, String> {
 
 // full flags, then less of them. a check failure prints nothing a table could match, so
 // after the signatures are out this is the only thing left that knows anything
+//
+// no LTO none: filter-lto has already taken -flto and the jobs cap out of all three
+// lists by then, so it resolves to the same flags every time and could only spend a
+// build. the last rung is the smallest set strip-flags leaves standing rather than
+// -pipe, which moves where the compiler keeps its temporaries and nothing in the code
 const LADDER: &[(bool, &str)] = &[
     (true, "filter-lto"),
-    (false, "LTO none"),
     (false, "OPT -O2"),
     (false, "CFLAGS_MARCH"),
-    (false, "CFLAGS -pipe"),
+    (true, "strip-flags"),
 ];
 
 fn note(at: &Path, line: &str, why: &str) -> Result<(), String> {
@@ -694,16 +698,29 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
             ));
         }
 
-        let Some((filter, line)) = LADDER.get(rung) else {
-            say!("first failure is {}", first.display());
-            return Err(stuck(p, t, "the ladder ran out"));
+        // a rung that resolves to the flags already in force rebuilds into a result
+        // already known. OPT -O2 on a box whose config says -O2 is that, and so is any
+        // rung whose flag an earlier fix already took out
+        let now = flags(root, &p.name, Some(&p.dir))?;
+        let (filter, line) = loop {
+            let Some(r) = LADDER.get(rung) else {
+                say!("first failure is {}", first.display());
+                return Err(stuck(p, t, "the ladder ran out"));
+            };
+            rung += 1;
+            let then = flags_with(root, &p.name, Some(&p.dir), Some(r))?;
+            if then.record() != now.record() || then.env != now.env {
+                break r;
+            }
         };
-        rung += 1;
         let at = match filter {
             true => p.dir.join("filter"),
             false => root.join("etc/kiry/pkg").join(&p.name),
         };
-        note(&at, line, &format!("rung {rung} after {} failed on {t}", phase(&log)))?;
+        // the line that failed goes beside the rung, as it does beside a table fix. a
+        // rung with only its phase on it cannot be judged once the log is overwritten
+        let why = format!("rung {rung} after {} failed on {t}\n#   {}", phase(&log), blame(&log));
+        note(&at, line, &why)?;
     }
 }
 
@@ -1848,7 +1865,25 @@ fn filtered(
 }
 
 fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
-    let from = settings(root, name)?;
+    flags_with(root, name, dir, None)
+}
+
+// the same resolve with one ladder rung on top as though it had been written, so whether
+// a rung changes anything is known before a build is spent on it and nothing touches disk
+fn flags_with(
+    root: &Path,
+    name: &str,
+    dir: Option<&Path>,
+    rung: Option<&(bool, &str)>,
+) -> Result<Flags, String> {
+    let entry = |l: &str| {
+        let (k, v) = l.split_once(' ').unwrap_or((l, ""));
+        ("ladder".to_string(), k.to_string(), v.to_string())
+    };
+    let mut from = settings(root, name)?;
+    if let Some((false, l)) = rung {
+        from.push(entry(l));
+    }
     let mut knob: HashMap<&str, String> =
         KNOBS.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
     let (mut c, mut cxx, mut ld) = (Vec::new(), Vec::new(), Vec::new());
@@ -1940,9 +1975,11 @@ fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
     let mut ldf: Vec<String> = link.iter().chain(ld.iter()).flat_map(words).collect();
     let rsf: Vec<String> = rbase.iter().chain(rs.iter()).flat_map(words).collect();
 
-    let mut from = from;
     if let Some(d) = dir {
-        let f = filters(d)?;
+        let mut f = filters(d)?;
+        if let Some((true, l)) = rung {
+            f.push(entry(l));
+        }
         filtered(&f, &mut cf, &mut cxf, &mut ldf)?;
         from.extend(f);
     }

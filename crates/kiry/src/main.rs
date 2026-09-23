@@ -36,6 +36,7 @@ fn main() {
         Some("owns") => owns_cmd(&args[1..]),
         Some("rebuild") => rebuild_cmd(&args[1..]),
         Some("flags") => flags_cmd(&args[1..]),
+        Some("bisect-flags") => bisect_cmd(&args[1..]),
         Some("why") => why_cmd(&args[1..]),
         Some("ahead") => ahead_cmd(&args[1..]),
         Some("sync") => sync_cmd(&args[1..]),
@@ -87,6 +88,7 @@ fn usage() {
     say!("  sync [-n] [--net]       bump those into testing/");
     say!("  promote <pkg>...        testing/ into the tree");
     say!("  rebuild [-n]            drain the soname rebuild queue");
+    say!("  bisect-flags <pkg>...   take the ladder's rungs out and find what still needs one");
     say!("");
     say!("the other root");
     say!("  commit                  keep the root that is running");
@@ -732,6 +734,92 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
         // rung with only its phase on it cannot be judged once the log is overwritten
         let why = format!("rung {rung} after {} failed on {t}\n#   {}", phase(&log), blame(&log));
         note(&at, line, &why)?;
+    }
+}
+
+// the ladder only walks down, and what it wrote was true of the toolchain, the sysroot
+// and the recipe on the day. all three move. this takes the rungs a package carries back
+// out and recovers from the full flags, so a rung still needed comes back with a fresh
+// note and a stale one stays gone. the table's fixes stay: each one names the line that
+// needed it, and a rung only ever named a phase
+fn bisect_cmd(args: &[String]) {
+    let (root, _, rest) = opts(args);
+    let names = asked(rest, &[]);
+    writes(&root);
+    if names.is_empty() {
+        die("bisect-flags wants a package".into());
+    }
+    for n in expand(&root, names) {
+        let p = match resolve(&root, &n).and_then(|at| pkg::load(&at).map_err(|e| e.to_string())) {
+            Ok(p) => p,
+            Err(e) => die(e),
+        };
+        let files = [p.dir.join("filter"), root.join("etc/kiry/pkg").join(&p.name)];
+        let had: Vec<Option<String>> = files.iter().map(|f| fs::read_to_string(f).ok()).collect();
+        let mut any = false;
+        for (f, h) in files.iter().zip(&had) {
+            let Some(h) = h else { continue };
+            let left = unrung(h);
+            if left == *h {
+                continue;
+            }
+            any = true;
+            let r = match left.trim().is_empty() {
+                true => fs::remove_file(f),
+                false => fs::write(f, left),
+            };
+            if let Err(e) = r {
+                die(format!("{}: {e}", f.display()));
+            }
+        }
+        if !any {
+            say!("{} carries no rung", p.name);
+            continue;
+        }
+        if let Err(e) = p.targets.iter().try_for_each(|t| recover(&root, &p, t, false, 1)) {
+            // stuck from the full flags says nothing about the rungs it had, so the
+            // package goes back to exactly what it built with before
+            for (f, h) in files.iter().zip(&had) {
+                if let Some(h) = h {
+                    let _ = fs::write(f, h);
+                }
+            }
+            die(e);
+        }
+    }
+}
+
+// a filter or settings file with the ladder's lines taken out. note() heads each one
+// with "# <date> rung", and only the dated header nearest the line decides whose it is:
+// comments above that belong to whoever wrote them
+fn unrung(text: &str) -> String {
+    let dated = |c: &&str| {
+        c.split_whitespace()
+            .nth(1)
+            .is_some_and(|d| d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-')
+    };
+    let mut out: Vec<&str> = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    for l in text.lines() {
+        if l.trim_start().starts_with('#') {
+            block.push(l);
+            continue;
+        }
+        match block.iter().rposition(dated) {
+            Some(at) if block[at].split_whitespace().nth(2) == Some("rung") => {
+                out.extend(&block[..at]);
+            }
+            _ => {
+                out.extend(&block);
+                out.push(l);
+            }
+        }
+        block.clear();
+    }
+    out.extend(&block);
+    match out.is_empty() {
+        true => String::new(),
+        false => out.join("\n") + "\n",
     }
 }
 
@@ -7137,6 +7225,48 @@ mod tests {
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
 
+    // what the ladder wrote goes, header and all. what the table wrote and what a person
+    // wrote stay, and so does a hand comment sitting on top of a rung
+    #[test]
+    fn bisect_takes_out_the_rungs_and_nothing_else() {
+        let had = "\
+# seeded from the portage grep
+filter-flags -fno-plt
+# the upstream build hates lto
+# 2026-09-12 rung 1 after check failed on x86_64-musl
+filter-lto
+# 2026-09-20 link failed, recompile with -fPIC
+#   relocation R_X86_64_32 cannot be used; recompile with -fPIC
+append-flags -fPIC
+# 2026-09-24 rung 3 after compile failed on x86_64-musl
+#   foo.c:3:9: error: not on this cpu
+CFLAGS_MARCH
+# 2026-09-24 stuck on x86_64-gnu: the ladder ran out
+
+";
+        assert_eq!(
+            unrung(had),
+            "\
+# seeded from the portage grep
+filter-flags -fno-plt
+# the upstream build hates lto
+# 2026-09-20 link failed, recompile with -fPIC
+#   relocation R_X86_64_32 cannot be used; recompile with -fPIC
+append-flags -fPIC
+# 2026-09-24 stuck on x86_64-gnu: the ladder ran out
+
+"
+        );
+        assert_eq!(unrung("# 2026-09-12 rung 1 after compile failed on x86_64-musl\nfilter-lto\n"), "");
+        // a rung whose line somebody deleted by hand leaves its header over the next
+        // entry, and it is the header nearest a line that says whose the line is
+        let dangling = "\
+# 2026-09-12 rung 2 after compile failed on x86_64-musl
+# 2026-09-20 link failed, recompile with -fPIC
+append-flags -fPIC
+";
+        assert_eq!(unrung(dangling), dangling);
+    }
 }
 
 #[cfg(test)]

@@ -2449,7 +2449,7 @@ fn a_file_that_crashes_on_every_rung_is_stuck_after_one_build() {
 }
 
 // the machine running out is not the compiler's fault, and half the thinlto jobs link
-// the same code. a relink rather than a rebuild, which is what the reuse row was for
+// the same code. a relink rather than a rebuild
 #[test]
 fn a_killed_link_goes_again_with_half_the_lto_jobs() {
     let at = scratch("inflight-oom");

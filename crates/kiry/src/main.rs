@@ -7072,6 +7072,78 @@ mod sidecar {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
+mod provenance {
+    use super::*;
+
+    fn root(name: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("kiry-drift-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn rec(root: &Path, t: &str, name: &str, hash: &str) {
+        db::write(
+            root,
+            &db::Installed {
+                name: name.into(),
+                target: t.into(),
+                version: pkg::Version::parse("1.0 1").unwrap(),
+                depends: Vec::new(),
+                manifest: Vec::new(),
+                hash: hash.into(),
+                users: Vec::new(),
+                flags: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    // the hash every artifact carries is what makes "the two graphics stacks cannot
+    // drift" a check and not a design claim. a bump that reached one target and not the
+    // other is what it catches
+    #[test]
+    fn a_package_whose_targets_were_built_from_different_sources_is_a_finding() {
+        let at = root("mismatch");
+        let ts = ["x86_64-musl".to_string(), "x86_64-gnu".to_string()];
+        rec(&at, &ts[0], "mesa", "aaa");
+        rec(&at, &ts[1], "mesa", "aaa");
+        rec(&at, &ts[0], "zlib", "bbb");
+        rec(&at, &ts[1], "zlib", "ccc");
+
+        let found = drift(&at, &ts);
+        let names: Vec<&str> = found.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(names, vec!["zlib"], "{names:?}");
+    }
+
+    // a record written before kiry recorded one says nothing rather than no, the same
+    // call the cache key makes
+    #[test]
+    fn a_record_with_no_hash_is_not_drift() {
+        let at = root("nohash");
+        let ts = ["x86_64-musl".to_string(), "x86_64-gnu".to_string()];
+        rec(&at, &ts[0], "mesa", "aaa");
+        rec(&at, &ts[1], "mesa", "");
+
+        assert!(drift(&at, &ts).is_empty());
+    }
+
+    // one target of a two-target recipe is the ordinary case for a package that only
+    // builds on one, and nothing to report
+    #[test]
+    fn a_package_on_one_target_alone_is_not_drift() {
+        let at = root("single");
+        let ts = ["x86_64-musl".to_string(), "x86_64-gnu".to_string()];
+        rec(&at, &ts[0], "dwl", "aaa");
+
+        assert!(drift(&at, &ts).is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod deps {
     use super::*;
 

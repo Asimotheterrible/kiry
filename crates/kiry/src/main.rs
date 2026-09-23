@@ -583,6 +583,9 @@ fn fetcher(url: &str, dst: &Path) -> Result<Command, String> {
 // lists by then, so it resolves to the same flags every time and could only spend a
 // build. the last rung is the smallest set strip-flags leaves standing rather than
 // -pipe, which moves where the compiler keeps its temporaries and nothing in the code
+//
+// CC_WRAPPER walks the same rungs in place when clang crashes, so a change here is a
+// change there too
 const LADDER: &[(bool, &str)] = &[
     (true, "filter-lto"),
     (false, "OPT -O2"),
@@ -670,6 +673,14 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
         // is gone by the time anyone reads it and the rung that fixed it cannot be judged
         if !first.exists() {
             let _ = fs::copy(logpath(root, p, t), &first);
+        }
+
+        // the wrapper already walked the ladder in place on the file that crashed, and
+        // clang crashed on every rung. the table's crash row and the ladder here would
+        // walk the same rungs again, one whole build each
+        if let Some(l) = log.lines().find(|l| l.starts_with("kirycc: ") && l.ends_with("at every rung")) {
+            say!("first failure is {}", first.display());
+            return Err(stuck(p, t, &l["kirycc: ".len()..]));
         }
 
         if tried.len() < 3 {
@@ -952,10 +963,10 @@ fn compile(
             "meson",
             "#!/bin/sh -e\nexec muon meson \"$@\"\n".to_string(),
         ),
-        ("kirycc", cc.replace("@REAL@", "clang")),
+        ("kirycc", cc.replace("@REAL@", "clang").replace("@EXTRA@", "")),
         (
             "kiryc++",
-            cc.replace("@REAL@", "clang++").replace("\"$@\"", &format!("{cxx_extra} \"$@\"")),
+            cc.replace("@REAL@", "clang++").replace("@EXTRA@", &cxx_extra),
         ),
     ] {
         let at = bin.join(n);
@@ -1050,6 +1061,15 @@ fn compile(
 
     match c.status() {
         Ok(s) if s.success() => {
+            // a file the wrapper stepped down built with less than the record says, and
+            // the log is the only other place that knows
+            if !verbose {
+                for l in fs::read_to_string(&log).unwrap_or_default().lines() {
+                    if let Some(r) = l.strip_prefix("kirycc: ") {
+                        say!("{} {t} {r}", p.name);
+                    }
+                }
+            }
             // ahead of trim, which drops on policy rather than on the build having
             // failed, and would otherwise make the two indistinguishable
             if staged(&dest) == 0 {
@@ -1236,11 +1256,68 @@ if test \"$datarootdir\" = '${prefix}/share'; then datarootdir=@DATADIR@; fi
 // zlib decided it had no strerror this way, then failed to build against its own
 // conclusion
 //
-// exec rather than a shell function so $CC being split on whitespace behaves, and -e so
-// a missing clang says so instead of returning success
+// a file rather than a shell function so $CC being split on whitespace behaves
+//
+// a crash is answered here, on the one command it happened to, instead of by a restart.
+// the build system never sees it fail, so nothing that already compiled compiles again
+// -- a rung through recover() costs a whole build, and for mesa that is hours per rung.
+// the rungs are LADDER's, in its order, applied to this command line only. clang exits
+// 1 for a crash and for a typo alike, which is why stderr is held back and read
+//
+// nothing gets written down. a filter line would take -O3 off the whole package for
+// one file's sake, and the next build steps the same file down the same way for the
+// price of a few failed compiles. what happened is in the log as kirycc: lines, which
+// compile() repeats and recover() reads
+//
+// a kill is the machine running out rather than the compiler, and fewer thinlto jobs
+// link the same code, so that one goes again with half and nothing else changes. a
+// compile fed on stdin gets one go: there is nothing left to read the second time
 const CC_WRAPPER: &str = "\
-#!/bin/sh -e
-exec @REAL@ --target=@TRIPLE@@SYSROOT@ \"$@\"
+#!/bin/sh
+run() { @REAL@ --target=@TRIPLE@@SYSROOT@@EXTRA@ \"$@\"; }
+case \" $* \" in *\" - \"*) run \"$@\"; exit ;; esac
+e=/tmp/.kirycc.$$
+trap 'rm -f \"$e\"' EXIT
+cc() { run \"$@\" 2>\"$e\"; s=$?; [ -s \"$e\" ] && cat \"$e\" >&2; return $s; }
+cc \"$@\" && exit
+s=$?
+o= p=
+for a do [ \"$p\" = -o ] && o=$a; p=$a; done
+o=${o:-$p}
+if [ $s -eq 137 ] || grep -q -e 'command: Killed' -e 'out of memory' \"$e\"; then
+\tfor a do
+\t\tshift
+\t\tcase $a in -Wl,--thinlto-jobs=*) n=${a#*=}; a=-Wl,--thinlto-jobs=$((n > 1 ? n / 2 : 1)) ;; esac
+\t\tset -- \"$@\" \"$a\"
+\tdone
+\techo \"kirycc: $o was killed, again with half the lto jobs\" >&2
+\tcc \"$@\"
+\texit
+fi
+grep -q -e 'PLEASE submit a bug report' -e 'failed due to signal' \"$e\" || exit $s
+for r in filter-lto 'OPT -O2' CFLAGS_MARCH strip-flags; do
+\twas=$*
+\tfor a do
+\t\tshift
+\t\tcase $r in
+\t\tfilter-lto) case $a in -flto*|-Wl,--thinlto-jobs=*) continue ;; esac ;;
+\t\t'OPT -O2') case $a in -O3|-O4|-Ofast) a=-O2 ;; esac ;;
+\t\tCFLAGS_MARCH) case $a in -march=*) continue ;; esac ;;
+\t\tstrip-flags)
+\t\t\tcase \" $CFLAGS $CXXFLAGS \" in *\" $a \"*)
+\t\t\t\tcase $a in -O*|-march=*|-mtune=*|-mcpu=*|-pipe|-g*) ;; *) continue ;; esac ;;
+\t\t\tesac ;;
+\t\tesac
+\t\tset -- \"$@\" \"$a\"
+\tdone
+\t[ \"$*\" = \"$was\" ] && continue
+\techo \"kirycc: $o crashed clang, again at $r\" >&2
+\tcc \"$@\" && exit
+\ts=$?
+\tgrep -q -e 'PLEASE submit a bug report' -e 'failed due to signal' \"$e\" || exit $s
+done
+echo \"kirycc: $o crashed clang at every rung\" >&2
+exit $s
 ";
 
 // abuild's wrapper, deviating twice: auto_features stays auto because the closure is
@@ -7059,6 +7136,7 @@ mod tests {
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
+
 }
 
 #[cfg(test)]

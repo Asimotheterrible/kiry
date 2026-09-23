@@ -172,7 +172,7 @@ fn bootstrap(root: &Path) -> bool {
         .collect();
     for a in [
         "sh", "mkdir", "cp", "ln", "rm", "mv", "cat", "echo", "printf", "chmod", "find",
-        "head", "install", "patch", "tar", "dd", "true", "false", "sed", "touch",
+        "head", "install", "patch", "tar", "dd", "true", "false", "sed", "touch", "grep",
     ] {
         let at = format!("usr/bin/{a}");
         // this busybox is built without patch and the closure is the whole of what a
@@ -2311,6 +2311,169 @@ fn the_last_rung_is_the_smallest_set_of_flags() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let f = fs::read_to_string(d.join("filter")).unwrap();
     assert!(f.contains("strip-flags"), "{f}");
+}
+
+// the sandbox has no compiler, and a crash on demand is not something a real clang
+// can be asked for per flag. this one does what clang does on a crash when its
+// arguments match, and otherwise writes down what it was handed
+fn fake_clang(when: &str, then: &str) -> String {
+    format!(
+        "mkdir -p /src/bin\n\
+         printf '%s\\n' '#!/bin/sh' 'case \" $* \" in {when}) {then} ;; esac' \
+         'echo \"$*\" >> /src/args' >/src/bin/clang\n\
+         chmod +x /src/bin/clang\n\
+         export PATH=/src/bin:$PATH\n"
+    )
+}
+
+const CRASH: &str =
+    "echo \"PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/\" >&2; exit 1";
+
+fn tries(o: &Output) -> usize {
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter(|l| l.contains(" building "))
+        .count()
+}
+
+// a crash is answered on the file it happened to, in place. the build system never sees
+// it, so nothing that already compiled goes again, and the rest of the package keeps
+// every flag it had
+#[test]
+fn a_crash_steps_the_one_file_down_in_place() {
+    let at = scratch("inflight");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "{}kirycc $CFLAGS -c x.c -o x.o\n\
+             grep -q march /src/args && exit 1\n{GOOD}",
+            fake_clang("*-march=*", CRASH)
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(tries(&o), 1, "{said}");
+    assert!(said.contains("x.o crashed clang, again at CFLAGS_MARCH"), "{said}");
+    // the config already says -O2, so that rung is the same command twice
+    assert!(!said.contains("again at OPT -O2"), "{said}");
+    assert!(!d.join("filter").exists());
+    assert!(!root.join("etc/kiry/pkg/hello").exists());
+}
+
+// the ladder in place ends where recover()'s does, on the smallest set of flags, and it
+// can only take out what kiry put in: $CFLAGS is how it tells the two apart
+#[test]
+fn the_last_rung_in_place_is_the_smallest_set_of_flags() {
+    let at = scratch("inflight-strip");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "{}kirycc $CFLAGS -DKEEP -c x.c -o x.o\n\
+             grep -q bad-idea /src/args && exit 1\n\
+             grep -q KEEP /src/args || exit 1\n{GOOD}",
+            fake_clang("*-fbad-idea*", CRASH)
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nLTO thin\n");
+    config(&root, Some("hello"), "CFLAGS -fbad-idea\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("again at strip-flags"));
+}
+
+// stdin is read once. a retry would compile nothing and could well succeed at it
+#[test]
+fn a_compile_fed_on_stdin_gets_one_go() {
+    let at = scratch("inflight-stdin");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "{}echo 'int x;' | kirycc $CFLAGS -x c -c - -o x.o\n{GOOD}",
+            fake_clang("*-march=*", CRASH)
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "CFLAGS_MARCH znver3\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("again at"));
+}
+
+// the wrapper already tried every rung on that file, so a restart would only walk the
+// same ladder over the whole package. the table's crash row included
+#[test]
+fn a_file_that_crashes_on_every_rung_is_stuck_after_one_build() {
+    let at = scratch("inflight-stuck");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!("{}kirycc $CFLAGS -c x.c -o x.o\n{GOOD}", fake_clang("*", CRASH)),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O3\nCFLAGS_MARCH znver3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("x.o crashed clang at every rung"), "{err}");
+    assert_eq!(tries(&o), 1, "{}", String::from_utf8_lossy(&o.stdout));
+    assert!(!root.join("etc/kiry/pkg/hello").exists());
+    let f = fs::read_to_string(d.join("filter")).unwrap();
+    assert!(f.contains("stuck") && !f.contains("rung "), "{f}");
+}
+
+// the machine running out is not the compiler's fault, and half the thinlto jobs link
+// the same code. a relink rather than a rebuild, which is what the reuse row was for
+#[test]
+fn a_killed_link_goes_again_with_half_the_lto_jobs() {
+    let at = scratch("inflight-oom");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "{}kirycc $LDFLAGS -o x x.o\n\
+             grep -q thinlto-jobs=4 /src/args || exit 1\n{GOOD}",
+            fake_clang("*--thinlto-jobs=8*", "kill -9 $$")
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "LTO thin\nKIRY_THINLTO_JOBS 8\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(tries(&o), 1, "{said}");
+    assert!(said.contains("x was killed, again with half the lto jobs"), "{said}");
 }
 
 // no flag change can reach a portability bug, so it says so instead of burning retries

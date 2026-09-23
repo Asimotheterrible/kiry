@@ -252,7 +252,7 @@ fn build_cmd(args: &[String]) {
         let p = &recipes[name];
         let r = match fix {
             true => targets.iter().try_for_each(|t| recover(&root, p, t, verbose, 1)),
-            false => build(&root, p, targets, verbose, false, false, 1).map(|_| ()),
+            false => build(&root, p, targets, verbose, false, 1).map(|_| ()),
         };
         if let Err(e) = r {
             die(e);
@@ -267,14 +267,12 @@ fn build(
     p: &Package,
     targets: &[String],
     verbose: bool,
-    reuse: bool,
     boot: bool,
     at_once: usize,
 ) -> Result<Vec<PathBuf>, String> {
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
-    let mut f = flags(root, &p.name, Some(&p.dir))?;
-    f.reuse = reuse;
+    let f = flags(root, &p.name, Some(&p.dir))?;
 
     let past = history(root);
     let mut built = Vec::new();
@@ -659,18 +657,16 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
     let one = [t.to_string()];
     let mut tried: Vec<String> = Vec::new();
     let mut rung = 0;
-    let mut reuse = false;
     // so a first.log that is there is always this run's
     let first = firstlog(root, p, t);
     let _ = fs::remove_file(&first);
 
     loop {
-        match build(root, p, &one, verbose, reuse, false, at_once) {
+        match build(root, p, &one, verbose, false, at_once) {
             Ok(_) => return Ok(()),
             Err(e) => say!("{e}"),
         }
         let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
-        reuse = false;
         // every retry truncates the log, so without this the failure that started it all
         // is gone by the time anyone reads it and the rung that fixed it cannot be judged
         if !first.exists() {
@@ -694,7 +690,6 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
                     tried.push(f.act.clone());
                     say!("{} {t} {} phase, {}", p.name, phase(&log), f.rule);
                     if write_fix(root, &p.dir, &p.name, &f, &log)? {
-                        reuse = f.reuse;
                         continue;
                     }
                 }
@@ -906,15 +901,8 @@ fn compile(
     let src = work.join("src");
     let dest = work.join("dest");
 
-    // a reuse retry keeps every object that compiled and re-invokes the build system,
-    // which relinks and nothing else. the source is byte-identical and only flags moved,
-    // so what is stale is decidable -- this is not the persistent tree that was rejected,
-    // and the tree still goes when the sequence ends
-    let again = f.reuse && src.is_dir();
-    if !again {
-        let _ = fs::remove_dir_all(&work);
-        mkdirs(&src)?;
-    }
+    let _ = fs::remove_dir_all(&work);
+    mkdirs(&src)?;
     let _ = fs::remove_dir_all(&dest);
     mkdirs(&dest)?;
 
@@ -942,7 +930,7 @@ fn compile(
     // abuild's split: a recipe with an unpack() of its own is handed the sources as they
     // arrived and extracts what it wants, which is how libyuv hashes the tree it untars
     let own_unpack = fs::read_to_string(&script).is_ok_and(|s| s.contains("\nunpack()"));
-    for (name, path, _) in srcs.iter().filter(|_| !again) {
+    for (name, path, _) in srcs {
         let name = name.as_str();
         if tarball(name) && !own_unpack {
             untar(path, &src, name)?;
@@ -1860,8 +1848,6 @@ const KNOBS: &[(&str, &str)] = &[
 ];
 
 struct Flags {
-    // set only by a recovery retry whose rule said the fix touches no compile flag
-    reuse: bool,
     cflags: String,
     cxxflags: String,
     ldflags: String,
@@ -2151,7 +2137,6 @@ fn flags_with(
 
     use_flags.sort();
     Ok(Flags {
-        reuse: false,
         cflags: cf.join(" "),
         cxxflags: cxf.join(" "),
         ldflags: ldf.join(" "),
@@ -2475,24 +2460,21 @@ fn seq(ps: &[Piece], s: &[char], i: usize, caps: &mut Vec<Option<(usize, usize)>
 // first match wins and the rows are most-specific first, so /etc/kiry/failures.d is
 // consulted ahead of the table proper
 const FAILURES: &str = "\
-# regex                                      action                     retry
-LLVM ERROR: out of memory.*lto               set LTO thin               clean
-(out of memory|signal 9|exit status 137)     set KIRY_THINLTO_JOBS /2   reuse
-(Not a valid object file|invalid bitcode)    filter-lto                 clean
-unknown argument: '(-[fm][\\w=-]+)'          drop $1                    clean
-recompile with -fPIC                         append -fPIC               clean
-undefined symbol: __\\w+_chk                  append -U_FORTIFY_SOURCE   clean
-error: instruction requires:                 set CFLAGS_MARCH x86-64    clean
-undefined reference to `__isoc99_            notaflag musl-portability  clean
-PLEASE submit a bug report                   set OPT -O2                clean
+# regex                                      action
+LLVM ERROR: out of memory.*lto               set LTO thin
+(out of memory|signal 9|exit status 137)     set KIRY_THINLTO_JOBS /2
+(Not a valid object file|invalid bitcode)    filter-lto
+unknown argument: '(-[fm][\\w=-]+)'          drop $1
+recompile with -fPIC                         append -fPIC
+undefined symbol: __\\w+_chk                  append -U_FORTIFY_SOURCE
+error: instruction requires:                 set CFLAGS_MARCH x86-64
+undefined reference to `__isoc99_            notaflag musl-portability
+PLEASE submit a bug report                   set OPT -O2
 ";
 
 struct Rule {
     rx: Rx,
     act: String,
-    // whether the work dir survives: it depends on whether the fix changes CFLAGS, not
-    // on which phase died and not on where the action is written
-    reuse: bool,
 }
 
 fn rules(root: &Path) -> Result<Vec<Rule>, String> {
@@ -2518,19 +2500,16 @@ fn rules(root: &Path) -> Result<Vec<Rule>, String> {
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
-        // the pattern has single spaces in it, so only a run of two or a tab ends it
+        // the pattern has single spaces in it, so only a run of two or a tab ends it.
+        // a third column some tables on disk still carry is read as nothing: every retry
+        // starts clean, and a relink after a kill happens inside the build, in kirycc
         let mut f = l.split('\t').flat_map(|x| x.split("  ")).map(str::trim).filter(|x| !x.is_empty());
-        let (Some(rx), Some(act), reuse) = (f.next(), f.next(), f.next()) else {
-            return Err(format!("failures:{}: wants a pattern, an action and a retry", n + 1));
+        let (Some(rx), Some(act)) = (f.next(), f.next()) else {
+            return Err(format!("failures:{}: wants a pattern and an action", n + 1));
         };
         out.push(Rule {
             rx: Rx::new(rx).map_err(|e| format!("failures:{}: {e}", n + 1))?,
             act: act.to_string(),
-            reuse: match reuse {
-                Some("reuse") => true,
-                Some("clean") | None => false,
-                Some(x) => return Err(format!("failures:{}: retry is reuse or clean, not {x}", n + 1)),
-            },
         });
     }
     Ok(out)
@@ -2561,7 +2540,6 @@ struct Fix {
     rule: String,
     line: String,
     act: String,
-    reuse: bool,
 }
 
 fn scan(rules: &[Rule], log: &str) -> Option<Fix> {
@@ -2576,7 +2554,6 @@ fn scan(rules: &[Rule], log: &str) -> Option<Fix> {
                 rule: r.rx.as_str().to_string(),
                 line: l.trim().to_string(),
                 act,
-                reuse: r.reuse,
             });
         }
     }
@@ -2951,9 +2928,9 @@ fn install_cmd(args: &[String]) {
                 return Ok(());
             }
             match (boot, fix) {
-                (true, _) => build(&root, p, &need, verbose, false, true, w).map(|_| ()),
+                (true, _) => build(&root, p, &need, verbose, true, w).map(|_| ()),
                 (false, true) => need.iter().try_for_each(|t| recover(&root, p, t, verbose, w)),
-                (false, false) => build(&root, p, &need, verbose, false, false, w).map(|_| ()),
+                (false, false) => build(&root, p, &need, verbose, false, w).map(|_| ()),
             }
         });
         if let Err(e) = built {
@@ -4054,7 +4031,7 @@ fn rebuild_cmd(args: &[String]) {
                 // a bootstrap pass is a stand-in that exists to be replaced, so it is
                 // built straight rather than put through the recovery loop
                 match boot {
-                    true => build(&root, p, std::slice::from_ref(target), false, false, true, w).map(|_| ())?,
+                    true => build(&root, p, std::slice::from_ref(target), false, true, w).map(|_| ())?,
                     false => recover(&root, p, target, false, w)?,
                 }
             }
@@ -7106,20 +7083,19 @@ mod tests {
         assert!(seen >= 8, "only {seen} fixtures found");
     }
 
-    // the row the whole design is for: every object compiled, only the link died, so
-    // halving the jobs is a relink and not a rebuild
+    // tables on disk carry a retry column, and a file kiry reads has to keep working
+    // across kiry versions
     #[test]
-    fn only_the_oom_row_keeps_the_work_dir() {
-        let rs = rules(Path::new("/nonexistent-root")).unwrap();
-        let at = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/failures");
-        let reuse = |n: &str| {
-            scan(&rs, &fs::read_to_string(at.join(n)).unwrap())
-                .map(|f| f.reuse)
-                .unwrap()
-        };
-        assert!(reuse("oom-kill.log"));
-        assert!(!reuse("lto-oom.log"));
-        assert!(!reuse("bitcode.log"));
+    fn a_table_with_the_old_retry_column_still_reads() {
+        let at = std::env::temp_dir().join(format!("kiry-oldtable-{}", std::process::id()));
+        let d = at.join("etc/kiry/failures.d");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("10-local"), "No zipfiles found\tnotaflag source-missing\tclean\n").unwrap();
+        let rs = rules(&at).unwrap();
+        let f = scan(&rs, "unzip: No zipfiles found.").unwrap();
+        assert_eq!(f.act, "notaflag source-missing");
+        let f = scan(&rs, "ld.lld: error: out of memory").unwrap();
+        assert_eq!(f.act, "set KIRY_THINLTO_JOBS /2");
     }
 
     #[test]
@@ -7175,11 +7151,11 @@ mod tests {
     }
 
     #[test]
-    fn a_row_missing_its_retry_column_is_refused() {
+    fn a_row_missing_its_action_is_refused() {
         let root = scratch("badrow");
         let d = root.join("etc/kiry/failures.d");
         fs::create_dir_all(&d).unwrap();
-        fs::write(d.join("10-bad"), "boom  set LTO none  sometimes\n").unwrap();
+        fs::write(d.join("10-bad"), "boom set LTO none\n").unwrap();
         assert!(rules(&root).is_err());
     }
 
@@ -7309,7 +7285,6 @@ mod sidecar {
         let art = at.join("thing-1.0-1.x86_64-gnu.tar.zst");
         let linked = vec!["libpcre2".to_string(), "zlib".to_string()];
         let f = Flags {
-            reuse: false,
             cflags: String::new(),
             cxxflags: String::new(),
             ldflags: String::new(),

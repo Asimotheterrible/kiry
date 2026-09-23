@@ -1251,6 +1251,13 @@ exec @REAL@ --target=@TRIPLE@@SYSROOT@ \"$@\"
 // bc that is what the build type means once the optimisation level is kiry's -- llvm
 // without it builds its assertions. defined here before the compiler is enabled, bc
 // cmake_initialize_per_config_variable only fills these in when they are not already set
+//
+// an object library gets no -fPIC from cmake while a shared library beside it does, so
+// one translation unit comes out -fPIE. PIE Level is a Max-merged module flag, so under
+// thinlto the whole link reads as pie, tls drops to local-exec and lld refuses the
+// TPOFF32 in a -shared output -- libobs, one object out of 91. position independent code
+// gives a library and an object library -fPIC and an executable -fPIE, which is why this
+// is here and not -fPIC in the global CFLAGS, where every executable would pay for it
 const TOOLCHAIN_CMAKE: &str = "\
 foreach(_d CMAKE_INSTALL_LIBDIR CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_DATAROOTDIR)
   if(DEFINED CACHE{${_d}})
@@ -1266,6 +1273,7 @@ foreach(_l C CXX)
     set(CMAKE_${_l}_FLAGS_${_c} \"-DNDEBUG\" CACHE STRING \"\" FORCE)
   endforeach()
 endforeach()
+set(CMAKE_POSITION_INDEPENDENT_CODE ON CACHE BOOL \"\" FORCE)
 @FIND@";
 
 // find_package looks under the prefixes cmake knows about, and the gnu tier's headers

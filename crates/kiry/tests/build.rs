@@ -2476,6 +2476,84 @@ fn a_killed_link_goes_again_with_half_the_lto_jobs() {
     assert!(said.contains("x was killed, again with half the lto jobs"), "{said}");
 }
 
+const RUNG: &str = "# 2026-09-12 rung 1 after compile failed on x86_64-musl\nfilter-lto\n";
+const TABLE: &str =
+    "# 2026-09-20 link failed, recompile with -fPIC\n#   recompile with -fPIC\nappend-flags -fPIC\n";
+
+// a rung nothing needs any more goes, and the fix the table wrote off a line it matched
+// stays where it is
+#[test]
+fn bisect_takes_back_a_rung_nothing_needs_any_more() {
+    let at = scratch("bisect-stale");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "LTO thin\n");
+    fs::write(d.join("filter"), format!("{TABLE}{RUNG}")).unwrap();
+
+    let o = kiry(&["bisect-flags", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(tries(&o), 1);
+    assert_eq!(fs::read_to_string(d.join("filter")).unwrap(), TABLE);
+
+    // and once there is no rung left there is nothing to build
+    let o = kiry(&["bisect-flags", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(tries(&o), 0);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("hello carries no rung"));
+}
+
+// one still needed comes back, with today's note and the line that failed beside it
+// rather than the old one that only knew the phase
+#[test]
+fn bisect_puts_back_a_rung_that_is_still_needed() {
+    let at = scratch("bisect-needed");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "case \"$CFLAGS\" in\n\
+             *-flto*) echo 'foo.c:1:1: error: lto again' >&2; exit 1 ;;\n\
+             esac\n{GOOD}"
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "LTO thin\n");
+    fs::write(d.join("filter"), RUNG).unwrap();
+
+    let o = kiry(&["bisect-flags", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(tries(&o), 2);
+    let f = fs::read_to_string(d.join("filter")).unwrap();
+    assert!(f.contains("filter-lto") && f.contains("lto again"), "{f}");
+    assert!(!f.contains("2026-09-12"), "{f}");
+}
+
+// stuck from the full flags says nothing about the rungs, so the package goes back to
+// exactly what it built with
+#[test]
+fn a_bisect_that_gets_stuck_leaves_the_package_as_it_was() {
+    let at = scratch("bisect-stuck");
+    let d = recipe(&at, "x86_64-musl", "echo 'curl: could not resolve host' >&2\nexit 1\n");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    fs::write(d.join("filter"), format!("{TABLE}{RUNG}")).unwrap();
+
+    let o = kiry(&["bisect-flags", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    assert_eq!(fs::read_to_string(d.join("filter")).unwrap(), format!("{TABLE}{RUNG}"));
+}
+
 // no flag change can reach a portability bug, so it says so instead of burning retries
 #[test]
 fn a_failure_no_flag_can_fix_says_so_at_once() {

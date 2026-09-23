@@ -4262,3 +4262,48 @@ fn a_build_that_stages_nothing_is_not_ok() {
     assert!(said.contains("staged nothing"), "{said}");
     assert!(artifacts(&root).is_empty());
 }
+
+// RLIMIT_DATA is per process, so the cap has to know how many builds hold one: two
+// builds each allowed half the machine is the whole machine. only this side of the exec
+// knows the number, so it crosses by name the way KIRY_MEM does
+#[test]
+fn the_memory_cap_is_split_between_the_builds_of_a_level() {
+    let one = scratch("share-one");
+    let two = scratch("share-two");
+    let say = |f: &str| {
+        format!("mkdir -p \"$DESTDIR/usr/bin\"\nprintf %s \"$KIRY_SHARE\" > \"$DESTDIR/usr/bin/{f}\"\n")
+    };
+    let a = recipe(&one, "x86_64-musl", &say("hello"));
+    let b = recipe(&two, "x86_64-musl", &say("hullo"));
+    let b2 = two.join("hullo");
+    fs::rename(&b, &b2).unwrap();
+
+    let root = one.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    // nothing orders these two, so they are one level and it is two wide
+    let o = Command::new(KIRY)
+        .args(["i", "--root", root.to_str().unwrap(), a.to_str().unwrap(), b2.to_str().unwrap()])
+        .env("KIRY_PARALLEL", "2")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(root.join("usr/bin/hello")).unwrap(), "2");
+    assert_eq!(fs::read_to_string(root.join("usr/bin/hullo")).unwrap(), "2");
+
+    // and one on its own keeps the whole share, however wide the setting says
+    let solo = scratch("share-solo");
+    let c = recipe(&solo, "x86_64-musl", &say("only"));
+    let c2 = solo.join("only");
+    fs::rename(&c, &c2).unwrap();
+    let o = Command::new(KIRY)
+        .args(["i", "--root", root.to_str().unwrap(), c2.to_str().unwrap()])
+        .env("KIRY_PARALLEL", "2")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(root.join("usr/bin/only")).unwrap(), "1");
+}

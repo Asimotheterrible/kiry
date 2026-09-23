@@ -249,8 +249,8 @@ fn build_cmd(args: &[String]) {
     for (name, targets) in &todo {
         let p = &recipes[name];
         let r = match fix {
-            true => targets.iter().try_for_each(|t| recover(&root, p, t, verbose)),
-            false => build(&root, p, targets, verbose, false, false).map(|_| ()),
+            true => targets.iter().try_for_each(|t| recover(&root, p, t, verbose, 1)),
+            false => build(&root, p, targets, verbose, false, false, 1).map(|_| ()),
         };
         if let Err(e) = r {
             die(e);
@@ -267,6 +267,7 @@ fn build(
     verbose: bool,
     reuse: bool,
     boot: bool,
+    at_once: usize,
 ) -> Result<Vec<PathBuf>, String> {
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
@@ -282,7 +283,7 @@ fn build(
         };
         say!("{} {} {t} building {eta}", p.name, p.version.upstream);
         let start = Instant::now();
-        let (work, linked) = compile(root, p, t, &srcs, &f, verbose, boot)?;
+        let (work, linked) = compile(root, p, t, &srcs, &f, verbose, boot, at_once)?;
         let secs = start.elapsed().as_secs();
         say!("{} {} {t} ok {}", p.name, p.version.upstream, clock(secs));
         keep_time(root, p, t, secs);
@@ -644,7 +645,7 @@ fn blame(log: &str) -> &str {
 
 // build fails, read the log, fix it, build again. three signature retries and never the
 // same action twice, then the ladder, then it is stuck and says why
-fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), String> {
+fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> Result<(), String> {
     let rs = rules(root)?;
     let one = [t.to_string()];
     let mut tried: Vec<String> = Vec::new();
@@ -655,7 +656,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool) -> Result<(), Strin
     let _ = fs::remove_file(&first);
 
     loop {
-        match build(root, p, &one, verbose, reuse, false) {
+        match build(root, p, &one, verbose, reuse, false, at_once) {
             Ok(_) => return Ok(()),
             Err(e) => say!("{e}"),
         }
@@ -780,6 +781,7 @@ fn compile(
     f: &Flags,
     verbose: bool,
     boot: bool,
+    at_once: usize,
 ) -> Result<(PathBuf, Vec<String>), String> {
     let work = root.join("var/kiry/stage").join(format!(
         "{}-{}-{}.{t}",
@@ -1014,6 +1016,9 @@ fn compile(
             c.env(k, v);
         }
     }
+    // the build is its own process, so the number of them running at once is something
+    // only this side knows and has to say
+    c.env("KIRY_SHARE", at_once.to_string());
 
     // the log is written either way. -v only decides whether you also watch it
     let log = logpath(root, p, t);
@@ -2716,7 +2721,7 @@ fn install_cmd(args: &[String]) {
             let boot = mine.iter().any(|(_, b)| *b);
             (boot, mine.iter().map(|(i, _)| set[*i].1.clone()).collect())
         };
-        let w = if verbose { 1 } else { width() };
+        let w = if verbose { 1 } else { width().min(order.len().max(1)) };
         let built = parallel(&order, w, |name| {
             let p = &recipes[*name];
             let (boot, targets) = targets_of(name);
@@ -2736,9 +2741,9 @@ fn install_cmd(args: &[String]) {
                 return Ok(());
             }
             match (boot, fix) {
-                (true, _) => build(&root, p, &need, verbose, false, true).map(|_| ()),
-                (false, true) => need.iter().try_for_each(|t| recover(&root, p, t, verbose)),
-                (false, false) => build(&root, p, &need, verbose, false, false).map(|_| ()),
+                (true, _) => build(&root, p, &need, verbose, false, true, w).map(|_| ()),
+                (false, true) => need.iter().try_for_each(|t| recover(&root, p, t, verbose, w)),
+                (false, false) => build(&root, p, &need, verbose, false, false, w).map(|_| ()),
             }
         });
         if let Err(e) = built {
@@ -3819,15 +3824,16 @@ fn rebuild_cmd(args: &[String]) {
                 names.push(&want[*i].0);
             }
         }
-        let built = parallel(&names, width(), |name| {
+        let w = width().min(names.len().max(1));
+        let built = parallel(&names, w, |name| {
             let p = &recipes[*name];
             for (i, boot) in level.iter().filter(|(i, _)| want[*i].0 == **name) {
                 let target = &want[*i].1;
                 // a bootstrap pass is a stand-in that exists to be replaced, so it is
                 // built straight rather than put through the recovery loop
                 match boot {
-                    true => build(&root, p, std::slice::from_ref(target), false, false, true).map(|_| ())?,
-                    false => recover(&root, p, target, false)?,
+                    true => build(&root, p, std::slice::from_ref(target), false, false, true, w).map(|_| ())?,
+                    false => recover(&root, p, target, false, w)?,
                 }
             }
             Ok(())

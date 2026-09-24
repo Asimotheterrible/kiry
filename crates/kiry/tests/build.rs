@@ -4690,6 +4690,58 @@ fn a_missing_dependency_is_named_with_what_wanted_it() {
     assert!(err.contains("aliases"), "{err}");
 }
 
+// an upstream that moved costs a second fetch, from where alpine keeps the same bytes,
+// when the recipe carries alpine's sha512 to prove them
+#[test]
+fn a_dead_upstream_falls_back_to_a_copy_the_sha512_vouches_for() {
+    let at = scratch("mirror");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let tar = at.join("hello-1.0.tar");
+    let mirror = at.join("mirror");
+    fs::create_dir_all(&mirror).unwrap();
+    fs::copy(&tar, mirror.join("hello-1.0.tar")).unwrap();
+    // port 9 refuses at once, which is what a dead host looks like without a network
+    fs::write(d.join("sources"), "hello-1.0.tar::http://127.0.0.1:9/hello-1.0.tar\n").unwrap();
+    let sum = kiry_core::sha512(fs::File::open(&tar).unwrap()).unwrap();
+    fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("KIRY_MIRROR", format!("file://{}/nothing-here file://{}", at.display(), mirror.display()))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains(&format!("hello-1.0.tar from file://{}/hello-1.0.tar", mirror.display())), "{said}");
+}
+
+// a sha256 is kiry's own hash of what it fetched the first time, and no mirror of
+// alpine's has any reason to hold those bytes
+#[test]
+fn a_recipe_of_our_own_does_not_go_looking_elsewhere() {
+    let at = scratch("no-mirror");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let mirror = at.join("mirror");
+    fs::create_dir_all(&mirror).unwrap();
+    fs::copy(at.join("hello-1.0.tar"), mirror.join("hello-1.0.tar")).unwrap();
+    fs::write(d.join("sources"), "hello-1.0.tar::http://127.0.0.1:9/hello-1.0.tar\n").unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("KIRY_MIRROR", format!("file://{}", mirror.display()))
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(!String::from_utf8_lossy(&o.stdout).contains(" from file://"));
+}
+
 
 fn have_rsync() -> bool {
     if Command::new("rsync").arg("--version").output().is_ok_and(|o| o.status.success()) {

@@ -499,7 +499,12 @@ fn sources(root: &Path, p: &Package) -> Result<Vec<(String, PathBuf, String)>, S
         let path = if from.contains("://") {
             let dst = cache.join(name);
             if !dst.exists() {
-                grab(from, &dst)?;
+                if let Err(e) = grab(from, &dst) {
+                    match p.checksums.get(i).filter(|c| c.len() == 128) {
+                        Some(_) => mirrored(name, &dst).map_err(|m| format!("{e}\n{m}"))?,
+                        None => return Err(e),
+                    }
+                }
             }
             dst
         } else {
@@ -545,6 +550,10 @@ fn filename(s: &str) -> Result<(&str, &str), String> {
 }
 
 fn grab(url: &str, dst: &Path) -> Result<(), String> {
+    fetch(url, dst, false)
+}
+
+fn fetch(url: &str, dst: &Path, quiet: bool) -> Result<(), String> {
     // one partial file per fetch. two builds of a level can go after the same tarball at
     // once, and a shared .part is two downloads interleaved into one file
     static FETCH: AtomicUsize = AtomicUsize::new(0);
@@ -552,9 +561,59 @@ fn grab(url: &str, dst: &Path) -> Result<(), String> {
     part.push(format!(".part{}", FETCH.fetch_add(1, Ordering::Relaxed)));
     let part = PathBuf::from(part);
 
-    run(&mut fetcher(url, &part)?, url)?;
+    let mut c = fetcher(url, &part)?;
+    if quiet {
+        c.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    if let Err(e) = run(&mut c, url) {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
 
     fs::rename(&part, dst).map_err(|e| format!("{}: {e}", dst.display()))
+}
+
+const DISTFILES: &str = "https://distfiles.alpinelinux.org/distfiles/";
+
+// alpine keeps every source it has built under the file's own name, and a converted
+// recipe's sha512 names exactly those bytes, so an upstream that moved or died costs a
+// second fetch rather than a stuck build. xmlto's pagure url and rsync's samba one went
+// in the same afternoon. KIRY_MIRROR is the list to try instead, for a test or a nearer
+// copy; unset, it is every branch alpine's index lists, edge and then newest first
+fn mirrored(name: &str, dst: &Path) -> Result<(), String> {
+    let bases: Vec<String> = match std::env::var("KIRY_MIRROR") {
+        Ok(v) => v.split_whitespace().map(String::from).collect(),
+        Err(_) => branches(dst)?,
+    };
+    for b in &bases {
+        let url = format!("{}/{name}", b.trim_end_matches('/'));
+        if fetch(&url, dst, true).is_ok() {
+            say!("{name} from {url}");
+            return Ok(());
+        }
+    }
+    Err(format!("{name}: not at {} either", bases.join(" ")))
+}
+
+fn branches(near: &Path) -> Result<Vec<String>, String> {
+    let at = near.with_file_name(".distfiles-index");
+    fetch(DISTFILES, &at, true)?;
+    let text = fs::read_to_string(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+    let _ = fs::remove_file(&at);
+    let mut v: Vec<(u32, u32, String)> = text
+        .split("href=\"")
+        .filter_map(|h| h.split('"').next())
+        .filter_map(|h| {
+            let b = h.strip_suffix('/')?;
+            if b == "edge" {
+                return Some((u32::MAX, 0, b.to_string()));
+            }
+            let (x, y) = b.strip_prefix('v')?.split_once('.')?;
+            Some((x.parse().ok()?, y.parse().ok()?, b.to_string()))
+        })
+        .collect();
+    v.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    Ok(v.into_iter().map(|(_, _, b)| format!("{DISTFILES}{b}")).collect())
 }
 
 // split out so a probe can silence the progress meter. the template is the same one, and

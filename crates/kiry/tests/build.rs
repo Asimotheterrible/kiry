@@ -5007,3 +5007,211 @@ fn a_core_bump_without_a_scheme_waits() {
     assert!(said.contains("core recipes promote only with a scheme"), "{said}");
     assert!(testing.join("toolish").exists(), "{said}");
 }
+
+// an installed package made of real files, for the prune tests: they are about what the
+// index sees, so the records have to point at elf files that exist
+fn installed_as(root: &Path, name: &str, files: &[(&str, &Path)], sonames: &[&str]) {
+    let mut manifest = Vec::new();
+    for (path, from) in files {
+        let dst = root.join(path);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        let _ = fs::remove_file(&dst);
+        fs::copy(from, &dst).unwrap();
+        manifest.push(db::Entry {
+            mode: 0o755,
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(&dst).unwrap()).unwrap()),
+            path: (*path).to_string(),
+        });
+    }
+    record(root, name, &[], manifest);
+    let ps: Vec<db::Provide> = sonames
+        .iter()
+        .map(|s| db::Provide {
+            soname: (*s).to_string(),
+            versioned: false,
+            path: format!("usr/lib/{s}"),
+        })
+        .collect();
+    db::write_provides(root, "x86_64-musl", name, &ps).unwrap();
+}
+
+// a symbol-prune recipe whose "link" is a fake clang handing out one of two real
+// libraries: the whole one, or the pruned one when a version script is asked for. the
+// sandbox has no compiler, and what is under test is what kiry does around the link
+fn prune_fixture(at: &Path, root: &Path) -> (PathBuf, PathBuf) {
+    let full = lib_with(
+        &at.join("full"),
+        "libfoo.so.1",
+        "void p(void){}\nvoid q(void){}\nvoid r(void){}\nconst char mark[] = \"WHOLE-LIBRARY\";\n",
+    );
+    let small = lib_with(&at.join("small"), "libfoo.so.1", "void p(void){}\n");
+    let app = app_calling(&at.join("app"), "app", "p", &full);
+    installed_as(root, "libfoo", &[("usr/lib/libfoo.so.1", &full)], &["libfoo.so.1"]);
+    installed_as(root, "app", &[("usr/bin/app", &app)], &[]);
+
+    let top = at.join("src/libfoo-1.0");
+    fs::create_dir_all(&top).unwrap();
+    fs::copy(&full, top.join("full.so")).unwrap();
+    fs::copy(&small, top.join("small.so")).unwrap();
+    let arc = at.join("libfoo-1.0.tar");
+    assert!(Command::new("tar")
+        .arg("-cf")
+        .arg(&arc)
+        .arg("-C")
+        .arg(at.join("src"))
+        .arg("libfoo-1.0")
+        .status()
+        .unwrap()
+        .success());
+    let d = at.join("libfoo");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("version"), "1.0 1\n").unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(d.join("sources"), "../libfoo-1.0.tar\n").unwrap();
+    fs::write(d.join("checksums"), format!("{}\n", kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap())).unwrap();
+    fs::write(d.join("symbol-prune"), "").unwrap();
+    fs::write(
+        d.join("build"),
+        "mkdir -p /src/bin \"$DESTDIR/usr/lib\" \"$DESTDIR/usr/share\"\n\
+         cat > /src/bin/clang <<'X'\n\
+         #!/bin/sh\n\
+         o= p= v=\n\
+         for a do [ \"$p\" = -o ] && o=$a; case $a in -Wl,--version-script=*) v=${a#*=} ;; esac; p=$a; done\n\
+         if [ -n \"$v\" ]; then cp /src/libfoo-1.0/small.so \"$o\"; cp \"$v\" \"$DESTDIR/usr/share/keep\"; else cp /src/libfoo-1.0/full.so \"$o\"; fi\n\
+         X\n\
+         chmod +x /src/bin/clang\n\
+         export PATH=/src/bin:$PATH\n\
+         kirycc -shared -o libfoo.so.1 foo.o\n\
+         cp libfoo.so.1 \"$DESTDIR/usr/lib/libfoo.so.1\"\n",
+    )
+    .unwrap();
+    (d, full)
+}
+
+// only what installed code asks for is exported, and the whole library ships beside the
+// pruned one so the next build of anything linking it links against all of it
+#[test]
+fn a_pruned_library_keeps_what_is_asked_for_and_builds_see_all_of_it() {
+    let at = scratch("prune");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) || !have_cc() {
+        return;
+    }
+    let (d, _) = prune_fixture(&at, &root);
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("pruned libfoo.so.1 4 exports -> 1"), "{said}");
+    let art = format!("{}/var/kiry/cache/libfoo-1.0-1.x86_64-musl.tar.zst", root.display());
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), &art]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let keep = fs::read_to_string(root.join("usr/share/keep")).unwrap();
+    assert!(keep.contains("\"p\";") && !keep.contains("\"q\";"), "{keep}");
+    assert!(keep.contains("local: *;"), "{keep}");
+    let has = |f: &str| String::from_utf8_lossy(&fs::read(root.join(f)).unwrap()).contains("WHOLE-LIBRARY");
+    assert!(has("usr/lib/kiry/prune/libfoo.so.1"));
+    assert!(!has("usr/lib/libfoo.so.1"));
+
+    // a build against it is handed the whole one
+    let u = recipe(
+        &at.join("user"),
+        "x86_64-musl",
+        &format!("grep -q WHOLE-LIBRARY /usr/lib/libfoo.so.1 && echo whole-here\n{GOOD}"),
+    );
+    fs::write(u.join("depends"), "libfoo\n").unwrap();
+    let o = kiry(&["b", "-v", "--root", root.to_str().unwrap(), u.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("whole-here"));
+}
+
+// something installed after the prune that wants what it dropped gets the library
+// queued with the symbol, and the next prune keeps it
+#[test]
+fn a_symbol_pruned_away_and_wanted_later_queues_the_library() {
+    let at = scratch("prune-later");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) || !have_cc() {
+        return;
+    }
+    let (d, full) = prune_fixture(&at, &root);
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let later = app_calling(&at.join("later"), "later", "q", &full);
+    installed_as(&root, "later", &[("usr/bin/later", &later)], &[]);
+    let art = format!("{}/var/kiry/cache/libfoo-1.0-1.x86_64-musl.tar.zst", root.display());
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), &art]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("libfoo x86_64-musl was pruned of q, which later needs  queued"), "{said}");
+    let q = db::read_queue(&root).unwrap();
+    assert!(
+        q.iter().any(|r| r.name == "libfoo" && r.soname == "libfoo.so.1" && r.changed == ["q"]),
+        "{:?}",
+        q.iter().map(|r| (&r.name, &r.soname, &r.changed)).collect::<Vec<_>>()
+    );
+
+    // and the next prune keeps it
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), &art]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let keep = fs::read_to_string(root.join("usr/share/keep")).unwrap();
+    assert!(keep.contains("\"p\";") && keep.contains("\"q\";"), "{keep}");
+}
+
+// the three cases where pruning cannot be decided, each left whole with the reason said
+#[test]
+fn a_prune_that_cannot_be_decided_leaves_the_library_whole() {
+    let at = scratch("prune-no");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) || !have_cc() {
+        return;
+    }
+    let (d, full) = prune_fixture(&at, &root);
+    let build = || {
+        let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+
+    // something that can dlopen has it in what it loads
+    let src = at.join("loader.c");
+    fs::write(&src, "void p(void);\nvoid *dlopen(const char *, int);\nvoid _start(void){p();dlopen(0,0);}\n").unwrap();
+    let loader = at.join("loader");
+    assert!(Command::new("cc")
+        .args(["-nostdlib", "-Wl,--unresolved-symbols=ignore-all", "-o"])
+        .arg(&loader)
+        .arg(&src)
+        .arg(&full)
+        .status()
+        .unwrap()
+        .success());
+    installed_as(&root, "loader", &[("usr/bin/loader", &loader)], &[]);
+    let said = build();
+    assert!(said.contains("not pruned: libfoo can dlopen") || said.contains("can dlopen, and libfoo.so.1 is in what it loads"), "{said}");
+    db::forget(&root, "x86_64-musl", "loader").unwrap();
+
+    // versioned: an anonymous script cannot sit beside named versions
+    db::write_provides(
+        &root,
+        "x86_64-musl",
+        "libfoo",
+        &[db::Provide {
+            soname: "libfoo.so.1".into(),
+            versioned: true,
+            path: "usr/lib/libfoo.so.1".into(),
+        }],
+    )
+    .unwrap();
+    assert!(build().contains("not pruned: it versions its symbols"));
+
+    // never installed: nothing says what uses it
+    db::forget(&root, "x86_64-musl", "libfoo").unwrap();
+    assert!(build().contains("not pruned: not installed yet"));
+}

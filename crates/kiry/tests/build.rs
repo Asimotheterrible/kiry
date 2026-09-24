@@ -4003,6 +4003,8 @@ fn converted_offer(repo: &Path, name: &str, version: &str, body: &str) {
     .unwrap();
     fs::write(d.join("version"), format!("{version} 0\n")).unwrap();
     fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    // tree() is core, and a core recipe says what its numbering is or its bumps wait
+    fs::write(d.join("scheme"), "major minor patch\n").unwrap();
 }
 
 fn upstream_at(root: &Path, name: &str, version: &str, body: &str) {
@@ -4210,6 +4212,7 @@ fn a_hand_written_build_is_not_replaced_by_the_conversion() {
     fs::write(d.join("build"), "make defconfig\nmake install\n").unwrap();
     fs::write(d.join("version"), "1.0 0\n").unwrap();
     fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(d.join("scheme"), "major minor patch\n").unwrap();
     upstream_at(&root, "served", "1.0", "\t./configure\n");
 
     sync_at(&root);
@@ -4959,4 +4962,48 @@ fn a_flag_turned_on_brings_its_dependency_into_the_build() {
     assert!(run().contains("x11=no"));
     config(&root, None, "flags X\n");
     assert!(run().contains("x11=yes"));
+}
+
+// a policy narrower than always holds a bump bigger than it names in testing, for a
+// person to promote, and says which rule held it
+#[test]
+fn a_policy_holds_a_bump_bigger_than_it_allows() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, _, testing) = tree("syncpolicy");
+    let extra = root.parent().unwrap().join("extra");
+    converted_offer(&extra, "careful", "1.0", "\t./configure\n");
+    fs::write(extra.join("careful/policy"), "auto=patch\n").unwrap();
+    upstream_at(&root, "careful", "1.0", "\tmake\n");
+    let o = kiry(&["sync", "--root", root.to_str().unwrap(), "careful"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    upstream_at(&root, "careful", "1.1", "\tmake\n");
+    let o = kiry(&["ahead", "--root", root.to_str().unwrap(), "careful"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("minor"), "{}", String::from_utf8_lossy(&o.stdout));
+    let o = kiry(&["sync", "--root", root.to_str().unwrap(), "careful"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("auto=patch holds a minor bump"), "{said}");
+    assert!(testing.join("careful").exists(), "{said}");
+    assert_eq!(fs::read_to_string(extra.join("careful/version")).unwrap(), "1.0 0\n");
+}
+
+// the scheme rule: a core bump nobody has said the numbering of waits in testing
+#[test]
+fn a_core_bump_without_a_scheme_waits() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncscheme");
+    converted_offer(&repo, "toolish", "1.0", "\t./configure\n");
+    fs::remove_file(repo.join("toolish/scheme")).unwrap();
+    upstream_at(&root, "toolish", "1.0", "\tmake\n");
+    sync_at(&root);
+
+    upstream_at(&root, "toolish", "1.0.1", "\tmake\n");
+    let said = sync_at(&root);
+    assert!(said.contains("core recipes promote only with a scheme"), "{said}");
+    assert!(testing.join("toolish").exists(), "{said}");
 }

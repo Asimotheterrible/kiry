@@ -6500,6 +6500,7 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
     let sets = exported(&elves);
     let mut linked: HashSet<usize> = HashSet::new();
     let mut needs: Vec<Vec<usize>> = vec![Vec::new(); elves.len()];
+    let mut open: Vec<(usize, String)> = Vec::new();
     for (i, (path, o)) in elves.iter().enumerate() {
         let where_ = search(o, path, dirs);
         for want in &o.needed {
@@ -6518,12 +6519,31 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
                         });
                     }
                 }
-                None => out.push(Finding {
-                    pkg: owners[i].clone(),
-                    path: path.clone(),
-                    what: What::Unresolved(want.clone()),
-                }),
+                None => open.push((i, want.clone())),
             }
+        }
+    }
+
+    // a library that only its own package's code ever loads can lean on that package
+    // having loaded something first. every native library of a jdk names libjvm.so, which
+    // sits in server/ where none of their $ORIGIN rpaths look, and they resolve it
+    // because the jvm is already in the process when System.loadLibrary opens them. an
+    // executable gets no such pass -- nothing is loaded ahead of it -- and neither does a
+    // library some other package links, which is what the search path is for
+    for (i, want) in open {
+        let theirs = |k: usize| owners[k] == owners[i];
+        let inside = !elves[i].1.interp && (0..elves.len()).all(|k| !needs[k].contains(&i) || theirs(k));
+        let j = (0..elves.len()).find(|&j| theirs(j) && elves[j].1.soname.as_deref() == Some(want.as_str()));
+        match j.filter(|_| inside) {
+            Some(j) => {
+                linked.insert(j);
+                needs[i].push(j);
+            }
+            None => out.push(Finding {
+                pkg: owners[i].clone(),
+                path: elves[i].0.clone(),
+                what: What::Unresolved(want),
+            }),
         }
     }
 
@@ -6627,7 +6647,24 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
     }
     let mut dupes: Vec<((usize, usize), usize)> = pairs.into_iter().collect();
     dupes.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+    // the programs each library ends up in. load order only decides something when both
+    // are in one process: ffmpeg 7 and 8 sit side by side for their own consumers, and
+    // two jdks' libjli never meet
+    let mut into: Vec<Vec<usize>> = vec![Vec::new(); elves.len()];
+    for (e, _) in elves.iter().enumerate().filter(|(_, (_, o))| o.interp) {
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut stack = vec![e];
+        while let Some(i) = stack.pop() {
+            if seen.insert(i) {
+                into[i].push(e);
+                stack.extend(needs[i].iter().copied());
+            }
+        }
+    }
     for ((a, b), n) in dupes {
+        if !into[a].iter().any(|e| into[b].binary_search(e).is_ok()) {
+            continue;
+        }
         // two libraries out of one package sharing names is how that package was built,
         // not two answers to the same question. readline ships libhistory, nspr ships
         // three of them, and no one can act on being told so

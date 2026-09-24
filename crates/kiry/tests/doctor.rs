@@ -934,13 +934,31 @@ fn two_libraries_exporting_one_name_are_reported() {
         assert!(out.is_empty(), "{out}");
     }
 
-    let both = binsrc(
-        &at.join("both"),
-        "both",
+    // a second program on libtwo alone. two processes, one answer each, no clash
+    let other = binsrc(
+        &at.join("other"),
+        "other",
         "void p(void);\nvoid _start(void){p();}\n",
         &two,
         Some("$ORIGIN/../lib64"),
     );
+    install(&root, "other", &[("usr/bin/other", &other)]);
+    let (_, out) = doctor(&root);
+    assert!(!out.contains("duplicate-symbols"), "{out}");
+
+    // one program loading both is where load order picks a p
+    let src = at.join("both.c");
+    fs::write(&src, "void p(void);\nvoid q(void);\nvoid _start(void){p();q();}\n").unwrap();
+    let both = at.join("both");
+    assert!(cc()
+        .args(["-nostdlib", "-Wl,--allow-shlib-undefined", "-Wl,-rpath,$ORIGIN/../lib64", "-o"])
+        .arg(&both)
+        .arg(&src)
+        .arg(&one)
+        .arg(&two)
+        .status()
+        .unwrap()
+        .success());
     install(&root, "both", &[("usr/bin/both", &both)]);
 
     let (ok, out) = doctor(&root);
@@ -1303,4 +1321,70 @@ fn a_preserved_library_is_not_an_orphan() {
         .unwrap();
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(!out.contains("usr/lib64/libp.so.1 unowned"), "{out}");
+}
+
+// the shape of a jdk: libjava.so names libjvm.so and looks only in $ORIGIN, and libjvm.so
+// is one directory down. it works because the jvm is loaded first, which only holds while
+// nothing outside the package is what loads libjava
+fn jvm_like(at: &Path) -> (PathBuf, PathBuf) {
+    let jvm = lib(&at.join("server"), "libjvm.so");
+    let src = at.join("java.c");
+    fs::write(&src, "void p(void);\nvoid q(void){p();}\n").unwrap();
+    let java = at.join("libjava.so");
+    let ok = cc()
+        .args(["-shared", "-fPIC", "-nostdlib", "-Wl,-soname,libjava.so", "-Wl,-rpath,$ORIGIN"])
+        .arg("-o")
+        .arg(&java)
+        .arg(&src)
+        .arg(&jvm)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    (jvm, java)
+}
+
+#[test]
+fn a_library_only_its_own_package_loads_may_lean_on_what_that_package_loaded() {
+    if skip("package-internal load order") {
+        return;
+    }
+    let at = scratch("jvm");
+    let root = at.join("root");
+    let (jvm, java) = jvm_like(&at);
+    install(
+        &root,
+        "jdk",
+        &[("usr/lib/jvm/j/lib/server/libjvm.so", &jvm), ("usr/lib/jvm/j/lib/libjava.so", &java)],
+    );
+
+    let (_, out) = doctor(&root);
+    assert!(!out.contains("unresolved"), "{out}");
+}
+
+// the same library linked from another package is loaded with nothing ahead of it, and
+// so is an executable, so both still need the search path to find it
+#[test]
+fn another_package_or_an_executable_gets_no_such_pass() {
+    if skip("package-internal load order") {
+        return;
+    }
+    let at = scratch("jvm-outside");
+    let root = at.join("root");
+    let (jvm, java) = jvm_like(&at);
+    let user = binsrc(&at, "user", "void q(void);\nvoid _start(void){q();}\n", &java, Some("/usr/lib/jvm/j/lib"));
+    let exe = bin(&at, "exe", &jvm, None);
+    install(
+        &root,
+        "jdk",
+        &[
+            ("usr/lib/jvm/j/lib/server/libjvm.so", &jvm),
+            ("usr/lib/jvm/j/lib/libjava.so", &java),
+            ("usr/lib/jvm/j/bin/exe", &exe),
+        ],
+    );
+    install(&root, "user", &[("usr/bin/user", &user)]);
+
+    let (_, out) = doctor(&root);
+    assert!(out.contains(&format!("usr/lib/jvm/j/lib/libjava.so {TARGET} unresolved libjvm.so")), "{out}");
+    assert!(out.contains(&format!("usr/lib/jvm/j/bin/exe {TARGET} unresolved libjvm.so")), "{out}");
 }

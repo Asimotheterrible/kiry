@@ -1108,7 +1108,8 @@ fn compile(
         .env("CXXFLAGS", &f.cxxflags)
         .env("LDFLAGS", &f.ldflags)
         .env("RUSTFLAGS", &f.rustflags)
-        .env("KIRY_FLAGS", f.use_flags.join(" "));
+        .env("KIRY_FLAGS", f.use_flags.join(" "))
+        .env("KIRY_MESON_ARGS", meson_args(&src, &f.use_flags));
     for (k, v) in &f.env {
         c.env(k, v);
     }
@@ -1152,6 +1153,9 @@ fn compile(
                 return Err(format!("{} {t}: built and staged nothing", p.name));
             }
             trim(&dest, t, &p.name)?;
+            for (dep, so) in unlinked(root, p, f, t, &dest) {
+                say!("{} {t} flag brought in {dep} and nothing links {so}", p.name);
+            }
             // after trim, so a gnu binary that gets dropped does not argue for a dep
             let mut linked = BTreeSet::new();
             for (soname, who, kind) in undeclared(root, &members, &deps, t, &dest) {
@@ -1479,6 +1483,7 @@ exec muon meson setup \\
 \t-Db_staticpic=true \\
 \t-Db_pie=true \\
 \t-Dwerror=false \\
+\t$KIRY_MESON_ARGS \\
 \t\"$@\"
 ";
 
@@ -1815,10 +1820,14 @@ fn dir_hash(p: &Package) -> Result<String, String> {
 
 fn dir_blob(p: &Package) -> Result<Vec<u8>, String> {
     let rd = fs::read_dir(&p.dir).map_err(|e| format!("{}: {e}", p.dir.display()))?;
+    // gentoo acts on a build only through flags someone set, and those are in the flags
+    // record already. hashed, the first sync that fetches entries would have made two
+    // thousand cached artifacts read as changed recipes
     let mut names: Vec<String> = rd
         .flatten()
         .filter(|e| e.path().is_file())
         .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter(|n| n != "gentoo")
         .collect();
     names.sort();
 
@@ -2049,17 +2058,16 @@ fn flags_with(
             "LDFLAGS" => ld.push(v.clone()),
             "RUSTFLAGS" => rs.push(v.clone()),
             // a later - takes one back off, so a package subtracts from the global set
-            // without restating it
+            // without restating it. kept as -name rather than dropped: off is a choice,
+            // and it is the one that takes a dependency out of the closure
             "flags" => {
                 for t in v.split_whitespace() {
                     let (on, n) = match t.strip_prefix('-') {
                         Some(n) => (false, n),
                         None => (true, t.strip_prefix('+').unwrap_or(t)),
                     };
-                    use_flags.retain(|x| x != n);
-                    if on {
-                        use_flags.push(n.to_string());
-                    }
+                    use_flags.retain(|x| x.trim_start_matches('-') != n);
+                    use_flags.push(if on { n.to_string() } else { format!("-{n}") });
                 }
             }
             _ => {
@@ -2135,6 +2143,14 @@ fn flags_with(
         from.extend(f);
     }
 
+    // a flag means something only where this version's gentoo entry declares it, the way
+    // portage reads USE against IUSE. without that a global -gtk would change the record
+    // of every package installed and queue all of them for a rebuild that changes nothing
+    let declared: HashSet<String> = dir
+        .and_then(gentoo)
+        .map(|g| g.iuse.into_iter().map(|(n, _)| n).collect())
+        .unwrap_or_default();
+    use_flags.retain(|f| declared.contains(f.trim_start_matches('-')));
     use_flags.sort();
     Ok(Flags {
         cflags: cf.join(" "),
@@ -2151,6 +2167,445 @@ fn flags_with(
 // has to come apart before anything can be taken out of it
 fn words(s: &String) -> Vec<String> {
     s.split_whitespace().map(str::to_string).collect()
+}
+
+// a flag turned on is a claim that the build uses what it brought in, and DT_NEEDED is
+// where that shows. a library the flag added that nothing links is a flag configure
+// never looked at -- the negative direction needs no check, the sandbox enforces it
+fn unlinked(root: &Path, p: &Package, f: &Flags, t: &str, dest: &Path) -> Vec<(String, String)> {
+    let Some(g) = gentoo(&p.dir) else { return Vec::new() };
+    let set = chosen(&f.use_flags);
+    if !set.values().any(|on| *on) {
+        return Vec::new();
+    }
+    let brought: Vec<String> = g
+        .wanted(&set)
+        .into_iter()
+        .filter(|(_, n)| *n != Needs::Tool)
+        .filter_map(|(a, _)| recipe_for(root, &a))
+        .collect();
+    let mut files = Vec::new();
+    under(dest, &mut files);
+    let needed: HashSet<String> = files
+        .iter()
+        .filter_map(|x| elf::read(x).ok())
+        .flat_map(|o| o.needed)
+        .collect();
+    let mut out = Vec::new();
+    for dep in brought {
+        let Ok(ps) = db::read_provides(root, t, &dep) else { continue };
+        if ps.is_empty() || ps.iter().any(|x| needed.contains(&x.soname)) {
+            continue;
+        }
+        if !out.iter().any(|(d, _): &(String, String)| *d == dep) {
+            out.push((dep, ps[0].soname.clone()));
+        }
+    }
+    out
+}
+
+// what the gentoo entry is, and what the chosen flags do to the closure through it
+fn gentoo_says(root: &Path, d: &Path, f: &Flags) {
+    let Ok(text) = fs::read_to_string(d.join("gentoo")) else { return };
+    let head = text.lines().next().and_then(|l| l.strip_prefix("# ")).unwrap_or("?").trim();
+    let Some(g) = gentoo(d) else {
+        say!("gentoo {head} is for another version, so no flags");
+        return;
+    };
+    say!("gentoo {head}");
+    let set = chosen(&f.use_flags);
+    let Ok(p) = pkg::load(d) else { return };
+    let have: Vec<String> = p
+        .depends
+        .iter()
+        .map(|x| called(root, &x.name).unwrap_or_else(|| x.name.clone()))
+        .collect();
+    for n in &have {
+        if g.unwanted(&set, n) {
+            say!("drops {n}");
+        }
+    }
+    let mut added: Vec<String> = Vec::new();
+    for (a, _) in g.wanted(&set) {
+        match recipe_for(root, &a) {
+            Some(n) if !have.contains(&n) && !added.contains(&n) && n != p.name => {
+                say!("adds {n}");
+                added.push(n);
+            }
+            Some(_) => {}
+            None => say!("wants {a}, and no recipe answers to it"),
+        }
+    }
+}
+
+// which flags a config chose for one package, as name -> on. a flag nobody set is
+// absent rather than defaulted: the recipe's depends are already alpine's choice, and
+// only a flag someone chose moves the closure off it
+fn chosen(use_flags: &[String]) -> HashMap<&str, bool> {
+    use_flags
+        .iter()
+        .map(|f| match f.strip_prefix('-') {
+            Some(n) => (n, false),
+            None => (f.as_str(), true),
+        })
+        .collect()
+}
+
+// where a gentoo dependency sits, which is what kind of edge it becomes here
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum Needs {
+    Run,
+    Build,
+    Tool,
+}
+
+struct Gentoo {
+    // declared flags, and whether each is on by default
+    iuse: Vec<(String, bool)>,
+    // every conditional atom, with the flags it sits under and the state each one wants
+    conds: Vec<(Vec<(String, bool)>, String, Needs)>,
+    // atoms under no condition at all, which no flag can take out
+    plain: Vec<String>,
+}
+
+// the md5-cache entry for exactly the version the recipe builds, verbatim under a
+// header naming which one it is. a header for any other version is a file a bump carried
+// across, and it counts as no file at all -- absence over approximation, until sync
+// fetches the right one
+fn gentoo(dir: &Path) -> Option<Gentoo> {
+    let text = fs::read_to_string(dir.join("gentoo")).ok()?;
+    let ver = fs::read_to_string(dir.join("version")).ok()?;
+    let head = text.lines().next()?.strip_prefix("# ")?.trim();
+    let (_, pv) = pf(head.rsplit('/').next()?)?;
+    if Some(pv) != ver.split_whitespace().next() {
+        return None;
+    }
+    let mut g = Gentoo {
+        iuse: Vec::new(),
+        conds: Vec::new(),
+        plain: Vec::new(),
+    };
+    for l in text.lines() {
+        let Some((k, v)) = l.split_once('=') else { continue };
+        match k {
+            "IUSE" => {
+                g.iuse = v
+                    .split_whitespace()
+                    .map(|f| match f.strip_prefix('+') {
+                        Some(n) => (n.to_string(), true),
+                        None => (f.trim_start_matches('-').to_string(), false),
+                    })
+                    .collect();
+            }
+            "RDEPEND" | "PDEPEND" => spec(v, Needs::Run, &mut g),
+            "DEPEND" => spec(v, Needs::Build, &mut g),
+            "BDEPEND" | "IDEPEND" => spec(v, Needs::Tool, &mut g),
+            _ => {}
+        }
+    }
+    Some(g)
+}
+
+// a gentoo PF split into name and version: mesa-26.2.3-r1 is mesa and 26.2.3. a name may
+// not end in anything that reads as a version, so the last hyphen before a digit is it
+fn pf(s: &str) -> Option<(&str, &str)> {
+    let base = match s.rsplit_once("-r") {
+        Some((b, r)) if !r.is_empty() && r.bytes().all(|c| c.is_ascii_digit()) => b,
+        _ => s,
+    };
+    let at = base
+        .match_indices('-')
+        .map(|(i, _)| i)
+        .filter(|&i| base[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+        .last()?;
+    Some((&base[..at], &base[at + 1..]))
+}
+
+// as much of DEPEND's grammar as a flag needs. flag? and !flag? open a group that only
+// counts under that flag, || ( ) and a bare ( ) are groups with no condition, and a
+// blocker is not a dependency
+fn spec(v: &str, needs: Needs, g: &mut Gentoo) {
+    let mut stack: Vec<Option<(String, bool)>> = Vec::new();
+    let mut next: Option<(String, bool)> = None;
+    for t in v.split_whitespace() {
+        match t {
+            "(" => stack.push(next.take()),
+            ")" => {
+                stack.pop();
+            }
+            "||" => {}
+            _ if t.ends_with('?') => {
+                let f = &t[..t.len() - 1];
+                next = Some(match f.strip_prefix('!') {
+                    Some(n) => (n.to_string(), false),
+                    None => (f.to_string(), true),
+                });
+            }
+            _ => {
+                let Some(a) = atom(t) else { continue };
+                let under: Vec<(String, bool)> = stack.iter().flatten().cloned().collect();
+                match under.is_empty() {
+                    true => g.plain.push(a),
+                    false => g.conds.push((under, a, needs)),
+                }
+            }
+        }
+    }
+}
+
+// category/name out of an atom: >=x11-libs/libdrm-2.4.133[abi_x86_32(-)?]:0= is
+// x11-libs/libdrm
+fn atom(t: &str) -> Option<String> {
+    if t.starts_with('!') {
+        return None;
+    }
+    let t = t.split(['[', ':']).next()?;
+    let bare = t.trim_start_matches(['>', '<', '=', '~']);
+    let name = match bare.len() == t.len() {
+        true => bare,
+        false => pf(bare.trim_end_matches('*'))?.0,
+    };
+    name.contains('/').then(|| name.to_string())
+}
+
+// gentoo's name and this tree's for one package agree once case and alpine's prefixes
+// are set aside: x11-libs/libX11 is libx11, media-libs/libsdl2 is sdl2, dev-qt/qtbase is
+// qt6-qtbase, dev-lang/lua is lua5.4
+fn same(atom: &str, name: &str) -> bool {
+    let a = atom.rsplit('/').next().unwrap_or(atom).to_lowercase();
+    let b = name.to_lowercase();
+    let b = match b.split_once('-') {
+        Some((p, rest)) if matches!(p, "py3" | "perl" | "qt5" | "qt6" | "kf5" | "kf6") => rest.to_string(),
+        _ => b,
+    };
+    let bare = b.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    a == b
+        || a.strip_prefix("lib") == Some(b.as_str())
+        || b.strip_prefix("lib") == Some(a.as_str())
+        || (bare != b && bare == a)
+}
+
+// the recipe a gentoo atom names, for a flag turned on that asks for something the
+// recipe never listed
+fn recipe_for(root: &Path, atom: &str) -> Option<String> {
+    let (cat, pn) = atom.split_once('/')?;
+    let pn = pn.to_lowercase();
+    let mut names = vec![pn.clone(), format!("lib{pn}")];
+    if let Some(s) = pn.strip_prefix("lib") {
+        names.push(s.to_string());
+    }
+    let prefix = match cat {
+        "dev-python" => Some("py3"),
+        "dev-perl" => Some("perl"),
+        "dev-qt" => Some("qt6"),
+        _ => None,
+    };
+    if let Some(x) = prefix {
+        names.insert(0, format!("{x}-{pn}"));
+    }
+    names
+        .into_iter()
+        .map(|n| called(root, &n).unwrap_or(n))
+        .find(|n| recipe(root, n).is_some())
+}
+
+// a flag's meson name is the option of the same name, and its value is the option's
+// type: a feature is enabled or disabled, a boolean true or false. a combo only where it
+// has a word for the state asked -- which of mesa's glx=dri|xlib on should mean is not
+// something a flag can say. auto_features stays auto either way; this is only for what
+// someone chose
+fn meson_args(src: &Path, use_flags: &[String]) -> String {
+    let set = chosen(use_flags);
+    if set.is_empty() {
+        return String::new();
+    }
+    // newer projects say meson.options and mesa has already moved, so looking only for
+    // the old name finds nothing and says nothing
+    let mut dirs = vec![src.to_path_buf()];
+    let mut tops: Vec<PathBuf> = fs::read_dir(src)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    tops.sort();
+    dirs.extend(tops);
+    let Some(text) = dirs
+        .iter()
+        .flat_map(|d| [d.join("meson.options"), d.join("meson_options.txt")])
+        .find_map(|f| fs::read_to_string(f).ok())
+    else {
+        return String::new();
+    };
+    let mut out = Vec::new();
+    for (name, kind, choices) in options(&text) {
+        let Some(&on) = set.get(name.as_str()) else { continue };
+        let has = |w: &[&'static str]| w.iter().copied().find(|c| choices.iter().any(|x| x == c));
+        let v = match (kind.as_str(), on) {
+            ("feature", true) => "enabled",
+            ("feature", false) => "disabled",
+            ("boolean", true) => "true",
+            ("boolean", false) => "false",
+            ("combo", true) => match has(&["enabled", "true"]) {
+                Some(v) => v,
+                None => continue,
+            },
+            ("combo", false) => match has(&["disabled", "false", "none"]) {
+                Some(v) => v,
+                None => continue,
+            },
+            _ => continue,
+        };
+        out.push(format!("-D{name}={v}"));
+    }
+    out.join(" ")
+}
+
+// meson's option() calls as (name, type, choices). tokens rather than lines, because an
+// option spans several lines as often as not and a description can hold a quote or a #
+fn options(text: &str) -> Vec<(String, String, Vec<String>)> {
+    enum T {
+        S(String),
+        W(String),
+        P(char),
+    }
+    let mut toks = Vec::new();
+    let mut it = text.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '#' => {
+                while it.peek().is_some_and(|&n| n != '\n') {
+                    it.next();
+                }
+            }
+            '\'' => {
+                let mut s = String::new();
+                // a ''' string runs to the next ''' and may hold a lone quote
+                let triple = it.peek() == Some(&'\'') && {
+                    let mut look = it.clone();
+                    look.next();
+                    look.peek() == Some(&'\'')
+                };
+                if triple {
+                    it.next();
+                    it.next();
+                }
+                while let Some(n) = it.next() {
+                    match n {
+                        '\\' => {
+                            if let Some(e) = it.next() {
+                                s.push(e);
+                            }
+                        }
+                        '\'' if !triple => break,
+                        '\'' if it.peek() == Some(&'\'') => {
+                            let mut look = it.clone();
+                            look.next();
+                            if look.peek() == Some(&'\'') {
+                                it.next();
+                                it.next();
+                                break;
+                            }
+                            s.push(n);
+                        }
+                        _ => s.push(n),
+                    }
+                }
+                toks.push(T::S(s));
+            }
+            c if c.is_alphanumeric() || c == '_' => {
+                let mut w = c.to_string();
+                while let Some(&n) = it.peek().filter(|n| n.is_alphanumeric() || **n == '_') {
+                    w.push(n);
+                    it.next();
+                }
+                toks.push(T::W(w));
+            }
+            c if c.is_whitespace() => {}
+            c => toks.push(T::P(c)),
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if !matches!((&toks[i], toks.get(i + 1)), (T::W(w), Some(T::P('('))) if w == "option") {
+            i += 1;
+            continue;
+        }
+        i += 2;
+        let (mut name, mut kind, mut choices) = (None, String::new(), Vec::new());
+        let mut depth = 1;
+        while i < toks.len() && depth > 0 {
+            match &toks[i] {
+                T::P('(') => depth += 1,
+                T::P(')') => depth -= 1,
+                T::S(s) if name.is_none() => name = Some(s.clone()),
+                T::W(w) if w == "type" => {
+                    if let Some(T::S(t)) = toks.get(i + 2) {
+                        kind = t.clone();
+                    }
+                }
+                T::W(w) if w == "choices" => {
+                    let mut j = i + 3;
+                    while let Some(T::S(c)) = toks.get(j) {
+                        choices.push(c.clone());
+                        j += 2;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if let Some(n) = name {
+            out.push((n, kind, choices));
+        }
+    }
+    out
+}
+
+impl Gentoo {
+    // a flag turned off takes out a dependency only when every place gentoo names it is
+    // under a flag the config has against it. one occurrence still standing keeps it,
+    // and a name gentoo never mentions is alpine's choice and not a flag's to undo
+    fn unwanted(&self, set: &HashMap<&str, bool>, name: &str) -> bool {
+        if self.plain.iter().any(|a| same(a, name)) {
+            return false;
+        }
+        let mut seen = false;
+        for (under, a, _) in &self.conds {
+            if !same(a, name) {
+                continue;
+            }
+            seen = true;
+            if !under.iter().any(|(f, w)| set.get(f.as_str()) == Some(&!w)) {
+                return false;
+            }
+        }
+        seen
+    }
+
+    // atoms whose every condition holds, where at least one of them holds because a
+    // config said so. a flag's default only fills in the rest of a nested condition
+    fn wanted(&self, set: &HashMap<&str, bool>) -> Vec<(String, Needs)> {
+        let default = |f: &str| self.iuse.iter().any(|(n, on)| n == f && *on);
+        let mut out: Vec<(String, Needs)> = self
+            .conds
+            .iter()
+            .filter(|(under, _, _)| {
+                under.iter().any(|(f, _)| set.contains_key(f.as_str()))
+                    && under
+                        .iter()
+                        .all(|(f, w)| set.get(f.as_str()).copied().unwrap_or_else(|| default(f)) == *w)
+            })
+            .map(|(_, a, n)| (a.clone(), *n))
+            .collect();
+        // a runtime edge first, so an atom gentoo lists in RDEPEND and BDEPEND both does
+        // not end up here as a build tool only
+        out.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
 }
 
 fn flags_cmd(args: &[String]) {
@@ -2184,6 +2639,9 @@ fn flags_cmd(args: &[String]) {
         }
         for l in f.record() {
             say!("resolved {l}");
+        }
+        if let Some(d) = dir.as_deref() {
+            gentoo_says(&root, d, &f);
         }
         return;
     }
@@ -3694,6 +4152,27 @@ fn load(root: &Path, at: &Path) -> Result<Package, String> {
             out.push(d);
         }
     }
+    // flags act through the closure: off takes a dependency out of the namespace the
+    // build sees, on puts one in, and configure's own detection does the rest
+    if let Some(g) = gentoo(&p.dir) {
+        let f = flags(root, &p.name, Some(&p.dir))?;
+        let set = chosen(&f.use_flags);
+        if !set.is_empty() {
+            out.retain(|d| !g.unwanted(&set, &d.name));
+            for (a, needs) in g.wanted(&set) {
+                let Some(n) = recipe_for(root, &a) else { continue };
+                if n == p.name || out.iter().any(|d| d.name == n) {
+                    continue;
+                }
+                out.push(Dep {
+                    name: n,
+                    make: needs != Needs::Run,
+                    host: needs == Needs::Tool,
+                    only: None,
+                });
+            }
+        }
+    }
     p.depends = out;
     Ok(p)
 }
@@ -4864,9 +5343,136 @@ fn sync_cmd(args: &[String]) {
         (false, 0) => say!("{} bumped {failed} failed", moving - failed),
         (false, _) => say!("{} bumped {failed} failed {holds} held", moving - failed),
     }
+    // after the bumps, so what testing/ just received gets its entry in the same run. a
+    // gentoo mirror that cannot be reached costs flags for a while, not the sync. only
+    // with --net, which is what reaching out is for -- 150MB of md5-cache is not a thing
+    // an offline sync against the aports clone should go and fetch -- or with KIRY_GENTOO
+    // naming the source outright
+    if !dry && (net || std::env::var_os("KIRY_GENTOO").is_some()) {
+        match refresh_gentoo(&root, &list, &want) {
+            Ok(0) => {}
+            Ok(n) => say!("{n} gentoo entries written"),
+            Err(e) => say!("gentoo {e}"),
+        }
+    }
     if failed > 0 {
         std::process::exit(1);
     }
+}
+
+const PORTAGE: &str = "rsync://rsync.gentoo.org/gentoo-portage/metadata/md5-cache/";
+
+// gentoo's md5-cache mirrored under var, where everything regenerable lives, and the
+// entry for each recipe's exact version copied into the recipe as its gentoo file. extra
+// and testing are machine-written and get one wherever gentoo has the version; a
+// hand-kept repo only has one refreshed where someone put one. KIRY_GENTOO names another
+// place to rsync from, which is how the tests do it
+fn refresh_gentoo(root: &Path, list: &[PathBuf], want: &[String]) -> Result<usize, String> {
+    let cache = root.join("var/kiry/gentoo/md5-cache");
+    mkdirs(&cache)?;
+    let from = std::env::var("KIRY_GENTOO").unwrap_or_else(|_| PORTAGE.into());
+    run(
+        Command::new("rsync")
+            .args(["-a", "--delete", "--exclude=Manifest*"])
+            .arg(&from)
+            .arg(format!("{}/", cache.display())),
+        "rsync",
+    )?;
+
+    // lowercase name -> (category, pf) for every entry, read off the file names alone.
+    // virtual/pipewire and acct-user/pipewire are not pipewire, and counted they would
+    // make every name they share ambiguous
+    let mut by: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for c in fs::read_dir(&cache).map_err(|e| format!("{}: {e}", cache.display()))?.flatten() {
+        let cat = c.file_name().to_string_lossy().into_owned();
+        if matches!(cat.as_str(), "virtual" | "acct-user" | "acct-group") {
+            continue;
+        }
+        let Ok(rd) = fs::read_dir(c.path()) else { continue };
+        for e in rd.flatten() {
+            let f = e.file_name().to_string_lossy().into_owned();
+            if let Some((pn, _)) = pf(&f) {
+                by.entry(pn.to_lowercase()).or_default().push((cat.clone(), f.clone()));
+            }
+        }
+    }
+
+    let mut wrote = 0;
+    for repo in list {
+        let machine = repo.file_name().is_some_and(|n| n == "extra" || n == "testing");
+        let Ok(rd) = fs::read_dir(repo) else { continue };
+        for e in rd.flatten() {
+            let dir = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !want.is_empty() && !want.contains(&name) {
+                continue;
+            }
+            if !(machine || dir.join("gentoo").is_file()) || !dir.join("build").is_file() {
+                continue;
+            }
+            let Ok(ver) = fs::read_to_string(dir.join("version")) else { continue };
+            let Some(ver) = ver.split_whitespace().next() else { continue };
+            let Some((cat, pf_)) = portage_entry(&by, &name, ver, &cache) else { continue };
+            let text = fs::read_to_string(cache.join(&cat).join(&pf_)).map_err(|e| format!("{cat}/{pf_}: {e}"))?;
+            let body = format!("# {cat}/{pf_}\n{text}");
+            if fs::read_to_string(dir.join("gentoo")).ok().as_deref() == Some(body.as_str()) {
+                continue;
+            }
+            fs::write(dir.join("gentoo"), body).map_err(|e| format!("{}: {e}", dir.display()))?;
+            wrote += 1;
+        }
+    }
+    Ok(wrote)
+}
+
+// the entry for a recipe: its name as gentoo spells it, in exactly one category, at
+// exactly its version, keyworded for amd64 stable or testing. the highest -r of that
+// version, since a revision is gentoo's fix and not a different upstream. anything less
+// certain is no entry: a package with no flags for a while is better than one with the
+// wrong ones
+fn portage_entry(
+    by: &HashMap<String, Vec<(String, String)>>,
+    name: &str,
+    ver: &str,
+    cache: &Path,
+) -> Option<(String, String)> {
+    let lower = name.to_lowercase();
+    let mut guesses = vec![(lower.clone(), None)];
+    if let Some((p, rest)) = lower.split_once('-') {
+        match p {
+            "py3" => guesses.push((rest.to_string(), Some("dev-python"))),
+            "perl" => guesses.push((rest.to_string(), Some("dev-perl"))),
+            "qt6" => guesses.push((rest.to_string(), Some("dev-qt"))),
+            _ => {}
+        }
+    }
+    for (pn, cat) in guesses {
+        let Some(all) = by.get(&pn) else { continue };
+        let all: Vec<&(String, String)> = all.iter().filter(|(c, _)| cat.is_none_or(|w| c == w)).collect();
+        let cats: HashSet<&String> = all.iter().map(|(c, _)| c).collect();
+        if cats.len() != 1 {
+            continue;
+        }
+        let rev = |f: &str| {
+            f.rsplit_once("-r")
+                .and_then(|(_, r)| r.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        let best = all
+            .iter()
+            .filter(|(_, f)| pf(f).is_some_and(|(_, v)| v == ver))
+            .filter(|(c, f)| {
+                fs::read_to_string(cache.join(c).join(f)).is_ok_and(|t| {
+                    t.lines().any(|l| {
+                        l.strip_prefix("KEYWORDS=")
+                            .is_some_and(|k| k.split_whitespace().any(|w| w == "amd64" || w == "~amd64"))
+                    })
+                })
+            })
+            .max_by_key(|(_, f)| rev(f))?;
+        return Some((best.0.clone(), best.1.clone()));
+    }
+    None
 }
 
 // the aports clone is blobless and checks out apkbuilds alone, so every patch and config
@@ -7728,5 +8334,142 @@ mod names {
 
         let p = load(&r, &at).unwrap();
         assert_eq!(deps(&p), vec!["mesa"]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod gentoo_flags {
+    use super::*;
+
+    fn entry(iuse: &str, rdepend: &str) -> Gentoo {
+        let mut g = Gentoo {
+            iuse: iuse
+                .split_whitespace()
+                .map(|f| match f.strip_prefix('+') {
+                    Some(n) => (n.to_string(), true),
+                    None => (f.to_string(), false),
+                })
+                .collect(),
+            conds: Vec::new(),
+            plain: Vec::new(),
+        };
+        spec(rdepend, Needs::Run, &mut g);
+        g
+    }
+
+    fn set(fs: &[&str]) -> Vec<String> {
+        fs.iter().map(|f| (*f).to_string()).collect()
+    }
+
+    #[test]
+    fn a_pf_splits_at_the_version_and_keeps_hyphens_in_the_name() {
+        assert_eq!(pf("mesa-26.2.3-r1"), Some(("mesa", "26.2.3")));
+        assert_eq!(pf("font-noto-cjk-20230817"), Some(("font-noto-cjk", "20230817")));
+        assert_eq!(pf("gtk+-3.24.43"), Some(("gtk+", "3.24.43")));
+        assert_eq!(pf("foo-rust-1.0_rc2-r3"), Some(("foo-rust", "1.0_rc2")));
+        assert_eq!(pf("nothing"), None);
+    }
+
+    #[test]
+    fn an_atom_is_its_category_and_name_whatever_hangs_off_it() {
+        assert_eq!(atom(">=x11-libs/libdrm-2.4.133[abi_x86_32(-)?]").as_deref(), Some("x11-libs/libdrm"));
+        assert_eq!(atom("dev-qt/qtbase:6[gui,widgets]").as_deref(), Some("dev-qt/qtbase"));
+        assert_eq!(atom("=dev-libs/foo-1.2*").as_deref(), Some("dev-libs/foo"));
+        assert_eq!(atom("~media-libs/mesa-26.2.3:=").as_deref(), Some("media-libs/mesa"));
+        assert_eq!(atom("media-libs/libsdl2").as_deref(), Some("media-libs/libsdl2"));
+        assert_eq!(atom("!dev-libs/bar"), None);
+        assert_eq!(atom("!!<dev-libs/bar-2"), None);
+    }
+
+    // off takes a dependency out only where nothing else still asks for it
+    #[test]
+    fn off_takes_out_only_what_every_mention_puts_under_that_flag() {
+        let g = entry(
+            "+wayland X doc",
+            "dev-libs/wayland X? ( x11-libs/libX11 ) wayland? ( dev-libs/wayland ) doc? ( app-text/doxygen ) \
+             || ( X? ( x11-libs/libXext ) media-libs/mesa )",
+        );
+        let off = set(&["-X", "-wayland"]);
+        let s = chosen(&off);
+        assert!(g.unwanted(&s, "libx11"));
+        assert!(g.unwanted(&s, "libxext"));
+        // named with no condition too, so the flag does not own it
+        assert!(!g.unwanted(&s, "wayland"));
+        // doc was not chosen either way, and alpine's choice stands
+        assert!(!g.unwanted(&s, "doxygen"));
+        // gentoo never mentions it, so no flag can take it
+        assert!(!g.unwanted(&s, "zlib"));
+    }
+
+    #[test]
+    fn a_negated_group_is_taken_out_by_the_flag_being_on() {
+        let g = entry("system-lua", "!system-lua? ( dev-lang/lua )");
+        assert!(g.unwanted(&chosen(&set(&["system-lua"])), "lua5.4"));
+        assert!(!g.unwanted(&chosen(&set(&["-system-lua"])), "lua5.4"));
+    }
+
+    // on brings in what a chosen flag names, and a default fills in the rest of a nested
+    // condition. a default alone brings nothing: that is alpine's closure already
+    #[test]
+    fn on_brings_in_what_a_chosen_flag_names_and_defaults_only_finish_the_sentence() {
+        let g = entry(
+            "vulkan +wayland X",
+            "wayland? ( dev-libs/wayland-extra ) \
+             vulkan? ( media-libs/vulkan-loader wayland? ( dev-libs/wayland ) X? ( x11-libs/libX11 ) )",
+        );
+        let names = |fs: &[&str]| -> Vec<String> {
+            g.wanted(&chosen(&set(fs))).into_iter().map(|(a, _)| a).collect()
+        };
+        assert_eq!(names(&["vulkan"]), vec!["media-libs/vulkan-loader", "dev-libs/wayland"]);
+        assert_eq!(names(&["vulkan", "X"]).len(), 3);
+        assert!(names(&[]).is_empty());
+        assert!(names(&["-vulkan"]).is_empty());
+    }
+
+    #[test]
+    fn gentoo_and_alpine_names_meet_past_case_and_prefixes() {
+        assert!(same("x11-libs/libX11", "libx11"));
+        assert!(same("media-libs/libsdl2", "sdl2"));
+        assert!(same("dev-qt/qtbase", "qt6-qtbase"));
+        assert!(same("dev-lang/lua", "lua5.4"));
+        assert!(same("x11-libs/gtk+", "gtk+3.0"));
+        assert!(same("dev-python/pillow", "py3-pillow"));
+        assert!(!same("dev-libs/libfoo", "bar"));
+        assert!(!same("dev-libs/wayland", "wayland-protocols"));
+    }
+
+    // what an option looks like in the wild: split over lines, a quote in a description,
+    // a comment with a quote in it, a ''' description
+    #[test]
+    fn meson_options_read_through_what_real_files_do() {
+        let text = "\
+# don't be fooled by option('fake', type : 'boolean')
+option('glvnd', type : 'feature', value : 'auto',
+  description : 'use glvnd, it\\'s optional')
+option(
+  'glx',
+  type : 'combo',
+  choices : ['auto', 'disabled', 'dri', 'xlib',],
+  value : 'auto',
+  description : '''a ''quoted'' thing''',
+)
+option('x11', type : 'boolean', value : true)
+option('platforms', type : 'array', choices : ['x11', 'wayland'])
+";
+        let got = options(text);
+        let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["glvnd", "glx", "x11", "platforms"]);
+        assert_eq!(got[1].1, "combo");
+        assert_eq!(got[1].2, vec!["auto", "disabled", "dri", "xlib"]);
+
+        let d = std::env::temp_dir().join(format!("kiry-meson-{}", std::process::id()));
+        let top = d.join("mesa-26.2.3");
+        fs::create_dir_all(&top).unwrap();
+        fs::write(top.join("meson.options"), text).unwrap();
+        let args = meson_args(&d, &set(&["-glvnd", "-glx", "x11", "platforms", "unrelated"]));
+        assert_eq!(args, "-Dglvnd=disabled -Dglx=disabled -Dx11=true");
+        // on for a combo with no word for on is not a guess worth making
+        assert_eq!(meson_args(&d, &set(&["glx"])), "");
     }
 }

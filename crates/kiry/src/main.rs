@@ -1183,6 +1183,10 @@ fn compile(
     // the build is its own process, so the number of them running at once is something
     // only this side knows and has to say
     c.env("KIRY_SHARE", at_once.to_string());
+    let prune = p.dir.join("symbol-prune").is_file() && !t.ends_with("gnu");
+    if prune {
+        c.env("KIRY_PRUNE", "1");
+    }
 
     // the log is written either way. -v only decides whether you also watch it
     let log = logpath(root, p, t);
@@ -1210,6 +1214,11 @@ fn compile(
             // failed, and would otherwise make the two indistinguishable
             if staged(&dest) == 0 {
                 return Err(format!("{} {t}: built and staged nothing", p.name));
+            }
+            if prune {
+                if let Err(e) = prune_pass(root, p, t, &work, &mut c, &log, verbose) {
+                    say!("{} {t} not pruned: {e}", p.name);
+                }
             }
             trim(&dest, t, &p.name)?;
             for (dep, so) in unlinked(root, p, f, t, &dest) {
@@ -1411,10 +1420,16 @@ if test \"$datarootdir\" = '${prefix}/share'; then datarootdir=@DATADIR@; fi
 // a kill is the machine running out rather than the compiler, and fewer thinlto jobs
 // link the same code, so that one goes again with half and nothing else changes. a
 // compile fed on stdin gets one go: there is nothing left to read the second time
+//
+// under KIRY_PRUNE every shared link is written down as it was run, so prune_pass can
+// run it again with a version script once the build is over
 const CC_WRAPPER: &str = "\
 #!/bin/sh
 run() { @REAL@ --target=@TRIPLE@@SYSROOT@@EXTRA@ \"$@\"; }
 case \" $* \" in *\" - \"*) run \"$@\"; exit ;; esac
+if [ -n \"$KIRY_PRUNE\" ]; then
+\tcase \" $* \" in *\" -shared \"*) { printf '%s\\0' \"$PWD\" \"$PATH\" \"${0##*/}\" \"$@\"; printf '\\n'; } >>/src/.kiry-links ;; esac
+fi
 e=/tmp/.kirycc.$$
 trap 'rm -f \"$e\"' EXIT
 cc() { run \"$@\" 2>\"$e\"; s=$?; [ -s \"$e\" ] && cat \"$e\" >&2; return $s; }
@@ -2226,6 +2241,216 @@ fn flags_with(
 // has to come apart before anything can be taken out of it
 fn words(s: &String) -> Vec<String> {
     s.split_whitespace().map(str::to_string).collect()
+}
+
+use sandbox::PRUNED;
+
+// what a pruned library has to go on exporting: every symbol something installed asks it
+// for, this build's own files included. a package installed since the last prune that
+// wanted more is installed by the time the next one runs, so it is counted then -- the
+// queue row skew writes is what gets that prune run. an Err is why pruning is not safe
+// to decide here, which leaves the library as it linked
+//
+// 11a is the gate. dlsym resolves a name at runtime and no index sees it, so a library
+// in the image of anything that can dlopen -- imports dlopen/dlsym/dlvsym/dlmopen, or is
+// itself loaded that way because nothing links it -- is not this function's to prune
+fn keep_list(
+    root: &Path,
+    p: &Package,
+    t: &str,
+    dest: &Path,
+    ours: &HashSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let was = db::read_provides(root, t, &p.name).unwrap_or_default();
+    if was.is_empty() {
+        return Err("not installed yet, so nothing says what uses it".into());
+    }
+    // an anonymous version tag is scope and nothing else, and lld refuses one beside named
+    // versions. a library that versions its symbols has already said what its api is
+    if was.iter().any(|x| x.versioned) {
+        return Err("it versions its symbols, and an anonymous version script cannot sit beside them".into());
+    }
+
+    let mut elves: Vec<(String, elf::Elf)> = Vec::new();
+    let mut files = Vec::new();
+    under(dest, &mut files);
+    for f in files.iter().filter(|f| !f.to_string_lossy().contains(PRUNED)) {
+        if let Ok(o) = elf::read(f) {
+            elves.push((f.display().to_string(), o));
+        }
+    }
+    let others: Vec<String> = db::installed(root, t)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| *n != p.name)
+        .collect();
+    for (rec, seen) in scans(root, t, &others).into_iter().flatten() {
+        for (path, what) in seen {
+            if let install::Seen::Elf(o) = what {
+                elves.push((format!("{} {path}", rec.name), o));
+            }
+        }
+    }
+
+    let mut by: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (_, o)) in elves.iter().enumerate() {
+        if let Some(s) = &o.soname {
+            by.entry(s.as_str()).or_default().push(i);
+        }
+    }
+    let needs = |i: usize| -> Vec<usize> {
+        elves[i].1.needed.iter().flat_map(|n| by.get(n.as_str()).cloned().unwrap_or_default()).collect()
+    };
+    let linked: HashSet<usize> = (0..elves.len()).flat_map(needs).collect();
+    let dl = ["dlopen", "dlsym", "dlvsym", "dlmopen"];
+    for c in 0..elves.len() {
+        let o = &elves[c].1;
+        let can = o.undefined.iter().any(|u| dl.contains(&u.name.as_str())) || (!o.interp && !linked.contains(&c));
+        if !can {
+            continue;
+        }
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut stack = vec![c];
+        while let Some(i) = stack.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            if let Some(s) = elves[i].1.soname.as_ref().filter(|s| ours.contains(*s)) {
+                return Err(format!("{} can dlopen, and {s} is in what it loads", elves[c].0));
+            }
+            stack.extend(needs(i));
+        }
+    }
+
+    Ok(elves
+        .iter()
+        .filter(|(_, o)| o.needed.iter().any(|n| ours.contains(n)))
+        .flat_map(|(_, o)| o.undefined.iter().map(|u| u.name.clone()))
+        .collect())
+}
+
+// the libraries of a symbol-prune package linked a second time, with only the exports
+// something asks for, so lto's internalize can delete the rest. the links the wrapper
+// wrote down are run again as they were, in the same sandbox, with -o moved and a
+// version script added. the first link ships under PRUNED beside the second
+fn prune_pass(
+    root: &Path,
+    p: &Package,
+    t: &str,
+    work: &Path,
+    c: &mut Command,
+    log: &Path,
+    verbose: bool,
+) -> Result<(), String> {
+    let (src, dest) = (work.join("src"), work.join("dest"));
+    let mut files = Vec::new();
+    under(&dest, &mut files);
+    let libs: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .filter_map(|f| {
+            let o = elf::read(&f).ok()?;
+            (!o.interp).then_some(())?;
+            Some((f, o.soname?))
+        })
+        .collect();
+    let ours: HashSet<String> = libs.iter().map(|(_, s)| s.clone()).collect();
+    if ours.is_empty() {
+        return Err("it built no shared library".into());
+    }
+    let keep = keep_list(root, p, t, &dest, &ours)?;
+
+    let mut vs = String::from("{\n  global:\n");
+    for k in &keep {
+        vs.push_str(&format!("    \"{k}\";\n"));
+    }
+    vs.push_str("  local: *;\n};\n");
+    fs::write(src.join(".kiry-keep"), vs).map_err(|e| format!(".kiry-keep: {e}"))?;
+
+    // the last link of each output wins: libtool links again at install time
+    let links = fs::read(src.join(".kiry-links")).map_err(|_| "no shared link was written down")?;
+    let mut by_out: HashMap<String, Vec<String>> = HashMap::new();
+    for rec in links.split(|b| *b == b'\n').filter(|r| !r.is_empty()) {
+        let f: Vec<String> = rec
+            .split(|b| *b == 0)
+            .map(|x| String::from_utf8_lossy(x).into_owned())
+            .filter(|x| !x.is_empty())
+            .collect();
+        let Some(i) = f.iter().skip(3).position(|a| a == "-o").map(|i| i + 3) else { continue };
+        let Some(out) = f.get(i + 1).and_then(|o| o.rsplit('/').next()) else { continue };
+        by_out.insert(out.to_string(), f);
+    }
+
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let mut script = String::from("mkdir -p /src/.kiry-pruned\n");
+    let mut todo = Vec::new();
+    for (lib, _) in &libs {
+        let base = lib.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let Some(f) = by_out.get(&base) else {
+            say!("{} {t} no link of {base} was written down, left whole", p.name);
+            continue;
+        };
+        // the PATH it ran under too: a recipe that puts its own tools first is running a
+        // different link otherwise
+        let (cwd, path, driver, argv) = (&f[0], &f[1], &f[2], &f[3..]);
+        let mut args: Vec<String> = Vec::new();
+        let mut it = argv.iter();
+        while let Some(a) = it.next() {
+            if a == "-o" {
+                it.next();
+                args.push("-o".into());
+                args.push(format!("/src/.kiry-pruned/{base}"));
+            } else {
+                args.push(a.clone());
+            }
+        }
+        args.push("-Wl,--version-script=/src/.kiry-keep".into());
+        let line: Vec<String> = args.iter().map(|a| q(a)).collect();
+        script.push_str(&format!(
+            "(cd {} && PATH={} {} {}) || echo 'kirycc: {base} did not link pruned'\n",
+            q(cwd),
+            q(path),
+            q(driver),
+            line.join(" ")
+        ));
+        todo.push((lib.clone(), base));
+    }
+    if todo.is_empty() {
+        return Err("nothing to link again".into());
+    }
+    fs::write(work.join("sysroot/build"), script).map_err(|e| format!("prune script: {e}"))?;
+    c.env("KIRY_PRUNE", "");
+    if !verbose {
+        let out = fs::OpenOptions::new()
+            .append(true)
+            .open(log)
+            .map_err(|e| format!("{}: {e}", log.display()))?;
+        let err = out.try_clone().map_err(|e| format!("{}: {e}", log.display()))?;
+        c.stdout(out).stderr(err);
+    }
+    run(c, "the pruned links")?;
+
+    for (lib, base) in todo {
+        let pruned = src.join(".kiry-pruned").join(&base);
+        let Ok(small) = elf::read(&pruned) else {
+            say!("{} {t} {base} left whole, its pruned link failed and the log says why", p.name);
+            continue;
+        };
+        let Ok(big) = elf::read(&lib) else { continue };
+        let full = dest.join(PRUNED).join(&base);
+        mkdirs(full.parent().unwrap_or(&dest))?;
+        fs::rename(&lib, &full).map_err(|e| format!("{}: {e}", full.display()))?;
+        fs::copy(&pruned, &lib).map_err(|e| format!("{}: {e}", lib.display()))?;
+        let size = |f: &Path| fs::metadata(f).map_or(0, |m| m.len()) / 1024;
+        say!(
+            "{} {t} pruned {base} {} exports -> {}, {}K -> {}K",
+            p.name,
+            big.exports.len(),
+            small.exports.len(),
+            size(&full),
+            size(&lib)
+        );
+    }
+    Ok(())
 }
 
 // a flag turned on is a claim that the build uses what it brought in, and DT_NEEDED is
@@ -3481,6 +3706,7 @@ fn skew(root: &Path) {
     if hurt.is_empty() {
         return;
     }
+    requeue_pruned(root, &hurt);
     let queued: HashSet<String> = db::read_queue(root)
         .unwrap_or_default()
         .into_iter()
@@ -3489,6 +3715,56 @@ fn skew(root: &Path) {
     for (t, f) in &hurt {
         let note = if queued.contains(&f.pkg) { "  queued" } else { "" };
         say!("{} {t} {}{note}", f.path, f.what);
+    }
+}
+
+// a pruned library dropped whatever nothing installed asked for when it was linked. a
+// package installed since that asks for one of them gets the library queued, with the
+// symbols, so the rebuild keeps them -- and the queue row heals the moment the soname
+// exports them again, the same way every other row does
+fn requeue_pruned(root: &Path, hurt: &[(String, Finding)]) {
+    if !hurt.iter().any(|(_, f)| matches!(f.what, What::MissingSymbol(_))) {
+        return;
+    }
+    // (target, owner, soname, what the first link exported)
+    let mut pruned: Vec<(String, String, String, HashSet<String>)> = Vec::new();
+    for t in db::targets(root).unwrap_or_default() {
+        for name in db::installed(root, &t).unwrap_or_default() {
+            let Ok(rec) = db::read(root, &t, &name) else { continue };
+            for e in rec.manifest.iter().filter(|e| e.path.starts_with(PRUNED)) {
+                let Ok(o) = elf::read(&root.join(&e.path)) else { continue };
+                let Some(so) = o.soname else { continue };
+                pruned.push((t.clone(), name.clone(), so, o.exports.into_iter().map(|x| x.name).collect()));
+            }
+        }
+    }
+    let mut rows: Vec<db::Queued> = db::read_queue(root).unwrap_or_default();
+    let before = rows.len();
+    for (t, f) in hurt {
+        let What::MissingSymbol(sym) = &f.what else { continue };
+        let sym = sym.split('@').next().unwrap_or(sym);
+        let Ok(o) = elf::read(&root.join(&f.path)) else { continue };
+        for (pt, owner, so, full) in &pruned {
+            if pt != t || !o.needed.contains(so) || !full.contains(sym) {
+                continue;
+            }
+            match rows.iter_mut().find(|q| q.target == *t && q.name == *owner && q.soname == *so) {
+                Some(q) if !q.changed.iter().any(|c| c == sym) => q.changed.push(sym.to_string()),
+                Some(_) => {}
+                None => rows.push(db::Queued {
+                    target: t.clone(),
+                    name: owner.clone(),
+                    soname: so.clone(),
+                    changed: vec![sym.to_string()],
+                }),
+            }
+            say!("{owner} {t} was pruned of {sym}, which {} needs  queued", f.pkg);
+        }
+    }
+    if rows.len() != before || rows.iter().any(|q| !q.changed.is_empty()) {
+        rows.sort();
+        rows.dedup();
+        let _ = db::write_queue(root, &rows);
     }
 }
 

@@ -64,6 +64,9 @@ pub fn toolchain(root: &Path) -> Result<Vec<Dep>, String> {
 // compiler-rt and libunwind and llvm-runtimes builds both for musl, so a gnu link is
 // told --rtlib=libgcc and then needs the thing. musl's side of that comes with the
 // toolchain set already
+// where kiry keeps a pruned library's first link, which is what a build links against
+pub const PRUNED: &str = "usr/lib/kiry/prune/";
+
 pub fn substrate(t: &str) -> &'static [(&'static str, bool)] {
     if t.ends_with("gnu") {
         // gcc-stage1 is the odd one and it is a make dep because it is a host tool: it
@@ -197,11 +200,30 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
     for m in members {
         let rec = db::read(root, &m.target, &m.name).map_err(|e| e.to_string())?;
         let whole = dev.remove(&(m.target.clone(), m.name.clone()));
+        // a pruned library exports what installed code asked for. a build is how new code
+        // arrives, and it links against the first link, which kiry keeps for exactly this
+        let full: BTreeMap<&str, &str> = rec
+            .manifest
+            .iter()
+            .filter_map(|e| Some((e.path.strip_prefix(PRUNED)?, e.path.as_str())))
+            .collect();
         for e in &rec.manifest {
             if !whole && builds_against(&e.path) {
                 continue;
             }
-            place(root, into, e)?;
+            let base = e.path.rsplit('/').next().unwrap_or_default();
+            match (&e.kind, full.get(base)) {
+                (db::Kind::File(_), Some(f)) if !e.path.starts_with(PRUNED) => {
+                    let dst = into.join(&e.path);
+                    if let Some(d) = dst.parent() {
+                        fs::create_dir_all(d).map_err(|x| format!("{}: {x}", d.display()))?;
+                    }
+                    clone(&root.join(f), &dst)?;
+                    fs::set_permissions(&dst, fs::Permissions::from_mode(e.mode))
+                        .map_err(|x| format!("{}: {x}", dst.display()))?;
+                }
+                _ => place(root, into, e)?,
+            }
         }
     }
     // whatever is left is named by a .pc and reached by no runtime edge -- x11.pc names

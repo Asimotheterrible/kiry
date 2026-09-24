@@ -219,7 +219,9 @@ fn subpackage_functions_do_not_come_across() {
 }
 
 // a version constraint, a ! for a conflict and a -dev suffix are all alpine spellings
-// with no kiry equivalent. what cannot be carried is reported rather than invented
+// with no kiry equivalent. what cannot be carried is reported rather than invented. a
+// so: name is carried as it is: which package it means is decided when the recipe is
+// read, against what is installed then
 #[test]
 fn alpine_dep_spellings_become_kiry_names() {
     if !have_busybox() {
@@ -241,11 +243,11 @@ fn alpine_dep_spellings_become_kiry_names() {
         got,
         // core/aliases maps meson to muon, so the conversion picks that up from the
         // repos this machine has configured
-        ["barlib", "expat make", "libfoo", "muon make"],
+        ["barlib", "expat make", "libfoo", "muon make", "so:libz.so.1 make"],
         "{deps}"
     );
     assert!(said.contains("!gettext-dev"), "{said}");
-    assert!(said.contains("so:libz.so.1"), "{said}");
+    assert!(!said.contains("so:libz.so.1"), "{said}");
 }
 
 // abuild cds into builddir before running build(), and kiry lands in /src when more than
@@ -598,8 +600,14 @@ fn a_dependency_on_a_subpackage_is_a_dependency_on_its_parent() {
         "depends=\"db-client libdb lua\"\nmakedepends=\"db-dev\"",
     );
     let out = at.join("out");
+    // a root of its own: this machine's aliases may well have chosen a lua already, and
+    // what is under test is that convert does not
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
     let o = kiry(&[
         "convert",
+        "--root",
+        root.to_str().unwrap(),
         "-n",
         a.to_str().unwrap(),
         l1.to_str().unwrap(),

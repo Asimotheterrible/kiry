@@ -304,7 +304,7 @@ pub fn recipe(
     depends.sort_by(|a, b| (a.make, a.host, &a.name).cmp(&(b.make, b.host, &b.name)));
     depends.dedup_by(|a, b| a.name == b.name && a.make == b.make && a.host == b.host);
 
-    for x in &depends {
+    for x in depends.iter().filter(|x| !x.name.contains(':')) {
         if !repos
             .iter()
             .any(|r| r.join(&x.name).join("build").is_file())
@@ -572,10 +572,16 @@ fn body(text: &str, name: &str) -> Option<String> {
 // file or a command rather than a package and have no equivalent at all
 fn dep(raw: &str) -> Option<String> {
     let raw = raw.trim();
-    if raw.is_empty() || raw.starts_with('!') || raw.contains(':') {
+    if raw.is_empty() || raw.starts_with('!') {
         return None;
     }
     let cut = raw.find(['<', '>', '=', '~']).unwrap_or(raw.len());
+    // whatever provides a library, a command or a pkg-config file. which package that is
+    // gets decided when the recipe is read, against what is installed then. dropping it
+    // takes the libGL librewolf dlopens with it, and nothing else would ever notice
+    if let Some((kind, _)) = raw.split_once(':') {
+        return matches!(kind, "so" | "cmd" | "pc").then(|| raw[..cut].to_string());
+    }
     let mut n = &raw[..cut];
     for suffix in ["-dev", "-static", "-libs"] {
         if let Some(s) = n.strip_suffix(suffix) {

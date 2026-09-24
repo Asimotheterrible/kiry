@@ -213,9 +213,9 @@ fn build_cmd(args: &[String]) {
             Ok(at) => at,
             Err(e) => die(e),
         };
-        let p = match pkg::load(&at) {
+        let p = match load(&root, &at) {
             Ok(p) => p,
-            Err(e) => die(e.to_string()),
+            Err(e) => die(e),
         };
         let targets = match &want {
             Some(t) if !p.targets.contains(t) => die(format!("{} does not build for {t}", p.name)),
@@ -745,7 +745,7 @@ fn bisect_cmd(args: &[String]) {
         die("bisect-flags wants a package".into());
     }
     for n in expand(&root, names) {
-        let p = match resolve(&root, &n).and_then(|at| pkg::load(&at).map_err(|e| e.to_string())) {
+        let p = match resolve(&root, &n).and_then(|at| load(&root, &at)) {
             Ok(p) => p,
             Err(e) => die(e),
         };
@@ -2792,9 +2792,9 @@ fn install_cmd(args: &[String]) {
             Ok(at) => at,
             Err(e) => die(e),
         };
-        let p = match pkg::load(&at) {
+        let p = match load(&root, &at) {
             Ok(p) => p,
-            Err(e) => die(e.to_string()),
+            Err(e) => die(e),
         };
         let targets = match &want {
             Some(t) if !p.targets.contains(t) => die(format!("{} does not build for {t}", p.name)),
@@ -3019,6 +3019,9 @@ fn wanted(
     let host = sandbox::host();
     let mut out = seeds.to_vec();
     let mut seen: HashSet<(String, String)> = seeds.iter().cloned().collect();
+    // who asked, for the one error where a bare name says nothing: java-jre on its own
+    // does not say it came from prismlauncher, or that it is a name an alias can answer
+    let mut by: HashMap<String, String> = HashMap::new();
     let mut i = 0;
     while i < out.len() {
         let (name, t) = out[i].clone();
@@ -3026,11 +3029,18 @@ fn wanted(
         if !recipes.contains_key(&name) {
             let at = match resolve(root, &name) {
                 Ok(at) => at,
-                Err(e) => die(e),
+                Err(e) => match by.get(&name) {
+                    Some(who) => die(format!(
+                        "{who} depends on {name}, and no recipe, alias or installed package answers to it\n\
+                         a line \"{name} <package>\" in {} says which one does",
+                        repos(root).first().map_or(PathBuf::from("aliases"), |r| r.join("aliases")).display()
+                    )),
+                    None => die(e),
+                },
             };
-            match pkg::load(&at) {
+            match load(root, &at) {
                 Ok(p) => recipes.insert(name.clone(), p),
-                Err(e) => die(e.to_string()),
+                Err(e) => die(e),
             };
         }
         let p = &recipes[&name];
@@ -3050,6 +3060,7 @@ fn wanted(
             if db::read(root, &d.1, &d.0).is_ok() || !seen.insert(d.clone()) {
                 continue;
             }
+            by.entry(d.0.clone()).or_insert_with(|| name.clone());
             out.push(d);
         }
     }
@@ -3663,6 +3674,92 @@ fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
         .find(|d| d.join("build").is_file())
 }
 
+// a recipe the way the rest of kiry sees it: every dependency named the way this system
+// names it. a depends file can say what alpine said -- java-jre, so:libGL.so.1,
+// cmd:emacs -- and which package that means is decided here, when it is read, against
+// the aliases and what is installed now. the plan, the sidecar and the installed record
+// then carry a real package, so removal and why see the real edge, and a pair added to
+// an aliases file counts from the next command rather than the next conversion
+fn load(root: &Path, at: &Path) -> Result<Package, String> {
+    let mut p = pkg::load(at).map_err(|e| e.to_string())?;
+    let mut out: Vec<Dep> = Vec::new();
+    for mut d in std::mem::take(&mut p.depends) {
+        match called(root, &d.name) {
+            // no equivalent here, or its own subpackage
+            Some(to) if to == "-" || to == p.name => continue,
+            Some(to) => d.name = to,
+            None => {}
+        }
+        if !out.iter().any(|x| x.name == d.name && x.make == d.make && x.host == d.host && x.only == d.only) {
+            out.push(d);
+        }
+    }
+    p.depends = out;
+    Ok(p)
+}
+
+// read once per root and kept: a plan loads hundreds of recipes, and the generated table
+// is seventeen thousand lines. the owner index waits for the first so:, cmd: or pc:
+// name, because it walks every manifest installed
+struct Names {
+    alias: HashMap<String, String>,
+    owners: Option<HashMap<String, String>>,
+}
+
+fn called(root: &Path, name: &str) -> Option<String> {
+    static SEEN: std::sync::Mutex<Option<HashMap<PathBuf, Names>>> = std::sync::Mutex::new(None);
+    let mut all = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let n = all.get_or_insert_with(HashMap::new).entry(root.to_path_buf()).or_insert_with(|| Names {
+        alias: convert::aliases(&repos(root)),
+        owners: None,
+    });
+    let Some((kind, what)) = name.split_once(':') else {
+        return n.alias.get(name).cloned();
+    };
+    // what this machine has installed is the answer before anything alpine wrote down
+    let owners = n.owners.get_or_insert_with(|| owners(root));
+    if let Some(p) = owners.get(name).or_else(|| n.alias.get(name)) {
+        return Some(p.clone());
+    }
+    // nothing installed answers. a recipe named after the command or the .pc is the
+    // likely provider, and a wrong guess still fails loudly at its own build
+    (matches!(kind, "cmd" | "pc") && recipe(root, what).is_some()).then(|| what.to_string())
+}
+
+// so:<soname>, cmd:<command> and pc:<module> for everything installed, on any target,
+// to the package that ships it
+fn owners(root: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for t in db::targets(root).unwrap_or_default() {
+        for name in db::installed(root, &t).unwrap_or_default() {
+            for pv in db::read_provides(root, &t, &name).unwrap_or_default() {
+                out.entry(format!("so:{}", pv.soname)).or_insert_with(|| name.clone());
+            }
+            let Ok(rec) = db::read(root, &t, &name) else { continue };
+            for e in &rec.manifest {
+                let path = e.path.as_str();
+                let key = if let Some(c) = ["usr/bin/", "usr/sbin/", "bin/", "sbin/"]
+                    .iter()
+                    .find_map(|d| path.strip_prefix(d))
+                    .filter(|c| !c.contains('/'))
+                {
+                    format!("cmd:{c}")
+                } else if let Some(m) = path
+                    .strip_suffix(".pc")
+                    .and_then(|s| s.rsplit_once("/pkgconfig/"))
+                    .map(|(_, m)| m)
+                {
+                    format!("pc:{m}")
+                } else {
+                    continue;
+                };
+                out.entry(key).or_insert_with(|| name.clone());
+            }
+        }
+    }
+    out
+}
+
 // a name, a repo/name, or a path. the path is tried first and only when something is
 // actually there, so a staging root or a scratch dir still builds and the two forms
 // never have to be told apart by their spelling
@@ -3996,9 +4093,9 @@ fn rebuild_cmd(args: &[String]) {
                 "{name} needs rebuilding and no repo has a recipe for it"
             ));
         };
-        match pkg::load(&dir) {
+        match load(&root, &dir) {
             Ok(p) => recipes.insert(name.clone(), p),
-            Err(e) => die(e.to_string()),
+            Err(e) => die(e),
         };
     }
 
@@ -7476,5 +7573,123 @@ mod deps {
                 .any(|(s, who, k)| *s == want && who == "carrier" && *k == "build-only"),
             "{got:?}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod names {
+    use super::*;
+
+    const T: &str = "x86_64-musl";
+
+    fn root(name: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("kiry-names-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn recipe(root: &Path, repo: &str, name: &str, depends: &str) -> PathBuf {
+        let d = root.join(REPOS_AT).join(repo).join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("version"), "1.0 1\n").unwrap();
+        fs::write(d.join("targets"), format!("{T}\n")).unwrap();
+        fs::write(d.join("build"), "true\n").unwrap();
+        fs::write(d.join("depends"), depends).unwrap();
+        d
+    }
+
+    fn installed(root: &Path, name: &str, files: &[&str], sonames: &[&str]) {
+        db::write(
+            root,
+            &db::Installed {
+                name: name.into(),
+                target: T.into(),
+                version: pkg::Version::parse("1.0 1").unwrap(),
+                depends: Vec::new(),
+                manifest: files
+                    .iter()
+                    .map(|f| db::Entry {
+                        mode: 0o755,
+                        kind: db::Kind::File("0".repeat(64)),
+                        path: (*f).to_string(),
+                    })
+                    .collect(),
+                hash: String::new(),
+                users: Vec::new(),
+                flags: Vec::new(),
+            },
+        )
+        .unwrap();
+        let ps: Vec<db::Provide> = sonames
+            .iter()
+            .map(|s| db::Provide {
+                soname: (*s).to_string(),
+                versioned: false,
+                path: format!("usr/lib/{s}"),
+            })
+            .collect();
+        db::write_provides(root, T, name, &ps).unwrap();
+    }
+
+    fn deps(p: &Package) -> Vec<String> {
+        p.depends.iter().map(ToString::to_string).collect()
+    }
+
+    // a virtual is a choice, and the pair in an aliases file is where it was made. it
+    // counts when the recipe is read, not only when one is next converted
+    #[test]
+    fn an_alias_decides_what_a_virtual_means_when_the_recipe_is_read() {
+        let r = root("virtual");
+        let at = recipe(&r, "extra", "prismlauncher", "java-jre\nopenjdk8 make\n");
+        recipe(&r, "extra", "openjdk21", "");
+        fs::create_dir_all(r.join(REPOS_AT).join("local")).unwrap();
+        fs::write(r.join(REPOS_AT).join("local/aliases"), "java-jre\topenjdk21\n").unwrap();
+
+        let p = load(&r, &at).unwrap();
+        assert_eq!(deps(&p), vec!["openjdk21", "openjdk8 make"]);
+    }
+
+    // what is installed says who ships a library, a command or a .pc before anything
+    // alpine wrote down does
+    #[test]
+    fn a_library_a_command_and_a_pc_file_resolve_to_what_ships_them() {
+        let r = root("owners");
+        installed(&r, "mesa", &["usr/lib/libGL.so.1"], &["libGL.so.1"]);
+        installed(&r, "ncurses", &["usr/bin/tput", "usr/lib/pkgconfig/ncursesw.pc"], &[]);
+        let at = recipe(&r, "extra", "app", "so:libGL.so.1\ncmd:tput\npc:ncursesw make\n");
+
+        let p = load(&r, &at).unwrap();
+        assert_eq!(deps(&p), vec!["mesa", "ncurses", "ncurses make"]);
+    }
+
+    // nothing installed has the command, and a recipe named after it is the likely
+    // provider. a library has no such name to guess from, so it stays as alpine wrote it
+    // and the plan says so
+    #[test]
+    fn nothing_installed_falls_back_to_a_recipe_by_that_name_and_no_further() {
+        let r = root("guess");
+        recipe(&r, "extra", "emacs", "");
+        let at = recipe(&r, "extra", "emacs-magit", "cmd:emacs\nso:libSDL3.so.0\n");
+
+        let p = load(&r, &at).unwrap();
+        assert_eq!(deps(&p), vec!["emacs", "so:libSDL3.so.0"]);
+    }
+
+    // - is no equivalent here, and a name that comes back to the recipe itself is its own
+    // subpackage. neither is an edge, and two spellings of one package are one
+    #[test]
+    fn nothing_itself_and_twice_are_not_edges() {
+        let r = root("drops");
+        installed(&r, "mesa", &[], &["libGL.so.1", "libEGL.so.1"]);
+        fs::create_dir_all(r.join(REPOS_AT).join("local")).unwrap();
+        fs::write(r.join(REPOS_AT).join("local/aliases"), "gtk-doc\t-\nlibfoo-tools\tfoo\n").unwrap();
+        let at = recipe(&r, "extra", "foo", "gtk-doc make\nlibfoo-tools\nso:libGL.so.1\nso:libEGL.so.1\n");
+
+        let p = load(&r, &at).unwrap();
+        assert_eq!(deps(&p), vec!["mesa"]);
     }
 }

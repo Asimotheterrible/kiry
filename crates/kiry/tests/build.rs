@@ -4664,3 +4664,20 @@ fn make_is_told_the_jobs_of_a_level_and_nothing_gnu_only() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(fs::read_to_string(root.join("usr/bin/plum")).unwrap(), "-j8");
 }
+
+// a bare "no recipe java-jre" does not say it came from prismlauncher or that it is a
+// name an aliases file can answer, and both are what the next step needs
+#[test]
+fn a_missing_dependency_is_named_with_what_wanted_it() {
+    let at = scratch("missing-dep");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    fs::write(d.join("depends"), "java-jre\n").unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("hello depends on java-jre"), "{err}");
+    assert!(err.contains("aliases"), "{err}");
+}

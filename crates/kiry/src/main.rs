@@ -4962,6 +4962,13 @@ fn parts(v: &str) -> Vec<Part> {
 // -- rc against a release, a trailing letter, a date where a count was -- is a thing only
 // scheme will be able to say, and guessing it would report a bump that is a downgrade
 fn compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    compare_as(a, b, false)
+}
+
+// letters is what a scheme buys: a recipe that has one has said how its numbering goes,
+// so text in the same place orders as text -- tzdata's 2026c before 2026d. without one
+// that is exactly the guess the comparison refuses
+fn compare_as(a: &str, b: &str, letters: bool) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     let (x, y) = (parts(a), parts(b));
     for i in 0..x.len().min(y.len()) {
@@ -4969,6 +4976,7 @@ fn compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
             (Part::Num(p), Part::Num(q)) if p != q => return Some(p.cmp(q)),
             (Part::Num(_), Part::Num(_)) | (Part::Sep, Part::Sep) => {}
             (Part::Text(p), Part::Text(q)) if p == q => {}
+            (Part::Text(p), Part::Text(q)) if letters => return Some(p.cmp(q)),
             _ => return None,
         }
     }
@@ -5000,6 +5008,58 @@ fn compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 struct Up {
     version: String,
     from: String,
+}
+
+// what a bump is, read off the first component that moved -- 1.2.3 to 1.3.0 moved the
+// second -- and what the scheme calls that component. a recipe without one reads as
+// major minor patch, which is what most upstreams are. core gets no such default: a
+// guess about the toolchain's numbering is what the scheme rule exists to prevent
+fn level(dir: &Path, ours: &str, up: &str) -> Option<&'static str> {
+    let scheme = plain(&dir.join("scheme")).into_iter().next();
+    let core = dir.parent().and_then(|r| r.file_name()).is_some_and(|n| n == "core");
+    if scheme.is_none() && core {
+        return None;
+    }
+    let roles: Vec<String> = match &scheme {
+        Some(s) => s.split_whitespace().map(String::from).collect(),
+        None => ["major", "minor", "patch"].map(String::from).to_vec(),
+    };
+    let comps = |v: &str| -> Vec<Part> { parts(v).into_iter().filter(|p| !matches!(p, Part::Sep)).collect() };
+    let (x, y) = (comps(ours), comps(up));
+    let moved = (0..x.len().max(y.len())).find(|&i| match (x.get(i), y.get(i)) {
+        (Some(Part::Num(a)), Some(Part::Num(b))) => a != b,
+        (Some(Part::Text(a)), Some(Part::Text(b))) => a != b,
+        (None, Some(Part::Num(0))) | (Some(Part::Num(0)), None) => false,
+        _ => true,
+    })?;
+    // a component past the end of the scheme is a finer one than it names
+    match roles.get(moved).map_or("patch", String::as_str) {
+        "major" => Some("major"),
+        "minor" => Some("minor"),
+        "patch" => Some("patch"),
+        _ => None,
+    }
+}
+
+// how far a bump may go before a person promotes it. auto=always is the default and the
+// rule: the fallback snapshot makes a bad install one reboot either way, so a gate here
+// buys nothing it does not
+fn policy_allows(dir: &Path, level: Option<&str>) -> Result<(), String> {
+    let core = dir.parent().and_then(|r| r.file_name()).is_some_and(|n| n == "core");
+    if core && !dir.join("scheme").is_file() {
+        return Err("core recipes promote only with a scheme to say what the bump is".into());
+    }
+    let p = plain(&dir.join("policy")).into_iter().next().unwrap_or_else(|| "auto=always".into());
+    let ok = match (p.as_str(), level) {
+        ("auto=always", _) => true,
+        ("auto=minor", Some("minor" | "patch")) | ("auto=patch", Some("patch")) => true,
+        ("auto=minor" | "auto=patch" | "auto=none", _) => false,
+        (other, _) => return Err(format!("policy {other} is not auto=always, minor, patch or none")),
+    };
+    match ok {
+        true => Ok(()),
+        false => Err(format!("{p} holds a {} bump for promote", level.unwrap_or("unclassified"))),
+    }
 }
 
 // the first pkgver= line. a value naming a variable needs the shell to resolve and half
@@ -5065,16 +5125,12 @@ fn from_aports(root: &Path, name: &str, pin: Option<&str>) -> Option<Up> {
     None
 }
 
-// a tracker is a url and nothing else, so the body has to be a version on its own. the
-// steam one is a debian Packages file and comes back unknown, which is the first thing
-// the format will have to grow a way to say
+// a tracker is a url, and a pattern on the next line when the body is more than a
+// version on its own. steam's is a debian Packages file: the pattern's first group is
+// the version, and the highest one any line gives is the answer
 fn from_tracker(dir: &Path) -> Result<Up, &'static str> {
-    let text = fs::read_to_string(dir.join("tracker")).map_err(|_| "tracker unreadable")?;
-    let url = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .ok_or("tracker is empty")?;
+    let lines = plain(&dir.join("tracker"));
+    let url = lines.first().ok_or("tracker is empty")?;
 
     let at = std::env::temp_dir().join(format!("kiry-tracker-{}", std::process::id()));
     let _ = fs::remove_file(&at);
@@ -5083,15 +5139,35 @@ fn from_tracker(dir: &Path) -> Result<Up, &'static str> {
     let body = fs::read_to_string(&at).map_err(|_| "tracker fetch wrote nothing")?;
     let _ = fs::remove_file(&at);
 
-    let mut words = body.split_whitespace();
-    let v = words.next().ok_or("tracker answered nothing")?;
-    if words.next().is_some() || !v.starts_with(|c: char| c.is_ascii_digit()) {
-        return Err("tracker body is not a version on its own");
-    }
+    let v = match lines.get(1) {
+        Some(pat) => version_in(&body, pat)?,
+        None => {
+            let mut words = body.split_whitespace();
+            let v = words.next().ok_or("tracker answered nothing")?;
+            if words.next().is_some() || !v.starts_with(|c: char| c.is_ascii_digit()) {
+                return Err("tracker body is not a version on its own, and no pattern says where one is");
+            }
+            v.to_string()
+        }
+    };
     Ok(Up {
-        version: v.to_string(),
+        version: v,
         from: "tracker".to_string(),
     })
+}
+
+fn version_in(body: &str, pat: &str) -> Result<String, &'static str> {
+    let rx = Rx::new(pat).map_err(|_| "tracker pattern does not parse")?;
+    let mut best: Option<String> = None;
+    for l in body.lines() {
+        let Some(v) = rx.find(l).and_then(|c| c.into_iter().next()).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        if best.as_deref().is_none_or(|b| compare(b, &v) == Some(std::cmp::Ordering::Less)) {
+            best = Some(v);
+        }
+    }
+    best.ok_or("tracker pattern matched nothing")
 }
 
 struct Row {
@@ -5167,9 +5243,12 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
             };
 
             let (status, mut note) = match &up {
-                Some(u) => match compare(&p.version.upstream, &u.version) {
+                Some(u) => match compare_as(&p.version.upstream, &u.version, d.join("scheme").is_file()) {
                     Some(std::cmp::Ordering::Equal) => ("ok", String::new()),
-                    Some(std::cmp::Ordering::Less) => ("behind", String::new()),
+                    Some(std::cmp::Ordering::Less) => (
+                        "behind",
+                        level(&d, &p.version.upstream, &u.version).unwrap_or("no scheme").to_string(),
+                    ),
                     Some(std::cmp::Ordering::Greater) => ("ahead", String::new()),
                     None => ("unknown", "unordered".to_string()),
                 },
@@ -5373,7 +5452,11 @@ fn sync_cmd(args: &[String]) {
                         }
                         // nothing alpine wrote moved and nothing else needs a decision,
                         // so there is no reading to do and no reason to make you do it
-                        if b.settled && b.differ.is_empty() {
+                        let allowed = policy_allows(&old, level(&old, &r.ours, &up.version));
+                        if let Err(why) = &allowed {
+                            notes.push(why.clone());
+                        }
+                        if b.settled && b.differ.is_empty() && allowed.is_ok() {
                             match promote_one(&root, &list, &r.name) {
                                 Ok(to) => outcome = format!("promoted  {}", to.display()),
                                 Err(e) => notes.push(format!("not promoted {e}")),
@@ -8530,5 +8613,85 @@ option('platforms', type : 'array', choices : ['x11', 'wayland'])
         assert_eq!(args, "-Dglvnd=disabled -Dglx=disabled -Dx11=true");
         // on for a combo with no word for on is not a guess worth making
         assert_eq!(meson_args(&d, &set(&["glx"])), "");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod bump_policy {
+    use super::*;
+
+    fn at(repo: &str, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("kiry-policy-{}", std::process::id()))
+            .join(repo)
+            .join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        for (f, body) in files {
+            fs::write(d.join(f), body).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn a_bump_is_what_the_scheme_calls_the_first_part_that_moved() {
+        let plain = at("extra", "plain", &[]);
+        assert_eq!(level(&plain, "1.2.3", "1.2.4"), Some("patch"));
+        assert_eq!(level(&plain, "1.2.3", "1.3.0"), Some("minor"));
+        assert_eq!(level(&plain, "1.2.3", "2.0"), Some("major"));
+        // a trailing zero is the same version and a new trailing part is the finest one
+        assert_eq!(level(&plain, "1.2", "1.2.1"), Some("patch"));
+        // 1.2 and 1.2.0 are one version, so 1.2.0.1 moved the fourth part and not the third
+        let four = at("extra", "four", &[("scheme", "major minor minor patch\n")]);
+        assert_eq!(level(&four, "1.2", "1.2.0.1"), Some("patch"));
+        // mesa's first number is a year and its second a release in that year
+        let mesa = at("extra", "mesa", &[("scheme", "major minor patch\n")]);
+        assert_eq!(level(&mesa, "25.2.3", "26.0.0"), Some("major"));
+        let tz = at("extra", "tzdata", &[("scheme", "major patch\n")]);
+        assert_eq!(level(&tz, "2026c", "2026d"), Some("patch"));
+        assert_eq!(level(&at("extra", "odd", &[("scheme", "epoch\n")]), "1", "2"), None);
+    }
+
+    // the rule: a core recipe says what its numbering is, or its bumps wait for a person
+    #[test]
+    fn core_gets_no_default_scheme() {
+        let gcc = at("core", "gcc", &[]);
+        assert_eq!(level(&gcc, "15.2.0", "15.2.1"), None);
+        assert!(policy_allows(&gcc, None).unwrap_err().contains("scheme"));
+        let llvm = at("core", "llvm", &[("scheme", "major minor patch\n")]);
+        assert!(policy_allows(&llvm, level(&llvm, "20.1.8", "21.1.0")).is_ok());
+    }
+
+    #[test]
+    fn a_policy_lets_through_what_it_names_and_holds_the_rest() {
+        let a = at("extra", "always", &[]);
+        assert!(policy_allows(&a, Some("major")).is_ok());
+        let m = at("extra", "minor", &[("policy", "auto=minor\n")]);
+        assert!(policy_allows(&m, Some("patch")).is_ok());
+        assert!(policy_allows(&m, Some("minor")).is_ok());
+        assert!(policy_allows(&m, Some("major")).unwrap_err().contains("auto=minor holds a major bump"));
+        let p = at("extra", "patch", &[("policy", "auto=patch\n")]);
+        assert!(policy_allows(&p, Some("minor")).is_err());
+        let n = at("extra", "none", &[("policy", "auto=none\n")]);
+        assert!(policy_allows(&n, Some("patch")).is_err());
+        let bad = at("extra", "bad", &[("policy", "sometimes\n")]);
+        assert!(policy_allows(&bad, Some("patch")).unwrap_err().contains("not auto=always"));
+    }
+
+    #[test]
+    fn a_scheme_lets_letters_order() {
+        assert_eq!(compare("2026c", "2026d"), None);
+        assert_eq!(compare_as("2026c", "2026d", true), Some(std::cmp::Ordering::Less));
+    }
+
+    // steam's tracker answers a debian Packages file, and the version is one field of it
+    #[test]
+    fn a_tracker_pattern_finds_the_highest_version_it_matches() {
+        let body = "Package: steam-launcher\nVersion: 1:1.0.0.83\nArchitecture: all\n\n\
+                    Package: steam-libs-amd64\nVersion: 1:1.0.0.85\n\n\
+                    Package: steam\nVersion: 1:1.0.0.84\n";
+        assert_eq!(version_in(body, "Version: 1:([0-9.]+)").unwrap(), "1.0.0.85");
+        assert!(version_in(body, "Release: ([0-9.]+)").is_err());
     }
 }

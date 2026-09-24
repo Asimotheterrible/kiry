@@ -1925,15 +1925,23 @@ fn a_package_replaces_a_knob_and_appends_to_the_rest() {
     assert!(said.contains("/etc/kiry/pkg/glibc OPT -O2"), "{said}");
 }
 
-// a global flag turned off for one package, without that package restating the set
+// a global flag turned off for one package, without that package restating the set.
+// the off is kept, because off is the choice that takes a dependency out, and only the
+// flags foot's gentoo entry declares count for foot
 #[test]
 fn a_later_minus_takes_a_flag_back_off() {
     let root = scratch("useflags");
-    config(&root, None, "flags x11 wayland vulkan\n");
+    let d = root.join("var/db/kiry/extra/foot");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("version"), "1.23.1 1\n").unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(d.join("build"), "true\n").unwrap();
+    fs::write(d.join("gentoo"), "# gui-apps/foot-1.23.1\nIUSE=x11 +wayland vulkan\n").unwrap();
+    config(&root, None, "flags x11 wayland vulkan gtk\n");
     config(&root, Some("foot"), "flags -x11\n");
 
     assert!(
-        resolved(&root, "foot").contains("resolved FLAGS vulkan wayland"),
+        resolved(&root, "foot").contains("resolved FLAGS -x11 vulkan wayland\n"),
         "{}",
         resolved(&root, "foot")
     );
@@ -4680,4 +4688,223 @@ fn a_missing_dependency_is_named_with_what_wanted_it() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("hello depends on java-jre"), "{err}");
     assert!(err.contains("aliases"), "{err}");
+}
+
+
+fn have_rsync() -> bool {
+    if Command::new("rsync").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        return true;
+    }
+    assert!(
+        std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
+        "no rsync to mirror a gentoo md5-cache with"
+    );
+    false
+}
+
+fn entry(at: &Path, cat: &str, pf: &str, body: &str) {
+    let d = at.join("md5-cache").join(cat);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join(pf), body).unwrap();
+}
+
+fn repo_recipe(root: &Path, repo: &str, name: &str, version: &str) -> PathBuf {
+    let d = root.join("var/db/kiry").join(repo).join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("version"), format!("{version} 1\n")).unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(d.join("build"), "true\n").unwrap();
+    d
+}
+
+// exactly the version the recipe builds, keyworded for amd64, its highest revision. an
+// extra recipe gets one wherever gentoo has that; a hand-kept one only where someone
+// asked by putting a file there
+#[test]
+fn sync_writes_the_gentoo_entry_for_exactly_this_version() {
+    if !have_rsync() {
+        return;
+    }
+    let at = scratch("gentoo-sync");
+    let root = at.join("root");
+    let foot = repo_recipe(&root, "extra", "foot", "1.23.1");
+    let old = repo_recipe(&root, "extra", "mako", "1.9.0");
+    let mine = repo_recipe(&root, "core", "libdrm", "2.4.133");
+    entry(&at, "gui-apps", "foot-1.23.1", "IUSE=X\nKEYWORDS=amd64\n");
+    entry(&at, "gui-apps", "foot-1.23.1-r1", "IUSE=+wayland X\nKEYWORDS=~amd64 ~arm64\n");
+    entry(&at, "gui-apps", "foot-1.23.1-r2", "IUSE=\nKEYWORDS=~arm64\n");
+    entry(&at, "gui-apps", "mako-1.10.0", "IUSE=\nKEYWORDS=~amd64\n");
+    entry(&at, "x11-libs", "libdrm-2.4.133", "IUSE=\nKEYWORDS=amd64\n");
+    // a virtual and an account sharing the name are not a second candidate
+    entry(&at, "virtual", "foot-1", "IUSE=\nKEYWORDS=amd64\n");
+    entry(&at, "acct-user", "foot-0", "IUSE=\nKEYWORDS=amd64\n");
+
+    let o = Command::new(KIRY)
+        .args(["sync", "--root", root.to_str().unwrap()])
+        .env("KIRY_GENTOO", format!("{}/md5-cache/", at.display()))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let got = fs::read_to_string(foot.join("gentoo")).unwrap();
+    assert!(got.starts_with("# gui-apps/foot-1.23.1-r1\n"), "{got}");
+    assert!(got.contains("IUSE=+wayland X"), "{got}");
+    assert!(!old.join("gentoo").exists());
+    assert!(!mine.join("gentoo").exists());
+}
+
+// the whole mechanism in one build: a flag turned off, and the library it named is not
+// in the namespace the build runs in
+#[test]
+fn a_flag_turned_off_takes_its_dependency_out_of_the_build() {
+    let at = scratch("flag-off");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let h = root.join("usr/include/X11/Xlib.h");
+    fs::create_dir_all(h.parent().unwrap()).unwrap();
+    fs::write(&h, "int x;\n").unwrap();
+    record(
+        &root,
+        "libx11",
+        &[],
+        vec![db::Entry {
+            mode: 0o644,
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(&h).unwrap()).unwrap()),
+            path: "usr/include/X11/Xlib.h".into(),
+        }],
+    );
+    db::write_provides(&root, "x86_64-musl", "libx11", &[]).unwrap();
+
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!("if [ -e /usr/include/X11/Xlib.h ]; then echo x11=yes; else echo x11=no; fi\n{GOOD}"),
+    );
+    fs::write(d.join("depends"), "libx11\n").unwrap();
+    fs::write(d.join("gentoo"), "# gui-apps/hello-1.0\nIUSE=X\nRDEPEND=X? ( x11-libs/libX11 )\n").unwrap();
+
+    let run = || {
+        let o = kiry(&["b", "-v", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    assert!(run().contains("x11=yes"));
+    config(&root, None, "flags -X\n");
+    assert!(run().contains("x11=no"));
+}
+
+// a header for another version is what a bump carried across, and it counts as no file
+#[test]
+fn an_entry_for_another_version_means_no_flags() {
+    let root = scratch("stale-gentoo");
+    let d = repo_recipe(&root, "extra", "foot", "1.24.0");
+    fs::write(d.join("gentoo"), "# gui-apps/foot-1.23.1\nIUSE=X\n").unwrap();
+    config(&root, None, "flags -X\n");
+
+    let said = resolved(&root, "foot");
+    assert!(!said.contains("resolved FLAGS"), "{said}");
+    assert!(said.contains("gentoo gui-apps/foot-1.23.1 is for another version"), "{said}");
+}
+
+// sync writing an entry is not the recipe changing: without flags set it cannot move a
+// build, and hashing it would have sent two thousand cached artifacts back to be rebuilt
+#[test]
+fn a_gentoo_entry_arriving_does_not_make_the_cache_stale() {
+    let at = scratch("gentoo-hash");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    fs::write(d.join("gentoo"), "# app-misc/hello-1.0\nIUSE=X\n").unwrap();
+
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("cached"), "{said}");
+    assert!(!said.contains("recipe changed"), "{said}");
+}
+
+// a flag turned on that brings in a library nothing ends up linking is a flag configure
+// never looked at, and the build says so rather than carrying a dependency for nothing
+#[test]
+fn a_flag_that_links_nothing_says_so() {
+    let at = scratch("flag-unlinked");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    record(&root, "libx11", &[], Vec::new());
+    db::write_provides(
+        &root,
+        "x86_64-musl",
+        "libx11",
+        &[db::Provide {
+            soname: "libX11.so.6".into(),
+            versioned: false,
+            path: "usr/lib/libX11.so.6".into(),
+        }],
+    )
+    .unwrap();
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    fs::write(d.join("gentoo"), "# app-misc/hello-1.0\nIUSE=X\nRDEPEND=X? ( x11-libs/libX11 )\n").unwrap();
+    let lib = root.join("var/db/kiry/extra/libx11");
+    fs::create_dir_all(&lib).unwrap();
+    fs::write(lib.join("version"), "1.0 1\n").unwrap();
+    fs::write(lib.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(lib.join("build"), "true\n").unwrap();
+    config(&root, None, "flags X\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("flag brought in libx11 and nothing links libX11.so.6"), "{said}");
+}
+
+// the other half: on puts a library the recipe never listed into the namespace, and
+// configure's own detection finds it there
+#[test]
+fn a_flag_turned_on_brings_its_dependency_into_the_build() {
+    let at = scratch("flag-on");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let h = root.join("usr/include/X11/Xlib.h");
+    fs::create_dir_all(h.parent().unwrap()).unwrap();
+    fs::write(&h, "int x;\n").unwrap();
+    record(
+        &root,
+        "libx11",
+        &[],
+        vec![db::Entry {
+            mode: 0o644,
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(&h).unwrap()).unwrap()),
+            path: "usr/include/X11/Xlib.h".into(),
+        }],
+    );
+    db::write_provides(&root, "x86_64-musl", "libx11", &[]).unwrap();
+    repo_recipe(&root, "extra", "libx11", "1.0");
+
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!("if [ -e /usr/include/X11/Xlib.h ]; then echo x11=yes; else echo x11=no; fi\n{GOOD}"),
+    );
+    fs::write(d.join("gentoo"), "# gui-apps/hello-1.0\nIUSE=X\nRDEPEND=X? ( x11-libs/libX11 )\n").unwrap();
+
+    let run = || {
+        let o = kiry(&["b", "-v", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    assert!(run().contains("x11=no"));
+    config(&root, None, "flags X\n");
+    assert!(run().contains("x11=yes"));
 }

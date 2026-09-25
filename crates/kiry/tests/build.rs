@@ -173,6 +173,7 @@ fn bootstrap(root: &Path) -> bool {
     for a in [
         "sh", "mkdir", "cp", "ln", "rm", "mv", "cat", "echo", "printf", "chmod", "find",
         "head", "install", "patch", "tar", "dd", "true", "false", "sed", "touch", "grep",
+        "sort", "wc", "xargs", "nproc", "tr",
     ] {
         let at = format!("usr/bin/{a}");
         // this busybox is built without patch and the closure is the whole of what a
@@ -5214,4 +5215,80 @@ fn a_prune_that_cannot_be_decided_leaves_the_library_whole() {
     // never installed: nothing says what uses it
     db::forget(&root, "x86_64-musl", "libfoo").unwrap();
     assert!(build().contains("not pruned: not installed yet"));
+}
+
+// the test sandbox has no compiler, so the toolchain comes from the closure like any
+// other: a clang that prints the layout dump a header carries in //D lines
+fn layout_toolchain(at: &Path, root: &Path) {
+    let f = at.join("fake-clang");
+    fs::write(
+        &f,
+        "#!/bin/sh\nf= p=\nfor a do [ \"$p\" = -include ] && f=$a; p=$a; done\n\
+         [ -n \"$f\" ] && sed -n 's#^//D ##p; s#^//D$##p' \"$f\"\nexit 0\n",
+    )
+    .unwrap();
+    installed_as(root, "clang-fake", &[("usr/bin/clang", &f)], &[]);
+}
+
+fn layout_recipe(at: &Path, version: &str, header: &str) -> PathBuf {
+    let d = recipe(
+        at,
+        "x86_64-musl",
+        &format!(
+            "mkdir -p \"$DESTDIR/usr/include\"\ncat > \"$DESTDIR/usr/include/bar.h\" <<'H'\n{header}H\n{GOOD}"
+        ),
+    );
+    let bar = at.join("libbar");
+    let _ = fs::remove_dir_all(&bar);
+    fs::rename(&d, &bar).unwrap();
+    fs::write(bar.join("version"), format!("{version} 1\n")).unwrap();
+    fs::write(bar.join("depends"), "clang-fake make\n").unwrap();
+    bar
+}
+
+fn bar_h(size: u32, line: u32) -> String {
+    format!(
+        "//D *** Dumping AST Record Layout\n//D          0 | struct bar\n//D          0 |   int a\n\
+         //D            | [sizeof={size}, dsize={size}, align=4,\n//D            |  nvsize={size}, nvalign=4]\n//D\n\
+         //D *** Dumping AST Record Layout\n//D          0 | struct (unnamed at /dest/usr/include/bar.h:{line}:1)\n\
+         //D          0 |   char c\n//D            | [sizeof=1, dsize=1, align=1,\n//D            |  nvsize=1, nvalign=1]\n//D\n\
+         struct bar {{ int a; }};\n"
+    )
+}
+
+// a struct in a public header grows and nothing in any elf says so. what builds against
+// it is queued; a comment moving a line is not a change; and what the same batch built
+// against the new header already has it
+#[test]
+fn a_struct_that_grows_queues_what_builds_against_it() {
+    let at = scratch("layout");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    layout_toolchain(&at, &root);
+    let r = root.to_str().unwrap();
+    let build_and_install = |version: &str, header: &str| -> String {
+        let d = layout_recipe(&at, version, header);
+        let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let art = format!("{r}/var/kiry/cache/libbar-{version}-1.x86_64-musl.tar.zst");
+        let o = kiry(&["i", "--root", r, &art]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+
+    build_and_install("1.0", &bar_h(4, 7));
+    record(&root, "baruser", &["libbar"], Vec::new());
+    db::write_provides(&root, "x86_64-musl", "baruser", &[]).unwrap();
+
+    let said = build_and_install("1.1", &bar_h(4, 12));
+    assert!(!said.contains("layout moved"), "{said}");
+    assert!(db::read_queue(&root).unwrap().is_empty());
+
+    let said = build_and_install("1.2", &bar_h(8, 12));
+    assert!(said.contains("libbar x86_64-musl layout moved for 1 records (struct bar), queued 1"), "{said}");
+    let q = db::read_queue(&root).unwrap();
+    assert!(q.iter().any(|x| x.name == "baruser" && x.soname == "layout"), "{}", q.len());
 }

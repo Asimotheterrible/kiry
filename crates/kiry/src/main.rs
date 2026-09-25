@@ -1,7 +1,7 @@
 mod convert;
 mod sandbox;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -300,6 +300,11 @@ fn build(
     for (t, (art, part), linked) in &ready {
         fs::rename(part, art).map_err(|e| format!("{}: {e}", art.display()))?;
         meta(p, t, &hash, &f, art, linked)?;
+        if let Some((_, work, _)) = built.iter().find(|(bt, _, _)| bt == t) {
+            let mut d = art.as_os_str().to_owned();
+            d.push(".meta/layout");
+            let _ = fs::copy(work.join("layout"), PathBuf::from(d));
+        }
     }
     for (_, work, _) in &built {
         let _ = fs::remove_dir_all(work);
@@ -1219,6 +1224,9 @@ fn compile(
                 if let Err(e) = prune_pass(root, p, t, &work, &mut c, &log, verbose) {
                     say!("{} {t} not pruned: {e}", p.name);
                 }
+            }
+            if let Err(e) = probe_layouts(p, t, &work, &mut c, &log, verbose) {
+                say!("{} {t} no layout recorded: {e}", p.name);
             }
             trim(&dest, t, &p.name)?;
             for (dep, so) in unlinked(root, p, f, t, &dest) {
@@ -2244,6 +2252,238 @@ fn words(s: &String) -> Vec<String> {
 }
 
 use sandbox::PRUNED;
+
+// a package with more headers than this gets no fingerprint rather than a build that
+// spends its last ten minutes parsing boost one header at a time
+const MOST_HEADERS: usize = 2000;
+
+// the compile-time half of an abi, which no elf shows: a struct in a public header
+// grows, the library rebuilds consistently, its exports do not move, and every consumer
+// compiled against the old header passes a wrong-sized struct. clang is the oracle --
+// each installed header compiled alone, since no package's set compiles as one tu and
+// about one in seven does not compile alone either, which is counted and said
+fn probe_layouts(
+    p: &Package,
+    t: &str,
+    work: &Path,
+    c: &mut Command,
+    log: &Path,
+    verbose: bool,
+) -> Result<(), String> {
+    let inc = format!("/dest{}", incdir(t));
+    if !work.join("dest").join(incdir(t).trim_start_matches('/')).is_dir() {
+        return Ok(());
+    }
+    let script = LAYOUT_PROBE.replace("@INC@", &inc).replace("@MOST@", &MOST_HEADERS.to_string());
+    fs::write(work.join("sysroot/build"), script).map_err(|e| format!("probe script: {e}"))?;
+    c.env("KIRY_PRUNE", "");
+    if !verbose {
+        let out = fs::OpenOptions::new()
+            .append(true)
+            .open(log)
+            .map_err(|e| format!("{}: {e}", log.display()))?;
+        let err = out.try_clone().map_err(|e| format!("{}: {e}", log.display()))?;
+        c.stdout(out).stderr(err);
+    }
+    run(c, "the header probes")?;
+
+    let out = work.join("src/.kiry-layout");
+    let list = fs::read_to_string(out.join("list")).unwrap_or_default();
+    let heads: Vec<&str> = list.lines().collect();
+    if heads.is_empty() {
+        return Ok(());
+    }
+    if heads.len() > MOST_HEADERS {
+        return Err(format!("{} headers is more than {MOST_HEADERS} to probe", heads.len()));
+    }
+    let own = work.join("dest").join(incdir(t).trim_start_matches('/'));
+    let mut ids: HashSet<String> = HashSet::new();
+    for h in &heads {
+        let text = fs::read_to_string(own.join(h)).unwrap_or_default();
+        ids.extend(text.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| !w.is_empty()).map(String::from));
+    }
+    let mut all: BTreeMap<String, String> = BTreeMap::new();
+    let mut bad = 0;
+    for h in &heads {
+        let f = h.replace('/', "%");
+        if !out.join(format!("{f}.ok")).is_file() {
+            bad += 1;
+            continue;
+        }
+        let dump = fs::read_to_string(out.join(format!("{f}.dump"))).unwrap_or_default();
+        for (k, v) in records(&dump, &ids) {
+            all.entry(k).or_insert(v);
+        }
+    }
+    let body: String = all.iter().map(|(k, v)| format!("{v} {k}\n")).collect();
+    fs::write(work.join("layout"), body).map_err(|e| format!("layout: {e}"))?;
+    say!(
+        "{} {t} layout {} records from {} headers, {bad} would not compile alone",
+        p.name,
+        all.len(),
+        heads.len() - bad
+    );
+    Ok(())
+}
+
+// each installed header compiled alone, in parallel, c first and c++ when that fails.
+// every first-level include directory goes on the path because a header includes its
+// siblings the way its .pc says to, and the package is not installed in its own sysroot
+const LAYOUT_PROBE: &str = "\
+inc=@INC@
+out=/src/.kiry-layout
+mkdir -p \"$out\"
+cd \"$inc\"
+flags=\"-I$inc\"
+for d in */; do
+\t[ -d \"$d\" ] && flags=\"$flags -I$inc/${d%/}\"
+done
+for pc in /dest/usr/lib/pkgconfig/*.pc /dest/usr/lib64/pkgconfig/*.pc /dest/usr/share/pkgconfig/*.pc; do
+\t[ -f \"$pc\" ] || continue
+\tn=${pc##*/}
+\tflags=\"$flags $(PKG_CONFIG_PATH=${pc%/*} pkgconf --cflags \"${n%.pc}\" 2>/dev/null)\"
+done
+export inc flags out
+find . -type f \\( -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' \\) | sed 's#^\\./##' | sort >\"$out/list\"
+[ \"$(wc -l <\"$out/list\")\" -le @MOST@ ] || exit 0
+xargs -P \"$(nproc)\" -n 1 sh -c '
+h=$1
+f=$(printf %s \"$h\" | tr / %)
+case $h in *.hh|*.hpp|*.hxx) xs=c++ ;; *) xs=\"c c++\" ;; esac
+for x in $xs; do
+\tcc=kirycc
+\t[ $x = c++ ] && cc=kiryc++
+\tif $cc -x $x -fsyntax-only -Xclang -fdump-record-layouts-complete $flags -include \"$inc/$h\" /dev/null >\"$out/$f.dump\" 2>\"$out/$f.err\"; then
+\t\techo $x >\"$out/$f.ok\"
+\t\texit 0
+\tfi
+done
+exit 0' _ <\"$out/list\"
+";
+
+// clang's layout dump as record -> hash, for the records this package's headers name.
+// a named record counts when its name is a word in one of them -- struct timespec is
+// musl's, and only matters to a package whose headers mention it. an anonymous record
+// counts when clang places it in this package's tree, and is keyed by the file that
+// declares it and its order there, because its own name is a file:line:col that a
+// comment would move
+fn records(dump: &str, ids: &HashSet<String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut anon: HashMap<String, usize> = HashMap::new();
+    for block in dump.split("*** Dumping AST Record Layout").skip(1) {
+        let block = block.split("\n\n").next().unwrap_or(block);
+        let Some(first) = block.lines().find_map(|l| l.split_once('|').map(|(_, r)| r.trim())) else {
+            continue;
+        };
+        let key = match first.find(" at /") {
+            Some(i) => {
+                let Some(at) = first[i + 4..].strip_prefix("/dest") else { continue };
+                let file = at.split(':').next().unwrap_or(at).to_string();
+                let n = anon.entry(file.clone()).or_default();
+                *n += 1;
+                format!("{file}#{n}")
+            }
+            None => {
+                let last = first.rsplit([' ', ':']).next().unwrap_or(first);
+                let word = last.split('<').next().unwrap_or(last);
+                if !ids.contains(word) {
+                    continue;
+                }
+                first.to_string()
+            }
+        };
+        let hash = kiry_core::sha256(unplaced(block).as_bytes()).unwrap_or_default();
+        out.push((key, hash[..16.min(hash.len())].to_string()));
+    }
+    out
+}
+
+// every " at /path:line:col" taken out of a block, which is where a comment moving a
+// line would otherwise show up as a layout change
+fn unplaced(block: &str) -> String {
+    let mut out = String::new();
+    let mut rest = block;
+    while let Some(i) = rest.find(" at /") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 4..];
+        let end = tail.find([')', '\n']).unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+// the records whose layout moved between what is installed and what is about to be,
+// read off the two sidecars. no fingerprint on either side is no answer, not a change
+fn layouts_moved(root: &Path, jobs: &[install::Job]) -> Vec<(String, String, Vec<String>)> {
+    let read = |a: &Path| -> Option<BTreeMap<String, String>> {
+        let mut d = a.as_os_str().to_owned();
+        d.push(".meta/layout");
+        let text = fs::read_to_string(PathBuf::from(d)).ok()?;
+        Some(
+            text.lines()
+                .filter_map(|l| l.split_once(' ').map(|(h, k)| (k.to_string(), h.to_string())))
+                .collect(),
+        )
+    };
+    let mut out = Vec::new();
+    for j in jobs {
+        let Ok(rec) = db::read(root, &j.target, &j.name) else { continue };
+        let old = root.join("var/kiry/cache").join(format!(
+            "{}-{}-{}.{}.tar.zst",
+            j.name, rec.version.upstream, rec.version.rev, j.target
+        ));
+        let (Some(was), Some(now)) = (read(&old), read(&j.archive)) else { continue };
+        let moved: Vec<String> = was
+            .iter()
+            .filter(|(k, h)| now.get(*k) != Some(*h))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !moved.is_empty() {
+            out.push((j.target.clone(), j.name.clone(), moved));
+        }
+    }
+    out
+}
+
+// everything installed that builds against a package whose layouts moved, queued the way
+// a soname break queues its consumers. what this batch just built against the new
+// headers is left out -- it already has them
+fn queue_layouts(root: &Path, moved: &[(String, String, Vec<String>)], just: &HashSet<(String, String)>) {
+    if moved.is_empty() {
+        return;
+    }
+    let mut rows = db::read_queue(root).unwrap_or_default();
+    for (t, name, recs) in moved {
+        let mut who = Vec::new();
+        for q in db::installed(root, t).unwrap_or_default() {
+            if q == *name || just.contains(&(t.clone(), q.clone())) {
+                continue;
+            }
+            let Ok(rec) = db::read(root, t, &q) else { continue };
+            if rec.depends.iter().any(|d| d.name == *name) {
+                rows.push(db::Queued {
+                    target: t.clone(),
+                    name: q.clone(),
+                    soname: "layout".into(),
+                    changed: recs.clone(),
+                });
+                who.push(q);
+            }
+        }
+        let shown: Vec<&str> = recs.iter().take(3).map(String::as_str).collect();
+        say!(
+            "{name} {t} layout moved for {} records ({}{}), queued {} that build against it",
+            recs.len(),
+            shown.join(", "),
+            if recs.len() > 3 { ", ..." } else { "" },
+            who.len()
+        );
+    }
+    rows.sort();
+    rows.dedup();
+    let _ = db::write_queue(root, &rows);
+}
 
 // what a pruned library has to go on exporting: every symbol something installed asks it
 // for, this build's own files included. a package installed since the last prune that
@@ -4231,6 +4471,7 @@ fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
         Ok(j) => j,
         Err(e) => die(e.to_string()),
     };
+    let moved = layouts_moved(root, &jobs);
     let done = match install::apply(root, &jobs) {
         Ok(b) => b,
         Err(e) => die(e.to_string()),
@@ -4250,6 +4491,7 @@ fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
         say!("preserved {so}, still named by what has not rebuilt yet");
     }
     enqueue(root, &done.broke, &named(&jobs));
+    queue_layouts(root, &moved, &named(&jobs));
     hooks(root, jobs.iter().map(|j| j.target.clone()).collect());
 }
 
@@ -8969,5 +9211,99 @@ mod bump_policy {
                     Package: steam\nVersion: 1:1.0.0.84\n";
         assert_eq!(version_in(body, "Version: 1:([0-9.]+)").unwrap(), "1.0.0.85");
         assert!(version_in(body, "Release: ([0-9.]+)").is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod layouts {
+    use super::*;
+
+    // real clang output, trimmed: one named record of this package's, one of musl's that
+    // its headers never mention, and an anonymous one in each tree
+    const DUMP: &str = "\
+*** Dumping AST Record Layout
+         0 | struct bar
+         0 |   int a
+           | [sizeof=4, dsize=4, align=4,
+           |  nvsize=4, nvalign=4]
+
+*** Dumping AST Record Layout
+         0 | struct timespec
+         0 |   time_t tv_sec
+           | [sizeof=16, dsize=16, align=8,
+           |  nvsize=16, nvalign=8]
+
+*** Dumping AST Record Layout
+         0 | struct (unnamed at /dest/usr/include/bar.h:7:9)
+         0 |   char b
+           | [sizeof=1, dsize=1, align=1,
+           |  nvsize=1, nvalign=1]
+
+*** Dumping AST Record Layout
+         0 | struct (unnamed at /usr/include/bits/alltypes.h:41:9)
+         0 |   long long __ll
+           | [sizeof=8, dsize=8, align=8,
+           |  nvsize=8, nvalign=8]
+";
+
+    fn ids(words: &[&str]) -> HashSet<String> {
+        words.iter().map(|w| (*w).to_string()).collect()
+    }
+
+    #[test]
+    fn only_what_this_package_declares_is_fingerprinted() {
+        let got = records(DUMP, &ids(&["bar", "a"]));
+        let keys: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["struct bar", "/usr/include/bar.h#1"]);
+    }
+
+    // a comment above an anonymous record moves its line, and nothing about its layout
+    #[test]
+    fn a_line_moving_is_not_a_layout_moving() {
+        let moved = DUMP.replace("bar.h:7:9", "bar.h:12:9");
+        assert_eq!(records(DUMP, &ids(&["bar"])), records(&moved, &ids(&["bar"])));
+        let grown = DUMP.replace("sizeof=4, dsize=4", "sizeof=8, dsize=8");
+        assert_ne!(records(DUMP, &ids(&["bar"])), records(&grown, &ids(&["bar"])));
+    }
+
+    // what the same batch built against the new header already has it
+    #[test]
+    fn a_dependent_built_in_the_same_batch_is_not_queued() {
+        let root = std::env::temp_dir().join(format!("kiry-layoutq-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let t = "x86_64-musl";
+        for (n, deps) in [("libbar", vec![]), ("old", vec!["libbar"]), ("fresh", vec!["libbar"])] {
+            db::write(
+                &root,
+                &db::Installed {
+                    name: n.into(),
+                    target: t.into(),
+                    version: pkg::Version::parse("1.0 1").unwrap(),
+                    depends: deps
+                        .iter()
+                        .map(|d| Dep { name: (*d).into(), make: true, host: false, only: None })
+                        .collect(),
+                    manifest: Vec::new(),
+                    hash: String::new(),
+                    users: Vec::new(),
+                    flags: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        let moved = vec![(t.to_string(), "libbar".to_string(), vec!["struct bar".to_string()])];
+        let just: HashSet<(String, String)> = [(t.to_string(), "fresh".to_string())].into_iter().collect();
+        queue_layouts(&root, &moved, &just);
+        let names: Vec<String> = db::read_queue(&root).unwrap().into_iter().map(|q| q.name).collect();
+        assert_eq!(names, vec!["old"]);
+    }
+
+    #[test]
+    fn a_location_comes_out_and_the_rest_stays() {
+        assert_eq!(
+            unplaced("struct (unnamed at /dest/x.h:3:1)::(unnamed at /dest/x.h:4:2) y"),
+            "struct (unnamed)::(unnamed) y"
+        );
     }
 }

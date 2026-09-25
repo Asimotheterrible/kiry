@@ -262,6 +262,40 @@ fn build_cmd(args: &[String]) {
     say!("cached {}", root.join("var/kiry/cache").display());
 }
 
+// one build of a package at a time. compile() starts by deleting the stage dir, and a
+// second run doing that under a first still packing is how a kiry i ate a kiry b of llvm
+// mid-tar. the dir is deleted and remade, so the lock is a file beside it, held until
+// the build function returns
+fn claim(root: &Path, p: &Package) -> Result<fs::File, String> {
+    let at = root
+        .join("var/kiry/stage")
+        .join(format!("{}-{}-{}.lock", p.name, p.version.upstream, p.version.rev));
+    if let Some(d) = at.parent() {
+        mkdirs(d)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&at)
+        .map_err(|e| format!("{}: {e}", at.display()))?;
+    if rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+        let pid = fs::read_to_string(&at).unwrap_or_default();
+        return Err(format!("{} is being built already, by pid {}", p.name, pid.trim()));
+    }
+    let _ = f.set_len(0);
+    let _ = writeln!(f, "{}", std::process::id());
+    Ok(f)
+}
+
+// whether a build holds this lock right now. a lock nobody holds is a file like any other
+fn locked(lock: &Path) -> bool {
+    fs::File::open(lock).is_ok_and(|f| {
+        rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockShared).is_err()
+    })
+}
+
 fn build(
     root: &Path,
     p: &Package,
@@ -270,6 +304,7 @@ fn build(
     boot: bool,
     at_once: usize,
 ) -> Result<Vec<PathBuf>, String> {
+    let _lock = claim(root, p)?;
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
     let f = flags(root, &p.name, Some(&p.dir))?;
@@ -6905,6 +6940,17 @@ fn gc_cmd(args: &[String]) {
     let now = SystemTime::now();
     let (mut stale, mut busy) = (Vec::new(), 0);
     for e in listing(&var.join("stage")) {
+        // a build holds its lock for as long as it runs, however long ago it last wrote.
+        // a stage dir is <pkg>-<ver>-<rev>.<target> and its lock drops the target
+        let name = e.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let lock = match name.ends_with(".lock") {
+            true => e.clone(),
+            false => e.with_file_name(format!("{}.lock", name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s))),
+        };
+        if locked(&lock) {
+            busy += 1;
+            continue;
+        }
         match touched(&e, now).is_some_and(|d| d.as_secs() > 6 * 3600) {
             true => stale.push(e),
             false => busy += 1,

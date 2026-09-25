@@ -3604,6 +3604,71 @@ fn gc_leaves_a_stage_directory_that_is_still_being_written() {
     assert!(said.contains("1 kept back"), "{said}");
 }
 
+// held by busybox flock, which is a second process the way a second kiry is. ready
+// once the child is inside the lock, so nothing races its start
+fn hold(lock: &Path) -> std::process::Child {
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    fs::write(lock, "").unwrap();
+    let ready = lock.with_extension("ready");
+    let _ = fs::remove_file(&ready);
+    let c = Command::new("busybox")
+        .arg("flock")
+        .arg(lock)
+        .args(["sh", "-c", &format!("touch {} && sleep 30", ready.display())])
+        .spawn()
+        .unwrap();
+    for _ in 0..500 {
+        if ready.exists() {
+            return c;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("flock never took {}", lock.display());
+}
+
+// compile() deletes the stage dir before it starts, so a second build of the same
+// package under a first one that is still packing takes the first one's tree with it
+#[test]
+fn a_second_build_of_a_package_is_refused_while_one_runs() {
+    let at = scratch("stage-lock");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let d = recipe(&at.join("repo"), "x86_64-musl", GOOD);
+    let mut first = hold(&root.join("var/kiry/stage/hello-1.0-1.lock"));
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    let _ = first.kill();
+    let _ = first.wait();
+    assert!(!o.status.success(), "a second build ran beside the first");
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("hello is being built already"), "{said}");
+}
+
+// a build that has not written anything in six hours is still a build while it holds
+// its lock. rust's stage2 goes quiet for long enough
+#[test]
+fn gc_leaves_a_stage_directory_whose_build_holds_the_lock() {
+    let (root, repo, _) = tree("gcstage-lock");
+    offer(&repo, "foo", "1.0");
+    let stage = root.join("var/kiry/stage/foo-1.0-1.x86_64-musl");
+    fs::create_dir_all(stage.join("src")).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 3600);
+    for d in [stage.join("src"), stage.clone()] {
+        fs::File::open(&d).unwrap().set_modified(old).unwrap();
+    }
+    let lock = root.join("var/kiry/stage/foo-1.0-1.lock");
+    let mut build = hold(&lock);
+    fs::File::open(&lock).unwrap().set_modified(old).unwrap();
+    let _ = fs::remove_file(lock.with_extension("ready"));
+
+    let o = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    let _ = build.kill();
+    let _ = build.wait();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(stage.is_dir(), "a build holding its lock was collected");
+    assert!(lock.is_file(), "a held lock was collected");
+}
+
 // a --root with a typo in it reaches no repo at all, and every source and log under it
 // then looks like something nothing names
 #[test]

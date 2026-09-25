@@ -5128,6 +5128,40 @@ fn a_pruned_library_keeps_what_is_asked_for_and_builds_see_all_of_it() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("whole-here"));
 }
 
+// a soname bump keeps the old library for what has not rebuilt yet, and a build tool
+// that has not rebuilt yet runs inside the sandbox too
+#[test]
+fn a_build_gets_the_libraries_its_closure_still_runs_on() {
+    let at = scratch("preserved-staged");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let new = at.join("new.so");
+    let old = at.join("old.so");
+    fs::write(&new, "generation 2\n").unwrap();
+    fs::write(&old, "generation 1\n").unwrap();
+    installed_as(&root, "libfoo", &[("usr/lib/libfoo.so.2", &new)], &["libfoo.so.2"]);
+    fs::copy(&old, root.join("usr/lib/libfoo.so.1")).unwrap();
+    let kept = db::Entry {
+        mode: 0o755,
+        kind: db::Kind::File(kiry_core::sha256(fs::File::open(&old).unwrap()).unwrap()),
+        path: "usr/lib/libfoo.so.1".into(),
+    };
+    db::write_preserved(&root, "x86_64-musl", "libfoo", &[kept]).unwrap();
+
+    let u = recipe(
+        &at.join("user"),
+        "x86_64-musl",
+        &format!("grep -q 'generation 1' /usr/lib/libfoo.so.1 && echo old-here\n{GOOD}"),
+    );
+    fs::write(u.join("depends"), "libfoo\n").unwrap();
+    let o = kiry(&["b", "-v", "--root", root.to_str().unwrap(), u.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("old-here"));
+}
+
 // something installed after the prune that wants what it dropped gets the library
 // queued with the symbol, and the next prune keeps it
 #[test]

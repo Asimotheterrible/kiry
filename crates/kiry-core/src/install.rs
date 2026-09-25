@@ -119,6 +119,7 @@ fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
 pub struct Broke {
     pub target: String,
     pub soname: String,
+    // empty when the soname itself went with the version going out
     pub changed: Vec<elf::Change>,
 }
 
@@ -228,8 +229,19 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
             db::write_preserved(root, &j.target, &j.name, &all)?;
         }
         for (path, o) in &before[i] {
-            if m.iter().any(|e| &e.path == path) {
-                stayed.extend(o.soname.clone());
+            if !m.iter().any(|e| &e.path == path) {
+                continue;
+            }
+            // kept back because the soname left, so what still names it has to rebuild
+            // before the copy can go. there is no symbol to filter those by, which is
+            // what an empty change list says
+            if let Some(so) = &o.soname {
+                broke.push(Broke {
+                    target: j.target.clone(),
+                    soname: so.clone(),
+                    changed: Vec::new(),
+                });
+                stayed.push(so.clone());
             }
         }
         kept.extend(m.into_iter().map(|e| e.path));

@@ -2485,6 +2485,9 @@ fn queue_layouts(root: &Path, moved: &[(String, String, Vec<String>)], just: &Ha
     let _ = db::write_queue(root, &rows);
 }
 
+// what a binary imports when it can reach a library by name at runtime
+const DL: [&str; 4] = ["dlopen", "dlsym", "dlvsym", "dlmopen"];
+
 // what a pruned library has to go on exporting: every symbol something installed asks it
 // for, this build's own files included. a package installed since the last prune that
 // wanted more is installed by the time the next one runs, so it is counted then -- the
@@ -2492,8 +2495,8 @@ fn queue_layouts(root: &Path, moved: &[(String, String, Vec<String>)], just: &Ha
 // to decide here, which leaves the library as it linked
 //
 // 11a is the gate. dlsym resolves a name at runtime and no index sees it, so a library
-// in the image of anything that can dlopen -- imports dlopen/dlsym/dlvsym/dlmopen, or is
-// itself loaded that way because nothing links it -- is not this function's to prune
+// in the image of anything that can dlopen -- imports one of DL, or is itself loaded
+// that way because nothing links it -- is not this function's to prune
 fn keep_list(
     root: &Path,
     p: &Package,
@@ -2542,10 +2545,9 @@ fn keep_list(
         elves[i].1.needed.iter().flat_map(|n| by.get(n.as_str()).cloned().unwrap_or_default()).collect()
     };
     let linked: HashSet<usize> = (0..elves.len()).flat_map(needs).collect();
-    let dl = ["dlopen", "dlsym", "dlvsym", "dlmopen"];
     for c in 0..elves.len() {
         let o = &elves[c].1;
-        let can = o.undefined.iter().any(|u| dl.contains(&u.name.as_str())) || (!o.interp && !linked.contains(&c));
+        let can = o.undefined.iter().any(|u| DL.contains(&u.name.as_str())) || (!o.interp && !linked.contains(&c));
         if !can {
             continue;
         }
@@ -5289,14 +5291,18 @@ fn affected(
             let Ok(seen) = install::scan(root, &rec.manifest) else {
                 continue;
             };
+            // a soname that left has no symbol to filter by, and a consumer that can
+            // dlsym reaches names its undefined set never shows. both go whole
             let uses = seen.iter().any(|(_, s)| {
                 let install::Seen::Elf(o) = s else {
                     return false;
                 };
                 o.needed.contains(&b.soname)
-                    && o.undefined
-                        .iter()
-                        .any(|u| moved.contains(symbol(u, versions).as_str()))
+                    && (b.changed.is_empty()
+                        || o.undefined.iter().any(|u| DL.contains(&u.name.as_str()))
+                        || o.undefined
+                            .iter()
+                            .any(|u| moved.contains(symbol(u, versions).as_str())))
             });
             if uses {
                 out.push(db::Queued {

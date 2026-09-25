@@ -1532,6 +1532,90 @@ fn only_the_consumer_that_used_what_left_is_queued() {
     );
 }
 
+// a soname bump leaves the old library preserved, so the consumer still loads and no
+// check sees anything wrong. the queue is what gets it rebuilt and the old copy released
+#[test]
+fn a_soname_bump_queues_what_still_names_the_old_one() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-bump");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let one = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\n");
+    let two = lib_with(&at.join("v2"), "libp.so.2", "void p(void){}\n");
+    let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &one)]);
+    let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    place(&root, "usep", &[("usr/bin/usep", &app_calling(&at.join("a"), "usep", "p", &one))]);
+
+    let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.2", &two)]);
+    let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("preserved libp.so.1"));
+
+    let q = queued(&root);
+    assert!(
+        q.iter().any(|l| queued_pkg(l) == "usep" && l.contains("libp.so.1")),
+        "usep still names libp.so.1 and is not queued: {q:?}"
+    );
+}
+
+// dlsym reaches a library by a string no undefined set records, so a consumer that can
+// call it is rebuilt whatever it links against by name
+#[test]
+fn a_consumer_that_can_dlsym_is_queued_whatever_it_imports() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-dlsym");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let both = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\nvoid q(void){}\n");
+    let gone = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
+    let dl = lib_with(&at.join("dl"), "libdl.so.2", "void dlsym(void){}\n");
+    let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &both)]);
+    let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let a = at.join("a");
+    fs::create_dir_all(&a).unwrap();
+    fs::write(a.join("u.c"), "void p(void);\nvoid dlsym(void);\nvoid _start(void){p();dlsym();}\n").unwrap();
+    assert!(Command::new("cc")
+        .args(["-nostdlib", "-Wl,-rpath,$ORIGIN/../lib64", "-o"])
+        .arg(a.join("usedl"))
+        .arg(a.join("u.c"))
+        .arg(&both)
+        .arg(&dl)
+        .status()
+        .unwrap()
+        .success());
+    place(
+        &root,
+        "usedl",
+        &[("usr/bin/usedl", &a.join("usedl")), ("usr/lib64/libdl.so.2", &dl)],
+    );
+    place(&root, "usep", &[("usr/bin/usep", &app_calling(&at.join("b"), "usep", "p", &both))]);
+
+    let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &gone)]);
+    let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let q = queued(&root);
+    assert!(
+        q.iter().any(|l| queued_pkg(l) == "usedl"),
+        "usedl can dlsym and is not queued: {q:?}"
+    );
+    assert!(
+        !q.iter().any(|l| queued_pkg(l) == "usep"),
+        "usep never called q and was queued anyway: {q:?}"
+    );
+}
+
 // a config file the admin changed is theirs. a library that does not match its manifest
 // is a broken install, and preserving it would hide the break behind a working-looking one
 #[test]

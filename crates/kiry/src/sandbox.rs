@@ -225,6 +225,13 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
                 _ => place(root, into, e)?,
             }
         }
+        // what a soname bump kept back is still what the closure's own binaries load:
+        // rustc names libLLVM.so.20.1 inside a build as much as outside it, until rust
+        // rebuilds. preserve() never keeps a path the new version claims, so nothing
+        // here lands on top of the manifest above
+        for e in db::read_preserved(root, &m.target, &m.name).map_err(|e| e.to_string())? {
+            place(root, into, &e)?;
+        }
     }
     // whatever is left is named by a .pc and reached by no runtime edge -- x11.pc names
     // xproto and xorgproto is headers, so nothing in the closure ever links it. it comes

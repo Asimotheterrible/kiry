@@ -483,7 +483,7 @@ fn build(
     // .meta for an artifact that never arrives
     for (t, (art, part), linked) in &ready {
         fs::rename(part, art).map_err(|e| format!("{}: {e}", art.display()))?;
-        meta(p, t, &hash, &f, art, linked)?;
+        meta(root, p, t, &hash, &f, art, linked)?;
         if let Some((_, work, _)) = built.iter().find(|(bt, _, _)| bt == t) {
             let mut d = art.as_os_str().to_owned();
             d.push(".meta/layout");
@@ -1079,7 +1079,7 @@ fn cached(root: &Path, p: &Package, t: &str) -> Option<PathBuf> {
     if !a.is_file() {
         return None;
     }
-    match stale(root, p, &a) {
+    match stale(root, p, t, &a) {
         None => Some(a),
         // an artifact whose name still fits and whose key no longer does is news. the
         // version did not move and the thing that decides the build did
@@ -1091,12 +1091,13 @@ fn cached(root: &Path, p: &Package, t: &str) -> Option<PathBuf> {
 }
 
 // the file name carries name, version and rev, so what is left to decide is everything
-// that changes a build without moving any of them: the recipe, and the flags it compiles
-// with. the dependency closure is deliberately not in here -- see TODO
+// that changes a build without moving any of them: the recipe, the flags it compiles
+// with, and the stored pgo profile. the dependency closure is deliberately not in here --
+// see TODO
 //
 // a sidecar written before kiry recorded one of these says nothing rather than no. the
 // check would otherwise throw away a cache that is mostly still good on the day it lands
-fn stale(root: &Path, p: &Package, art: &Path) -> Option<&'static str> {
+fn stale(root: &Path, p: &Package, t: &str, art: &Path) -> Option<&'static str> {
     let mut d = art.as_os_str().to_owned();
     d.push(".meta");
     let d = PathBuf::from(d);
@@ -1119,7 +1120,63 @@ fn stale(root: &Path, p: &Package, art: &Path) -> Option<&'static str> {
             _ => return Some("flags changed"),
         }
     }
+    // a profile rm -r'd to retrain reads as none here, and that is what sends the
+    // artifact built on it back through a build that trains again
+    if let Ok(was) = fs::read_to_string(d.join("profile")) {
+        if was.trim() != profile_sum(&profile(root, p, t)) {
+            return Some("profile changed");
+        }
+    }
     None
+}
+
+// a trained profile outlives the build that made it, which is what spares the next build
+// its training run. per target, because musl and gnu compile different code
+fn profile(root: &Path, p: &Package, t: &str) -> PathBuf {
+    root.join("var/kiry/profiles")
+        .join(&p.name)
+        .join(t)
+        .join("merged.profdata")
+}
+
+fn profile_sum(at: &Path) -> String {
+    fs::File::open(at)
+        .ok()
+        .and_then(|f| kiry_core::sha256(f).ok())
+        .unwrap_or_else(|| "none".into())
+}
+
+// whole or not at all, because the next build is fed whatever sits at the name.
+// generated-for is for whoever wonders how old it is: an indexed profile only reads
+// forward, so after a clang bump the version it was written by is the first question.
+// its last word is how many functions the training build itself discarded
+fn keep_profile(
+    p: &Package,
+    out: &Path,
+    stored: &Path,
+    missed: Option<usize>,
+) -> Result<(), String> {
+    let dir = stored.parent().unwrap_or(stored);
+    mkdirs(dir)?;
+    let part = dir.join("merged.profdata.part");
+    fs::copy(out, &part).map_err(|e| format!("{}: {e}", part.display()))?;
+    fs::rename(&part, stored).map_err(|e| format!("{}: {e}", stored.display()))?;
+    let clang = Command::new("clang")
+        .arg("-dumpversion")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_or_else(|| "?".into(), |s| s.trim().to_string());
+    put(
+        &dir.join("generated-for"),
+        &format!(
+            "{} {} clang {clang} {} discarded {}\n",
+            p.version.upstream,
+            p.version.rev,
+            today(),
+            missed.map_or_else(|| "?".into(), |n| n.to_string())
+        ),
+    )
 }
 
 // the attempt that started a recovery, kept beside the log the retries keep overwriting
@@ -1204,6 +1261,14 @@ fn compile(
     let share = sysroot.join("usr/share/kiry");
     mkdirs(&share)?;
     fs::write(share.join("lib.sh"), LIB_SH).map_err(|e| format!("lib.sh: {e}"))?;
+    // copied in rather than mounted, so the build cannot write over the one kiry keeps.
+    // a recipe opts in by reading KIRY_PROFILE and leaving one at KIRY_PROFILE_OUT
+    let stored = profile(root, p, t);
+    let fed = stored.is_file();
+    if fed {
+        fs::copy(&stored, share.join("profile.profdata"))
+            .map_err(|e| format!("{}: {e}", stored.display()))?;
+    }
     // the automake in the root carries the config.sub that knows musl, and staging it
     // here is what gets it to the callers with no automake dep of their own
     let automake = fs::read_dir(root.join("usr/share"))
@@ -1357,6 +1422,12 @@ fn compile(
         .env("KIRY_NAME", &p.name)
         .env("KIRY_VERSION", &p.version.upstream)
         .env("KIRY_REV", p.version.rev.to_string())
+        .env(
+            "KIRY_PROFILE",
+            if fed { "/usr/share/kiry/profile.profdata" } else { "" },
+        )
+        // /src because /tmp dies with the namespace and /dest gets packaged
+        .env("KIRY_PROFILE_OUT", "/src/.kiry-profile.profdata")
         .env("CFLAGS", &f.cflags)
         .env("CXXFLAGS", &f.cxxflags)
         .env("LDFLAGS", &f.ldflags)
@@ -1408,6 +1479,37 @@ fn compile(
             // failed, and would otherwise make the two indistinguishable
             if staged(&dest) == 0 {
                 return Err(format!("{} {t}: built and staged nothing", p.name));
+            }
+            // clang drops the counts of a function whose cfg moved and compiles it cold,
+            // so an old profile costs speed, never correctness. retraining is hours for
+            // some packages, which is why this says so and does nothing. the count the
+            // training build itself logged is subtracted: two binaries of one package
+            // that each have a main collide by name in a profile and never match
+            let missed = match verbose {
+                true => None,
+                false => Some(
+                    fs::read_to_string(&log)
+                        .unwrap_or_default()
+                        .matches("(hash mismatch)")
+                        .count(),
+                ),
+            };
+            let out = src.join(".kiry-profile.profdata");
+            if out.is_file() {
+                keep_profile(p, &out, &stored, missed)?;
+            } else if let (true, Some(n)) = (fed, missed) {
+                let base = fs::read_to_string(stored.with_file_name("generated-for"))
+                    .ok()
+                    .and_then(|g| g.split_whitespace().last()?.parse().ok())
+                    .unwrap_or(0);
+                if n > base {
+                    say!(
+                        "{} {t} profile out of date for {} functions, rm -r {} retrains it",
+                        p.name,
+                        n - base,
+                        root.join("var/kiry/profiles").join(&p.name).display()
+                    );
+                }
             }
             if prune {
                 if let Err(e) = prune_pass(root, p, t, &work, &mut c, &log, verbose) {
@@ -2028,6 +2130,7 @@ fn pack(root: &Path, p: &Package, t: &str, work: &Path) -> Result<(PathBuf, Path
 }
 
 fn meta(
+    root: &Path,
     p: &Package,
     t: &str,
     hash: &str,
@@ -2048,6 +2151,8 @@ fn meta(
     put(&d.join("recipe"), &format!("{}\n", dir_hash(p)?))?;
     put(&d.join("users"), &format!("{}\n", p.users.join("\n")))?;
     put(&d.join("flags"), &format!("{}\n", f.record().join("\n")))?;
+    // the profile at its name now is the one this build used, fed or just trained
+    put(&d.join("profile"), &format!("{}\n", profile_sum(&profile(root, p, t))))?;
 
     // one line per dep that applies to this target, the same narrowing targets gets --
     // an artifact is built for one target and carries what that build actually used
@@ -9125,7 +9230,7 @@ mod sidecar {
             env: Vec::new(),
             from: Vec::new(),
         };
-        meta(&p, "x86_64-gnu", "0", &f, &art, &linked).unwrap();
+        meta(&at, &p, "x86_64-gnu", "0", &f, &art, &linked).unwrap();
 
         let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-gnu.tar.zst.meta/depends")).unwrap();
         let lines: Vec<&str> = got.lines().collect();

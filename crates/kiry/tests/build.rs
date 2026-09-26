@@ -4160,6 +4160,70 @@ fn an_edited_recipe_takes_the_cached_artifact_out_of_play() {
     );
 }
 
+// training is the expensive half of a pgo build, so the profile outlives the stage dir.
+// rm -r is the only retrain there is, and the artifact built on the old profile has to
+// notice or it stays on offer as a hit forever
+#[test]
+fn a_profile_outlives_its_build_and_removing_it_retrains() {
+    let at = scratch("profile");
+    let script = format!(
+        "{GOOD}if [ -n \"$KIRY_PROFILE\" ]; then\n\
+         cp \"$KIRY_PROFILE\" \"$DESTDIR/usr/bin/fed\"\n\
+         echo 'warning: function control flow change detected (hash mismatch) a'\n\
+         echo 'warning: function control flow change detected (hash mismatch) b'\n\
+         echo 'warning: function control flow change detected (hash mismatch) main'\n\
+         else echo trained > \"$KIRY_PROFILE_OUT\"\n\
+         echo 'warning: function control flow change detected (hash mismatch) main'\n\
+         fi\n"
+    );
+    let d = recipe(&at, "x86_64-musl", &script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let r = root.to_str().unwrap();
+    let dir = d.to_str().unwrap();
+    let kept = root.join("var/kiry/profiles/hello");
+    let prof = kept.join("x86_64-musl/merged.profdata");
+
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(&prof).unwrap(), "trained\n");
+    let made = fs::read_to_string(kept.join("x86_64-musl/generated-for")).unwrap();
+    assert!(made.starts_with("1.0 1 clang "), "{made}");
+    assert!(made.ends_with(" discarded 1\n"), "{made}");
+    let meta = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst.meta");
+    let sum = kiry_core::sha256(fs::File::open(&prof).unwrap()).unwrap();
+    assert_eq!(fs::read_to_string(meta.join("profile")).unwrap(), format!("{sum}\n"));
+
+    let o = kiry(&["i", "--root", r, "-n", dir]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("hello 1.0 x86_64-musl cached"), "{said}");
+
+    // the second build is handed the first one's profile and trains nothing
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        said.contains("hello x86_64-musl profile out of date for 2 functions"),
+        "{said}"
+    );
+
+    fs::remove_dir_all(&kept).unwrap();
+    let o = kiry(&["i", "--root", r, "-n", dir]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        said.contains("rebuilding  profile changed"),
+        "the profile it was built on is gone and the artifact is still on offer: {said}"
+    );
+
+    let arc = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst");
+    let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(root.join("usr/bin/fed")).unwrap(), "trained\n");
+}
+
 // a root holding one recipe and one installed record of it, with no artifact anywhere:
 // what the sets are read off is the db and the tree, and neither needs a build
 fn set_root(at: &Path, installed: &str, in_tree: &str) -> PathBuf {

@@ -5329,13 +5329,17 @@ fn rebuild_cmd(args: &[String]) {
             die(e.to_string());
         }
     }
+    // what put each one here, for the rebuild log: a queue row's soname, or doctor
+    let mut why: HashMap<(String, String), Vec<String>> = HashMap::new();
     for q in live {
+        why.entry((q.name.clone(), q.target.clone())).or_default().push(q.soname);
         if !want.contains(&(q.name.clone(), q.target.clone())) {
             want.push((q.name, q.target));
         }
     }
     for (t, f) in checks(&root) {
         if f.what.rebuilds() && !want.contains(&(f.pkg.clone(), t.clone())) {
+            why.entry((f.pkg.clone(), t.clone())).or_default().push("doctor".into());
             want.push((f.pkg.clone(), t));
         }
     }
@@ -5410,6 +5414,8 @@ fn rebuild_cmd(args: &[String]) {
             Ok(j) => j,
             Err(e) => die(e.to_string()),
         };
+        let was: Vec<Option<db::Installed>> =
+            jobs.iter().map(|j| db::read(&root, &j.target, &j.name).ok()).collect();
         let done = match install::apply(&root, &jobs) {
             Ok(b) => b,
             Err(e) => die(e.to_string()),
@@ -5422,8 +5428,14 @@ fn rebuild_cmd(args: &[String]) {
                 k.from.display()
             );
         }
-        for j in &jobs {
-            say!("{} {} {} rebuilt", j.name, j.version.upstream, j.target);
+        for (j, old) in jobs.iter().zip(&was) {
+            let now = db::read(&root, &j.target, &j.name).ok();
+            let same = matches!((old, &now), (Some(a), Some(b)) if hashes(&a.manifest) == hashes(&b.manifest));
+            let note = if same { "  to the same bytes it replaced" } else { "" };
+            say!("{} {} {} rebuilt{note}", j.name, j.version.upstream, j.target);
+            let k = (j.name.clone(), j.target.clone());
+            let reason = why.get(&k).map_or("-".to_string(), |w| w.join(","));
+            rebuilt_log(&root, &j.name, &j.target, &reason, same);
         }
         for so in &done.preserved {
             say!("preserved {so}, still named by what has not rebuilt yet");
@@ -5453,6 +5465,31 @@ fn rebuild_cmd(args: &[String]) {
     if left > 0 {
         std::process::exit(1);
     }
+}
+
+// every file a record holds, by content
+fn hashes(m: &[db::Entry]) -> BTreeSet<(&str, &str)> {
+    m.iter()
+        .filter_map(|e| match &e.kind {
+            db::Kind::File(h) => Some((e.path.as_str(), h.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+// one line per rebuild: what queued it, and whether it came out as the same bytes it
+// replaced. one storm says little, several say whether the per-consumer filter queues
+// too much. same is certain; changed can be a build that is not reproducible
+fn rebuilt_log(root: &Path, name: &str, target: &str, why: &str, same: bool) {
+    let at = root.join("var/kiry/log/rebuilds");
+    let when = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let line = format!("{name} {target} {why} {} {when}\n", if same { "same" } else { "changed" });
+    let _ = at.parent().map(fs::create_dir_all);
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&at)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
 // an abi break is only a break for the consumers that used what moved. everything that
@@ -7062,6 +7099,12 @@ fn stats_cmd(args: &[String]) {
         }
     }
     say!("queued {}", db::read_queue(&root).unwrap_or_default().len());
+    let log = fs::read_to_string(root.join("var/kiry/log/rebuilds")).unwrap_or_default();
+    let rows: Vec<&str> = log.lines().collect();
+    if !rows.is_empty() {
+        let same = rows.iter().filter(|l| l.split(' ').nth(3) == Some("same")).count();
+        say!("rebuilt {}, {same} to the same bytes", rows.len());
+    }
 }
 
 // the only thing that deletes anything. everything under /var/kiry is regenerable by

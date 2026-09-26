@@ -1367,6 +1367,162 @@ fn a_batch_names_its_package_in_the_title_and_rings_when_it_fails() {
     assert!(!String::from_utf8_lossy(&piped.stdout).contains('\x1b'));
 }
 
+// a pipe is read by something, so it gets a line per state change, single spaced, not
+// one escape byte. a terminal gets colour, and one line rewritten in
+// place for the build that is running
+#[test]
+fn a_pipe_gets_plain_lines_and_a_terminal_gets_colour_and_a_live_line() {
+    let at = scratch("colour");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let good = recipe(&at, "x86_64-musl", GOOD);
+    let r = root.display();
+
+    let piped = kiry(&["b", "--root", root.to_str().unwrap(), good.to_str().unwrap()]);
+    assert!(piped.status.success(), "{}", String::from_utf8_lossy(&piped.stderr));
+    let out = String::from_utf8_lossy(&piped.stdout);
+    let all = format!("{out}{}", String::from_utf8_lossy(&piped.stderr));
+    assert!(!all.contains('\x1b') && !all.contains('\r'), "{all:?}");
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("hello 1.0 x86_64-musl building -"), "{out}");
+    assert!(lines.any(|l| l.starts_with("hello 1.0 x86_64-musl ok ")), "{out}");
+
+    let cmd = format!("env -u NO_COLOR {KIRY} b --root {r} {}", good.display());
+    let tty = on_tty(120, &cmd);
+    assert!(tty.contains("\x1b[32mok"), "{tty:?}");
+    assert!(tty.contains("\x1b[36mx86_64-musl"), "{tty:?}");
+    assert!(tty.contains("\x1b[K[1/1] hello 1.0 x86_64-musl  building  "), "{tty:?}");
+    // the second time round there is a time to go by
+    assert!(tty.contains(" / ~"), "{tty:?}");
+    assert!(!tty.contains("building -"), "{tty:?}");
+
+    // any value at all, empty included
+    let plain = on_tty(120, &format!("NO_COLOR= {KIRY} b --root {r} {}", good.display()));
+    assert!(plain.contains("x86_64-musl  ok"), "{plain:?}");
+    assert!(!plain.contains("\x1b[0m") && !plain.contains("\x1b[32m"), "{plain:?}");
+}
+
+// -q is for a script or a cron job that only wants to hear about trouble. the art is a
+// person's, and a person who asked for quiet does not get it either
+#[test]
+fn dash_q_says_only_what_failed() {
+    let at = scratch("quiet");
+    let root = at.join("root");
+    fs::create_dir_all(root.join("usr/share/kiry/art")).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    fs::write(root.join("usr/share/kiry/art/ok"), "(=^.^=)\n").unwrap();
+    let r = root.to_str().unwrap();
+    let good = recipe(&at.join("good"), "x86_64-musl", GOOD);
+    let bad = recipe(&at.join("bad"), "x86_64-musl", "echo 'x.c:1:1: error: no' >&2\nexit 1\n");
+
+    let o = kiry(&["b", "-q", "--root", r, good.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
+    let tty = on_tty(120, &format!("{KIRY} b -q --root {r} {}", good.display()));
+    assert!(!tty.contains("(=^.^=)") && !tty.contains(" ok"), "{tty:?}");
+    let loud = on_tty(120, &format!("{KIRY} b --root {r} {}", good.display()));
+    assert!(loud.contains("(=^.^=)"), "the art is not there to be hidden: {loud:?}");
+
+    let o = kiry(&["b", "-q", "--root", r, bad.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.starts_with("hello 1.0 x86_64-musl failed "), "{out}");
+    assert!(out.contains("  x.c:1:1: error: no"), "{out}");
+    assert!(!out.contains("building"), "{out}");
+    // the log is written at every level
+    let log = fs::read_to_string(root.join("var/kiry/log/hello-1.0-1.x86_64-musl.log")).unwrap();
+    assert!(log.contains("error: no"), "{log}");
+
+    for args in [&["i", "-q", "-n", "--root", r, good.to_str().unwrap()][..], &["rebuild", "-q", "-n", "--root", r]] {
+        let o = kiry(args);
+        assert!(!String::from_utf8_lossy(&o.stderr).contains("-q"), "{args:?}: {o:?}");
+    }
+}
+
+// the line under a failure is the first thing that complained, with the colour a
+// compiler put on it taken off. make's sign-off only says that something above it failed
+const WRECK: &str = "printf 'src/a.c:1:1: \\033[1;31merror:\\033[0m use of undeclared identifier bar\\n' >&2\n\
+    echo '1 error generated.' >&2\n\
+    echo 'make: *** [Makefile:3: all] Error 1' >&2\n";
+
+#[test]
+fn a_failure_says_where_and_quotes_the_first_real_error() {
+    let at = scratch("first-error");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let d = recipe(&at, "x86_64-musl", &format!("{WRECK}exit 2\n"));
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let out = String::from_utf8_lossy(&o.stdout);
+    let block: Vec<&str> = out.lines().skip_while(|l| !l.contains(" failed ")).collect();
+    let log = format!("  log    {}", root.join("var/kiry/log/hello-1.0-1.x86_64-musl.log").display());
+    let first = "src/a.c:1:1: error: use of undeclared identifier bar";
+    assert_eq!(
+        block[1..],
+        ["  phase  compile", "  rule   none matched", log.as_str(), &format!("  {first}")],
+        "{out}"
+    );
+
+    // cut to the terminal rather than wrapped under the next line
+    let tty = on_tty(40, &format!("{KIRY} b --root {} {}", root.display(), d.display()));
+    let cut = format!("  {}", &first[..38]);
+    assert!(tty.lines().any(|l| l == cut), "{tty:?}");
+}
+
+// the ladder's note is read months later with the log long gone, so it gets the same
+// line and not make's
+#[test]
+fn a_rung_note_quotes_the_first_real_error() {
+    let at = scratch("first-error-rung");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!("case \"$CFLAGS\" in\n*-O3*) {{\n{WRECK}}}; exit 2 ;;\nesac\n{GOOD}"),
+    );
+    config(&root, None, "OPT -O3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let pkg = fs::read_to_string(root.join("etc/kiry/pkg/hello")).unwrap();
+    assert!(pkg.contains("#   src/a.c:1:1: error: use of undeclared identifier bar"), "{pkg}");
+    assert!(!pkg.contains("Error 1"), "{pkg}");
+}
+
+// curl redraws its meter with \r on stderr, which in a pipe is junk in someone's log
+#[test]
+fn a_fetch_in_a_pipe_draws_no_meter() {
+    let at = scratch("meter");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    fs::write(d.join("sources"), format!("file://{}\n", at.join("hello-1.0.tar").display())).unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("KIRY_FETCH", "curl -fL -o %o %u")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(root.join("var/kiry/cache/sources/hello-1.0.tar").exists());
+    assert!(!o.stderr.contains(&b'\r'), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
 // a rebuild that comes out as the bytes it replaced was not needed, and the log is what
 // says so across storms. a queue row the build cannot change anything about is that case
 #[test]

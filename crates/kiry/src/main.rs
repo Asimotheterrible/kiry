@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime};
 
-use kiry_core::pkg::{Dep, Package};
+use kiry_core::pkg::Dep;
 use kiry_core::{db, elf, install, pkg};
 
 macro_rules! say {
@@ -1903,10 +1903,21 @@ fn meta(
     // does this, at the one moment it is known: a library in DT_NEEDED that the recipe
     // cannot account for is a runtime edge whether anybody wrote it down or not. the
     // recipe stays what somebody typed and the sidecar carries what was true
+    //
+    // a build-only line does not account for a library the result links. alpine writes
+    // foo-dev in makedepends and gets the runtime edge from the soname later, so the
+    // converter hands over `foo make` for exactly the libraries that get linked, and a
+    // record that kept the make would leave them out of every closure built on top
     let mut deps = String::new();
     let mut said: HashSet<&str> = HashSet::new();
     for x in p.depends.iter().filter(|x| x.applies(t)) {
-        deps.push_str(&format!("{x}\n"));
+        match x.make && linked.contains(&x.name) {
+            true => {
+                let run = pkg::Dep { make: false, host: false, ..x.clone() };
+                deps.push_str(&format!("{run}\n"));
+            }
+            false => deps.push_str(&format!("{x}\n")),
+        }
         said.insert(&x.name);
     }
     for n in linked.iter().filter(|n| !said.contains(n.as_str())) {
@@ -2775,7 +2786,7 @@ fn gentoo_says(root: &Path, d: &Path, f: &Flags) {
     };
     say!("gentoo {head}");
     let set = chosen(&f.use_flags);
-    let Ok(p) = pkg::load(d) else { return };
+    let Ok(p) = read_recipe(d) else { return };
     let have: Vec<String> = p
         .depends
         .iter()
@@ -4728,7 +4739,7 @@ fn outdated(root: &Path) -> Result<Vec<(String, String, String)>, String> {
             let (Ok(rec), Some(at)) = (db::read(root, &t, &n), recipe(root, &n)) else {
                 continue;
             };
-            let Ok(p) = pkg::load(&at) else { continue };
+            let Ok(p) = read_recipe(&at) else { continue };
             let (is, want) = (rec.version.to_string(), p.version.to_string());
             if is != want && seen.insert(n.clone()) {
                 out.push((n, is, want));
@@ -4746,6 +4757,180 @@ fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
         .find(|d| d.join("build").is_file())
 }
 
+// a recipe dir as it is written. the repair path never reads one -- it installs from an
+// artifact's sidecar -- so this is the kiry crate's, not kiry-core's
+#[derive(Debug)]
+struct Package {
+    name: String,
+    dir: PathBuf,
+    version: pkg::Version,
+    sources: Vec<String>,
+    checksums: Vec<String>,
+    depends: Vec<Dep>,
+    targets: Vec<String>,
+    users: Vec<String>,
+}
+
+fn read_recipe(dir: &Path) -> Result<Package, kiry_core::Error> {
+    if !dir.is_dir() {
+        return Err(kiry_core::Error::NoPackage(dir.to_path_buf()));
+    }
+
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| kiry_core::Error::Name(dir.to_path_buf()))?
+        .to_string();
+
+    let version = pkg::Version::parse(&pkg::required(&dir.join("version"))?)?;
+
+    let sources = pkg::lines(&dir.join("sources"))?;
+    let checksums = pkg::lines(&dir.join("checksums"))?;
+    // a hand written recipe can have sources and no checksums yet
+    if !checksums.is_empty() && sources.len() != checksums.len() {
+        return Err(kiry_core::Error::Counts {
+            sources: sources.len(),
+            checksums: checksums.len(),
+        });
+    }
+
+    let depends = pkg::depends_from(pkg::lines(&dir.join("depends"))?);
+    let users = pkg::lines(&dir.join("users"))?;
+
+    // one line or one per line, either way
+    let mut targets = Vec::new();
+    for l in pkg::lines(&dir.join("targets"))? {
+        targets.extend(l.split_whitespace().map(String::from));
+    }
+    if targets.is_empty() {
+        return Err(kiry_core::Error::Empty(dir.join("targets")));
+    }
+
+    Ok(Package {
+        name,
+        dir: dir.to_path_buf(),
+        version,
+        sources,
+        checksums,
+        depends,
+        targets,
+        users,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod recipes {
+    use super::*;
+
+    // no tempfile, and CARGO_TARGET_TMPDIR is integration-tests only
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("kiry-t-{}", std::process::id()))
+            .join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(dir: &Path, file: &str, body: &str) {
+        fs::write(dir.join(file), body).unwrap();
+    }
+
+    #[test]
+    fn loads_a_whole_package() {
+        let d = scratch("mesa");
+        write(&d, "version", "25.2.0 1\n");
+        write(&d, "targets", "x86_64-musl x86_64-gnu\n");
+        write(
+            &d,
+            "sources",
+            "https://example.invalid/mesa-25.2.0.tar.xz\n",
+        );
+        write(&d, "checksums", &format!("{}\n", "e3b0c442".repeat(8)));
+        write(&d, "depends", "libdrm\nwayland\nmuon make\n");
+
+        let p = read_recipe(&d).unwrap();
+        assert_eq!(p.name, "mesa");
+        assert_eq!(p.version.to_string(), "25.2.0 1");
+        assert_eq!(p.targets, ["x86_64-musl", "x86_64-gnu"]);
+        assert_eq!(p.sources.len(), 1);
+        assert_eq!(p.checksums.len(), 1);
+
+        assert_eq!(p.depends.len(), 3);
+        assert!(!p.depends[0].make);
+        assert_eq!(p.depends[2].name, "muon");
+        assert!(p.depends[2].make);
+    }
+    #[test]
+    fn optional_files_can_just_not_be_there() {
+        let d = scratch("nodeps");
+        write(&d, "version", "1.0 1");
+        write(&d, "targets", "x86_64-musl");
+
+        let p = read_recipe(&d).unwrap();
+        assert!(p.depends.is_empty());
+        assert!(p.sources.is_empty());
+        assert_eq!(p.targets, ["x86_64-musl"]);
+    }
+    #[test]
+    fn targets_one_per_line_works_too() {
+        let d = scratch("perline");
+        write(&d, "version", "2 3");
+        write(&d, "targets", "x86_64-musl\nx86_64-gnu\n");
+
+        assert_eq!(read_recipe(&d).unwrap().targets, ["x86_64-musl", "x86_64-gnu"]);
+    }
+    #[test]
+    fn a_directory_that_isnt_there_says_so() {
+        let d = scratch("gone");
+        fs::remove_dir_all(&d).unwrap();
+        assert!(matches!(read_recipe(&d), Err(kiry_core::Error::NoPackage(_))));
+    }
+    #[test]
+    fn a_missing_version_names_the_file() {
+        let d = scratch("noversion");
+        write(&d, "targets", "x86_64-musl");
+
+        match read_recipe(&d) {
+            Err(kiry_core::Error::Required(p)) => assert!(p.ends_with("version")),
+            other => panic!("wanted Required, got {other:?}"),
+        }
+    }
+    #[test]
+    fn targets_cannot_be_blank() {
+        let d = scratch("notargets");
+        write(&d, "version", "1 1");
+        write(&d, "targets", "\n\n# only a comment\n");
+
+        assert!(matches!(read_recipe(&d), Err(kiry_core::Error::Empty(_))));
+    }
+    #[test]
+    fn checksums_have_to_pair_up_with_sources() {
+        let d = scratch("shortsums");
+        write(&d, "version", "1 1");
+        write(&d, "targets", "x86_64-musl");
+        write(&d, "sources", "a\nb\n");
+        write(&d, "checksums", "aa\n");
+
+        match read_recipe(&d) {
+            Err(kiry_core::Error::Counts { sources, checksums }) => {
+                assert_eq!((sources, checksums), (2, 1));
+            }
+            other => panic!("wanted Counts, got {other:?}"),
+        }
+    }
+    #[test]
+    fn a_file_that_will_not_read_is_not_an_empty_file() {
+        let d = scratch("weird");
+        write(&d, "version", "1 1");
+        write(&d, "targets", "x86_64-musl");
+        fs::create_dir(d.join("sources")).unwrap();
+
+        assert!(matches!(read_recipe(&d), Err(kiry_core::Error::Io(_, _))));
+    }
+}
+
 // a recipe the way the rest of kiry sees it: every dependency named the way this system
 // names it. a depends file can say what alpine said -- java-jre, so:libGL.so.1,
 // cmd:emacs -- and which package that means is decided here, when it is read, against
@@ -4753,7 +4938,7 @@ fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
 // then carry a real package, so removal and why see the real edge, and a pair added to
 // an aliases file counts from the next command rather than the next conversion
 fn load(root: &Path, at: &Path) -> Result<Package, String> {
-    let mut p = pkg::load(at).map_err(|e| e.to_string())?;
+    let mut p = read_recipe(at).map_err(|e| e.to_string())?;
     let mut out: Vec<Dep> = Vec::new();
     for mut d in std::mem::take(&mut p.depends) {
         match called(root, &d.name) {
@@ -5757,7 +5942,7 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         dirs.sort();
         for d in dirs {
-            let Ok(p) = pkg::load(&d) else { continue };
+            let Ok(p) = read_recipe(&d) else { continue };
             if !want.is_empty() && !want.contains(&p.name) {
                 continue;
             }
@@ -7015,7 +7200,7 @@ fn gc_cmd(args: &[String]) {
     let mut recipes = 0;
     for r in repos(&root) {
         for d in listing(&r) {
-            let Ok(p) = pkg::load(&d) else { continue };
+            let Ok(p) = read_recipe(&d) else { continue };
             recipes += 1;
             for line in &p.sources {
                 if let Ok((name, _)) = filename(line) {
@@ -7044,7 +7229,7 @@ fn gc_cmd(args: &[String]) {
     let mut now_building: HashSet<String> = HashSet::new();
     for r in repos(&root) {
         for d in listing(&r) {
-            if let Ok(p) = pkg::load(&d) {
+            if let Ok(p) = read_recipe(&d) {
                 now_building.insert(format!(
                     "{}-{}-{}.",
                     p.name, p.version.upstream, p.version.rev
@@ -8218,7 +8403,7 @@ fn show(args: &[String]) {
         Ok(d) => d,
         Err(e) => die(e),
     };
-    let p = match pkg::load(&dir) {
+    let p = match read_recipe(&dir) {
         Ok(p) => p,
         Err(e) => die(e.to_string()),
     };
@@ -8720,6 +8905,8 @@ mod sidecar {
             host: false,
             only: Some("musl".into()),
         };
+        let tool = pkg::Dep { name: "cmake".into(), make: true, host: true, only: None };
+        let headers = pkg::Dep { name: "libsepol".into(), make: true, host: true, only: None };
         let recipe = at.join("thing");
         mkdirs(&recipe).unwrap();
         fs::write(recipe.join("version"), "1.0 1\n").unwrap();
@@ -8729,13 +8916,13 @@ mod sidecar {
             version: pkg::Version::parse("1.0 1").unwrap(),
             sources: Vec::new(),
             checksums: Vec::new(),
-            depends: vec![declared, only_gnu],
+            depends: vec![declared, only_gnu, tool, headers],
             targets: vec!["x86_64-gnu".into()],
             users: Vec::new(),
         };
 
         let art = at.join("thing-1.0-1.x86_64-gnu.tar.zst");
-        let linked = vec!["libpcre2".to_string(), "zlib".to_string()];
+        let linked = vec!["libpcre2".to_string(), "zlib".to_string(), "libsepol".to_string()];
         let f = Flags {
             cflags: String::new(),
             cxxflags: String::new(),
@@ -8750,7 +8937,7 @@ mod sidecar {
         let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-gnu.tar.zst.meta/depends")).unwrap();
         let lines: Vec<&str> = got.lines().collect();
         // zlib was declared and linked, and is one line either way
-        assert_eq!(lines, vec!["zlib", "libpcre2"], "{got}");
+        assert_eq!(lines, vec!["zlib", "cmake make", "libsepol", "libpcre2"], "{got}");
     }
 }
 

@@ -219,11 +219,7 @@ pub fn preserved(root: &Path, target: &str, name: &str) -> PathBuf {
 pub fn write_preserved(root: &Path, target: &str, name: &str, m: &[Entry]) -> Result<(), Error> {
     let p = preserved(root, target, name);
     if m.is_empty() {
-        return match fs::remove_file(&p) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Io(p, e)),
-        };
+        return rm(&p);
     }
     let text = format_manifest(m)?;
     let parent = p.parent().unwrap_or(&p);
@@ -259,12 +255,7 @@ pub fn forget(root: &Path, target: &str, name: &str) -> Result<(), Error> {
     // it behind leaves a package that is gone still claiming the sonames it used to
     // carry -- invisible to anything that walks installed names, and a phantom to the
     // first thing that walks the provides directory instead
-    let p = provides(root, target, name);
-    match fs::remove_file(&p) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::Io(p, e)),
-    }
+    rm(&provides(root, target, name))?;
     let d = dir(root, target, name);
     fs::remove_dir_all(&d).map_err(|e| Error::Io(d, e))
 }
@@ -283,7 +274,8 @@ fn names(d: &Path) -> Result<Vec<String>, Error> {
     let mut out = Vec::new();
     for e in rd {
         let e = e.map_err(|e| Error::Io(d.to_path_buf(), e))?;
-        if let Some(n) = e.file_name().to_str() {
+        // a dot name is a put() a kill cut short, never a package
+        if let Some(n) = e.file_name().to_str().filter(|n| !n.starts_with('.')) {
             out.push(n.to_string());
         }
     }
@@ -324,17 +316,15 @@ pub fn write(root: &Path, rec: &Installed) -> Result<(), Error> {
     let d = dir(root, &rec.target, &rec.name);
     fs::create_dir_all(&d).map_err(|e| Error::Io(d.clone(), e))?;
 
-    // TODO: wants to land atomically, the install path will care about that
     put(&d.join("version"), &format!("{}\n", rec.version))?;
     put(&d.join("depends"), &depends)?;
-    if !rec.hash.is_empty() {
-        put(&d.join("hash"), &format!("{}\n", rec.hash))?;
-    }
-    if !rec.users.is_empty() {
-        put(&d.join("users"), &format!("{}\n", rec.users.join("\n")))?;
-    }
-    if !rec.flags.is_empty() {
-        put(&d.join("flags"), &format!("{}\n", rec.flags.join("\n")))?;
+    // one the new record lacks goes, or the last version's build hash outlives it
+    let (users, flags) = (rec.users.join("\n"), rec.flags.join("\n"));
+    for (f, v) in [("hash", &rec.hash), ("users", &users), ("flags", &flags)] {
+        match v.is_empty() {
+            true => rm(&d.join(f))?,
+            false => put(&d.join(f), &format!("{v}\n"))?,
+        }
     }
     put(&d.join("manifest"), &manifest)
 }
@@ -395,11 +385,7 @@ pub fn write_queue(root: &Path, q: &[Queued]) -> Result<(), Error> {
     q.dedup();
     let p = queue(root);
     if q.is_empty() {
-        return match fs::remove_file(&p) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Io(p, e)),
-        };
+        return rm(&p);
     }
     if let Some(d) = p.parent() {
         fs::create_dir_all(d).map_err(|e| Error::Io(d.to_path_buf(), e))?;
@@ -415,8 +401,17 @@ pub fn write_queue(root: &Path, q: &[Queued]) -> Result<(), Error> {
     put(&p, &body)
 }
 
+// beside and renamed over, so a kill leaves the old file or the new one and never half
 fn put(p: &Path, body: &str) -> Result<(), Error> {
-    fs::write(p, body).map_err(|e| Error::Io(p.to_path_buf(), e))
+    let tmp = p.with_file_name(format!(".{}", p.file_name().unwrap_or_default().display()));
+    fs::write(&tmp, body).and_then(|()| fs::rename(&tmp, p)).map_err(|e| Error::Io(p.to_path_buf(), e))
+}
+
+fn rm(p: &Path) -> Result<(), Error> {
+    match fs::remove_file(p) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(Error::Io(p.to_path_buf(), e)),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]

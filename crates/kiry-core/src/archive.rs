@@ -138,6 +138,13 @@ fn walk<R: Read>(
         };
 
         let landed = resolve_or(root, &path, follow_final, &made, &path)?;
+        // rename puts nothing over a directory and mkdir none over a file, and finding
+        // that out at extract time leaves the batch half applied
+        let there = fs::symlink_metadata(root.join(&landed));
+        if there.is_ok_and(|d| d.is_dir() != (what == What::Dir)) {
+            let why = "a directory and a non-directory would trade places";
+            return Err(Error::Archive { path: landed, why });
+        }
 
         if let What::Link(t) = &what {
             made.insert(landed.clone(), t.clone());
@@ -192,6 +199,9 @@ fn apply<R: Read>(
 ) -> Result<(), Error> {
     let (parent, name) = split(&m.path);
     let pfd = parent_fd(rootfd, parent, manifest)?;
+    // made beside the target and renamed over it, so a kill leaves the old or the new
+    let tmp = format!(".{name}.kiry");
+    clear(&pfd, &tmp);
 
     let mode = if keep.iter().any(|p| p == &m.path) {
         m.mode & 0o7777
@@ -218,10 +228,9 @@ fn apply<R: Read>(
             db::Kind::File(hex(&h.finalize()))
         }
         What::File => {
-            clear(&pfd, name);
             let fd = rustix::fs::openat(
                 &pfd,
-                name,
+                tmp.as_str(),
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
                 Mode::from_bits_truncate(mode),
             )
@@ -247,18 +256,16 @@ fn apply<R: Read>(
             db::Kind::File(hex(&h.finalize()))
         }
         What::Link(target) => {
-            clear(&pfd, name);
-            rustix::fs::symlinkat(target.as_str(), &pfd, name)
+            rustix::fs::symlinkat(target.as_str(), &pfd, tmp.as_str())
                 .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
             db::Kind::Link(target.clone())
         }
         What::Hard(target) => {
-            clear(&pfd, name);
             rustix::fs::linkat(
                 rootfd,
                 target.as_str(),
                 &pfd,
-                name,
+                tmp.as_str(),
                 rustix::fs::AtFlags::empty(),
             )
             .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
@@ -266,6 +273,10 @@ fn apply<R: Read>(
         }
     };
 
+    if m.what != What::Dir && !skip.contains(&m.path) {
+        rustix::fs::renameat(&pfd, tmp.as_str(), &pfd, name)
+            .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
+    }
     manifest.push(db::Entry {
         mode,
         kind,

@@ -773,3 +773,126 @@ fn a_version_that_takes_the_path_back_clears_the_record() {
     );
     assert!(root.join("usr/lib/libfoo.so.1.0.0").is_file());
 }
+
+// a package whose bin/foo-alias is a hardlink to bin/foo, the way zip ships zipinfo
+fn linked(at: &Path, ver: &str, alias: bool) -> PathBuf {
+    let src = at.join(format!("linked-{ver}-src"));
+    fs::create_dir_all(src.join("usr/bin")).unwrap();
+    fs::write(src.join("usr/bin/foo"), ver).unwrap();
+    if alias {
+        fs::hard_link(src.join("usr/bin/foo"), src.join("usr/bin/foo-alias")).unwrap();
+    }
+    let arc = at.join(format!("linked-{ver}.tar.zst"));
+    let sh = format!("cd {} && tar cf - . | zstd -q -o {}", src.display(), arc.display());
+    assert!(std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap().success());
+    let meta = at.join(format!("linked-{ver}.tar.zst.meta"));
+    fs::create_dir_all(&meta).unwrap();
+    fs::write(meta.join("name"), "linked\n").unwrap();
+    fs::write(meta.join("version"), format!("{ver} 1\n")).unwrap();
+    fs::write(meta.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(meta.join("depends"), "").unwrap();
+    arc
+}
+
+#[test]
+fn a_hardlink_goes_with_its_package() {
+    let (d, root) = rooted("hardlink-rm");
+    run(&root, &[linked(&d, "1.0", true)], false).unwrap();
+    let rec = db::read(&root, "x86_64-musl", "linked").unwrap();
+    assert!(rec.manifest.iter().any(|e| matches!(e.kind, db::Kind::Hard(_))));
+
+    let r = one(&root, "linked", false);
+    assert_eq!((r.gone, r.kept), (2, 0));
+    assert!(!root.join("usr/bin/foo-alias").exists());
+}
+
+#[test]
+fn an_upgrade_that_drops_a_hardlink_takes_it() {
+    let (d, root) = rooted("hardlink-up");
+    run(&root, &[linked(&d, "1.0", true)], false).unwrap();
+    run(&root, &[linked(&d, "2.0", false)], false).unwrap();
+    assert!(!root.join("usr/bin/foo-alias").exists());
+    assert_eq!(fs::read_to_string(root.join("usr/bin/foo")).unwrap(), "2.0");
+}
+
+// the new copy is written beside the old one and renamed over it, so an archive that
+// dies partway through a file leaves the old one standing rather than half of the new
+#[test]
+fn a_file_cut_off_partway_leaves_the_old_one_whole() {
+    let (d, root) = rooted("cutoff");
+    run(&root, &[pack(&at(&d, "v1"), "foo", &[], &["usr/lib/big"])], false).unwrap();
+
+    // letters off an lcg, so zstd cannot squeeze the file into its first few blocks
+    let mut x = 1u32;
+    let body: String = (0..8_000_000)
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            char::from(b'a' + ((x >> 16) % 26) as u8)
+        })
+        .collect();
+    let arc = packed(&at(&d, "v2"), "foo", &[], &["usr/lib/big"], &body);
+    let jobs = install::plan(&root, &[arc.clone()], false).unwrap();
+    let whole = fs::read(&arc).unwrap();
+    fs::write(&arc, &whole[..whole.len() * 9 / 10]).unwrap();
+
+    assert!(install::apply(&root, &jobs).is_err());
+    assert_eq!(fs::read_to_string(root.join("usr/lib/big")).unwrap(), "foo");
+}
+
+// the build hash is how a cached artifact is matched to what is installed, so one left
+// over from the version before claims a build that is not on disk
+#[test]
+fn a_record_keeps_nothing_the_new_one_lacks() {
+    let (d, root) = rooted("rec-whole");
+    let v1 = pack(&at(&d, "v1"), "foo", &[], &["usr/bin/foo"]);
+    fs::write(format!("{}.meta/hash", v1.display()), "abc\n").unwrap();
+    fs::write(format!("{}.meta/flags", v1.display()), "x\n").unwrap();
+    run(&root, &[v1], false).unwrap();
+    assert_eq!(db::read(&root, "x86_64-musl", "foo").unwrap().hash, "abc");
+
+    run(&root, &[pack(&at(&d, "v2"), "foo", &[], &["usr/bin/foo"])], false).unwrap();
+    let rec = db::read(&root, "x86_64-musl", "foo").unwrap();
+    assert_eq!((rec.hash.as_str(), rec.flags.len()), ("", 0));
+}
+
+// the edited-config rule holds against every record and not only the package's own, or
+// --force taking a config from somebody else writes over whatever was done to it
+#[test]
+fn forcing_a_path_keeps_a_config_its_owner_had_edited() {
+    let (d, root) = rooted("force-etc");
+    let first = pack(&d, "first", &[], &["etc/tool.conf", "etc/other.conf"]);
+    run(&root, &[first], false).unwrap();
+    fs::write(root.join("etc/tool.conf"), "edited by hand").unwrap();
+
+    let second = pack(&d, "second", &[], &["etc/tool.conf", "etc/other.conf"]);
+    let done = install::apply(&root, &install::plan(&root, &[second], true).unwrap()).unwrap();
+    assert_eq!(fs::read_to_string(root.join("etc/tool.conf")).unwrap(), "edited by hand");
+    assert_eq!(fs::read_to_string(root.join("etc/other.conf")).unwrap(), "second");
+    let kept: Vec<&str> = done.edits.iter().map(|k| k.path.as_str()).collect();
+    assert_eq!(kept, ["etc/tool.conf"]);
+}
+
+// ./bin/tool into a root with no usr-merge links makes bin a real directory, and the
+// baselayout that ships bin -> usr/bin would then die on EEXIST with the batch half applied
+#[test]
+fn a_link_over_a_real_directory_is_refused_before_anything_lands() {
+    let (d, root) = rooted("bin-dir");
+    run(&root, &[pack(&d, "tool", &[], &["bin/tool"])], false).unwrap();
+
+    let base = pack(&d, "baselayout", &[], &["usr/bin/.keep"]);
+    std::os::unix::fs::symlink("usr/bin", d.join("baselayout-src/bin")).unwrap();
+    fs::remove_file(&base).unwrap();
+    build(&d.join("baselayout-src"), &base);
+    let other = pack(&d, "other", &[], &["usr/share/other/x"]);
+    match run(&root, &[other, base], false) {
+        Err(Error::Archive { path, .. }) => assert_eq!(path, "bin"),
+        r => panic!("wanted a refusal naming bin, got {r:?}"),
+    }
+    assert!(!root.join("usr/share/other").exists(), "part of the batch went in");
+
+    // and a directory where a file already stands
+    fs::create_dir_all(root.join("usr/share")).unwrap();
+    fs::write(root.join("usr/share/other"), "a file").unwrap();
+    let under = pack(&at(&d, "under"), "under", &[], &["usr/share/other/y"]);
+    assert!(matches!(run(&root, &[under], false), Err(Error::Archive { .. })));
+}

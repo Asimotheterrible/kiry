@@ -1298,8 +1298,40 @@ fn rebuild_recompiles_what_the_break_names() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!said.contains("same bytes"), "app-2 replaced app-1 and was called the same: {said}");
+    let log = fs::read_to_string(root.join("var/kiry/log/rebuilds")).unwrap();
+    assert!(log.starts_with("app x86_64-gnu doctor changed "), "{log}");
 
     assert!(kiry(&["doctor", "--root", r]).status.success());
+}
+
+// a rebuild that comes out as the bytes it replaced was not needed, and the log is what
+// says so across storms. a queue row the build cannot change anything about is that case
+#[test]
+fn a_rebuild_that_changed_nothing_is_logged_as_the_same() {
+    let at = scratch("rebuild-same");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let d = recipe(&at.join("repo"), "x86_64-musl", GOOD);
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", at.join("repo").display())).unwrap();
+    let r = root.to_str().unwrap();
+    let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let arc = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst");
+    assert!(kiry(&["i", "--root", r, arc.to_str().unwrap()]).status.success());
+    fs::write(root.join("usr/lib/kiry/db/queue"), "x86_64-musl libx.so.1 hello\n").unwrap();
+
+    let o = kiry(&["rebuild", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("hello 1.0 x86_64-musl rebuilt  to the same bytes it replaced"), "{said}");
+    let log = fs::read_to_string(root.join("var/kiry/log/rebuilds")).unwrap();
+    assert!(log.starts_with("hello x86_64-musl libx.so.1 same "), "{log}");
+    let o = kiry(&["stats", "--root", r]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("rebuilt 1, 1 to the same bytes"));
 }
 
 // two broken consumers where alpha links beta, so the order the dependency asks for is

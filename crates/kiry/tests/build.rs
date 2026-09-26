@@ -1305,6 +1305,68 @@ fn rebuild_recompiles_what_the_break_names() {
     assert!(kiry(&["doctor", "--root", r]).status.success());
 }
 
+// run under a pty with a size, which is what a terminal is. busybox script, and rows as
+// well as columns: a pty with no rows reads as no size at all
+fn on_tty(cols: u32, cmd: &str) -> String {
+    let o = Command::new("script")
+        .args(["-qc", &format!("stty rows 40 cols {cols}; {cmd}"), "/dev/null"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&o.stdout).replace('\r', "")
+}
+
+// the art is for a person at a terminal wide enough to hold it beside the numbers, and
+// nothing that reads kiry's output ever sees it
+#[test]
+fn stats_puts_the_art_beside_itself_on_a_wide_terminal_only() {
+    let at = scratch("art");
+    let root = at.join("root");
+    fs::create_dir_all(root.join("usr/share/kiry/art")).unwrap();
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("usr/share/kiry/art/idle"), "(=^.^=)\n").unwrap();
+    fs::write(root.join("usr/share/kiry/quotes"), "# one per line\npresent day, present time\n").unwrap();
+    let cmd = format!("{KIRY} stats --root {}", root.display());
+
+    let wide = on_tty(120, &cmd);
+    assert!(wide.lines().any(|l| l.starts_with("(=^.^=)\x1b[0m  ")), "{wide}");
+    assert!(wide.contains("\"present day, present time\""), "{wide}");
+    let narrow = on_tty(60, &cmd);
+    assert!(!narrow.contains("(=^.^=)") && !narrow.contains("present day"), "{narrow}");
+    // piped from a terminal: /dev/tty is still there to ask for a width
+    let piped = on_tty(120, &format!("{cmd} | cat"));
+    assert!(!piped.contains("(=^.^=)") && !piped.contains('\x1b'), "{piped}");
+
+    fs::write(root.join("etc/kiry/config"), "KIRY_ART off\nKIRY_QUOTES off\n").unwrap();
+    let off = on_tty(120, &cmd);
+    assert!(!off.contains("(=^.^=)") && !off.contains("present day"), "{off}");
+}
+
+// the title says which package a batch is on and goes back to what it was after. the
+// bell is the byte after the title comes back, since the title ends in one too
+#[test]
+fn a_batch_names_its_package_in_the_title_and_rings_when_it_fails() {
+    let at = scratch("title");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let good = recipe(&at.join("good"), "x86_64-musl", GOOD);
+    let r = root.display();
+    let ok = on_tty(120, &format!("{KIRY} b --root {r} {}", good.display()));
+    assert!(ok.contains("\x1b[22;0t") && ok.contains("\x1b]2;kiry 1/1 hello\x07"), "{ok:?}");
+    let (_, after) = ok.rsplit_once("\x1b[23;0t").unwrap();
+    assert!(!after.contains('\x07'), "a short clean batch rang: {ok:?}");
+
+    let bad = recipe(&at.join("bad"), "x86_64-musl", "exit 1\n");
+    let failed = on_tty(120, &format!("{KIRY} b --root {r} {}", bad.display()));
+    let (_, after) = failed.rsplit_once("\x1b[23;0t").unwrap();
+    assert!(after.contains('\x07'), "a failed batch did not ring: {failed:?}");
+
+    let piped = kiry(&["b", "--root", root.to_str().unwrap(), good.to_str().unwrap()]);
+    assert!(!String::from_utf8_lossy(&piped.stdout).contains('\x1b'));
+}
+
 // a rebuild that comes out as the bytes it replaced was not needed, and the log is what
 // says so across storms. a queue row the build cannot change anything about is that case
 #[test]

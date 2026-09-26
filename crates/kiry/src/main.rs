@@ -118,7 +118,153 @@ fn die(msg: String) -> ! {
     for l in msg.lines() {
         eprintln!("kiry: {l}");
     }
+    batch_end(false);
     std::process::exit(1);
+}
+
+// what a terminal is told and a pipe is not: the package a long batch is on, as the
+// window title so it shows from an unfocused window, and a bell when the batch ends --
+// on failure always, on success only after a minute and unless KIRY_BELL is off
+struct Batch {
+    root: PathBuf,
+    start: Instant,
+    total: usize,
+    seen: HashSet<String>,
+    recovered: bool,
+}
+
+static BATCH: std::sync::Mutex<Option<Batch>> = std::sync::Mutex::new(None);
+
+fn tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
+fn batch_begin(root: &Path, total: usize) {
+    if !tty() || total == 0 {
+        return;
+    }
+    // the title the terminal had goes on its stack, so the end can put it back
+    print!("\x1b[22;0t");
+    *BATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Batch {
+        root: root.to_path_buf(),
+        start: Instant::now(),
+        total,
+        seen: HashSet::new(),
+        recovered: false,
+    });
+}
+
+fn batch_title(pkg: &str) {
+    let mut g = BATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(b) = g.as_mut() else { return };
+    b.seen.insert(pkg.to_string());
+    print!("\x1b]2;kiry {}/{} {pkg}\x07", b.seen.len().min(b.total), b.total);
+    let _ = std::io::stdout().flush();
+}
+
+fn batch_recovered() {
+    if let Some(b) = BATCH.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        b.recovered = true;
+    }
+}
+
+fn batch_end(ok: bool) {
+    let Some(b) = BATCH.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    print!("\x1b[23;0t");
+    let secs = b.start.elapsed().as_secs();
+    if ok {
+        let state = if b.recovered { "failed" } else { "ok" };
+        let line = format!("{} built in {}", b.seen.len(), clock(secs));
+        with_art(&b.root, state, &[line]);
+    } else {
+        with_art(&b.root, "stuck", &[]);
+    }
+    let quiet = setting(&b.root, "KIRY_BELL").is_some_and(|v| v == "off");
+    if !ok || (secs >= 60 && !quiet) {
+        print!("\x07");
+    }
+    let _ = std::io::stdout().flush();
+}
+
+// one KIRY_* line out of /etc/kiry/config
+fn setting(root: &Path, key: &str) -> Option<String> {
+    let text = fs::read_to_string(root.join("etc/kiry/config")).ok()?;
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter_map(|l| l.split_once(char::is_whitespace))
+        .filter(|(k, _)| *k == key)
+        .map(|(_, v)| v.trim().to_string())
+        .last()
+}
+
+// art and a quote beside a block of lines, pfetch-style, for stats and the end of a
+// batch and nowhere else. a tty 80 columns wide or more, KIRY_ART and KIRY_QUOTES not
+// off. no file for the state means no art, which is how kiry ships
+fn with_art(root: &Path, state: &str, lines: &[String]) {
+    let show = tty() && columns() >= 80;
+    let on = |k: &str| show && !setting(root, k).is_some_and(|v| v == "off");
+    let art = match on("KIRY_ART") {
+        true => fs::read_to_string(root.join("usr/share/kiry/art").join(state)).unwrap_or_default(),
+        false => String::new(),
+    };
+    let art: Vec<&str> = art.lines().collect();
+    let wide = art.iter().map(|l| cells(l)).max().unwrap_or(0);
+    for i in 0..art.len().max(lines.len()) {
+        let a = art.get(i).copied().unwrap_or("");
+        let l = lines.get(i).map_or("", String::as_str);
+        match (wide, a) {
+            (0, _) => say!("{l}"),
+            (_, "") => say!("{}  {l}", " ".repeat(wide)),
+            _ => say!("{a}\x1b[0m{}  {l}", " ".repeat(wide - cells(a))),
+        }
+    }
+    if !on("KIRY_QUOTES") {
+        return;
+    }
+    let all = fs::read_to_string(root.join("usr/share/kiry/quotes")).unwrap_or_default();
+    let quotes: Vec<&str> = all.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    let pick = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as usize);
+    if let Some(q) = quotes.get(pick % quotes.len().max(1)) {
+        say!("\n  \"{q}\"");
+    }
+}
+
+// what a line takes on screen: escape sequences take nothing, and the full width forms
+// character art is made of take two
+fn cells(s: &str) -> usize {
+    let mut n = 0;
+    let mut esc = false;
+    for c in s.chars() {
+        match (esc, c) {
+            (false, '\x1b') => esc = true,
+            (true, c) => esc = !c.is_ascii_alphabetic(),
+            (false, c) => {
+                let u = c as u32;
+                let two = matches!(u, 0x1100..=0x115f | 0x2e80..=0x303e | 0x3041..=0x33ff
+                    | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7a3 | 0xf900..=0xfaff
+                    | 0xfe30..=0xfe4f | 0xff00..=0xff60 | 0xffe0..=0xffe6);
+                n += if two { 2 } else { 1 };
+            }
+        }
+    }
+    n
+}
+
+// the terminal's width off the terminal itself. stty rather than an ioctl: rustix's
+// termios is a feature this crate does not build with, and this is the art path
+fn columns() -> usize {
+    let Ok(tty) = fs::File::open("/dev/tty") else { return 0 };
+    Command::new("stty")
+        .arg("size")
+        .stdin(tty)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().nth(1)?.parse().ok())
+        .unwrap_or(0)
 }
 
 fn opts(args: &[String]) -> (PathBuf, bool, Vec<String>) {
@@ -248,6 +394,7 @@ fn build_cmd(args: &[String]) {
 
     // every target of a package at once. a target that packed while a later one was
     // still to fail is the drift a multi-target recipe exists to prevent
+    batch_begin(&root, todo.len());
     for (name, targets) in &todo {
         let p = &recipes[name];
         let r = match fix {
@@ -260,6 +407,7 @@ fn build_cmd(args: &[String]) {
     }
 
     say!("cached {}", root.join("var/kiry/cache").display());
+    batch_end(true);
 }
 
 // one build of a package at a time. compile() starts by deleting the stage dir, and a
@@ -305,6 +453,7 @@ fn build(
     at_once: usize,
 ) -> Result<Vec<PathBuf>, String> {
     let _lock = claim(root, p)?;
+    batch_title(&p.name);
     let srcs = sources(root, p)?;
     let hash = recipe_hash(p, &srcs)?;
     let f = flags(root, &p.name, Some(&p.dir))?;
@@ -762,6 +911,11 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
 
     loop {
         match build(root, p, &one, verbose, false, at_once) {
+            // first.log is only there once this run has failed
+            Ok(_) if first.exists() => {
+                batch_recovered();
+                return Ok(());
+            }
             Ok(_) => return Ok(()),
             Err(e) => say!("{e}"),
         }
@@ -3907,6 +4061,10 @@ fn install_cmd(args: &[String]) {
         return;
     }
 
+    let mut names: Vec<&String> = set.iter().map(|(n, _)| n).collect();
+    names.sort();
+    names.dedup();
+    batch_begin(&root, names.len());
     for level in plan {
         // grouped by package, because every target of one builds before any of it is
         // packed. a musl mesa installed beside a gnu mesa that failed is exactly the
@@ -3970,6 +4128,7 @@ fn install_cmd(args: &[String]) {
         apply_batch(&root, &made, force);
     }
     skew(&root);
+    batch_end(true);
 }
 
 // the resolve every consumer does at load, run against what just landed instead of left
@@ -5373,6 +5532,10 @@ fn rebuild_cmd(args: &[String]) {
         return;
     }
 
+    let mut names: Vec<&String> = want.iter().map(|(n, _)| n).collect();
+    names.sort();
+    names.dedup();
+    batch_begin(&root, names.len());
     for level in plan {
         // every member of a level compiles before any of it is installed, and the level
         // below it is already in place, so each one links against what it will run with
@@ -5462,6 +5625,7 @@ fn rebuild_cmd(args: &[String]) {
             left += 1;
         }
     }
+    batch_end(left == 0);
     if left > 0 {
         std::process::exit(1);
     }
@@ -7056,9 +7220,10 @@ fn log_cmd(args: &[String]) {
 
 fn stats_cmd(args: &[String]) {
     let (root, _, _) = opts(args);
+    let mut out: Vec<String> = Vec::new();
 
     for t in db::targets(&root).unwrap_or_default() {
-        say!("installed {t} {}", db::installed(&root, &t).unwrap_or_default().len());
+        out.push(format!("installed {t} {}", db::installed(&root, &t).unwrap_or_default().len()));
     }
 
     let mut recipes = 0;
@@ -7066,10 +7231,10 @@ fn stats_cmd(args: &[String]) {
         let n = fs::read_dir(&r)
             .map(|rd| rd.flatten().filter(|e| e.path().join("build").is_file()).count())
             .unwrap_or(0);
-        say!("recipes {} {n}", r.display());
+        out.push(format!("recipes {} {n}", r.display()));
         recipes += n;
     }
-    say!("recipes total {recipes}");
+    out.push(format!("recipes total {recipes}"));
 
     let (mut arts, mut bytes) = (0u64, 0u64);
     for a in listing(&root.join("var/kiry/cache")) {
@@ -7078,7 +7243,7 @@ fn stats_cmd(args: &[String]) {
             bytes += weigh(&a);
         }
     }
-    say!("cache {arts} artifacts {}", size(bytes));
+    out.push(format!("cache {arts} artifacts {}", size(bytes)));
     // the three that answer where the disk went, which one number over the cache
     // directory did not: the tarballs under it outweigh the artifacts in it
     for (what, at) in [
@@ -7086,25 +7251,26 @@ fn stats_cmd(args: &[String]) {
         ("stage", "var/kiry/stage"),
         ("log", "var/kiry/log"),
     ] {
-        say!("{what} {}", size(weigh(&root.join(at))));
+        out.push(format!("{what} {}", size(weigh(&root.join(at)))));
     }
     let past = history(&root);
     if !past.is_empty() {
         let mut rows: Vec<(&(String, String), &u64)> = past.iter().collect();
         rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         // the sum of everything's last build, which is what building it all again costs
-        say!("world ~{}", clock(rows.iter().map(|(_, s)| **s).sum()));
+        out.push(format!("world ~{}", clock(rows.iter().map(|(_, s)| **s).sum())));
         for ((n, t), s) in rows.iter().take(3) {
-            say!("slowest {n} {t} {}", clock(**s));
+            out.push(format!("slowest {n} {t} {}", clock(**s)));
         }
     }
-    say!("queued {}", db::read_queue(&root).unwrap_or_default().len());
+    out.push(format!("queued {}", db::read_queue(&root).unwrap_or_default().len()));
     let log = fs::read_to_string(root.join("var/kiry/log/rebuilds")).unwrap_or_default();
     let rows: Vec<&str> = log.lines().collect();
     if !rows.is_empty() {
         let same = rows.iter().filter(|l| l.split(' ').nth(3) == Some("same")).count();
-        say!("rebuilt {}, {same} to the same bytes", rows.len());
+        out.push(format!("rebuilt {}, {same} to the same bytes", rows.len()));
     }
+    with_art(&root, "idle", &out);
 }
 
 // the only thing that deletes anything. everything under /var/kiry is regenerable by

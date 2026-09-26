@@ -155,16 +155,27 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
         });
     }
 
+    // every record and not only the one being replaced: --force takes paths from other
+    // packages too. only /etc, a binary that does not match its manifest is a broken
+    // install and wants overwriting, not preserving
+    let mut etc = Vec::new();
+    for t in db::targets(root)? {
+        for n in db::installed(root, &t)? {
+            let m = db::read(root, &t, &n)?.manifest;
+            etc.extend(m.into_iter().filter(|e| e.path.starts_with("etc/")));
+        }
+    }
+
     let mut broke = Vec::new();
     let mut edits = Vec::new();
     let mut kept: HashSet<String> = HashSet::new();
     // what each version coming in carries, set against what the one going out did
     let mut carried: Vec<Vec<db::Provide>> = Vec::new();
     for (i, j) in jobs.iter().enumerate() {
-        let skip = match &was[i] {
-            Some(o) => edited(root, &o.manifest)?,
-            None => Vec::new(),
-        };
+        let ships: HashSet<&str> = j.members.iter().map(|m| m.path.as_str()).collect();
+        let mine: Vec<db::Entry> =
+            etc.iter().filter(|e| ships.contains(e.path.as_str())).cloned().collect();
+        let skip = modified(root, &mine)?;
         let manifest = archive::extract(root, &j.archive, &skip)?;
         edits.extend(skip.into_iter().map(|path| Kept {
             path,
@@ -321,15 +332,6 @@ fn baseline<'a>(
     same.next().is_none().then_some(one)
 }
 
-fn edited(root: &Path, manifest: &[db::Entry]) -> Result<Vec<String>, Error> {
-    Ok(modified(root, manifest)?
-        .into_iter()
-        // only /etc. a binary that does not match its manifest is a broken install and
-        // wants overwriting, not preserving
-        .filter(|p| p.starts_with("etc/"))
-        .collect())
-}
-
 pub fn modified(root: &Path, manifest: &[db::Entry]) -> Result<Vec<String>, Error> {
     let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
@@ -339,8 +341,6 @@ pub fn modified(root: &Path, manifest: &[db::Entry]) -> Result<Vec<String>, Erro
         let db::Kind::File(want) = &e.kind else {
             continue;
         };
-        // only /etc. a binary that does not match its manifest is a broken install and
-        // wants overwriting, not preserving
         let (parent, leaf) = match e.path.rfind('/') {
             Some(i) => (&e.path[..i], &e.path[i + 1..]),
             None => ("", e.path.as_str()),
@@ -370,17 +370,14 @@ fn libraries(root: &Path, manifest: &[db::Entry]) -> Result<HashMap<String, elf:
 // that named it is overwritten, and no check can see it after that. the whole batch
 // decides what survives, so a path one member drops and another picks up stays put
 fn prune(root: &Path, was: &[Option<db::Installed>], kept: &HashSet<String>) -> Result<(), Error> {
-    let stale: Vec<Vec<db::Entry>> = was
+    let stale: Vec<(&[db::Entry], Vec<db::Entry>)> = was
         .iter()
         .flatten()
         .map(|old| {
-            old.manifest
-                .iter()
-                .filter(|e| !kept.contains(&e.path))
-                .cloned()
-                .collect()
+            let gone = old.manifest.iter().filter(|e| !kept.contains(&e.path)).cloned().collect();
+            (old.manifest.as_slice(), gone)
         })
-        .filter(|v: &Vec<db::Entry>| !v.is_empty())
+        .filter(|(_, v): &(&[db::Entry], Vec<db::Entry>)| !v.is_empty())
         .collect();
     if stale.is_empty() {
         return Ok(());
@@ -388,10 +385,10 @@ fn prune(root: &Path, was: &[Option<db::Installed>], kept: &HashSet<String>) -> 
 
     let rootfd = rustix::fs::open(root, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .map_err(|e| Error::Io(root.to_path_buf(), e.into()))?;
-    for gone in &stale {
+    for (all, gone) in &stale {
         // the same rules removal uses: a file that no longer hashes to what the
         // manifest said was edited by hand and is not ours to delete
-        unlink(&rootfd, gone)?;
+        unlink(&rootfd, gone, all)?;
     }
     Ok(())
 }
@@ -860,13 +857,22 @@ pub fn remove(
 
     let mut done = Vec::new();
     for (name, rec) in recs {
-        done.push((name.clone(), unlink(&rootfd, &rec.manifest)?));
+        done.push((name.clone(), unlink(&rootfd, &rec.manifest, &rec.manifest)?));
         db::forget(root, target, &name)?;
     }
     Ok(done)
 }
 
-fn unlink(rootfd: &OwnedFd, manifest: &[db::Entry]) -> Result<Removed, Error> {
+// all is the whole record the entries come from. a hardlink's third field is the path it
+// links to, not a hash, so what it should hash to is whatever that path's entry says
+fn unlink(rootfd: &OwnedFd, manifest: &[db::Entry], all: &[db::Entry]) -> Result<Removed, Error> {
+    let sums: HashMap<&str, &str> = all
+        .iter()
+        .filter_map(|e| match &e.kind {
+            db::Kind::File(h) => Some((e.path.as_str(), h.as_str())),
+            _ => None,
+        })
+        .collect();
     let mut out = Removed::default();
     for e in manifest.iter().rev() {
         let (parent, leaf) = match e.path.rfind('/') {
@@ -898,8 +904,8 @@ fn unlink(rootfd: &OwnedFd, manifest: &[db::Entry]) -> Result<Removed, Error> {
             },
             // only ENOENT is gone. NOFOLLOW turns a symlink standing where the file
             // belongs into ELOOP, and that is modified, not missing
-            db::Kind::File(want) | db::Kind::Hard(want) => match hash(&pfd, leaf) {
-                Ok(got) if got == *want => {
+            db::Kind::File(_) | db::Kind::Hard(_) => match hash(&pfd, leaf) {
+                Ok(got) if Some(got.as_str()) == want(&e.kind, &sums) => {
                     let _ = rustix::fs::unlinkat(&pfd, leaf, AtFlags::empty());
                     out.gone += 1;
                 }
@@ -911,6 +917,14 @@ fn unlink(rootfd: &OwnedFd, manifest: &[db::Entry]) -> Result<Removed, Error> {
     }
 
     Ok(out)
+}
+
+fn want<'a>(k: &'a db::Kind, sums: &HashMap<&str, &'a str>) -> Option<&'a str> {
+    match k {
+        db::Kind::File(h) => Some(h),
+        db::Kind::Hard(to) => sums.get(to.as_str()).copied(),
+        _ => None,
+    }
 }
 
 fn hash(pfd: &OwnedFd, name: &str) -> Result<String, Errno> {

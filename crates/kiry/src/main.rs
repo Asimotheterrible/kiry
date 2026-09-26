@@ -17,9 +17,14 @@ use kiry_core::{db, elf, install, pkg};
 
 macro_rules! say {
     ($($a:tt)*) => {
-        if writeln!(std::io::stdout(), $($a)*).is_err() {
-            std::process::exit(0);
-        }
+        line(&format!($($a)*), false)
+    };
+}
+
+// a failure, which -q still prints
+macro_rules! loud {
+    ($($a:tt)*) => {
+        line(&format!($($a)*), true)
     };
 }
 
@@ -80,14 +85,14 @@ fn usage() {
     say!("installed. `i @outdated` is the whole of it -- one batch, in order, or none.");
     say!("");
     say!("a package is named rather than pointed at: mesa, core/mesa, or a path to a");
-    say!("recipe. b and i take --target T, -v to stream the build, --recover to let the");
-    say!("failure table retry, and --force to override a conflict.");
+    say!("recipe. b and i take --target T, -v to stream the build, -q for failures only,");
+    say!("--recover to let the failure table retry, and --force to override a conflict.");
     say!("");
     say!("keeping up");
     say!("  ahead [--net] [pkg]...  which versions upstream moved past");
     say!("  sync [-n] [--net]       bump those into testing/");
     say!("  promote <pkg>...        testing/ into the tree");
-    say!("  rebuild [-n]            drain the soname rebuild queue");
+    say!("  rebuild [-n] [-q]       drain the soname rebuild queue");
     say!("  bisect-flags <pkg>...   take the ladder's rungs out and find what still needs one");
     say!("");
     say!("the other root");
@@ -115,11 +120,159 @@ fn usage() {
 fn die(msg: String) -> ! {
     // an error carrying several findings writes one per line, and a line without the
     // prefix is a line that does not grep
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).on.clear();
     for l in msg.lines() {
-        eprintln!("kiry: {l}");
+        complain(l);
     }
     batch_end(false);
     std::process::exit(1);
+}
+
+// -q: failures and errors only. the log is written the same either way
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// what is building right now, as one line a terminal keeps rewriting in place. a pipe
+// never gets it: there every state change is its own line, and a \r in a log is garbage
+struct Live {
+    on: Vec<(String, String, Instant, Option<u64>)>,
+    painted: bool,
+    cols: usize,
+}
+
+static LIVE: std::sync::Mutex<Live> = std::sync::Mutex::new(Live { on: Vec::new(), painted: false, cols: 0 });
+
+// every line kiry prints comes through here, under the same lock the ticker paints
+// with, so a line and the live line never land in the middle of each other
+fn line(s: &str, loud: bool) {
+    if !loud && QUIET.load(Ordering::Relaxed) {
+        return;
+    }
+    let g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = std::io::stdout().lock();
+    let r = match g.painted {
+        true => write!(out, "\r\x1b[K{s}\n{}", live_text(&g)).and_then(|_| out.flush()),
+        false => writeln!(out, "{s}"),
+    };
+    if r.is_err() {
+        std::process::exit(0);
+    }
+}
+
+// stderr, with the live line out of the way first. the ticker puts it back within a second
+fn complain(s: &str) {
+    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if g.painted {
+        print!("\r\x1b[K");
+        let _ = std::io::stdout().flush();
+        g.painted = false;
+    }
+    eprintln!("kiry: {s}");
+}
+
+// cut to the terminal so it never wraps: a wrapped line is one \r cannot take back
+fn live_text(g: &Live) -> String {
+    let Some((_, what, start, eta)) = g.on.first() else { return String::new() };
+    let mut s = format!("{what}  building  {}", clock(start.elapsed().as_secs()));
+    if let Some(e) = eta {
+        s += &format!(" / ~{}", clock(*e));
+    }
+    if g.on.len() > 1 {
+        s += &format!("  +{}", g.on.len() - 1);
+    }
+    s.chars().take(g.cols.saturating_sub(1).max(20)).collect()
+}
+
+fn paint(g: &mut Live) {
+    let text = live_text(g);
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "\r\x1b[K{text}").and_then(|_| out.flush());
+    g.painted = !text.is_empty();
+}
+
+// a thread that repaints once a second is the whole of the animation. it is started by
+// the first build that wants it and dies with the process
+fn live_start(key: &str, eta: Option<u64>) {
+    static TICK: std::sync::Once = std::sync::Once::new();
+    TICK.call_once(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if !g.on.is_empty() {
+                paint(&mut g);
+            }
+        });
+    });
+    let what = match batch_run(key) {
+        Some((i, n)) => format!("[{i}/{n}] {key}"),
+        None => key.to_string(),
+    };
+    let cols = columns();
+    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    g.cols = cols;
+    g.on.push((key.to_string(), what, Instant::now(), eta));
+    paint(&mut g);
+}
+
+fn live_stop(key: &str) {
+    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let before = g.on.len();
+    g.on.retain(|(k, _, _, _)| k != key);
+    // nothing left paints an empty line, which is the old one cleared
+    if g.on.len() != before && g.painted {
+        paint(&mut g);
+    }
+}
+
+fn live_on() -> bool {
+    !LIVE.lock().unwrap_or_else(|e| e.into_inner()).on.is_empty()
+}
+
+// ansi 0-15 only, so the colours are whatever the terminal's theme says they are. a pipe
+// never gets them and NO_COLOR set to anything at all turns them off
+fn hue(code: &str, s: &str) -> String {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match *ON.get_or_init(|| tty() && std::env::var_os("NO_COLOR").is_none()) && !code.is_empty() {
+        true => format!("\x1b[{code}m{s}\x1b[0m"),
+        false => s.to_string(),
+    }
+}
+
+// the shape a package's result line has. a pipe gets it single spaced, a terminal gets
+// columns as wide as the batch's widest, and a name is never cut to fit
+fn row(name: &str, ver: &str, t: &str, status: &str, time: &str) -> String {
+    if !tty() {
+        return format!("{name} {ver} {t} {status} {time}");
+    }
+    let w = BATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or([0; 3], |b| b.wide);
+    let target = match t {
+        t if t.ends_with("musl") => "36",
+        t if t.ends_with("gnu") => "35",
+        _ => "",
+    };
+    let state = match status {
+        "ok" => "32",
+        "failed" => "31",
+        "held" | "skip" => "33",
+        "stuck" => "2;31",
+        _ => "",
+    };
+    format!(
+        "{}  {}  {}  {}  {}",
+        hue("97", &format!("{name:<w$}", w = w[0])),
+        hue("2", &format!("{ver:<w$}", w = w[1])),
+        hue(target, &format!("{t:<w$}", w = w[2])),
+        hue(state, &format!("{status:<6}")),
+        hue("2", &format!("{time:>6}")),
+    )
+}
+
+// the key a build is known by on the live line and to the batch counting it
+fn key(p: &Package, t: &str) -> String {
+    format!("{} {} {t}", p.name, p.version.upstream)
 }
 
 // what a terminal is told and a pipe is not: the package a long batch is on, as the
@@ -131,6 +284,11 @@ struct Batch {
     total: usize,
     seen: HashSet<String>,
     recovered: bool,
+    // the live line's [i/n] counts builds, a package per target, and n is only those
+    // the cache cannot answer
+    builds: usize,
+    runs: HashMap<String, usize>,
+    wide: [usize; 3],
 }
 
 static BATCH: std::sync::Mutex<Option<Batch>> = std::sync::Mutex::new(None);
@@ -140,9 +298,16 @@ fn tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
-fn batch_begin(root: &Path, total: usize) {
+// rows is every name, version and target the batch could print, for the widths
+fn batch_begin(root: &Path, total: usize, builds: usize, rows: &[[&str; 3]]) {
     if !tty() || total == 0 {
         return;
+    }
+    let mut wide = [0; 3];
+    for r in rows {
+        for (w, c) in wide.iter_mut().zip(r) {
+            *w = (*w).max(c.len());
+        }
     }
     // the title the terminal had goes on its stack, so the end can put it back
     print!("\x1b[22;0t");
@@ -152,7 +317,19 @@ fn batch_begin(root: &Path, total: usize) {
         total,
         seen: HashSet::new(),
         recovered: false,
+        builds,
+        runs: HashMap::new(),
+        wide,
     });
+}
+
+// where a build falls in the batch. a retry is the same build and keeps its number
+fn batch_run(key: &str) -> Option<(usize, usize)> {
+    let mut g = BATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let b = g.as_mut()?;
+    let next = b.runs.len() + 1;
+    let i = *b.runs.entry(key.to_string()).or_insert(next);
+    Some((i, b.builds.max(i)))
 }
 
 fn batch_title(pkg: &str) {
@@ -331,6 +508,7 @@ fn build_cmd(args: &[String]) {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-v" => verbose = true,
+            "-q" => QUIET.store(true, Ordering::Relaxed),
             "--recover" => fix = true,
             "--target" => match it.next() {
                 Some(t) => want = Some(t.clone()),
@@ -394,7 +572,14 @@ fn build_cmd(args: &[String]) {
 
     // every target of a package at once. a target that packed while a later one was
     // still to fail is the drift a multi-target recipe exists to prevent
-    batch_begin(&root, todo.len());
+    let rows: Vec<[&str; 3]> = todo
+        .iter()
+        .flat_map(|(n, ts)| {
+            let v = recipes[n].version.upstream.as_str();
+            ts.iter().map(move |t| [n.as_str(), v, t.as_str()])
+        })
+        .collect();
+    batch_begin(&root, todo.len(), builds, &rows);
     for (name, targets) in &todo {
         let p = &recipes[name];
         let r = match fix {
@@ -461,15 +646,21 @@ fn build(
     let past = history(root);
     let mut built = Vec::new();
     for t in targets {
-        let eta = match past.get(&(p.name.clone(), t.clone())) {
-            Some(s) => format!("~{}", clock(*s)),
-            None => "-".to_string(),
-        };
-        say!("{} {} {t} building {eta}", p.name, p.version.upstream);
+        let eta = past.get(&(p.name.clone(), t.clone())).copied();
+        // -v has the build itself on the terminal, and a line rewriting itself under
+        // that is two things fighting over one cursor
+        let live = tty() && !verbose && !QUIET.load(Ordering::Relaxed);
+        match (live, eta) {
+            (true, _) => live_start(&key(p, t), eta),
+            (false, Some(s)) => say!("{} building ~{}", key(p, t), clock(s)),
+            (false, None) => say!("{} building -", key(p, t)),
+        }
         let start = Instant::now();
-        let (work, linked) = compile(root, p, t, &srcs, &f, verbose, boot, at_once)?;
+        let r = compile(root, p, t, &srcs, &f, verbose, boot, at_once);
+        live_stop(&key(p, t));
+        let (work, linked) = r?;
         let secs = start.elapsed().as_secs();
-        say!("{} {} {t} ok {}", p.name, p.version.upstream, clock(secs));
+        say!("{}", row(&p.name, &p.version.upstream, t, "ok", &clock(secs)));
         keep_time(root, p, t, secs);
         built.push((t.clone(), work, linked));
     }
@@ -718,7 +909,7 @@ fn sources(root: &Path, p: &Package) -> Result<Vec<(String, PathBuf, String)>, S
                     ));
                 }
             }
-            None => eprintln!("kiry: {}: no checksum, sha256 is {sum}", path.display()),
+            None => complain(&format!("{}: no checksum, sha256 is {sum}", path.display())),
         }
         out.push((name.to_string(), path, sum));
     }
@@ -815,6 +1006,13 @@ fn fetcher(url: &str, dst: &Path) -> Result<Command, String> {
     };
 
     let mut c = Command::new(prog);
+    // curl's meter is a line it keeps rewriting with \r on stderr. in a pipe that is
+    // noise in whatever reads kiry's, and on a terminal it fights the live line. -S keeps
+    // curl's own error when it fails
+    use std::io::IsTerminal;
+    if Path::new(prog).file_name().is_some_and(|n| n == "curl") && (!std::io::stderr().is_terminal() || live_on()) {
+        c.arg("-sS");
+    }
     for w in words {
         c.arg(
             w.replace("%o", &dst.display().to_string())
@@ -882,20 +1080,70 @@ fn compiled(log: &str) -> bool {
         })
 }
 
-// the line to put in front of someone. the last line is usually not it -- mozbuild signs
-// off with where it wrote a profile, four lines under the ValueError that stopped it --
-// so walk back for something that reads like a complaint and only fall back to the end
-fn blame(log: &str) -> &str {
-    let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
-    lines
-        .iter()
-        .rev()
-        .find(|l| {
+// the line to put in front of someone: the first real complaint. the last line is
+// usually not it -- mozbuild signs off with where it wrote a profile, four lines under the
+// ValueError that stopped it -- and make, ninja, clang and collect2 all sign off with a
+// line that only says something above it failed. not found is a weaker kind, since a
+// build script probing for which or git says it on the way to working
+fn blame(log: &str) -> String {
+    let lines: Vec<String> = log
+        .lines()
+        .map(|l| unescaped(l).trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let summary = |l: &str| {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        matches!(w[..], [.., "Error", n] | [.., "Error", n, "(ignored)"] if n.parse::<u32>().is_ok())
+            || (l.ends_with("generated.") && l.contains(" error"))
+            || l.starts_with("ninja: build stopped")
+            || l.contains("ld returned 1 exit status")
+            || l.contains("linker command failed with exit code")
+    };
+    let hit = |words: &[&str]| {
+        lines.iter().find(|l| {
             let s = l.to_lowercase();
-            s.contains("error") || s.contains("not found") || s.contains("no such")
+            !summary(l) && !s.starts_with("checking ") && words.iter().any(|w| s.contains(w))
         })
+    };
+    hit(&["error:", "fatal error", "undefined reference", "undefined symbol"])
+        .or_else(|| hit(&["not found", "no such file"]))
+        .or_else(|| lines.iter().rev().find(|l| !summary(l) && l.to_lowercase().contains("error")))
         .or_else(|| lines.last())
-        .map_or("the log is empty", |l| l.trim())
+        .map_or("the log is empty".to_string(), String::clone)
+}
+
+// a compiler that colours its diagnostics colours them in the log too
+fn unescaped(s: &str) -> String {
+    let mut esc = false;
+    s.chars()
+        .filter(|&c| {
+            let keep = !esc && c != '\x1b';
+            esc = match (esc, c) {
+                (false, c) => c == '\x1b',
+                (true, c) => !c.is_ascii_alphabetic(),
+            };
+            keep
+        })
+        .collect()
+}
+
+// the failed line and what to read next under it: where it died, whether the table knows
+// the failure, and the first real complaint rather than the log. -v had the log on the
+// terminal already and wrote none
+fn failed(root: &Path, p: &Package, t: &str, log: Option<&Path>, secs: u64) {
+    live_stop(&key(p, t));
+    loud!("{}", row(&p.name, &p.version.upstream, t, "failed", &clock(secs)));
+    let Some(log) = log else { return };
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let rule = rules(root).ok().and_then(|rs| scan(&rs, &text));
+    loud!("  phase  {}", phase(&text));
+    loud!("  rule   {}", rule.map_or("none matched".to_string(), |f| f.rule));
+    loud!("  log    {}", log.display());
+    let first = blame(&text);
+    match (tty(), columns()) {
+        (true, c) if c > 2 => loud!("  {}", first.chars().take(c - 2).collect::<String>()),
+        _ => loud!("  {first}"),
+    }
 }
 
 // build fails, read the log, fix it, build again. three signature retries and never the
@@ -917,7 +1165,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
                 return Ok(());
             }
             Ok(_) => return Ok(()),
-            Err(e) => say!("{e}"),
+            Err(e) => loud!("{e}"),
         }
         let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
         // every retry truncates the log, so without this the failure that started it all
@@ -930,7 +1178,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
         // clang crashed on every rung. the table's crash row and the ladder here would
         // walk the same rungs again, one whole build each
         if let Some(l) = log.lines().find(|l| l.starts_with("kirycc: ") && l.ends_with("at every rung")) {
-            say!("first failure is {}", first.display());
+            loud!("first failure is {}", first.display());
             return Err(stuck(p, t, &l["kirycc: ".len()..]));
         }
 
@@ -941,8 +1189,8 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
                 }
                 if !tried.contains(&f.act) {
                     tried.push(f.act.clone());
-                    say!("{} {t} {} phase, {}", p.name, phase(&log), f.rule);
                     if write_fix(root, &p.dir, &p.name, &f, &log)? {
+                        loud!("  retry  {}/3", tried.len());
                         continue;
                     }
                 }
@@ -951,7 +1199,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
 
         if !compiled(&log) {
             // no note anywhere: the recipe and the settings are both innocent here
-            say!("first failure is {}", first.display());
+            loud!("first failure is {}", first.display());
             return Err(format!(
                 "{} {t}: stuck, nothing compiled: {}",
                 p.name,
@@ -965,7 +1213,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
         let now = flags(root, &p.name, Some(&p.dir))?;
         let (filter, line) = loop {
             let Some(r) = LADDER.get(rung) else {
-                say!("first failure is {}", first.display());
+                loud!("first failure is {}", first.display());
                 return Err(stuck(p, t, "the ladder ran out"));
             };
             rung += 1;
@@ -1204,6 +1452,7 @@ fn compile(
     boot: bool,
     at_once: usize,
 ) -> Result<(PathBuf, Vec<String>), String> {
+    let start = Instant::now();
     let work = root.join("var/kiry/stage").join(format!(
         "{}-{}-{}.{t}",
         p.name, p.version.upstream, p.version.rev
@@ -1531,12 +1780,14 @@ fn compile(
             }
             Ok((work, linked.into_iter().collect()))
         }
-        Ok(_) if verbose => Err(format!("{} {t}: build failed", p.name)),
-        Ok(_) => Err(format!(
-            "{} {t}: build failed, log is {}",
-            p.name,
-            log.display()
-        )),
+        Ok(_) if verbose => {
+            failed(root, p, t, None, start.elapsed().as_secs());
+            Err(format!("{} {t}: build failed", p.name))
+        }
+        Ok(_) => {
+            failed(root, p, t, Some(&log), start.elapsed().as_secs());
+            Err(format!("{} {t}: build failed, log is {}", p.name, log.display()))
+        }
         Err(e) => Err(format!("{} {t}: {e}", p.name)),
     }
 }
@@ -3989,7 +4240,7 @@ fn history(root: &Path) -> HashMap<(String, String), u64> {
 
 // said before any of it starts, because the whole value of an estimate is deciding
 // whether to wait, and that is a decision made at the beginning
-fn forecast(root: &Path, todo: &[(String, String)], recipes: &HashMap<String, Package>) {
+fn forecast(root: &Path, todo: &[(String, String)], recipes: &HashMap<String, Package>) -> usize {
     let past = history(root);
     let (mut n, mut secs, mut new) = (0, 0u64, 0);
     for (name, t) in todo {
@@ -4004,13 +4255,14 @@ fn forecast(root: &Path, todo: &[(String, String)], recipes: &HashMap<String, Pa
         }
     }
     if n < 2 {
-        return;
+        return n;
     }
     let note = match new {
         0 => String::new(),
         u => format!("  {u} never built here"),
     };
     say!("{n} builds  ~{}{note}", clock(secs));
+    n
 }
 
 fn install_cmd(args: &[String]) {
@@ -4024,6 +4276,7 @@ fn install_cmd(args: &[String]) {
     while let Some(a) = it.next() {
         match a.as_str() {
             "-v" => verbose = true,
+            "-q" => QUIET.store(true, Ordering::Relaxed),
             "-n" => dry = true,
             "--live" => live = true,
             "--recover" => fix = true,
@@ -4156,7 +4409,7 @@ fn install_cmd(args: &[String]) {
         .collect();
     // decided once, before any of it is built, so a batch cannot change its mind halfway
     settle(&root, &set, live);
-    forecast(&root, &set, &recipes);
+    let builds = forecast(&root, &set, &recipes);
     if let Some(all) = ready {
         for (n, t) in &set {
             say!("{n} {} {t} cached", recipes[n].version.upstream);
@@ -4169,7 +4422,11 @@ fn install_cmd(args: &[String]) {
     let mut names: Vec<&String> = set.iter().map(|(n, _)| n).collect();
     names.sort();
     names.dedup();
-    batch_begin(&root, names.len());
+    let rows: Vec<[&str; 3]> = set
+        .iter()
+        .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
+        .collect();
+    batch_begin(&root, names.len(), builds, &rows);
     for level in plan {
         // grouped by package, because every target of one builds before any of it is
         // packed. a musl mesa installed beside a gnu mesa that failed is exactly the
@@ -4827,8 +5084,8 @@ fn hooks(root: &Path, targets: BTreeSet<String>) {
         c.args(&targets).env("KIRY_ROOT", root);
         match c.status() {
             Ok(s) if s.success() => {}
-            Ok(s) => eprintln!("kiry: {}: {s}", h.display()),
-            Err(e) => eprintln!("kiry: {}: {e}", h.display()),
+            Ok(s) => complain(&format!("{}: {s}", h.display())),
+            Err(e) => complain(&format!("{}: {e}", h.display())),
         }
     }
 }
@@ -5566,6 +5823,8 @@ fn rebuild_cmd(args: &[String]) {
     for a in args {
         if a == "-n" {
             dry = true;
+        } else if a == "-q" {
+            QUIET.store(true, Ordering::Relaxed);
         } else {
             rest.push(a.clone());
         }
@@ -5640,7 +5899,11 @@ fn rebuild_cmd(args: &[String]) {
     let mut names: Vec<&String> = want.iter().map(|(n, _)| n).collect();
     names.sort();
     names.dedup();
-    batch_begin(&root, names.len());
+    let rows: Vec<[&str; 3]> = want
+        .iter()
+        .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
+        .collect();
+    batch_begin(&root, names.len(), want.len(), &rows);
     for level in plan {
         // every member of a level compiles before any of it is installed, and the level
         // below it is already in place, so each one links against what it will run with

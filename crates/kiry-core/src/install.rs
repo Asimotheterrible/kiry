@@ -490,11 +490,10 @@ pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Seen)>, 
         let head = &head[..n];
 
         if head.starts_with(&elf::MAGIC) {
-            let mut bytes = head.to_vec();
-            if f.read_to_end(&mut bytes).is_err() {
+            let Ok(bytes) = elf::bytes(&f) else {
                 out.push((e.path.clone(), Seen::Bad));
                 continue;
-            }
+            };
             out.push((
                 e.path.clone(),
                 match elf::parse(&bytes) {

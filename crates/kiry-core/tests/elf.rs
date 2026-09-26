@@ -161,9 +161,13 @@ fn agrees_with_readelf_on_every_library_here() {
 }
 
 fn strtab_addr(p: &PathBuf) -> u64 {
+    tag_addr(p, "(STRTAB)")
+}
+
+fn tag_addr(p: &PathBuf, tag: &str) -> u64 {
     let out = Command::new("readelf").arg("-d").arg(p).output().unwrap();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if line.contains("(STRTAB)") {
+        if line.contains(tag) {
             if let Some(hex) = line.split_whitespace().last() {
                 if let Some(h) = hex.strip_prefix("0x") {
                     if let Ok(v) = u64::from_str_radix(h, 16) {
@@ -173,7 +177,60 @@ fn strtab_addr(p: &PathBuf) -> u64 {
             }
         }
     }
-    panic!("no STRTAB in {}", p.display());
+    panic!("no {tag} in {}", p.display());
+}
+
+// gnu ld puts the version tables after the string table and lld puts them before it.
+// read() fetches only the tables, so the ones past the string table are what it could
+// miss: 380 of the elf installed here are laid out that way, the jdk's libraries among
+// them. lld makes the same layout when a script asks it to
+#[test]
+fn reads_version_tables_that_come_after_the_string_table() {
+    let dir = std::env::temp_dir().join(format!("kiry-elf-order-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let put = |n: &str, body: &str| {
+        let p = dir.join(n);
+        std::fs::write(&p, body).unwrap();
+        p
+    };
+    let v = dir.join("libv.so.1");
+    let u = dir.join("libu.so.1");
+    let lib = |out: &Path, soname: &str, extra: &[&Path]| {
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-nostdlib"])
+            .arg(format!("-Wl,-soname,{soname}"))
+            .arg("-o")
+            .arg(out)
+            .args(extra)
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let map = put("v.map", "V1 { global: f; local: *; };\n");
+    let order = put(
+        "order.ld",
+        "SECTIONS {\n  . = SIZEOF_HEADERS;\n  .dynsym : { *(.dynsym) }\n  .dynstr : { *(.dynstr) }\n  \
+         .gnu.version : { *(.gnu.version) }\n  .gnu.version_r : { *(.gnu.version_r) }\n}\nINSERT BEFORE .text;\n",
+    );
+    let script = format!("-Wl,--version-script={}", map.display());
+    let lay = format!("-Wl,-T,{}", order.display());
+    let built = lib(&v, "libv.so.1", &[Path::new(&script), &put("v.c", "void f(void){}\n")])
+        && lib(&u, "libu.so.1", &[Path::new(&lay), &put("u.c", "void f(void);\nvoid g(void){f();}\n"), &v]);
+    if !built {
+        assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "cc cannot build the fixture");
+        return;
+    }
+    for tag in ["(VERSYM)", "(VERNEED)"] {
+        assert!(
+            tag_addr(&u, tag) > strtab_addr(&u),
+            "{tag} is ahead of the string table, so this no longer tests the layout past it"
+        );
+    }
+
+    let whole = elf::parse(&std::fs::read(&u).unwrap()).unwrap();
+    let f = whole.undefined.iter().find(|s| s.name == "f").unwrap();
+    assert_eq!(f.version.as_deref(), Some("V1"));
+    assert_eq!(elf::read(&u).unwrap(), whole);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // DT_STRTAB is an address, not a file offset, and on a PIE binary the two happen

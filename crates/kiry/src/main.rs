@@ -1903,21 +1903,10 @@ fn meta(
     // does this, at the one moment it is known: a library in DT_NEEDED that the recipe
     // cannot account for is a runtime edge whether anybody wrote it down or not. the
     // recipe stays what somebody typed and the sidecar carries what was true
-    //
-    // a build-only line does not account for a library the result links. alpine writes
-    // foo-dev in makedepends and gets the runtime edge from the soname later, so the
-    // converter hands over `foo make` for exactly the libraries that get linked, and a
-    // record that kept the make would leave them out of every closure built on top
     let mut deps = String::new();
     let mut said: HashSet<&str> = HashSet::new();
     for x in p.depends.iter().filter(|x| x.applies(t)) {
-        match x.make && linked.contains(&x.name) {
-            true => {
-                let run = pkg::Dep { make: false, host: false, ..x.clone() };
-                deps.push_str(&format!("{run}\n"));
-            }
-            false => deps.push_str(&format!("{x}\n")),
-        }
+        deps.push_str(&format!("{x}\n"));
         said.insert(&x.name);
     }
     for n in linked.iter().filter(|n| !said.contains(n.as_str())) {
@@ -4325,12 +4314,9 @@ fn commits(num: &str, was: &[String]) -> Result<(), String> {
 // export a name is a standing condition, not a regression
 fn broken(root: &Path) -> Vec<(String, Finding)> {
     let mut out = Vec::new();
-    let world = everywhere(root);
-    for t in db::targets(root).unwrap_or_default() {
-        for f in check(root, &t, &world) {
-            if f.what.breaks() {
-                out.push((t.clone(), f));
-            }
+    for (t, f) in checks(root) {
+        if f.what.breaks() {
+            out.push((t, f));
         }
     }
     out
@@ -5326,10 +5312,9 @@ fn rebuild_cmd(args: &[String]) {
         die(format!("rebuild takes no arguments, got {a}"));
     }
 
-    let targets = match db::targets(&root) {
-        Ok(t) => t,
-        Err(e) => die(e.to_string()),
-    };
+    if let Err(e) = db::targets(&root) {
+        die(e.to_string());
+    }
 
     let mut want: Vec<(String, String)> = Vec::new();
     // the queue names consumers of a library whose abi moved, which resolves fine and
@@ -5349,12 +5334,9 @@ fn rebuild_cmd(args: &[String]) {
             want.push((q.name, q.target));
         }
     }
-    let world = everywhere(&root);
-    for t in &targets {
-        for f in check(&root, t, &world) {
-            if f.what.rebuilds() && !want.contains(&(f.pkg.clone(), t.clone())) {
-                want.push((f.pkg.clone(), t.clone()));
-            }
+    for (t, f) in checks(&root) {
+        if f.what.rebuilds() && !want.contains(&(f.pkg.clone(), t.clone())) {
+            want.push((f.pkg.clone(), t));
         }
     }
     if want.is_empty() {
@@ -5462,13 +5444,10 @@ fn rebuild_cmd(args: &[String]) {
     }
 
     let mut left = 0;
-    let world = everywhere(&root);
-    for t in &targets {
-        for f in check(&root, t, &world) {
-            if f.what.rebuilds() {
-                say!("{} {t} {}", f.path, f.what);
-                left += 1;
-            }
+    for (t, f) in checks(&root) {
+        if f.what.rebuilds() {
+            say!("{} {t} {}", f.path, f.what);
+            left += 1;
         }
     }
     if left > 0 {
@@ -7507,12 +7486,9 @@ fn doctor_cmd(args: &[String]) {
     };
 
     let mut found = 0;
-    let world = everywhere(&root);
-    for t in &targets {
-        for f in check(&root, t, &world) {
-            say!("{} {t} {}", f.path, f.what);
-            found += 1;
-        }
+    for (t, f) in checks(&root) {
+        say!("{} {t} {}", f.path, f.what);
+        found += 1;
     }
     for f in drift(&root, &targets) {
         say!("{} {} {}", f.path, f.pkg, f.what);
@@ -7656,13 +7632,13 @@ fn unowned(root: &Path, targets: &[String]) -> (Vec<Finding>, usize) {
 // they stop matching when a recipe is bumped and only one target is rebuilt
 fn drift(root: &Path, targets: &[String]) -> Vec<Finding> {
     let mut seen: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // the hash and nothing else: a whole record is its manifest, and llvm's is 3567 lines
     for t in targets {
         for name in db::installed(root, t).unwrap_or_default() {
-            let Ok(rec) = db::read(root, t, name.as_str()) else {
-                continue;
-            };
-            if !rec.hash.is_empty() {
-                seen.entry(name).or_default().push((t.clone(), rec.hash));
+            let hash = fs::read_to_string(db::dir(root, t, &name).join("hash")).unwrap_or_default();
+            let hash = hash.trim();
+            if !hash.is_empty() {
+                seen.entry(name).or_default().push((t.clone(), hash.to_string()));
             }
         }
     }
@@ -7687,16 +7663,13 @@ fn drift(root: &Path, targets: &[String]) -> Vec<Finding> {
 
 // kiry never writes /etc/passwd. a recipe says which accounts it expects and doctor
 // reports the ones that are not there
-fn missing_users(root: &Path, target: &str, names: &[String]) -> Vec<Finding> {
+fn missing_users(root: &Path, users: &[(String, Vec<String>)]) -> Vec<Finding> {
     let passwd = fs::read_to_string(root.join("etc/passwd")).unwrap_or_default();
     let have: HashSet<&str> = passwd.lines().filter_map(|l| l.split(':').next()).collect();
 
     let mut out = Vec::new();
-    for name in names {
-        let Ok(rec) = db::read(root, target, name) else {
-            continue;
-        };
-        for u in rec.users.iter().filter(|u| !have.contains(u.as_str())) {
+    for (name, wants) in users {
+        for u in wants.iter().filter(|u| !have.contains(u.as_str())) {
             out.push(Finding {
                 pkg: name.clone(),
                 path: name.clone(),
@@ -7776,28 +7749,36 @@ type Scan = Result<(db::Installed, Vec<(String, install::Seen)>), String>;
 // sixteen threads. everything after this is an index, which is order-dependent, so the
 // results come back in the order the names were in
 fn scans(root: &Path, target: &str, names: &[String]) -> Vec<Scan> {
+    each(names.len(), |i| {
+        db::read(root, target, &names[i])
+            .map_err(|e| e.to_string())
+            .and_then(|rec| {
+                install::scan(root, &rec.manifest)
+                    .map_err(|e| e.to_string())
+                    .map(|seen| (rec, seen))
+            })
+    })
+}
+
+// f over 0..n on every thread there is, the results in index order. a work queue rather
+// than chunks, bc one package is llvm and the next is a font
+fn each<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|s| {
-        for _ in 0..jobs().min(names.len()) {
-            let tx = tx.clone();
-            let next = &next;
+        for _ in 0..jobs().min(n) {
+            let (tx, next, f) = (tx.clone(), &next, &f);
             s.spawn(move || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(name) = names.get(i) else { return };
-                let one = db::read(root, target, name)
-                    .map_err(|e| e.to_string())
-                    .and_then(|rec| {
-                        install::scan(root, &rec.manifest)
-                            .map_err(|e| e.to_string())
-                            .map(|seen| (rec, seen))
-                    });
-                let _ = tx.send((i, one));
+                if i >= n {
+                    return;
+                }
+                let _ = tx.send((i, f(i)));
             });
         }
     });
     drop(tx);
-    let mut out: Vec<Option<Scan>> = (0..names.len()).map(|_| None).collect();
+    let mut out: Vec<Option<T>> = (0..n).map(|_| None).collect();
     for (i, one) in rx {
         out[i] = Some(one);
     }
@@ -7891,13 +7872,18 @@ fn accounted(
     out
 }
 
-fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
+type Script = (String, String, Vec<String>);
+
+// one target's findings, and what the shebang check needs from it: its scripts and the
+// index of every path it owns. checks() runs that last, over all targets at once
+fn check(root: &Path, target: &str) -> (Vec<Finding>, Vec<Script>, World) {
     let Some(dirs) = defaults(target) else {
-        return vec![Finding {
+        let bad = Finding {
             pkg: "-".into(),
             path: target.to_string(),
             what: What::UnknownTarget,
-        }];
+        };
+        return (vec![bad], Vec::new(), (HashSet::new(), HashMap::new()));
     };
 
     let names = match db::installed(root, target) {
@@ -7910,7 +7896,7 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
     let mut owners: Vec<String> = Vec::new();
     let mut here: HashMap<String, usize> = HashMap::new();
     let mut links: HashMap<String, String> = HashMap::new();
-    let mut shebangs: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut shebangs: Vec<Script> = Vec::new();
     // every regular file, not only the ones that parse as elf: an interpreter is a file
     // a hardlink is one too -- the same inode under a second name, which is how perl
     // ships /usr/bin/perl beside perl5.44.0
@@ -7919,6 +7905,7 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
     // every installed name of this target is in names, so this is the whole graph and
     // nothing has to go back to disk for a depends the scan already read
     let mut deps: HashMap<String, Vec<Dep>> = HashMap::new();
+    let mut users: Vec<(String, Vec<String>)> = Vec::new();
 
     for (name, one) in names.iter().zip(scans(root, target, &names)) {
         let (mut rec, seen) = match one {
@@ -7926,6 +7913,7 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
             Err(e) => die(e),
         };
         deps.insert(name.clone(), std::mem::take(&mut rec.depends));
+        users.push((name.clone(), std::mem::take(&mut rec.users)));
         // the loader opens a path, so a symlink on the way to a library is part of
         // resolution. musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1
         // points at the loader itself
@@ -7984,14 +7972,16 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
     // out of what records claim. without this every consumer of a soname the tree has
     // moved past reads unresolved and every symbol behind it reads missing -- 47 rows
     // against electron that were one fact
-    for name in db::preserving(root, target).unwrap_or_default() {
-        let Ok(m) = db::read_preserved(root, target, &name) else {
-            continue;
-        };
+    let kept = db::preserving(root, target).unwrap_or_default();
+    let read = each(kept.len(), |i| {
+        let m = db::read_preserved(root, target, &kept[i]).ok()?;
+        let seen = install::scan(root, &m);
+        Some((m, seen))
+    });
+    for (name, one) in kept.into_iter().zip(read) {
+        let Some((m, seen)) = one else { continue };
         index(&m, &mut present, &mut links);
-        let Ok(seen) = install::scan(root, &m) else {
-            continue;
-        };
+        let Ok(seen) = seen else { continue };
         for (path, what) in seen {
             let install::Seen::Elf(o) = what else { continue };
             here.insert(fold(&path), elves.len());
@@ -8051,39 +8041,6 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
     }
 
     out.extend(accounted(target, &deps, &elves, &owners, &needs));
-
-    // the kernel will not start a script whose interpreter is not there, which is the
-    // same failure DT_NEEDED describes and nothing was checking it
-    let (anywhere, anylinks) = world;
-    for (pkg, path, words) in &shebangs {
-        let mut want = words[0].trim_start_matches('/').to_string();
-        // env looks the real one up on PATH, so that is the name that has to exist
-        if want.ends_with("/env") || want == "env" {
-            // env takes its own options and VAR=value pairs first. -S is the common one
-            match words
-                .iter()
-                .skip(1)
-                .find(|w| !w.starts_with('-') && !w.contains('='))
-            {
-                Some(w) => want.clone_from(w),
-                None => continue,
-            }
-        }
-        let there = if want.contains('/') {
-            exists(anywhere, anylinks, &want)
-        } else {
-            ["usr/bin", "usr/sbin"]
-                .iter()
-                .any(|d| exists(anywhere, anylinks, &format!("{d}/{want}")))
-        };
-        if !there {
-            out.push(Finding {
-                pkg: pkg.clone(),
-                path: path.clone(),
-                what: What::NoInterpreter(words.join(" ")),
-            });
-        }
-    }
 
     // a perl xs module is dlopened, so nothing links it and it is not asked. the library
     // it pulls in is linked, but only by something equally unknowable, and the question
@@ -8180,7 +8137,57 @@ fn check(root: &Path, target: &str, world: &World) -> Vec<Finding> {
             what: What::Duplicate(n, elves[b].0.clone()),
         });
     }
-    out.extend(missing_users(root, target, &names));
+    out.extend(missing_users(root, &users));
+    (out, shebangs, (present, links))
+}
+
+// every target's findings. the shebang check wants every target's files, and each
+// check() indexed its own already, so their union is that and no record is read twice
+fn checks(root: &Path) -> Vec<(String, Finding)> {
+    let mut out = Vec::new();
+    let (mut anywhere, mut anylinks) = (HashSet::new(), HashMap::new());
+    let mut scripts = Vec::new();
+    for t in db::targets(root).unwrap_or_default() {
+        let (found, shebangs, (present, links)) = check(root, &t);
+        out.extend(found.into_iter().map(|f| (t.clone(), f)));
+        anywhere.extend(present);
+        anylinks.extend(links);
+        scripts.extend(shebangs.into_iter().map(|s| (t.clone(), s)));
+    }
+    // the kernel will not start a script whose interpreter is not there, which is the
+    // same failure DT_NEEDED describes and nothing was checking it
+    for (t, (pkg, path, words)) in &scripts {
+        let mut want = words[0].trim_start_matches('/').to_string();
+        // env looks the real one up on PATH, so that is the name that has to exist
+        if want.ends_with("/env") || want == "env" {
+            // env takes its own options and VAR=value pairs first. -S is the common one
+            match words
+                .iter()
+                .skip(1)
+                .find(|w| !w.starts_with('-') && !w.contains('='))
+            {
+                Some(w) => want.clone_from(w),
+                None => continue,
+            }
+        }
+        let there = if want.contains('/') {
+            exists(&anywhere, &anylinks, &want)
+        } else {
+            ["usr/bin", "usr/sbin"]
+                .iter()
+                .any(|d| exists(&anywhere, &anylinks, &format!("{d}/{want}")))
+        };
+        if !there {
+            out.push((
+                t.clone(),
+                Finding {
+                    pkg: pkg.clone(),
+                    path: path.clone(),
+                    what: What::NoInterpreter(words.join(" ")),
+                },
+            ));
+        }
+    }
     out
 }
 
@@ -8227,27 +8234,6 @@ fn index(
 // so glibc's own scripts reach the busybox sh the musl side owns. linkage stays inside
 // one target -- that is what cross-tier exists to catch -- but this does not
 type World = (HashSet<String>, HashMap<String, String>);
-
-// every path either target installs, for the interpreter check: a script names one file
-// and nothing says which target owns it
-fn everywhere(root: &Path) -> World {
-    let mut present = HashSet::new();
-    let mut links = HashMap::new();
-    let Ok(targets) = db::targets(root) else {
-        return (present, links);
-    };
-    for t in &targets {
-        let Ok(names) = db::installed(root, t) else {
-            continue;
-        };
-        for n in &names {
-            if let Ok(rec) = db::read(root, t, n) {
-                index(&rec.manifest, &mut present, &mut links);
-            }
-        }
-    }
-    (present, links)
-}
 
 fn exists(present: &HashSet<String>, links: &HashMap<String, String>, path: &str) -> bool {
     let mut at = fold(path);
@@ -8905,8 +8891,6 @@ mod sidecar {
             host: false,
             only: Some("musl".into()),
         };
-        let tool = pkg::Dep { name: "cmake".into(), make: true, host: true, only: None };
-        let headers = pkg::Dep { name: "libsepol".into(), make: true, host: true, only: None };
         let recipe = at.join("thing");
         mkdirs(&recipe).unwrap();
         fs::write(recipe.join("version"), "1.0 1\n").unwrap();
@@ -8916,13 +8900,13 @@ mod sidecar {
             version: pkg::Version::parse("1.0 1").unwrap(),
             sources: Vec::new(),
             checksums: Vec::new(),
-            depends: vec![declared, only_gnu, tool, headers],
+            depends: vec![declared, only_gnu],
             targets: vec!["x86_64-gnu".into()],
             users: Vec::new(),
         };
 
         let art = at.join("thing-1.0-1.x86_64-gnu.tar.zst");
-        let linked = vec!["libpcre2".to_string(), "zlib".to_string(), "libsepol".to_string()];
+        let linked = vec!["libpcre2".to_string(), "zlib".to_string()];
         let f = Flags {
             cflags: String::new(),
             cxxflags: String::new(),
@@ -8937,7 +8921,7 @@ mod sidecar {
         let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-gnu.tar.zst.meta/depends")).unwrap();
         let lines: Vec<&str> = got.lines().collect();
         // zlib was declared and linked, and is one line either way
-        assert_eq!(lines, vec!["zlib", "cmake make", "libsepol", "libpcre2"], "{got}");
+        assert_eq!(lines, vec!["zlib", "libpcre2"], "{got}");
     }
 }
 

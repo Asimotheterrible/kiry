@@ -74,12 +74,90 @@ pub struct Elf {
 }
 
 pub fn read(p: &Path) -> Result<Elf, Error> {
-    // TODO: no cache, so doctor re-reads every library it has already seen
-    let b = fs::read(p).map_err(|e| Error::Io(p.to_path_buf(), e))?;
+    let io = |e| Error::Io(p.to_path_buf(), e);
+    let b = bytes(&fs::File::open(p).map_err(io)?).map_err(io)?;
     parse(&b).map_err(|why| Error::Elf {
         path: p.display().to_string(),
         why,
     })
+}
+
+// an open file rather than a path, so a caller that opened it beneath a root reads that
+// one. positioned reads, so wherever the caller left the offset does not matter
+pub fn bytes(f: &fs::File) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let len = usize::try_from(f.metadata()?.len()).unwrap_or(usize::MAX);
+    if let Some(b) = sparse(f, len) {
+        return Ok(b);
+    }
+    let mut b = vec![0u8; len];
+    f.read_exact_at(&mut b, 0)?;
+    Ok(b)
+}
+
+// whole files are 2670MiB of installed elf read for doctor to use 51 of it. parse() looks
+// at the headers, the dynamic segment and the tables it points at, which sit together
+// ahead of the code, and a zeroed buffer the length of the file costs pages only where a
+// read lands, so parse() runs unchanged on it. None is anything unexpected, and the
+// caller reads the whole file instead
+fn sparse(f: &fs::File, len: usize) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut b = vec![0u8; len];
+    let fill = |b: &mut Vec<u8>, off: usize, n: usize| -> Option<()> {
+        let end = off.checked_add(n)?;
+        f.read_exact_at(b.get_mut(off..end)?, off as u64).ok()
+    };
+    fill(&mut b, 0, 64)?;
+    if !b.starts_with(&MAGIC) {
+        return None;
+    }
+    let phoff = at(u64at(&b, 32)?).ok()?;
+    let phentsize = u16at(&b, 54)? as usize;
+    let phnum = u16at(&b, 56)? as usize;
+    if phentsize < 56 || phnum == 0xffff {
+        return None;
+    }
+    fill(&mut b, phoff, phnum.checked_mul(phentsize)?)?;
+    let mut loads = Vec::new();
+    let mut dynamic = None;
+    for i in 0..phnum {
+        let ph = b.get(phoff + i * phentsize..)?;
+        let (off, vaddr, filesz) = (u64at(ph, 8)?, u64at(ph, 16)?, u64at(ph, 32)?);
+        match u32at(ph, 0)? {
+            PT_LOAD => loads.push((vaddr, filesz, off)),
+            PT_DYNAMIC => dynamic = Some((at(off).ok()?, at(filesz).ok()?)),
+            _ => {}
+        }
+    }
+    let Some((dynoff, dynsz)) = dynamic else {
+        return Some(b);
+    };
+    fill(&mut b, dynoff, dynsz)?;
+
+    let (mut strtab, mut strsz, mut tables) = (None, None, Vec::new());
+    for e in b.get(dynoff..dynoff + dynsz)?.chunks_exact(16) {
+        let (tag, val) = (u64at(e, 0)? as i64, u64at(e, 8)?);
+        match tag {
+            DT_NULL => break,
+            DT_STRTAB => strtab = Some(val),
+            DT_STRSZ => strsz = Some(val),
+            DT_SYMTAB | DT_HASH | DT_GNU_HASH | DT_VERSYM | DT_VERDEF | DT_VERNEED => tables.push(val),
+            _ => {}
+        }
+    }
+    let (Some(strtab), Some(strsz)) = (strtab, strsz) else {
+        return Some(b);
+    };
+    // each table ends where the next one starts, so only the one furthest along has no
+    // neighbour to stop it. the string table says its own size; anything past it runs to
+    // the end of its segment, which is gnu ld putting the version tables after it
+    let mut hi = at(offset_of(&loads, strtab).ok()?).ok()?.checked_add(at(strsz).ok()?)?;
+    if let Some(last) = tables.into_iter().filter(|a| *a > strtab).max() {
+        let &(_, filesz, off) = loads.iter().find(|&&(v, s, _)| last >= v && last - v < s)?;
+        hi = hi.max(at(off.checked_add(filesz)?).ok()?);
+    }
+    fill(&mut b, 0, hi)?;
+    Some(b)
 }
 
 pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {

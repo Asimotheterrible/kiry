@@ -693,3 +693,83 @@ fn an_offline_conversion_keeps_alpines_sha512() {
         sum
     );
 }
+
+// kiry never runs check(), so a suite the configure line asks for is built for nothing,
+// and glm, cxxopts and mbedtls2 each failed inside theirs on clang's -Werror
+#[test]
+fn test_suites_the_build_asks_for_are_switched_off() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("untest");
+    let (d, _) = convert(
+        &at,
+        "pkgname=thing\npkgver=1.0\npkgrel=0\n\
+         _conf() {\n\t./configure --enable-tests \"--enable-unit-tests\" --enable-test\n}\n\
+         build() {\n\tcmake -B build -DBUILD_TESTING=ON \\\n\
+         \t\t-DGLM_BUILD_TESTS=TRUE -DKDSoap_TESTS=true -DBUILD_TESTS:BOOL=1 \\\n\
+         \t\t-DQUIC_BUILD_TEST=on -DENABLE_TESTING=Yes\n\
+         \tmeson setup build -Dtests=true -Dunit_tests=enabled -Dtest=true\n\t_conf\n}\n\
+         package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    for want in [
+        "./configure --disable-tests \"--disable-unit-tests\" --disable-test\n",
+        "-DBUILD_TESTING=OFF \\\n",
+        "-DGLM_BUILD_TESTS=FALSE ",
+        "-DKDSoap_TESTS=false ",
+        "-DBUILD_TESTS:BOOL=0 ",
+        "-DQUIC_BUILD_TEST=off ",
+        "-DENABLE_TESTING=No\n",
+        "-Dtests=false ",
+        "-Dunit_tests=disabled ",
+        "-Dtest=false\n",
+    ] {
+        assert!(script.contains(want), "no {want:?} in\n{script}");
+    }
+}
+
+// a false positive switches off something the package installs, which is worse than a
+// suite built for nothing. each of these is a real flag from a real apkbuild
+#[test]
+fn options_that_only_look_like_tests_stay_on() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("keeptest");
+    let flags = [
+        // link the system gtest, not build one
+        "-DUSE_SYSTEM_GTEST=ON",
+        "-DRC_ENABLE_GTEST_TESTS=ON",
+        // already saying off
+        "-DNO_TESTS=ON",
+        "-DSKIP_TESTS=ON",
+        "-DIGNORE_TESTS=ON",
+        "-DDISABLE_TESTS=ON",
+        // libSDL2_test, liborc-test and the kcapi tool, all installed
+        "-DSDL_TEST=ON",
+        "-Dorc-test=enabled",
+        "--enable-kcapi-test",
+        // php's zend_test extension
+        "--enable-zend-test=shared",
+        // a value is what it asks for, and flipping the name alone keeps the value
+        "--enable-testing-mode=no",
+        // a value that is not a yes
+        "-DBUILD_TESTING=\"$build_testing\"",
+        "-DTESTDATA=ON",
+        "-DLATEST=ON",
+    ];
+    let (d, _) = convert(
+        &at,
+        &format!(
+            "pkgname=thing\npkgver=1.0\npkgrel=0\n\
+             build() {{\n\tcmake {}\n}}\n\
+             package() {{\n\tmake install DESTDIR=\"$pkgdir\"\n}}\n",
+            flags.join(" ")
+        ),
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    for f in flags {
+        assert!(script.contains(&format!(" {f}")), "{f} was changed\n{script}");
+    }
+}

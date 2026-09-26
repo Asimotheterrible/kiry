@@ -359,8 +359,10 @@ pub fn recipe(
         wrote.push(f.clone());
         script.push_str(&format!(
             "\n{f}() {{\n{}}}\n",
-            b.replace("$pkgdir", "$DESTDIR")
-                .replace("${pkgdir}", "$DESTDIR")
+            untested(
+                &b.replace("$pkgdir", "$DESTDIR")
+                    .replace("${pkgdir}", "$DESTDIR")
+            )
         ));
     }
     // abuild runs default_prepare when an apkbuild defines no prepare() of its own, and
@@ -565,6 +567,82 @@ fn body(text: &str, name: &str) -> Option<String> {
         out.push('\n');
     }
     None
+}
+
+// kiry never runs check(), and a test suite it builds anyway is one more thing to fail:
+// mbedtls2, glm and cxxopts all stopped on clang's -Werror inside their tests. a word at a
+// time, so the whitespace and the line continuations stay as they were
+fn untested(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut word = String::new();
+    for c in body.chars() {
+        if c.is_whitespace() {
+            out.push_str(&off(&word));
+            word.clear();
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    out.push_str(&off(&word));
+    out
+}
+
+// the same word switched off, or as it was. an --enable- with a value is left alone: the
+// value is what it asks for, and --disable-testing-mode=no is anybody's guess
+fn off(word: &str) -> String {
+    let inner = word.trim_start_matches(['"', '\'']);
+    let bare = inner.trim_end_matches(['"', '\'']);
+    let (lead, tail) = (&word[..word.len() - inner.len()], &inner[bare.len()..]);
+    let flipped = if let Some(name) = bare.strip_prefix("--enable-") {
+        (!name.contains('=') && tests(name)).then(|| format!("--disable-{name}"))
+    } else if let Some((name, val)) = bare.strip_prefix("-D").and_then(|r| r.split_once('='))
+    {
+        let no = match val {
+            "ON" => Some("OFF"),
+            "on" => Some("off"),
+            "On" => Some("Off"),
+            "TRUE" => Some("FALSE"),
+            "True" => Some("False"),
+            "true" => Some("false"),
+            "YES" => Some("NO"),
+            "Yes" => Some("No"),
+            "yes" => Some("no"),
+            "1" => Some("0"),
+            "enabled" => Some("disabled"),
+            _ => None,
+        };
+        no.filter(|_| tests(name.split(':').next().unwrap_or(name)))
+            .map(|no| format!("-D{name}={no}"))
+    } else {
+        None
+    };
+    match flipped {
+        Some(f) => format!("{lead}{f}{tail}"),
+        None => word.to_string(),
+    }
+}
+
+// whether an option names a test suite. a bare singular TEST is too often a library the
+// package installs -- SDL_TEST is libSDL2_test, orc-test is liborc-test, kcapi-test is the
+// kcapi tool -- so it only counts on its own or right after BUILD, ENABLE, WITH or INCLUDE.
+// a gtest in the name is the system gtest to link, and NO_TESTS=ON already says off
+fn tests(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    let seg: Vec<&str> = up.split(['_', '-']).collect();
+    if seg.iter().any(|s| {
+        matches!(
+            *s,
+            "NO" | "DISABLE" | "DISABLED" | "SKIP" | "IGNORE" | "WITHOUT"
+        ) || s.contains("GTEST")
+    }) {
+        return false;
+    }
+    seg.iter().any(|s| matches!(*s, "TESTS" | "TESTING"))
+        || matches!(
+            seg.as_slice(),
+            ["TEST"] | [.., "BUILD" | "ENABLE" | "WITH" | "INCLUDE", "TEST"]
+        )
 }
 
 // alpine deps carry three things kiry's do not: a version constraint, a ! meaning a

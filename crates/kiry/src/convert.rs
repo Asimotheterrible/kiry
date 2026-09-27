@@ -33,6 +33,8 @@ const WANT: &[&str] = &[
     "options",
     // the other names a recipe answers to, which is what parents() reads
     "provides",
+    // what a -dev package hands whatever builds against it, read off the dep's apkbuild
+    "depends_dev",
 ];
 
 // what could not be carried across, reported rather than guessed at
@@ -262,6 +264,7 @@ pub fn recipe(
     }
 
     let mut depends = Vec::new();
+    let mut dev = Vec::new();
     for (key, make) in [
         ("depends", false),
         ("makedepends", true),
@@ -278,6 +281,9 @@ pub fn recipe(
                 notes.push(format!("dropped {key} entry {raw}"));
                 continue;
             };
+            if make {
+                dev.extend(depends_dev(apkbuild, raw, alias));
+            }
             match alias.get(&n).map(String::as_str) {
                 Some("-") => notes.push(format!("{raw} has no equivalent here")),
                 // its own subpackage, which the one recipe already builds
@@ -299,6 +305,14 @@ pub fn recipe(
                     only: None,
                 }),
             }
+        }
+    }
+    // compiled against, so from the target, and only what the recipe does not name already
+    for raw in dev {
+        let Some(n) = dep(&raw) else { continue };
+        let n = alias.get(&n).cloned().unwrap_or(n);
+        if n != "-" && n != name && !depends.iter().any(|d: &Dep| d.name == n) {
+            depends.push(Dep { name: n, make: true, host: false, only: None });
         }
     }
     depends.sort_by(|a, b| (a.make, a.host, &a.name).cmp(&(b.make, b.host, &b.name)));
@@ -668,6 +682,43 @@ fn dep(raw: &str) -> Option<String> {
         }
     }
     (!n.is_empty()).then(|| n.to_string())
+}
+
+// a -dev package drags its depends_dev along for whatever builds against it. libraries
+// in it come into the sandbox through their .pc files and tools and plugins are not
+// headers, which leaves the header-only packages no .pc names: gtk+-3.0.pc never names
+// wayland-protocols, which gtk+3.0-dev hands every consumer. taking the whole list was
+// 12078 lines across 3003 recipes, openssl and python3 and qt plugins among them.
+// linux-headers is in every build already, through the toolchain
+fn depends_dev(apkbuild: &Path, raw: &str, alias: &HashMap<String, String>) -> Vec<String> {
+    let cut = raw.find(['<', '>', '=', '~']).unwrap_or(raw.len());
+    let Some(base) = raw[..cut].strip_suffix("-dev") else {
+        return Vec::new();
+    };
+    // <aports>/<repo>/<pkg>/APKBUILD, and the dep's own is a sibling of it
+    let Some(aports) = apkbuild.parent().and_then(Path::parent).and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let origin = [Some(base), alias.get(base).map(String::as_str)];
+    for o in origin.into_iter().flatten() {
+        for repo in ["main", "community", "testing"] {
+            let a = aports.join(repo).join(o).join("APKBUILD");
+            if !a.is_file() || a == apkbuild {
+                continue;
+            }
+            let Ok((v, _)) = variables(&a) else { return Vec::new() };
+            let list = v.get("depends_dev").map(String::as_str).unwrap_or("");
+            return list
+                .split_whitespace()
+                .filter(|d| {
+                    (d.ends_with("-protocols") || d.ends_with("-headers") || d.ends_with("proto"))
+                        && *d != "linux-headers"
+                })
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 fn sha512sums(text: &str) -> HashMap<String, String> {

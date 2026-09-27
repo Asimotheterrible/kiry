@@ -1400,6 +1400,15 @@ fn unrung(text: &str) -> String {
     }
 }
 
+// cached() without the line it prints, for planning, which asks before anything runs
+fn fresh(root: &Path, p: &Package, t: &str) -> bool {
+    let a = root.join("var/kiry/cache").join(format!(
+        "{}-{}-{}.{t}.tar.zst",
+        p.name, p.version.upstream, p.version.rev
+    ));
+    a.is_file() && stale(root, p, t, &a).is_none()
+}
+
 fn cached(root: &Path, p: &Package, t: &str) -> Option<PathBuf> {
     let a = root.join("var/kiry/cache").join(format!(
         "{}-{}-{}.{t}.tar.zst",
@@ -4449,7 +4458,8 @@ fn install_cmd(args: &[String]) {
     }
 
     let set = wanted(&root, &seeds, &mut recipes);
-    let mut plan = levels(&set, &recipes);
+    let built: Vec<bool> = set.iter().map(|(n, t)| fresh(&root, &recipes[n], t)).collect();
+    let mut plan = levels(&set, &recipes, &built);
     longest_first(&mut plan, &set, &history(&root));
     if dry {
         let mut building = 0;
@@ -4742,10 +4752,14 @@ fn wanted(
         if !p.targets.contains(&t) {
             die(format!("{name} is wanted for {t} and does not build for it"));
         }
+        // a built artifact is installed, which asks for its runtime deps alone. walking
+        // its build deps too closed llvm, cmake and python3 into a cycle on an empty
+        // root with every one of them sitting in the cache
+        let built = fresh(root, p, &t);
         let next: Vec<(String, String)> = p
             .depends
             .iter()
-            .filter(|d| d.applies(&t))
+            .filter(|d| d.applies(&t) && !(built && d.make))
             .map(|d| {
                 let dt = if d.host { host.clone() } else { t.clone() };
                 (d.name.clone(), dt)
@@ -5748,7 +5762,12 @@ fn resolve(root: &Path, arg: &str) -> Result<PathBuf, String> {
 // the bool is a bootstrap pass: the same package built from its bootstrap script, which
 // stands in for it until the real one can be built. it stays in the plan afterwards,
 // because a first pass is a stand-in and not the article
-fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<Vec<(usize, bool)>> {
+// built says which members install from the cache, whose build deps order nothing
+fn levels(
+    want: &[(String, String)],
+    recipes: &HashMap<String, Package>,
+    built: &[bool],
+) -> Vec<Vec<(usize, bool)>> {
     let host = sandbox::host();
     let mut left: Vec<usize> = (0..want.len()).collect();
     let mut done: Vec<usize> = Vec::new();
@@ -5765,7 +5784,10 @@ fn levels(want: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<
                         && deps.is_some_and(|d| {
                             d.iter().any(|x| {
                                 let t = if x.host { &host } else { &want[*i].1 };
-                                x.applies(&want[*i].1) && x.name == want[*j].0 && *t == want[*j].1
+                                x.applies(&want[*i].1)
+                                    && !(built[*i] && x.make)
+                                    && x.name == want[*j].0
+                                    && *t == want[*j].1
                             })
                         })
                 })
@@ -5981,12 +6003,16 @@ mod order {
             ("acl".to_string(), pkg("acl", vec![attr])),
             ("attr".to_string(), pkg("attr", Vec::new())),
         ]);
-        let plan = levels(&want, &recipes);
+        let plan = levels(&want, &recipes, &[false, false]);
         let order: Vec<Vec<&str>> = plan
             .iter()
             .map(|l| l.iter().map(|(i, _)| want[*i].0.as_str()).collect())
             .collect();
         assert_eq!(order, [["attr"], ["acl"]]);
+
+        // acl is in the cache, so nothing builds with attr and neither waits
+        let plan = levels(&want, &recipes, &[true, false]);
+        assert_eq!(plan.len(), 1, "{plan:?}");
     }
 }
 
@@ -6061,7 +6087,7 @@ fn rebuild_cmd(args: &[String]) {
         };
     }
 
-    let mut plan = levels(&want, &recipes);
+    let mut plan = levels(&want, &recipes, &vec![false; want.len()]);
     longest_first(&mut plan, &want, &history(&root));
     if dry {
         for (i, boot) in plan.into_iter().flatten() {

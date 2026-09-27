@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -408,9 +408,34 @@ fn clone(src: &Path, dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", dst.display()))
 }
 
+// a child that dies with the thread that started it. otherwise kiry killed under a build
+// leaves the build compiling in its namespace with nothing left to take what it made, and
+// a killed pack leaves its zstd writing a .part nobody will rename
+pub fn tied(c: &mut Command) -> &mut Command {
+    let parent = process::getpid();
+    // SAFETY: this runs between fork and exec, where only async-signal-safe work is
+    // allowed. both calls are a bare syscall, with no allocation and no lock taken
+    unsafe {
+        c.pre_exec(move || {
+            process::set_parent_process_death_signal(Some(process::Signal::KILL))?;
+            // a parent that died before the line above leaves nothing to fire it. pid 1
+            // of a new namespace has its parent outside it and reads it as none
+            match process::getppid() {
+                Some(p) if p != parent => Err(std::io::ErrorKind::Other.into()),
+                _ => Ok(()),
+            }
+        })
+    }
+}
+
 // a freshly exec'd process has exactly one thread, and CLONE_NEWUSER refuses to unshare
 // from a process that has more than one. that is why the build enters through a new kiry
 // rather than through this one, which is free to grow threads later
+//
+// the build is the first child after NEWPID, so it is pid 1 of its own namespace, and the
+// kernel kills everything in a namespace whose pid 1 is gone. tied twice over, this
+// process to kiry and the build to this process, that is the whole tree going with kiry
+// -- a pdeathsig alone reaches sh and not the make under it
 pub fn init() -> Result<(), String> {
     let work = PathBuf::from(
         std::env::var("KIRY_SANDBOX").map_err(|_| "KIRY_SANDBOX is not set".to_string())?,
@@ -419,10 +444,15 @@ pub fn init() -> Result<(), String> {
 
     let (uid, gid) = (process::getuid().as_raw(), process::getgid().as_raw());
     // SAFETY: rustix documents one hazard, UnshareFlags::FILES leaving a thread holding
-    // descriptors from a table it no longer shares. these three flags are not that one,
+    // descriptors from a table it no longer shares. none of these four is that one,
     // and a process this new has no second thread to hand a descriptor to anyway
     unsafe {
-        thread::unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS | UnshareFlags::NEWNET)
+        thread::unshare_unsafe(
+            UnshareFlags::NEWUSER
+                | UnshareFlags::NEWNS
+                | UnshareFlags::NEWNET
+                | UnshareFlags::NEWPID,
+        )
     }
     .map_err(|e| format!("unshare: {e}"))?;
     write("/proc/self/setgroups", "deny")?;
@@ -491,10 +521,10 @@ pub fn init() -> Result<(), String> {
     let cwd = crate::unpacked(Path::new("/src"));
     process::chdir(&cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
 
-    Err(format!(
-        "exec sh: {}",
-        Command::new("sh").arg("-e").arg("/build").exec()
-    ))
+    let s = tied(Command::new("sh").arg("-e").arg("/build"))
+        .status()
+        .map_err(|e| format!("sh: {e}"))?;
+    std::process::exit(s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)))
 }
 
 // enough for a build to run and nothing that reads or writes hardware

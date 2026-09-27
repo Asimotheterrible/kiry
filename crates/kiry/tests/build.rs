@@ -173,7 +173,7 @@ fn bootstrap(root: &Path) -> bool {
     for a in [
         "sh", "mkdir", "cp", "ln", "rm", "mv", "cat", "echo", "printf", "chmod", "find",
         "head", "install", "patch", "tar", "dd", "true", "false", "sed", "touch", "grep",
-        "sort", "wc", "xargs", "nproc", "tr",
+        "sort", "wc", "xargs", "nproc", "tr", "sleep",
     ] {
         let at = format!("usr/bin/{a}");
         // this busybox is built without patch and the closure is the whole of what a
@@ -802,6 +802,11 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
         assert!(
             said.contains("set(CMAKE_POSITION_INDEPENDENT_CODE ON CACHE BOOL \"\" FORCE)"),
             "{target} builds an object library without pic: {said}"
+        );
+        // nothing runs the suite, so compiling it is the whole of what it costs
+        assert!(
+            said.contains("set(BUILD_TESTING OFF CACHE BOOL \"\" FORCE)"),
+            "{target} builds its tests: {said}"
         );
     }
 }
@@ -2197,6 +2202,8 @@ fn no_lto_reaches_rustflags() {
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
     config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\nLTO full\n");
+    // flags answers for a package it knows of, and this one has nothing of its own
+    config(&root, Some("anything"), "");
     let said = resolved(&root, "anything");
     assert!(said.contains("resolved RUSTFLAGS -C target-cpu=znver3 -C opt-level=2\n"), "{said}");
     assert!(said.contains("resolved CFLAGS -O2 -march=znver3 -flto=full -g0"), "{said}");
@@ -2300,6 +2307,7 @@ fn a_setting_that_is_not_one_is_refused_by_name() {
 fn thinlto_jobs_only_appear_under_thin() {
     let root = scratch("ltojobs");
     config(&root, None, "LTO full\n");
+    config(&root, Some("mesa"), "");
     let said = resolved(&root, "mesa");
     assert!(said.contains("resolved LDFLAGS -flto=full -Wl,-O2"), "{said}");
     assert!(!said.contains("thinlto-jobs"), "{said}");
@@ -2624,9 +2632,38 @@ fn a_rung_that_changes_no_flag_costs_no_build() {
     // the first try, filter-lto, then the march rung that fixes it
     let tries = said.lines().filter(|l| l.contains(" building ")).count();
     assert_eq!(tries, 3, "{said}");
-    let pkg = fs::read_to_string(root.join("etc/kiry/pkg/hello")).unwrap();
-    assert!(pkg.contains("CFLAGS_MARCH"), "{pkg}");
-    assert!(!pkg.contains("OPT -O2"), "a rung that changed nothing was left behind: {pkg}");
+    let f = fs::read_to_string(d.join("filter")).unwrap();
+    assert!(f.contains("filter-flags -march=*"), "{f}");
+    assert!(
+        !root.join("etc/kiry/pkg/hello").exists(),
+        "a rung that changed nothing was left behind"
+    );
+}
+
+// every rung and it still fails, so none of them is a fix. left behind they read as one,
+// which is what retroarch was found carrying
+#[test]
+fn a_recovery_that_ends_stuck_takes_its_rungs_back_out() {
+    let at = scratch("stuck-rungs");
+    let d = recipe(&at, "x86_64-musl", "echo 'foo.c:3:9: error: no flag helps' >&2\nexit 1\n");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O3\nCFLAGS_MARCH znver3\nLTO thin\n");
+    fs::create_dir_all(root.join("etc/kiry/pkg")).unwrap();
+    fs::write(root.join("etc/kiry/pkg/hello"), "CFLAGS -fmine\n").unwrap();
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("the ladder ran out"), "{err}");
+    assert_eq!(fs::read_to_string(root.join("etc/kiry/pkg/hello")).unwrap(), "CFLAGS -fmine\n");
+    // the stuck note stays, and it is the only thing there
+    let f = fs::read_to_string(d.join("filter")).unwrap();
+    assert!(f.contains("stuck"), "{f}");
+    assert!(f.lines().all(|l| l.trim().is_empty() || l.starts_with('#')), "{f}");
 }
 
 // the ladder ends on the smallest set of flags, not on -pipe, which only moves where the
@@ -5788,4 +5825,222 @@ fn a_struct_that_grows_queues_what_builds_against_it() {
     assert!(said.contains("libbar x86_64-musl layout moved for 1 records (struct bar), queued 1"), "{said}");
     let q = db::read_queue(&root).unwrap();
     assert!(q.iter().any(|x| x.name == "baruser" && x.soname == "layout"), "{}", q.len());
+}
+
+// two installs into one root that both plan against the same db both say ok, and one
+// record comes out empty. the second waits for the first, and says who it waits on
+#[test]
+fn a_second_writer_waits_for_the_first() {
+    let at = scratch("dblock");
+    let root = at.join("root");
+    let file = at.join("f");
+    fs::write(&file, "x\n").unwrap();
+    let arc = archive(&at, "foo", &[("usr/share/foo", &file)]);
+    let lock = root.join("usr/lib/kiry/db/lock");
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let held = fs::File::create(&lock).unwrap();
+    rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    fs::write(&lock, "4242\n").unwrap();
+
+    let second = Command::new(KIRY)
+        .args(["i", "--root", root.to_str().unwrap(), arc.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let early = db::dir(&root, "x86_64-gnu", "foo").exists();
+    drop(held);
+    let o = second.wait_with_output().unwrap();
+    assert!(!early, "installed while another writer held the db");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("waiting for pid 4242"), "{said}");
+    assert!(db::dir(&root, "x86_64-gnu", "foo").exists());
+}
+
+// a caller types what they were shown: /bin/hello as often as /usr/bin/hello, with a
+// doubled slash or a .. on the way. and a path that is not there is not one nobody owns
+#[test]
+fn owns_reads_a_path_the_way_the_root_resolves_it() {
+    let at = scratch("owns");
+    let root = at.join("root");
+    fs::create_dir_all(root.join("usr/bin")).unwrap();
+    std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+    fs::write(root.join("usr/bin/hello"), "hi\n").unwrap();
+    fs::write(root.join("usr/bin/stray"), "x\n").unwrap();
+    let e = db::Entry {
+        mode: 0o755,
+        kind: db::Kind::File("0".repeat(64)),
+        path: "usr/bin/hello".into(),
+    };
+    record(&root, "hello", &[], vec![e]);
+    let r = root.to_str().unwrap();
+
+    for typed in ["/bin/hello", "//usr/./bin/hello", "/usr/share/../bin/hello", "bin//hello"] {
+        let o = kiry(&["owns", "--root", r, typed]);
+        let said = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success(), "{typed}: {said}");
+        assert_eq!(said, "/usr/bin/hello hello x86_64-musl\n", "{typed}");
+    }
+    let o = kiry(&["owns", "--root", r, "/bin/stray"]);
+    assert!(!o.status.success());
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "/usr/bin/stray owned by nobody\n");
+    let o = kiry(&["owns", "--root", r, "/bin/nope"]);
+    assert!(!o.status.success());
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "/usr/bin/nope does not exist\n");
+}
+
+// perl- starts perl-dbd-mysql's logs too, and the newer of the two must not be the one
+// shown
+#[test]
+fn log_is_for_the_package_named_and_not_one_whose_name_starts_the_same() {
+    let root = scratch("logexact");
+    let d = root.join("var/kiry/log");
+    fs::create_dir_all(&d).unwrap();
+    let r = root.to_str().unwrap();
+    fs::write(d.join("perl-5.42.0-1.x86_64-musl.log"), "perl itself\n").unwrap();
+    fs::write(d.join("foo-1.0-1.x86_64-musl.log"), "foo itself\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(d.join("perl-dbd-mysql-4.050-1.x86_64-musl.log"), "the driver\n").unwrap();
+    // a name that ends in a digit of its own looks like foo and a version
+    fs::write(d.join("foo-2-1.0-1.x86_64-musl.log"), "foo-2 instead\n").unwrap();
+
+    let said = String::from_utf8_lossy(&kiry(&["log", "--root", r, "perl"]).stdout).into_owned();
+    assert!(said.contains("perl itself") && !said.contains("the driver"), "{said}");
+
+    // what the db says is installed settles it
+    record(&root, "foo", &[], Vec::new());
+    let said = String::from_utf8_lossy(&kiry(&["log", "--root", r, "foo"]).stdout).into_owned();
+    assert!(said.contains("foo itself") && !said.contains("foo-2 instead"), "{said}");
+}
+
+// the config resolves for any name at all, so a typo would get a confident answer
+#[test]
+fn flags_for_a_package_nothing_knows_is_an_error() {
+    let root = scratch("flagsnone");
+    config(&root, None, "OPT -O2\n");
+    let o = kiry(&["flags", "--root", root.to_str().unwrap(), "nosuch"]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("nosuch"));
+}
+
+// r -n is not a package called -n
+#[test]
+fn r_refuses_a_flag_it_does_not_know() {
+    let root = scratch("rflag");
+    bare(&root, "one", &[]);
+    let o = kiry(&["r", "--root", root.to_str().unwrap(), "-n", "one"]);
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("no such flag: -n"), "{said}");
+    assert!(db::read(&root, "x86_64-musl", "one").is_ok(), "removed it anyway");
+}
+
+// a mistyped --root would read as a tree with nothing in it, which is what a clean one
+// says
+#[test]
+fn a_root_that_is_not_there_is_an_error_to_read_too() {
+    let at = scratch("noroot");
+    let typo = at.join("typo");
+    for cmd in ["l", "doctor"] {
+        let o = kiry(&[cmd, "--root", typo.to_str().unwrap()]);
+        assert!(!o.status.success(), "{cmd}");
+        assert!(String::from_utf8_lossy(&o.stderr).contains("no such directory"), "{cmd}");
+    }
+}
+
+// a pack killed partway leaves its .part behind. one whose build still holds its lock is
+// a pack in flight
+#[test]
+fn gc_drops_a_part_nobody_is_packing() {
+    let (root, repo, _) = tree("gcpart");
+    offer(&repo, "foo", "1.0");
+    let cache = root.join("var/kiry/cache");
+    fs::create_dir_all(&cache).unwrap();
+    let dead = cache.join("foo-1.0-1.x86_64-musl.tar.zst.part");
+    let live = cache.join("bar-2.0-1.x86_64-musl.tar.zst.part");
+    fs::write(&dead, "dead").unwrap();
+    fs::write(&live, "live").unwrap();
+    let mut build = hold(&root.join("var/kiry/stage/bar-2.0-1.lock"));
+
+    let o = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    let _ = build.kill();
+    let _ = build.wait();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!dead.exists(), "a dead .part stayed");
+    assert!(live.exists(), "a pack in flight lost its .part");
+}
+
+// kept back is files left on disk, not how many recipes or source names there are
+#[test]
+fn gc_counts_what_it_keeps_in_files() {
+    let (root, repo, _) = tree("gccount");
+    for n in ["foo", "bar", "baz"] {
+        offer(&repo, n, "1.0");
+    }
+    fs::write(
+        repo.join("foo/sources"),
+        "https://example.invalid/foo-1.0.tar.gz\nhttps://example.invalid/foo-extra.tar.gz\n",
+    )
+    .unwrap();
+    let src = root.join("var/kiry/cache/sources");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("foo-1.0.tar.gz"), "keep").unwrap();
+    fs::write(src.join("foo-0.9.tar.gz"), "drop").unwrap();
+    let log = root.join("var/kiry/log");
+    fs::create_dir_all(&log).unwrap();
+    fs::write(log.join("foo-1.0-1.x86_64-musl.log"), "keep").unwrap();
+    fs::write(log.join("foo-0.9-1.x86_64-musl.log"), "drop").unwrap();
+    fs::write(log.join("rebuilds"), "foo x86_64-musl doctor same 1\n").unwrap();
+
+    let o = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    for what in ["sources ", "log "] {
+        let l = said.lines().find(|l| l.starts_with(what)).unwrap_or_default();
+        assert!(l.ends_with("  1 kept back"), "{what}: {said}");
+    }
+    assert!(log.join("rebuilds").exists(), "gc took the rebuild log stats reads");
+}
+
+// kiry killed under a build must not leave it compiling in its namespace. the loop writes
+// beside the build's output, so it stops on its own once that is deleted, whatever the
+// verdict
+#[test]
+fn a_build_dies_with_the_kiry_that_started_it() {
+    let at = scratch("orphan");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "while echo x >> \"$DESTDIR/beat\"; do sleep 1; done &\nwait\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let work = root.join("var/kiry/stage/hello-1.0-1.x86_64-musl");
+    let beat = work.join("dest/beat");
+    let mut k = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if beat.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = k.kill();
+    let _ = k.wait();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let then = fs::read_to_string(&beat).unwrap_or_default();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let now = fs::read_to_string(&beat).unwrap_or_default();
+    let _ = fs::remove_dir_all(&work);
+    assert!(!then.is_empty(), "the build never started");
+    assert_eq!(then, now, "the build outlived the kiry that started it");
 }

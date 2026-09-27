@@ -1300,6 +1300,29 @@ fn a_preserved_library_still_answers_for_its_soname() {
     // reported rather than silent: a library the tree has moved past is something to
     // know about, it is just not a fault
     assert!(out.contains("1 preserved"), "{out}");
+    assert!(out.contains("waiting on a rebuild"), "{out}");
+}
+
+// nothing links the old one any more, so there is no rebuild for it to wait on
+#[test]
+fn a_preserved_library_nothing_links_is_not_waiting_on_anything() {
+    if skip("idle preserved library") {
+        return;
+    }
+    let at = scratch("preserved-idle");
+    let root = at.join("root");
+    let old = lib(&at, "libp.so.1");
+    let new = lib(&at, "libp.so.2");
+    let b = bin(&at, "app", &new, None);
+    install(&root, "libp", &[("usr/lib64/libp.so.2", &new)]);
+    install(&root, "app", &[("usr/bin/app", &b)]);
+    needs(&root, "app", &["libp"]);
+    preserving(&root, "libp", &[("usr/lib64/libp.so.1", &old)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(ok, "{out}");
+    assert!(out.contains("1 preserved and nothing links them"), "{out}");
+    assert!(!out.contains("waiting on a rebuild"), "{out}");
 }
 
 // an orphan is what these are not. kiry put them there and kiry takes them away
@@ -1387,4 +1410,70 @@ fn another_package_or_an_executable_gets_no_such_pass() {
     let (_, out) = doctor(&root);
     assert!(out.contains(&format!("usr/lib/jvm/j/lib/libjava.so {TARGET} unresolved libjvm.so")), "{out}");
     assert!(out.contains(&format!("usr/lib/jvm/j/bin/exe {TARGET} unresolved libjvm.so")), "{out}");
+}
+
+fn remove(root: &Path, args: &[&str]) -> Output {
+    Command::new(KIRY)
+        .arg("r")
+        .args(["--root", root.to_str().unwrap()])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+// jq names oniguruma as make only and links libonig.so.5 all the same. what the files
+// link is what a removal breaks, and every package it breaks is named, not the first
+#[test]
+fn a_removal_that_leaves_a_library_unresolved_is_refused() {
+    if skip("removal linkage") {
+        return;
+    }
+    let at = scratch("rm-linked");
+    let root = at.join("root");
+    let l = lib(&at, "libp.so.1");
+    let a = bin(&at, "a", &l, None);
+    let b = bin(&at, "b", &l, None);
+    install(&root, "libp", &[("usr/lib64/libp.so.1", &l)]);
+    install(&root, "a", &[("usr/bin/a", &a)]);
+    install(&root, "b", &[("usr/bin/b", &b)]);
+    let mut rec = db::read(&root, TARGET, "a").unwrap();
+    rec.depends = vec![Dep { name: "libp".into(), make: true, host: true, only: None }];
+    db::write(&root, &rec).unwrap();
+
+    let o = remove(&root, &["libp"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "removed a library two binaries link");
+    for who in ["a", "b"] {
+        let head = format!("{who} {TARGET} would break: ");
+        let l = err.lines().find(|l| l.contains(&head)).unwrap_or_default();
+        assert!(l.contains("unresolved libp.so.1"), "{who}: {err}");
+    }
+    assert!(root.join("usr/lib64/libp.so.1").is_file());
+
+    // what goes along with it breaks nothing that stays
+    let o = remove(&root, &["libp", "a"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("a would break") && !err.contains(&format!("a {TARGET}")), "{err}");
+
+    // --force means it, and what it left broken is said the way an install says it
+    let o = remove(&root, &["--force", "libp"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains(&format!("usr/bin/b {TARGET} unresolved libp.so.1")), "{said}");
+}
+
+#[test]
+fn every_package_still_needing_one_is_named() {
+    let at = scratch("rm-needed");
+    let root = at.join("root");
+    install(&root, "libp", &[]);
+    install(&root, "a", &[]);
+    install(&root, "b", &[]);
+    needs(&root, "a", &["libp"]);
+    needs(&root, "b", &["libp"]);
+
+    let o = remove(&root, &["libp"]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("a still needs libp") && err.contains("b still needs libp"), "{err}");
 }

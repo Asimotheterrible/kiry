@@ -2509,10 +2509,23 @@ fn meta(
     // does this, at the one moment it is known: a library in DT_NEEDED that the recipe
     // cannot account for is a runtime edge whether anybody wrote it down or not. the
     // recipe stays what somebody typed and the sidecar carries what was true
+    //
+    // that includes a dep the recipe calls build-only. makedepends names the -dev half
+    // of what gets linked, so imlib2 says libpng make and links libpng16.so.16, and a
+    // record that kept the make would plan a cached imlib2 without libpng
     let mut deps = String::new();
     let mut said: HashSet<&str> = HashSet::new();
     for x in p.depends.iter().filter(|x| x.applies(t)) {
-        deps.push_str(&format!("{x}\n"));
+        if x.make && linked.contains(&x.name) {
+            let run = Dep {
+                make: false,
+                host: false,
+                ..x.clone()
+            };
+            deps.push_str(&format!("{run}\n"));
+        } else {
+            deps.push_str(&format!("{x}\n"));
+        }
         said.insert(&x.name);
     }
     for n in linked.iter().filter(|n| !said.contains(n.as_str())) {
@@ -9850,6 +9863,59 @@ mod sidecar {
         let lines: Vec<&str> = got.lines().collect();
         // zlib was declared and linked, and is one line either way
         assert_eq!(lines, vec!["zlib", "libpcre2"], "{got}");
+    }
+
+    // a make line the build linked through is how most of extra reads, and it kept the
+    // make: 32 installed packages linked a library their record called build-only
+    #[test]
+    fn a_build_only_dep_the_build_linked_becomes_a_runtime_one() {
+        let at = std::env::temp_dir()
+            .join(format!("kiry-meta-{}", std::process::id()))
+            .join("promoted");
+        let _ = fs::remove_dir_all(&at);
+        mkdirs(&at).unwrap();
+
+        let dep = |name: &str, make: bool, host: bool, only: Option<&str>| pkg::Dep {
+            name: name.into(),
+            make,
+            host,
+            only: only.map(String::from),
+        };
+        let recipe = at.join("thing");
+        mkdirs(&recipe).unwrap();
+        fs::write(recipe.join("version"), "1.0 1\n").unwrap();
+        let p = Package {
+            name: "thing".into(),
+            dir: recipe,
+            version: pkg::Version::parse("1.0 1").unwrap(),
+            sources: Vec::new(),
+            checksums: Vec::new(),
+            depends: vec![
+                dep("libpng", true, true, None),
+                dep("cmake", true, true, None),
+                dep("argp", true, false, Some("musl")),
+            ],
+            targets: vec!["x86_64-musl".into()],
+            users: Vec::new(),
+        };
+
+        let art = at.join("thing-1.0-1.x86_64-musl.tar.zst");
+        let linked = vec!["argp".to_string(), "libpng".to_string()];
+        let f = Flags {
+            cflags: String::new(),
+            cxxflags: String::new(),
+            ldflags: String::new(),
+            rustflags: String::new(),
+            use_flags: Vec::new(),
+            env: Vec::new(),
+            from: Vec::new(),
+        };
+        meta(&at, &p, "x86_64-musl", "0", &f, &art, &linked).unwrap();
+
+        let got =
+            fs::read_to_string(at.join("thing-1.0-1.x86_64-musl.tar.zst.meta/depends")).unwrap();
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(lines, vec!["libpng", "cmake make", "argp musl"], "{got}");
     }
 }
 

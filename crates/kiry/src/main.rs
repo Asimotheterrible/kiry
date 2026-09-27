@@ -858,6 +858,20 @@ const KEPT: &[&str] = &[
 ];
 
 fn trim(dest: &Path, t: &str, name: &str) -> Result<(), String> {
+    // nitro is the init, so an openrc service has no openrc-run to start it. alpine's
+    // recipes install them and so do plenty of make installs
+    let openrc: Vec<&str> = ["etc/init.d", "etc/conf.d"]
+        .into_iter()
+        .filter(|d| dest.join(d).exists())
+        .collect();
+    for d in &openrc {
+        let at = dest.join(d);
+        fs::remove_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+    }
+    if !openrc.is_empty() {
+        say!("{name} {t} dropped {}", openrc.join(" "));
+    }
+
     if !t.ends_with("gnu") {
         return Ok(());
     }

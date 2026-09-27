@@ -309,6 +309,36 @@ fn round_trip_through_install() {
     );
 }
 
+#[test]
+fn an_openrc_service_never_reaches_the_artifact() {
+    let at = scratch("openrc");
+    let script = format!(
+        "{GOOD}mkdir -p \"$DESTDIR/etc/init.d\" \"$DESTDIR/etc/conf.d\"\n\
+         printf '#!/sbin/openrc-run\\n' > \"$DESTDIR/etc/init.d/hello\"\n\
+         echo x > \"$DESTDIR/etc/conf.d/hello\"\n"
+    );
+    let d = recipe(&at, "x86_64-musl", &script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("dropped etc/init.d etc/conf.d"));
+
+    let arc = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst");
+    let o = Command::new("sh")
+        .arg("-c")
+        .arg(format!("zstd -dc {} | tar tf -", arc.display()))
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&o.stdout);
+    assert!(listed.contains("usr/bin/hello"), "{listed}");
+    assert!(!listed.contains("etc/init.d") && !listed.contains("etc/conf.d"), "{listed}");
+}
+
 // the one above dies before anything is packed. this one dies inside tar
 #[test]
 fn a_target_dying_while_it_packs_leaves_no_sidecar() {

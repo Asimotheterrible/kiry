@@ -773,3 +773,37 @@ fn options_that_only_look_like_tests_stay_on() {
         assert!(script.contains(&format!(" {f}")), "{f} was changed\n{script}");
     }
 }
+
+// gtk+-3.0.pc never names wayland-protocols. alpine's gtk+3.0-dev hands it to whatever
+// builds against gtk, so a recipe converted from that makedepends has to name it itself
+#[test]
+fn a_dev_makedepend_brings_its_depends_dev_as_build_deps() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("devdeps");
+    let tree = at.join("aports/community");
+    for (pkg, body) in [
+        ("gtk", "pkgname=gtk\npkgver=3\npkgrel=0\ndepends_dev=\"glib-dev pango-libs python3 wayland-protocols\"\n"),
+        (
+            "thing",
+            "pkgname=thing\npkgver=1.0\npkgrel=0\nmakedepends=\"gtk-dev glib-dev\"\n\
+             package() {\n\ttrue\n}\n",
+        ),
+    ] {
+        fs::create_dir_all(tree.join(pkg)).unwrap();
+        fs::write(tree.join(pkg).join("APKBUILD"), body).unwrap();
+    }
+    let out = at.join("out");
+    let a = tree.join("thing/APKBUILD");
+    let o = kiry(&["convert", "-n", a.to_str().unwrap(), out.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let deps = fs::read_to_string(out.join("thing/depends")).unwrap();
+    let lines: Vec<&str> = deps.lines().collect();
+    assert!(lines.contains(&"wayland-protocols build"), "{deps}");
+    // a library comes in through its own .pc, so it adds nothing
+    assert!(lines.contains(&"glib make") && !lines.contains(&"glib build"), "{deps}");
+    assert!(!lines.contains(&"pango build"), "{deps}");
+    // a tool is not a header, whatever list it sits in
+    assert!(!lines.iter().any(|l| l.starts_with("python3")), "{deps}");
+}

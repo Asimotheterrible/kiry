@@ -707,7 +707,11 @@ fn build(
         live_stop(&key(p, t));
         let (work, linked) = r?;
         let secs = start.elapsed().as_secs();
-        say!("{}", row(&p.name, &p.version.upstream, t, "ok", &clock(secs)));
+        let note = again(root, p, t, &work, verbose).map_or_else(String::new, |n| match tty() {
+            true => format!("  {n}"),
+            false => format!(" {n}"),
+        });
+        say!("{}{note}", row(&p.name, &p.version.upstream, t, "ok", &clock(secs)));
         keep_time(root, p, t, secs);
         built.push((t.clone(), work, linked));
     }
@@ -732,6 +736,122 @@ fn build(
         let _ = fs::remove_dir_all(work);
     }
     Ok(ready.into_iter().map(|(_, (art, _), _)| art).collect())
+}
+
+// b of a package the cache already holds under the same key -- recipe, sources, flags,
+// profile -- is a reproducibility check for free. the staged tree is set against the
+// artifact it is about to replace, and a file that moved got that way from outside the
+// key: the toolchain, the closure, or a build that does not reproduce. the count goes on
+// the ok line and the paths in the log. nothing comparable in the cache says nothing
+fn again(root: &Path, p: &Package, t: &str, work: &Path, verbose: bool) -> Option<String> {
+    let art = artifact(root, p, t);
+    // stale() lets a sidecar from before a field was recorded count as a hit. one that
+    // does not say what it was built from cannot say it was this build, and no sidecar
+    // at all is no artifact
+    let meta = PathBuf::from(format!("{}.meta", art.display()));
+    let says = ["recipe", "flags", "profile"].iter().all(|n| meta.join(n).is_file());
+    if !says || stale(root, p, t, &art).is_some() {
+        return None;
+    }
+
+    // extract() is the reader install trusts and it hashes on the way through. what it
+    // writes is thrown away, the manifest it hands back is the point
+    let was = work.join("was");
+    let _ = fs::remove_dir_all(&was);
+    mkdirs(&was).ok()?;
+    let old = kiry_core::archive::extract(&was, &art, &[]);
+    let _ = fs::remove_dir_all(&was);
+    let old = old.ok()?;
+    // a hardlink is its target's bytes. which of two names tar keeps as the file is down
+    // to readdir order, and a walk of the staged tree cannot tell the two apart at all
+    let sums: HashMap<&str, &str> = old
+        .iter()
+        .filter_map(|e| match &e.kind {
+            db::Kind::File(s) => Some((e.path.as_str(), s.as_str())),
+            _ => None,
+        })
+        .collect();
+    let before: BTreeMap<String, (char, u32, String)> = old
+        .iter()
+        .map(|e| {
+            let v = match &e.kind {
+                db::Kind::File(s) => ('f', e.mode, s.clone()),
+                db::Kind::Hard(to) => ('f', e.mode, sums.get(to.as_str()).unwrap_or(&"").to_string()),
+                db::Kind::Link(to) => ('l', 0, to.clone()),
+                db::Kind::Dir => ('d', e.mode, String::new()),
+            };
+            (e.path.clone(), v)
+        })
+        .collect();
+
+    let dest = work.join("dest");
+    let mut all = Vec::new();
+    everything(&dest, &mut all);
+    // setuid comes off both sides, the way extract() takes it off without a setuid list
+    let now: BTreeMap<String, (char, u32, String)> = each(all.len(), |i| {
+        let at = &all[i];
+        let m = fs::symlink_metadata(at).ok()?;
+        let mode = m.permissions().mode() & 0o1777;
+        let v = match m.file_type() {
+            k if k.is_symlink() => ('l', 0, fs::read_link(at).ok()?.to_string_lossy().into_owned()),
+            k if k.is_dir() => ('d', mode, String::new()),
+            _ => ('f', mode, kiry_core::sha256(fs::File::open(at).ok()?).ok()?),
+        };
+        Some((at.strip_prefix(&dest).ok()?.to_string_lossy().into_owned(), v))
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut moved: Vec<(&str, &str)> = Vec::new();
+    for (path, a) in &before {
+        let why = match now.get(path) {
+            None => "only in old",
+            Some(b) if a.0 != b.0 => "type",
+            Some(b) if a.2 != b.2 && a.0 == 'l' => "link target",
+            Some(b) if a.2 != b.2 => "content",
+            Some(b) if a.1 != b.1 => "mode",
+            Some(_) => continue,
+        };
+        moved.push((why, path.as_str()));
+    }
+    for path in now.keys().filter(|k| !before.contains_key(*k)) {
+        moved.push(("only in new", path.as_str()));
+    }
+    if moved.is_empty() {
+        return Some("same bytes".into());
+    }
+    moved.sort_by_key(|m| m.1);
+    let note = match moved.len() {
+        1 => "1 file differs".to_string(),
+        n => format!("{n} files differ"),
+    };
+    let mut text = format!("kiry: {note} from the artifact this build replaces\n");
+    for (why, path) in &moved {
+        text += &format!("kiry:   {why:<11}  {path}\n");
+    }
+    match verbose {
+        // -v wrote no log, the terminal was the log
+        true => text.lines().for_each(|l| say!("{l}")),
+        false => {
+            let _ = fs::OpenOptions::new()
+                .append(true)
+                .open(logpath(root, p, t))
+                .and_then(|mut f| f.write_all(text.as_bytes()));
+        }
+    }
+    Some(note)
+}
+
+// every path under a staged tree, directories and links with the files, the top itself not
+fn everything(at: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(at) else { return };
+    for e in rd.flatten() {
+        out.push(e.path());
+        if e.file_type().is_ok_and(|k| k.is_dir()) {
+            everything(&e.path(), out);
+        }
+    }
 }
 
 // what the build linked against, set beside what the recipe declared. a transitive

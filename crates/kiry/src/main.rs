@@ -499,6 +499,14 @@ fn writes(root: &Path) {
     }
 }
 
+// a --root that is not there reads as a tree with nothing installed, and a read that
+// answers nothing for a typo looks exactly like a clean one
+fn there(root: &Path) {
+    if !root.is_dir() {
+        die(format!("{}: no such directory", root.display()));
+    }
+}
+
 fn build_cmd(args: &[String]) {
     let mut want = None;
     let mut verbose = false;
@@ -620,6 +628,45 @@ fn claim(root: &Path, p: &Package) -> Result<fs::File, String> {
     let _ = f.set_len(0);
     let _ = writeln!(f, "{}", std::process::id());
     Ok(f)
+}
+
+// one writer to the installed db at a time. two installs both plan against the db before
+// either applies, both pass the conflict check, and the second apply leaves the first a
+// record for files it no longer owns. held around plan and apply, never a build, so
+// builds of different packages still overlap. a second writer waits rather than fails
+fn writer(root: &Path) -> fs::File {
+    use rustix::fs::{flock, FlockOperation};
+    let at = root.join("usr/lib/kiry/db/lock");
+    if let Some(Err(e)) = at.parent().map(mkdirs) {
+        die(e);
+    }
+    let mut f = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&at)
+    {
+        Ok(f) => f,
+        Err(e) => die(format!("{}: {e}", at.display())),
+    };
+    if flock(&f, FlockOperation::NonBlockingLockExclusive).is_err() {
+        let pid = fs::read_to_string(&at).unwrap_or_default();
+        match pid.trim() {
+            "" => say!("waiting for another kiry writing {}", root.display()),
+            pid => say!("waiting for pid {pid}, which is writing {}", root.display()),
+        }
+        loop {
+            match flock(&f, FlockOperation::LockExclusive) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => die(format!("{}: {e}", at.display())),
+            }
+        }
+    }
+    let _ = f.set_len(0);
+    let _ = writeln!(f, "{}", std::process::id());
+    f
 }
 
 // whether a build holds this lock right now. a lock nobody holds is a file like any other
@@ -1032,10 +1079,14 @@ fn fetcher(url: &str, dst: &Path) -> Result<Command, String> {
 //
 // CC_WRAPPER walks the same rungs in place when clang crashes, so a change here is a
 // change there too
+//
+// -march comes off as a filter rather than a CFLAGS_MARCH line with nothing after it,
+// which reads as a setting someone forgot to finish, and would take rust's target-cpu
+// with it
 const LADDER: &[(bool, &str)] = &[
     (true, "filter-lto"),
     (false, "OPT -O2"),
-    (false, "CFLAGS_MARCH"),
+    (true, "filter-flags -march=*"),
     (true, "strip-flags"),
 ];
 
@@ -1156,6 +1207,18 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
     // so a first.log that is there is always this run's
     let first = firstlog(root, p, t);
     let _ = fs::remove_file(&first);
+    // a run that ends stuck proved none of what it wrote fixes anything, and left behind
+    // it reads as a fix. retroarch kept filter-lto and a march rung that way
+    let files = [p.dir.join("filter"), root.join("etc/kiry/pkg").join(&p.name)];
+    let had: Vec<Option<String>> = files.iter().map(|f| fs::read_to_string(f).ok()).collect();
+    let undo = || {
+        for (f, h) in files.iter().zip(&had) {
+            let _ = match h {
+                Some(h) => fs::write(f, h),
+                None => fs::remove_file(f),
+            };
+        }
+    };
 
     loop {
         match build(root, p, &one, verbose, false, at_once) {
@@ -1179,12 +1242,14 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
         // walk the same rungs again, one whole build each
         if let Some(l) = log.lines().find(|l| l.starts_with("kirycc: ") && l.ends_with("at every rung")) {
             loud!("first failure is {}", first.display());
+            undo();
             return Err(stuck(p, t, &l["kirycc: ".len()..]));
         }
 
         if tried.len() < 3 {
             if let Some(f) = scan(&rs, &log) {
                 if let Some(why) = f.act.strip_prefix("notaflag ") {
+                    undo();
                     return Err(stuck(p, t, why));
                 }
                 if !tried.contains(&f.act) {
@@ -1200,6 +1265,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
         if !compiled(&log) {
             // no note anywhere: the recipe and the settings are both innocent here
             loud!("first failure is {}", first.display());
+            undo();
             return Err(format!(
                 "{} {t}: stuck, nothing compiled: {}",
                 p.name,
@@ -1214,6 +1280,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
         let (filter, line) = loop {
             let Some(r) = LADDER.get(rung) else {
                 loud!("first failure is {}", first.display());
+                undo();
                 return Err(stuck(p, t, "the ladder ran out"));
             };
             rung += 1;
@@ -1620,7 +1687,8 @@ fn compile(
 
     let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut c = Command::new(me);
-    c.arg("sandbox")
+    sandbox::tied(&mut c)
+        .arg("sandbox")
         // an inherited CFLAGS or PYTHONPATH would change a build without appearing
         // in any recipe, and the closure is meant to be the whole of what one sees
         .env_clear()
@@ -2056,6 +2124,9 @@ exit $s
 // TPOFF32 in a -shared output -- libobs, one object out of 91. position independent code
 // gives a library and an object library -fPIC and an executable -fPIE, which is why this
 // is here and not -fPIC in the global CFLAGS, where every executable would pay for it
+//
+// CTest defaults BUILD_TESTING on and nothing here runs a suite -- want_check is always
+// false -- so a cmake recipe that does not say OFF itself compiles its tests for nothing
 const TOOLCHAIN_CMAKE: &str = "\
 foreach(_d CMAKE_INSTALL_LIBDIR CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_DATAROOTDIR)
   if(DEFINED CACHE{${_d}})
@@ -2072,6 +2143,7 @@ foreach(_l C CXX)
   endforeach()
 endforeach()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON CACHE BOOL \"\" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL \"\" FORCE)
 @FIND@";
 
 // find_package looks under the prefixes cmake knows about, and the gnu tier's headers
@@ -2346,7 +2418,7 @@ fn pack(root: &Path, p: &Package, t: &str, work: &Path) -> Result<(PathBuf, Path
     part.push(".part");
     let part = PathBuf::from(part);
 
-    let mut c = Command::new("tar")
+    let mut c = sandbox::tied(&mut Command::new("tar"))
         .arg("-cf")
         .arg("-")
         .arg("-C")
@@ -2360,7 +2432,7 @@ fn pack(root: &Path, p: &Package, t: &str, work: &Path) -> Result<(PathBuf, Path
         return Err("tar gave us no pipe".into());
     };
 
-    let z = Command::new("zstd")
+    let z = sandbox::tied(&mut Command::new("zstd"))
         .arg("-19")
         .arg("-T0")
         .arg("-qf")
@@ -3286,10 +3358,11 @@ fn gentoo_says(root: &Path, d: &Path, f: &Flags) {
     say!("gentoo {head}");
     let set = chosen(&f.use_flags);
     let Ok(p) = read_recipe(d) else { return };
+    let host = sandbox::host();
     let have: Vec<String> = p
         .depends
         .iter()
-        .map(|x| called(root, &x.name).unwrap_or_else(|| x.name.clone()))
+        .map(|x| called(root, &x.name, &host).unwrap_or_else(|| x.name.clone()))
         .collect();
     for n in &have {
         if g.unwanted(&set, n) {
@@ -3476,7 +3549,7 @@ fn recipe_for(root: &Path, atom: &str) -> Option<String> {
     }
     names
         .into_iter()
-        .map(|n| called(root, &n).unwrap_or(n))
+        .map(|n| called(root, &n, &sandbox::host()).unwrap_or(n))
         .find(|n| recipe(root, n).is_some())
 }
 
@@ -3702,6 +3775,17 @@ fn flags_cmd(args: &[String]) {
             Ok(f) => f,
             Err(e) => die(e),
         };
+        // the config resolves for any name at all, so a typo would get a confident answer.
+        // a settings file of its own is enough to be asked about
+        let known = dir.is_some()
+            || root.join("etc/kiry/pkg").join(name).is_file()
+            || db::targets(&root)
+                .unwrap_or_default()
+                .iter()
+                .any(|t| db::read(&root, t, name).is_ok());
+        if !known {
+            die(format!("no recipe, settings or installed package {name}"));
+        }
         for (src, k, v) in &f.from {
             match v.is_empty() {
                 true => say!("{src} {k}"),
@@ -3752,6 +3836,7 @@ fn flags_cmd(args: &[String]) {
     if !queue {
         return;
     }
+    let _w = writer(&root);
     // this command owns the flags rows. a package that resolves clean now should not
     // still be listed because it was stale an hour ago
     let mut all: Vec<db::Queued> = db::read_queue(&root)
@@ -4308,6 +4393,7 @@ fn install_cmd(args: &[String]) {
         let paths: Vec<PathBuf> = archives.iter().map(PathBuf::from).collect();
         let going: Vec<(String, String)> = paths.iter().filter_map(|a| sidecar(a)).collect();
         settle(&root, &going, live);
+        let _w = writer(&root);
         apply_batch(&root, &paths, force);
         skew(&root);
         return;
@@ -4414,6 +4500,7 @@ fn install_cmd(args: &[String]) {
         for (n, t) in &set {
             say!("{n} {} {t} cached", recipes[n].version.upstream);
         }
+        let _w = writer(&root);
         apply_batch(&root, &all, force);
         skew(&root);
         return;
@@ -4487,8 +4574,11 @@ fn install_cmd(args: &[String]) {
                 }
             }
         }
+        let w = writer(&root);
         apply_batch(&root, &made, force);
+        drop(w);
     }
+    let _w = writer(&root);
     skew(&root);
     batch_end(true);
 }
@@ -5097,11 +5187,13 @@ fn named(jobs: &[install::Job]) -> HashSet<(String, String)> {
 }
 
 fn remove_cmd(args: &[String]) {
-    let (root, force, names) = opts(args);
+    let (root, force, rest) = opts(args);
+    let names = asked(rest, &[]);
     writes(&root);
     if names.is_empty() {
         die("nothing to remove".into());
     }
+    let _w = writer(&root);
 
     let targets = match db::targets(&root) {
         Ok(t) => t,
@@ -5123,6 +5215,9 @@ fn remove_cmd(args: &[String]) {
         if !plan.iter().any(|(_, mine)| mine.contains(name)) {
             die(format!("{name} is not installed"));
         }
+    }
+    if !force {
+        held_by(&root, &plan);
     }
 
     for (t, mine) in &plan {
@@ -5148,10 +5243,56 @@ fn remove_cmd(args: &[String]) {
         }
     }
     hooks(&root, plan.iter().map(|(t, _)| (*t).clone()).collect());
+    skew(&root);
+}
+
+// everything a removal would leave without what it needs, named all at once: told only
+// the first, the next try finds the second. a depends line is what somebody wrote down
+// and what the files link is what breaks -- jq names oniguruma as make only and links
+// libonig.so.5 all the same -- so doctor is asked what it would newly find with these
+// gone, which also catches a script whose interpreter is going
+fn held_by(root: &Path, plan: &[(&String, Vec<String>)]) {
+    let mut held: Vec<String> = Vec::new();
+    for (t, mine) in plan {
+        for other in db::installed(root, t).unwrap_or_default() {
+            if mine.contains(&other) {
+                continue;
+            }
+            let Ok(o) = db::read(root, t, &other) else { continue };
+            for d in o.depends.iter().filter(|d| !d.make && mine.contains(&d.name)) {
+                held.push(format!("{other} still needs {}", d.name));
+            }
+        }
+    }
+
+    let gone: Vec<(String, String)> = plan
+        .iter()
+        .flat_map(|(t, mine)| mine.iter().map(|n| ((*t).clone(), n.clone())))
+        .collect();
+    let row = |t: &String, f: &Finding| (t.clone(), f.path.clone(), f.what.to_string());
+    let before: HashSet<(String, String, String)> =
+        broken(root).iter().map(|(t, f)| row(t, f)).collect();
+    let mut by: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for (t, f) in checks_without(root, &gone).0 {
+        // a preserved record keeps its package's name after the package is gone
+        let theirs = gone.contains(&(t.clone(), f.pkg.clone()));
+        if !f.what.breaks() || theirs || before.contains(&row(&t, &f)) {
+            continue;
+        }
+        by.entry((f.pkg.clone(), t)).or_default().insert(f.what.to_string());
+    }
+    for ((pkg, t), what) in by {
+        let what: Vec<String> = what.into_iter().collect();
+        held.push(format!("{pkg} {t} would break: {}", what.join(", ")));
+    }
+    if !held.is_empty() {
+        die(held.join("\n"));
+    }
 }
 
 fn list_cmd(args: &[String]) {
     let (root, _, _) = opts(args);
+    there(&root);
     let targets = match db::targets(&root) {
         Ok(t) => t,
         Err(e) => die(e.to_string()),
@@ -5446,16 +5587,32 @@ mod recipes {
 // an aliases file counts from the next command rather than the next conversion
 fn load(root: &Path, at: &Path) -> Result<Package, String> {
     let mut p = read_recipe(at).map_err(|e| e.to_string())?;
+    let host = sandbox::host();
     let mut out: Vec<Dep> = Vec::new();
-    for mut d in std::mem::take(&mut p.depends) {
-        match called(root, &d.name) {
-            // no equivalent here, or its own subpackage
-            Some(to) if to == "-" || to == p.name => continue,
-            Some(to) => d.name = to,
-            None => {}
+    for d in std::mem::take(&mut p.depends) {
+        // one soname can be two packages, mesa on musl and libglvnd on gnu, so a name is
+        // answered once per target the line is for and split by target where they differ
+        let mut on: Vec<&str> =
+            p.targets.iter().filter(|t| d.applies(t)).map(String::as_str).collect();
+        if d.host || on.is_empty() {
+            on = vec![host.as_str()];
         }
-        if !out.iter().any(|x| x.name == d.name && x.make == d.make && x.host == d.host && x.only == d.only) {
-            out.push(d);
+        let got: Vec<Option<String>> = on.iter().map(|t| called(root, &d.name, t)).collect();
+        let split = got.iter().any(|g| *g != got[0]);
+        for (t, to) in on.iter().zip(got) {
+            let mut d = d.clone();
+            if split {
+                d.only = Some((*t).to_string());
+            }
+            match to {
+                // no equivalent here, or its own subpackage
+                Some(to) if to == "-" || to == p.name => continue,
+                Some(to) => d.name = to,
+                None => {}
+            }
+            if !out.iter().any(|x| x.name == d.name && x.make == d.make && x.host == d.host && x.only == d.only) {
+                out.push(d);
+            }
         }
     }
     // flags act through the closure: off takes a dependency out of the namespace the
@@ -5488,10 +5645,12 @@ fn load(root: &Path, at: &Path) -> Result<Package, String> {
 // name, because it walks every manifest installed
 struct Names {
     alias: HashMap<String, String>,
-    owners: Option<HashMap<String, String>>,
+    owners: Option<HashMap<(String, String), String>>,
 }
 
-fn called(root: &Path, name: &str) -> Option<String> {
+// t is the target the name is wanted on. a provider installed only on the other target
+// answers nothing here: that is how gnu libglvnd came to stand in for musl mesa
+fn called(root: &Path, name: &str, t: &str) -> Option<String> {
     static SEEN: std::sync::Mutex<Option<HashMap<PathBuf, Names>>> = std::sync::Mutex::new(None);
     let mut all = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let n = all.get_or_insert_with(HashMap::new).entry(root.to_path_buf()).or_insert_with(|| Names {
@@ -5503,7 +5662,7 @@ fn called(root: &Path, name: &str) -> Option<String> {
     };
     // what this machine has installed is the answer before anything alpine wrote down
     let owners = n.owners.get_or_insert_with(|| owners(root));
-    if let Some(p) = owners.get(name).or_else(|| n.alias.get(name)) {
+    if let Some(p) = owners.get(&(t.to_string(), name.to_string())).or_else(|| n.alias.get(name)) {
         return Some(p.clone());
     }
     // nothing installed answers. a recipe named after the command or the .pc is the
@@ -5511,14 +5670,14 @@ fn called(root: &Path, name: &str) -> Option<String> {
     (matches!(kind, "cmd" | "pc") && recipe(root, what).is_some()).then(|| what.to_string())
 }
 
-// so:<soname>, cmd:<command> and pc:<module> for everything installed, on any target,
-// to the package that ships it
-fn owners(root: &Path) -> HashMap<String, String> {
+// so:<soname>, cmd:<command> and pc:<module> for everything installed, keyed by target
+// as well, to the package that ships it there
+fn owners(root: &Path) -> HashMap<(String, String), String> {
     let mut out = HashMap::new();
     for t in db::targets(root).unwrap_or_default() {
         for name in db::installed(root, &t).unwrap_or_default() {
             for pv in db::read_provides(root, &t, &name).unwrap_or_default() {
-                out.entry(format!("so:{}", pv.soname)).or_insert_with(|| name.clone());
+                out.entry((t.clone(), format!("so:{}", pv.soname))).or_insert_with(|| name.clone());
             }
             let Ok(rec) = db::read(root, &t, &name) else { continue };
             for e in &rec.manifest {
@@ -5538,7 +5697,7 @@ fn owners(root: &Path) -> HashMap<String, String> {
                 } else {
                     continue;
                 };
-                out.entry(key).or_insert_with(|| name.clone());
+                out.entry((t.clone(), key)).or_insert_with(|| name.clone());
             }
         }
     }
@@ -5840,6 +5999,7 @@ fn rebuild_cmd(args: &[String]) {
     }
 
     let mut want: Vec<(String, String)> = Vec::new();
+    let w = (!dry).then(|| writer(&root));
     // the queue names consumers of a library whose abi moved, which resolves fine and
     // so is invisible to a check. the checks name what is already broken
     let queued = db::read_queue(&root).unwrap_or_default();
@@ -5866,6 +6026,7 @@ fn rebuild_cmd(args: &[String]) {
             want.push((f.pkg.clone(), t));
         }
     }
+    drop(w);
     if want.is_empty() {
         return;
     }
@@ -5941,6 +6102,7 @@ fn rebuild_cmd(args: &[String]) {
                 None => die(format!("{} {target}: built nothing", p.name)),
             }
         }
+        let w = writer(&root);
         let jobs = match install::plan(&root, &made, false) {
             Ok(j) => j,
             Err(e) => die(e.to_string()),
@@ -5973,8 +6135,10 @@ fn rebuild_cmd(args: &[String]) {
         }
         enqueue(&root, &broke, &named(&jobs));
         hooks(&root, jobs.iter().map(|j| j.target.clone()).collect());
+        drop(w);
     }
 
+    let _w = writer(&root);
     // a rebuild that ran is off the queue whether or not it fixed anything, or the next
     // drain starts from the same list. what these rebuilds queued in turn stays
     let left_over: Vec<db::Queued> = db::read_queue(&root)
@@ -7404,6 +7568,7 @@ fn promote_cmd(args: &[String]) {
     if rest.is_empty() {
         die("promote wants a package".into());
     }
+    let _w = writer(&root);
     let list = repos(&root);
     for n in &rest {
         match promote_one(&root, &list, n) {
@@ -7558,11 +7723,31 @@ fn log_cmd(args: &[String]) {
     let Ok(rd) = fs::read_dir(&d) else {
         die(format!("{}: no logs", d.display()));
     };
+    // name-version-rev.target.log, and a name can hold a dash of its own: perl- starts
+    // perl-dbd-mysql's logs too. so the version is what the recipe and the db say, and
+    // only with neither is it whatever starts with a digit
+    let mut vers: Vec<String> = Vec::new();
+    if let Some(p) = recipe(&root, name).and_then(|d| read_recipe(&d).ok()) {
+        vers.push(format!("{}-{}.", p.version.upstream, p.version.rev));
+    }
+    for t in db::targets(&root).unwrap_or_default() {
+        if let Ok(r) = db::read(&root, &t, name) {
+            vers.push(format!("{}-{}.", r.version.upstream, r.version.rev));
+        }
+    }
+    let mine = |f: &str| {
+        let Some(rest) = f.strip_prefix(name.as_str()).and_then(|r| r.strip_prefix('-')) else {
+            return false;
+        };
+        match vers.is_empty() {
+            true => rest.starts_with(|c: char| c.is_ascii_digit()),
+            false => vers.iter().any(|v| rest.starts_with(v.as_str())),
+        }
+    };
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for e in rd.flatten() {
         let f = e.file_name().to_string_lossy().into_owned();
-        // name-version-rev.target.log, and a version can hold a dash of its own
-        if !f.starts_with(&format!("{name}-")) || !f.ends_with(".log") {
+        if !mine(&f) || !f.ends_with(".log") {
             continue;
         }
         let Ok(when) = e.metadata().and_then(|m| m.modified()) else {
@@ -7650,6 +7835,7 @@ fn gc_cmd(args: &[String]) {
     if !dry {
         writes(&root);
     }
+    let _w = (!dry).then(|| writer(&root));
     let var = root.join("var/kiry");
     let sweep = |what: &str, doomed: Vec<PathBuf>, skipped: usize| {
         let mut bytes = 0;
@@ -7748,7 +7934,23 @@ fn gc_cmd(args: &[String]) {
         doomed.push(a.3.clone());
         doomed.push(PathBuf::from(format!("{}.meta", a.3.display())));
     }
-    sweep("cache", doomed, keep.len());
+    // a pack killed partway leaves its .part. one still packing holds its build's lock
+    // until the rename, so a .part nobody holds is dead however new it is
+    let mut packing = 0;
+    for a in listing(&var.join("cache")) {
+        let name = a.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let Some(stem) = name.strip_suffix(".tar.zst.part") else {
+            continue;
+        };
+        // the lock drops the target, the way a stage dir's does
+        let stem = stem.rsplit_once('.').map_or(stem, |(s, _)| s);
+        let lock = var.join("stage").join(format!("{stem}.lock"));
+        match locked(&lock) {
+            true => packing += 1,
+            false => doomed.push(a),
+        }
+    }
+    sweep("cache", doomed, keep.len() + packing);
 
     // a tarball no recipe names any more. the recipes are the only thing that decides
     // this, which is why sources is a cache and not a store
@@ -7770,15 +7972,14 @@ fn gc_cmd(args: &[String]) {
     if recipes == 0 {
         die("no recipes in reach, so nothing can say which sources are still live".into());
     }
-    let gone: Vec<PathBuf> = listing(&var.join("cache/sources"))
+    let (gone, kept): (Vec<PathBuf>, Vec<PathBuf>) = listing(&var.join("cache/sources"))
         .into_iter()
-        .filter(|f| {
+        .partition(|f| {
             f.file_name()
                 .and_then(|n| n.to_str())
                 .is_none_or(|n| !live.contains(n))
-        })
-        .collect();
-    sweep("sources", gone, live.len());
+        });
+    sweep("sources", gone, kept.len());
 
     // a log for a version no recipe builds any more. kiry log answers for the current
     // one, and nothing reads the others
@@ -7793,15 +7994,16 @@ fn gc_cmd(args: &[String]) {
             }
         }
     }
-    let old: Vec<PathBuf> = listing(&var.join("log"))
+    // build logs and nothing else. rebuilds sits beside them and is what stats reads
+    let (old, kept): (Vec<PathBuf>, Vec<PathBuf>) = listing(&var.join("log"))
         .into_iter()
-        .filter(|f| {
+        .filter(|f| f.extension().is_some_and(|e| e == "log"))
+        .partition(|f| {
             f.file_name().and_then(|n| n.to_str()).is_none_or(|n| {
                 !now_building.iter().any(|pre| n.starts_with(pre.as_str()))
             })
-        })
-        .collect();
-    sweep("log", old, recipes);
+        });
+    sweep("log", old, kept.len());
 
     // a preserved library goes when nothing names its soname any more and nothing
     // running still has it open. either alone is the wrong answer: a library no
@@ -8025,17 +8227,23 @@ fn owns_cmd(args: &[String]) {
 
     let mut missed = false;
     for want in &rest {
-        // the manifest holds paths relative to the root, and a caller types the
-        // absolute one they were just shown
-        let key = want.trim_start_matches('/');
-        match owner.get(key) {
-            Some(who) => {
+        // the manifest holds paths relative to the root as the package spelled them, and
+        // a caller types whatever they were just shown, /bin/sh as often as /usr/bin/sh
+        let typed = lexical(want).join("/");
+        let real = spelled(&root, want);
+        let hit = [&typed, &real].into_iter().find_map(|k| owner.get(k.as_str()).map(|w| (k, w)));
+        match hit {
+            Some((key, who)) => {
                 for (name, t) in who {
                     say!("/{key} {name} {t}");
                 }
             }
+            None if fs::symlink_metadata(root.join(&real)).is_err() => {
+                say!("/{real} does not exist");
+                missed = true;
+            }
             None => {
-                say!("/{key} owned by nobody");
+                say!("/{real} owned by nobody");
                 missed = true;
             }
         }
@@ -8056,6 +8264,7 @@ fn doctor_cmd(args: &[String]) {
             _ => die(format!("doctor takes no arguments, got {a}")),
         }
     }
+    there(&root);
 
     let targets = match db::targets(&root) {
         Ok(t) => t,
@@ -8063,7 +8272,8 @@ fn doctor_cmd(args: &[String]) {
     };
 
     let mut found = 0;
-    for (t, f) in checks(&root) {
+    let (all, waiting) = checks_without(&root, &[]);
+    for (t, f) in all {
         say!("{} {t} {}", f.path, f.what);
         found += 1;
     }
@@ -8097,8 +8307,10 @@ fn doctor_cmd(args: &[String]) {
         .flatten()
         .filter(|e| matches!(e.kind, db::Kind::File(_)))
         .count();
-    if held > 0 {
-        say!("{held} preserved, waiting on a rebuild. kiry gc takes them when nothing asks");
+    match (held, waiting) {
+        (0, _) => {}
+        (_, 0) => say!("{held} preserved and nothing links them. kiry gc takes them unless still open"),
+        _ => say!("{held} preserved, waiting on a rebuild. kiry gc takes them when nothing asks"),
     }
     if found > 0 {
         std::process::exit(1);
@@ -8453,18 +8665,21 @@ type Script = (String, String, Vec<String>);
 
 // one target's findings, and what the shebang check needs from it: its scripts and the
 // index of every path it owns. checks() runs that last, over all targets at once
-fn check(root: &Path, target: &str) -> (Vec<Finding>, Vec<Script>, World) {
+//
+// gone is packages to read as already removed, which is how r asks what a removal
+// would break. the count is preserved libraries something still links
+fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Script>, World, usize) {
     let Some(dirs) = defaults(target) else {
         let bad = Finding {
             pkg: "-".into(),
             path: target.to_string(),
             what: What::UnknownTarget,
         };
-        return (vec![bad], Vec::new(), (HashSet::new(), HashMap::new()));
+        return (vec![bad], Vec::new(), (HashSet::new(), HashMap::new()), 0);
     };
 
-    let names = match db::installed(root, target) {
-        Ok(n) => n,
+    let names: Vec<String> = match db::installed(root, target) {
+        Ok(n) => n.into_iter().filter(|n| !gone.contains(n)).collect(),
         Err(e) => die(e.to_string()),
     };
 
@@ -8550,6 +8765,7 @@ fn check(root: &Path, target: &str) -> (Vec<Finding>, Vec<Script>, World) {
     // moved past reads unresolved and every symbol behind it reads missing -- 47 rows
     // against electron that were one fact
     let kept = db::preserving(root, target).unwrap_or_default();
+    let first_kept = elves.len();
     let read = each(kept.len(), |i| {
         let m = db::read_preserved(root, target, &kept[i]).ok()?;
         let seen = install::scan(root, &m);
@@ -8618,6 +8834,7 @@ fn check(root: &Path, target: &str) -> (Vec<Finding>, Vec<Script>, World) {
     }
 
     out.extend(accounted(target, &deps, &elves, &owners, &needs));
+    let waiting = (first_kept..elves.len()).filter(|j| linked.contains(j)).count();
 
     // a perl xs module is dlopened, so nothing links it and it is not asked. the library
     // it pulls in is linked, but only by something equally unknowable, and the question
@@ -8715,17 +8932,25 @@ fn check(root: &Path, target: &str) -> (Vec<Finding>, Vec<Script>, World) {
         });
     }
     out.extend(missing_users(root, &users));
-    (out, shebangs, (present, links))
+    (out, shebangs, (present, links), waiting)
+}
+
+fn checks(root: &Path) -> Vec<(String, Finding)> {
+    checks_without(root, &[]).0
 }
 
 // every target's findings. the shebang check wants every target's files, and each
 // check() indexed its own already, so their union is that and no record is read twice
-fn checks(root: &Path) -> Vec<(String, Finding)> {
+fn checks_without(root: &Path, gone: &[(String, String)]) -> (Vec<(String, Finding)>, usize) {
     let mut out = Vec::new();
+    let mut waiting = 0;
     let (mut anywhere, mut anylinks) = (HashSet::new(), HashMap::new());
     let mut scripts = Vec::new();
     for t in db::targets(root).unwrap_or_default() {
-        let (found, shebangs, (present, links)) = check(root, &t);
+        let mine: Vec<String> =
+            gone.iter().filter(|(gt, _)| *gt == t).map(|(_, n)| n.clone()).collect();
+        let (found, shebangs, (present, links), linked) = check(root, &t, &mine);
+        waiting += linked;
         out.extend(found.into_iter().map(|f| (t.clone(), f)));
         anywhere.extend(present);
         anylinks.extend(links);
@@ -8765,7 +8990,7 @@ fn checks(root: &Path) -> Vec<(String, Finding)> {
             ));
         }
     }
-    out
+    (out, waiting)
 }
 
 // DT_NEEDED names a file, not a soname. the loader opens the first directory on the
@@ -8941,18 +9166,44 @@ fn dirname(p: &str) -> &str {
 
 // /lib, /usr/lib and usr/bin/../lib all name one directory here
 fn fold(p: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
+    let mut parts = lexical(p);
+    if matches!(parts.first().map(String::as_str), Some("lib" | "lib64" | "bin" | "sbin")) {
+        parts.insert(0, "usr".into());
+    }
+    parts.join("/")
+}
+
+fn lexical(p: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
     for c in p.split('/') {
         match c {
             "" | "." => {}
             ".." => {
                 parts.pop();
             }
-            c => parts.push(c),
+            c => parts.push(c.to_string()),
         }
     }
-    if matches!(parts.first(), Some(&"lib" | &"lib64" | &"bin" | &"sbin")) {
-        parts.insert(0, "usr");
+    parts
+}
+
+// a path through whatever directory links the root really has, read from it rather than
+// assumed the way fold does, because owns answers for one root on disk. the last part is
+// never followed: a symlink a package ships is owned as itself
+fn spelled(root: &Path, p: &str) -> String {
+    let mut parts = lexical(p);
+    let (mut i, mut hops) = (0, 0);
+    while i + 1 < parts.len() {
+        match fs::read_link(root.join(parts[..=i].join("/"))) {
+            Ok(to) if hops < 40 => {
+                hops += 1;
+                let to = to.to_string_lossy();
+                let base = if to.starts_with('/') { String::new() } else { parts[..i].join("/") };
+                parts = lexical(&format!("{base}/{to}/{}", parts[i + 1..].join("/")));
+                i = 0;
+            }
+            _ => i += 1,
+        }
     }
     parts.join("/")
 }
@@ -9401,6 +9652,15 @@ mod tests {
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
 
+    // a setting with nothing after it reads as one somebody forgot to finish
+    #[test]
+    fn no_rung_writes_a_setting_without_a_value() {
+        for (filter, l) in LADDER {
+            let v = l.split_once(' ').map_or("", |(_, v)| v.trim());
+            assert!(*filter || !v.is_empty(), "{l} has no value");
+        }
+    }
+
     // what the ladder wrote goes, header and all. what the table wrote and what a person
     // wrote stay, and so does a hand comment sitting on top of a rung
     #[test]
@@ -9706,11 +9966,15 @@ mod names {
     }
 
     fn installed(root: &Path, name: &str, files: &[&str], sonames: &[&str]) {
+        installed_on(root, T, name, files, sonames)
+    }
+
+    fn installed_on(root: &Path, t: &str, name: &str, files: &[&str], sonames: &[&str]) {
         db::write(
             root,
             &db::Installed {
                 name: name.into(),
-                target: T.into(),
+                target: t.into(),
                 version: pkg::Version::parse("1.0 1").unwrap(),
                 depends: Vec::new(),
                 manifest: files
@@ -9735,7 +9999,7 @@ mod names {
                 path: format!("usr/lib/{s}"),
             })
             .collect();
-        db::write_provides(root, T, name, &ps).unwrap();
+        db::write_provides(root, t, name, &ps).unwrap();
     }
 
     fn deps(p: &Package) -> Vec<String> {
@@ -9767,6 +10031,24 @@ mod names {
 
         let p = load(&r, &at).unwrap();
         assert_eq!(deps(&p), vec!["mesa", "ncurses", "ncurses make"]);
+    }
+
+    // one soname, two packages: mesa on musl and libglvnd on gnu. gnu sorts first, so a
+    // lookup across targets would hand firefox on musl the gnu one
+    #[test]
+    fn a_library_resolves_to_what_ships_it_on_the_target_asking() {
+        let r = root("per-target");
+        installed_on(&r, "x86_64-gnu", "libglvnd", &[], &["libGL.so.1"]);
+        installed_on(&r, "x86_64-musl", "mesa", &[], &["libGL.so.1"]);
+        let at = recipe(&r, "extra", "firefox", "so:libGL.so.1\n");
+        assert_eq!(deps(&load(&r, &at).unwrap()), vec!["mesa"]);
+
+        // a recipe for both gets both answers, each held to its own target
+        fs::write(at.join("targets"), "x86_64-musl\nx86_64-gnu\n").unwrap();
+        assert_eq!(
+            deps(&load(&r, &at).unwrap()),
+            vec!["mesa x86_64-musl", "libglvnd x86_64-gnu"]
+        );
     }
 
     // nothing installed has the command, and a recipe named after it is the likely

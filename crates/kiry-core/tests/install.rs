@@ -2,6 +2,7 @@
 // is exactly why it lives in tests/ rather than inside kiry-core
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use kiry_core::archive::{Member, What};
@@ -815,6 +816,47 @@ fn an_upgrade_that_drops_a_hardlink_takes_it() {
     assert_eq!(fs::read_to_string(root.join("usr/bin/foo")).unwrap(), "2.0");
 }
 
+// an edited config is kept, so its hardlink already names the inode the new link points
+// at, and rename(2) between two links to one file succeeds without doing anything
+#[test]
+fn a_kept_config_leaves_no_temp_name_beside_its_hardlink() {
+    let (d, root) = rooted("hardlink-kept");
+    let arc = |ver: &str| {
+        let src = d.join(format!("conf-{ver}-src"));
+        fs::create_dir_all(src.join("etc")).unwrap();
+        fs::write(src.join("etc/tool.conf"), ver).unwrap();
+        fs::hard_link(src.join("etc/tool.conf"), src.join("etc/tool-alias.conf")).unwrap();
+        let a = d.join(format!("conf-{ver}.tar.zst"));
+        let sh = format!("cd {} && tar cf - . | zstd -q -o {}", src.display(), a.display());
+        assert!(std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap().success());
+        let meta = d.join(format!("conf-{ver}.tar.zst.meta"));
+        fs::create_dir_all(&meta).unwrap();
+        fs::write(meta.join("name"), "conf\n").unwrap();
+        fs::write(meta.join("version"), format!("{ver} 1\n")).unwrap();
+        fs::write(meta.join("targets"), "x86_64-musl\n").unwrap();
+        fs::write(meta.join("depends"), "").unwrap();
+        a
+    };
+    run(&root, &[arc("1.0")], false).unwrap();
+    // in place, so the two names stay one inode the way an editor writing through keeps them
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(root.join("etc/tool.conf"))
+        .unwrap()
+        .write_all(b"edited by hand")
+        .unwrap();
+    run(&root, &[arc("2.0")], false).unwrap();
+
+    assert_eq!(fs::read_to_string(root.join("etc/tool.conf")).unwrap(), "edited by hand");
+    let left: Vec<_> = fs::read_dir(root.join("etc"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".kiry"))
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+}
+
 // the new copy is written beside the old one and renamed over it, so an archive that
 // dies partway through a file leaves the old one standing rather than half of the new
 #[test]
@@ -837,6 +879,43 @@ fn a_file_cut_off_partway_leaves_the_old_one_whole() {
 
     assert!(install::apply(&root, &jobs).is_err());
     assert_eq!(fs::read_to_string(root.join("usr/lib/big")).unwrap(), "foo");
+}
+
+// the other way to be cut off: the tar stops short and zstd compresses what there is
+// into a stream with nothing wrong with it. tar reads a short entry as a short file and
+// a missing header as the end, so neither says anything
+#[test]
+fn a_tar_cut_off_inside_a_whole_zstd_stream_is_refused() {
+    let d = scratch("tar-cut");
+    let src = d.join("src");
+    fs::create_dir_all(src.join("usr/lib")).unwrap();
+    fs::write(src.join("usr/lib/big"), vec![b'x'; 100_000]).unwrap();
+    fs::write(src.join("usr/lib/next"), "next").unwrap();
+    let tar = d.join("whole.tar");
+    let sh = format!("cd {} && tar cf {} ./usr/lib/big ./usr/lib/next", src.display(), tar.display());
+    assert!(std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap().success());
+    let whole = fs::read(&tar).unwrap();
+    // one short of the first file's data, and exactly at the second header
+    for (name, cut) in [("mid", 512 + 50_000), ("edge", 512 + 100_352)] {
+        let at = d.join(name);
+        fs::create_dir_all(&at).unwrap();
+        let part = at.join("part.tar");
+        fs::write(&part, &whole[..cut]).unwrap();
+        let arc = at.join("foo.tar.zst");
+        let sh = format!("zstd -q {} -o {}", part.display(), arc.display());
+        assert!(std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap().success());
+        let meta = at.join("foo.tar.zst.meta");
+        fs::create_dir_all(&meta).unwrap();
+        fs::write(meta.join("name"), "foo\n").unwrap();
+        fs::write(meta.join("version"), "1.0 1\n").unwrap();
+        fs::write(meta.join("targets"), "x86_64-musl\n").unwrap();
+        fs::write(meta.join("depends"), "").unwrap();
+
+        let root = at.join("root");
+        fs::create_dir_all(&root).unwrap();
+        assert!(run(&root, &[arc], false).is_err(), "{name}: a cut tar installed");
+        assert!(db::read(&root, "x86_64-musl", "foo").is_err(), "{name}: recorded");
+    }
 }
 
 // the build hash is how a cached artifact is matched to what is installed, so one left

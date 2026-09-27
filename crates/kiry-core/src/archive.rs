@@ -56,9 +56,9 @@ pub fn plan_reader<R: Read>(root: &Path, reader: R) -> Result<Vec<Member>, Error
 fn walk<R: Read>(
     root: &Path,
     reader: R,
-    mut each: impl FnMut(&mut tar::Entry<'_, R>, &Member) -> Result<(), Error>,
+    mut each: impl FnMut(&mut tar::Entry<'_, Ends<R>>, &Member) -> Result<(), Error>,
 ) -> Result<Vec<Member>, Error> {
-    let mut tar = tar::Archive::new(reader);
+    let mut tar = tar::Archive::new(Ends { r: reader, zeros: 0 });
     let mut out = Vec::new();
     // symlinks this archive makes, before they exist on disk
     let mut made: HashMap<String, String> = HashMap::new();
@@ -158,8 +158,28 @@ fn walk<R: Read>(
         each(&mut e, &m)?;
         out.push(m);
     }
+    // tar reads a missing header as the end, so one cut at a boundary installs half quietly
+    if tar.into_inner().zeros < 512 {
+        let path = out.last().map_or(String::new(), |m| m.path.clone());
+        return Err(Error::Archive { path, why: "the tar stops here with no end block, cut off" });
+    }
 
     Ok(out)
+}
+
+// zero bytes at the end of what was read. a tar written out whole ends in a zero block
+pub struct Ends<R> {
+    r: R,
+    zeros: usize,
+}
+
+impl<R: Read> Read for Ends<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.r.read(buf)?;
+        let tail = buf[..n].iter().rev().take_while(|&&b| b == 0).count();
+        self.zeros = if tail == n { self.zeros + n } else { tail };
+        Ok(n)
+    }
 }
 
 // mkdirat, symlinkat and linkat take no resolve flags, so the parent is opened with
@@ -216,16 +236,7 @@ fn apply<R: Read>(
         }
         // records the archive's hash, not the disk's, so unlink still refuses to delete it
         What::File if skip.iter().any(|p| p == &m.path) => {
-            let mut h = Sha256::new();
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                let n = entry.read(&mut buf).map_err(anon)?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
-            db::Kind::File(hex(&h.finalize()))
+            db::Kind::File(crate::sha256(entry).map_err(anon)?)
         }
         What::File => {
             let fd = rustix::fs::openat(
@@ -277,6 +288,8 @@ fn apply<R: Read>(
         rustix::fs::renameat(&pfd, tmp.as_str(), &pfd, name)
             .map_err(|e| Error::Io(m.path.clone().into(), e.into()))?;
     }
+    // a hardlink whose name already is that inode renames as a no-op and keeps tmp
+    clear(&pfd, &tmp);
     manifest.push(db::Entry {
         mode,
         kind,

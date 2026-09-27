@@ -4099,6 +4099,28 @@ fn a_new_package_nothing_has_open_goes_live() {
     assert!(line.contains("not the running root"), "{line}");
 }
 
+// kiry upgrading itself in an early level of a batch: the file it runs from is replaced
+// underneath it, and the next level still has to enter its sandbox
+#[test]
+fn a_batch_still_builds_after_its_own_binary_is_replaced() {
+    let Some((at, root, repo)) = workshop("selfswap") else {
+        return;
+    };
+    buildable(&at, &repo, "low", "");
+    buildable(&at, &repo, "high", "low\n");
+    let me = at.join("kiry");
+    fs::copy(KIRY, &me).unwrap();
+    let hooks = root.join("etc/kiry/hooks.d");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("10-swap");
+    fs::write(&hook, format!("#!/bin/sh\ncp '{0}' '{0}.new' && mv '{0}.new' '{0}'\n", me.display())).unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let o = Command::new(&me).args(["i", "--root", root.to_str().unwrap(), "high"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(db::read(&root, "x86_64-musl", "high").is_ok(), "high never went in");
+}
+
 // a fresh root has no compiler, and building one needs a compiler. the cached one goes in
 // first, whatever flags it was built with, and the build runs on it
 #[test]

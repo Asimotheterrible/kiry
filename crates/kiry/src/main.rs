@@ -1709,8 +1709,10 @@ fn compile(
             .map_err(|e| format!("{n}: {e}"))?;
     }
 
-    let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let mut c = Command::new(me);
+    // not current_exe(): once an install renames a new kiry over this one, that reads back
+    // `/usr/bin/kiry (deleted)` and every later build of the batch fails to spawn. the
+    // magic link still execs the image that is running
+    let mut c = Command::new("/proc/self/exe");
     sandbox::tied(&mut c)
         .arg("sandbox")
         // an inherited CFLAGS or PYTHONPATH would change a build without appearing

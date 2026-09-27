@@ -6126,3 +6126,120 @@ fn a_build_dies_with_the_kiry_that_started_it() {
     assert!(!then.is_empty(), "the build never started");
     assert_eq!(then, now, "the build outlived the kiry that started it");
 }
+
+// b of a package the cache already holds under the same key is a second build of the same
+// thing, so it says whether the bytes came out the same. -q hides it with the ok line
+#[test]
+fn a_rebuild_under_the_same_key_says_it_made_the_same_bytes() {
+    let at = scratch("repro-same");
+    // a hardlink comes back out of the tar as a link to whichever name went in first,
+    // and the staged tree has two files. both are the same bytes
+    let script = format!(
+        "{GOOD}ln \"$DESTDIR/usr/bin/hello\" \"$DESTDIR/usr/bin/hi\"\n\
+         ln -s hello \"$DESTDIR/usr/bin/hey\"\n"
+    );
+    let d = recipe(&at, "x86_64-musl", &script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let (r, dir) = (root.to_str().unwrap(), d.to_str().unwrap());
+
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(!said.contains("same bytes"), "nothing to compare the first build with: {said}");
+
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("hello 1.0 x86_64-musl ok ") && said.contains(" same bytes\n"), "{said}");
+
+    let o = kiry(&["b", "-q", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("same bytes"));
+}
+
+// a file that changes every run is the build not reproducing, and the log says which
+#[test]
+fn a_rebuild_that_comes_out_different_names_the_file_in_its_log() {
+    let at = scratch("repro-differs");
+    let script = format!(
+        "{GOOD}mkdir -p \"$DESTDIR/usr/share/hello\"\n\
+         head -c16 /dev/urandom > \"$DESTDIR/usr/share/hello/stamp\"\n\
+         ln -s ../../bin/hello \"$DESTDIR/usr/share/hello/link\"\n"
+    );
+    let d = recipe(&at, "x86_64-musl", &script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let (r, dir) = (root.to_str().unwrap(), d.to_str().unwrap());
+
+    assert!(kiry(&["b", "--root", r, dir]).status.success());
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains(" 1 file differs\n"), "{said}");
+    let log = fs::read_to_string(root.join("var/kiry/log/hello-1.0-1.x86_64-musl.log")).unwrap();
+    assert!(log.contains("kiry:   content      usr/share/hello/stamp\n"), "{log}");
+    assert!(!log.contains("usr/share/hello/link"), "{log}");
+
+    // a name that changes is one file gone and another come
+    let at = scratch("repro-renamed");
+    let script = format!(
+        "{GOOD}mkdir -p \"$DESTDIR/usr/share/hello\"\n\
+         n=$(tr -dc a-z </dev/urandom | head -c12)\n\
+         touch \"$DESTDIR/usr/share/hello/$n\"\n"
+    );
+    let d = recipe(&at, "x86_64-musl", &script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    assert!(bootstrap(&root));
+    let (r, dir) = (root.to_str().unwrap(), d.to_str().unwrap());
+    assert!(kiry(&["b", "--root", r, dir]).status.success());
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains(" 2 files differ\n"), "{said}");
+    let log = fs::read_to_string(root.join("var/kiry/log/hello-1.0-1.x86_64-musl.log")).unwrap();
+    assert!(log.contains("kiry:   only in old  usr/share/hello/"), "{log}");
+    assert!(log.contains("kiry:   only in new  usr/share/hello/"), "{log}");
+}
+
+// a rebuild after the recipe, the flags or the sidecar moved is a different build, and
+// comparing it with the old one would call a real change irreproducible
+#[test]
+fn a_rebuild_under_another_key_compares_nothing() {
+    let at = scratch("repro-other");
+    let d = recipe(&at, "x86_64-musl", GOOD);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let (r, dir) = (root.to_str().unwrap(), d.to_str().unwrap());
+    let quiet = |said: &str| !said.contains("same bytes") && !said.contains("differ");
+
+    assert!(kiry(&["b", "--root", r, dir]).status.success());
+    fs::write(d.join("build"), format!("{GOOD}echo second thoughts\n")).unwrap();
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(quiet(&said), "the recipe moved: {said}");
+
+    fs::create_dir_all(root.join("etc/kiry/pkg")).unwrap();
+    fs::write(root.join("etc/kiry/pkg/hello"), "CFLAGS -O1\n").unwrap();
+    let o = kiry(&["b", "--root", r, dir]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(quiet(&said), "the flags moved: {said}");
+
+    // a sidecar from before profiles were recorded cannot say it was this build
+    let meta = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst.meta");
+    fs::remove_file(meta.join("profile")).unwrap();
+    let o = kiry(&["b", "--root", r, dir]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(quiet(&said), "the sidecar says nothing about a profile: {said}");
+}

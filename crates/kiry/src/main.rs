@@ -1400,20 +1400,21 @@ fn unrung(text: &str) -> String {
     }
 }
 
-// cached() without the line it prints, for planning, which asks before anything runs
-fn fresh(root: &Path, p: &Package, t: &str) -> bool {
-    let a = root.join("var/kiry/cache").join(format!(
+fn artifact(root: &Path, p: &Package, t: &str) -> PathBuf {
+    root.join("var/kiry/cache").join(format!(
         "{}-{}-{}.{t}.tar.zst",
         p.name, p.version.upstream, p.version.rev
-    ));
+    ))
+}
+
+// cached() without the line it prints, for planning, which asks before anything runs
+fn fresh(root: &Path, p: &Package, t: &str) -> bool {
+    let a = artifact(root, p, t);
     a.is_file() && stale(root, p, t, &a).is_none()
 }
 
 fn cached(root: &Path, p: &Package, t: &str) -> Option<PathBuf> {
-    let a = root.join("var/kiry/cache").join(format!(
-        "{}-{}-{}.{t}.tar.zst",
-        p.name, p.version.upstream, p.version.rev
-    ));
+    let a = artifact(root, p, t);
     if !a.is_file() {
         return None;
     }
@@ -4457,7 +4458,24 @@ fn install_cmd(args: &[String]) {
         return;
     }
 
-    let set = wanted(&root, &seeds, &mut recipes);
+    let mut set = wanted(&root, &seeds, &mut recipes, &HashSet::new());
+    // a build runs on the toolchain, and no recipe names it. a root without it takes the
+    // cached one first, stale or not: it compiles the same, and nothing here can build a
+    // compiler without one
+    if set.iter().any(|(n, t)| !fresh(&root, &recipes[n], t)) {
+        let tools = first_tools(&root, &mut recipes);
+        if !tools.is_empty() {
+            for (n, t, _) in &tools {
+                say!("{n} {} {t} goes in first from the cache, for the toolchain", recipes[n].version.upstream);
+            }
+            if !dry {
+                let _w = writer(&root);
+                apply_batch(&root, &tools.iter().map(|x| x.2.clone()).collect::<Vec<_>>(), force);
+            }
+            let have: HashSet<(String, String)> = tools.into_iter().map(|(n, t, _)| (n, t)).collect();
+            set = wanted(&root, &seeds, &mut recipes, &have);
+        }
+    }
     let built: Vec<bool> = set.iter().map(|(n, t)| fresh(&root, &recipes[n], t)).collect();
     let mut plan = levels(&set, &recipes, &built);
     longest_first(&mut plan, &set, &history(&root));
@@ -4716,10 +4734,12 @@ fn without(
     out.len()
 }
 
+// have is what counts as installed without the db saying so yet: a dry run's toolchain
 fn wanted(
     root: &Path,
     seeds: &[(String, String)],
     recipes: &mut HashMap<String, Package>,
+    have: &HashSet<(String, String)>,
 ) -> Vec<(String, String)> {
     let host = sandbox::host();
     let mut out = seeds.to_vec();
@@ -4766,12 +4786,43 @@ fn wanted(
             })
             .collect();
         for d in next {
-            if db::read(root, &d.1, &d.0).is_ok() || !seen.insert(d.clone()) {
+            if db::read(root, &d.1, &d.0).is_ok() || have.contains(&d) || !seen.insert(d.clone()) {
                 continue;
             }
             by.entry(d.0.clone()).or_insert_with(|| name.clone());
             out.push(d);
         }
+    }
+    out
+}
+
+// the toolchain members the root lacks, with the runtime deps they bring, each from an
+// artifact of its current version whatever its flags were
+fn first_tools(root: &Path, recipes: &mut HashMap<String, Package>) -> Vec<(String, String, PathBuf)> {
+    let host = sandbox::host();
+    let mut queue: Vec<String> = match sandbox::toolchain(root) {
+        Ok(t) => t.into_iter().map(|d| d.name).collect(),
+        Err(e) => die(e),
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    while let Some(n) = queue.pop() {
+        if db::read(root, &host, &n).is_ok() || !seen.insert(n.clone()) {
+            continue;
+        }
+        if !recipes.contains_key(&n) {
+            match resolve(root, &n).and_then(|at| load(root, &at)) {
+                Ok(p) => recipes.insert(n.clone(), p),
+                Err(e) => die(e),
+            };
+        }
+        let p = &recipes[&n];
+        let a = artifact(root, p, &host);
+        if !a.is_file() {
+            die(format!("{n} is in the toolchain and not installed, and there is no {host} artifact of it to start from"));
+        }
+        queue.extend(p.depends.iter().filter(|d| !d.make && d.applies(&host)).map(|d| d.name.clone()));
+        out.push((n, host.clone(), a));
     }
     out
 }

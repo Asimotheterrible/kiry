@@ -4099,6 +4099,36 @@ fn a_new_package_nothing_has_open_goes_live() {
     assert!(line.contains("not the running root"), "{line}");
 }
 
+// a fresh root has no compiler, and building one needs a compiler. the cached one goes in
+// first, whatever flags it was built with, and the build runs on it
+#[test]
+fn a_root_without_its_toolchain_takes_the_cached_one_first() {
+    let Some((at, root, repo)) = workshop("toolfirst") else {
+        return;
+    };
+    buildable(&at, &repo, "cc1", "");
+    buildable(&at, &repo, "top", "cc1\n");
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "cc1"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let tc = root.join("etc/kiry/toolchain");
+    fs::write(&tc, fs::read_to_string(&tc).unwrap() + "cc1\n").unwrap();
+
+    // -n installs nothing, so its plan has to count the toolchain as already there
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), "top"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("cc1 1.0 x86_64-musl goes in first from the cache"), "{said}");
+    assert!(!said.contains("cc1 1.0 x86_64-musl cached"), "{said}");
+    assert!(db::read(&root, "x86_64-musl", "cc1").is_err(), "a dry run installed cc1");
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "top"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("cc1 1.0 x86_64-musl goes in first from the cache"), "{said}");
+    assert!(db::read(&root, "x86_64-musl", "cc1").is_ok(), "cc1 never went in");
+    assert!(db::read(&root, "x86_64-musl", "top").is_ok(), "top never went in");
+}
+
 // asking whether something needs a reboot should not be the same act as rebooting for it
 #[test]
 fn install_dash_n_says_the_plan_and_writes_nothing() {

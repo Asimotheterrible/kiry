@@ -3068,6 +3068,54 @@ fn a_cargo_lock_is_fetched_outside_and_the_build_finds_it_offline() {
     assert!(args.trim_end().ends_with("hello-1.0/Cargo.toml"), "{args}");
 }
 
+// go.sum is go's lock, and the modules come in the same way the crates do. this go
+// writes where GOMODCACHE says, from the directory the go.sum is in
+#[test]
+fn a_go_sum_is_fetched_outside_and_the_build_finds_it_offline() {
+    let at = scratch("gomod");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "[ \"$GOPROXY\" = off ] && [ \"$GOTOOLCHAIN\" = local ] || exit 1\n\
+             [ -e \"$GOMODCACHE/cache/fetched\" ] || exit 1\n{GOOD}"
+        ),
+    );
+    fs::write(at.join("src/hello-1.0/go.sum"), "").unwrap();
+    let arc = tarball(&at);
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+    fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+
+    let bin = at.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("go"),
+        format!(
+            "#!/bin/sh\necho \"$* $(basename \"$PWD\") $GOTOOLCHAIN\" >> {}\n\
+             mkdir -p \"$GOMODCACHE/cache\"\ntouch \"$GOMODCACHE/cache/fetched\"\n",
+            at.join("args").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("go"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let args = fs::read_to_string(at.join("args")).unwrap();
+    assert_eq!(args, "mod download hello-1.0 local\n");
+}
+
 // clang gives a language it has no frontend for to gcc, and gcc is a link to clang, so
 // an ada probe forked until something killed the build. this clang hands over the way
 // the real one does, and this gcc only says it ran

@@ -1820,8 +1820,8 @@ fn compile(
     let deps: Vec<Dep> = p.depends.iter().filter(|d| d.applies(t)).cloned().collect();
     let members = sandbox::closure(root, t, &deps)?;
     sandbox::assemble(root, t, &members, &sysroot)?;
-    // this and the crates below are what a build writes that outlives it. mounted in
-    // rather than kept in the stage dir, which the next build of the package deletes
+    // this and the crates and modules below are what a build writes that outlives it,
+    // mounted rather than kept in the stage dir, which the next build of it deletes
     let lto = lto_cache(root, &p.name);
     mkdirs(&lto)?;
     mkdirs(&sysroot.join(sandbox::LTO_AT))?;
@@ -1833,21 +1833,29 @@ fn compile(
     let cargo = root.join("var/kiry/cargo");
     mkdirs(&cargo)?;
     mkdirs(&sysroot.join(sandbox::CARGO_AT))?;
-    for lock in lockfiles(&src, 3) {
-        let o = Command::new("cargo")
-            .arg("fetch")
+    for lock in shallowest(&src, "Cargo.lock", 3) {
+        let mut c = Command::new("cargo");
+        c.arg("fetch")
             .arg("--locked")
             .arg("--manifest-path")
             .arg(lock.with_file_name("Cargo.toml"))
-            .env("CARGO_HOME", abs(&cargo)?)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("cargo fetch: {e}"))?;
-        if !o.status.success() {
-            let err = String::from_utf8_lossy(&o.stderr);
-            let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-            return Err(format!("cargo fetch for {}: {last}", lock.display()));
-        }
+            .env("CARGO_HOME", abs(&cargo)?);
+        prefetch(&mut c, &lock)?;
+    }
+    // go's modules the same way, go.sum being its lock. GOTOOLCHAIN=local on both sides,
+    // or a go.mod asking for a newer go downloads one
+    let gomod = root.join("var/kiry/gomod");
+    mkdirs(&gomod)?;
+    mkdirs(&sysroot.join(sandbox::GOMOD_AT))?;
+    for sum in shallowest(&src, "go.sum", 3) {
+        let mut c = Command::new("go");
+        c.arg("mod")
+            .arg("download")
+            .current_dir(sum.parent().unwrap_or(&src))
+            .env("GOMODCACHE", abs(&gomod)?)
+            .env("GOFLAGS", "-modcacherw")
+            .env("GOTOOLCHAIN", "local");
+        prefetch(&mut c, &sum)?;
     }
 
     fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
@@ -2049,6 +2057,11 @@ fn compile(
     c.env("KIRY_CARGO", abs(&cargo)?);
     c.env("CARGO_HOME", format!("/{}", sandbox::CARGO_AT));
     c.env("CARGO_NET_OFFLINE", "true");
+    c.env("KIRY_GOMOD", abs(&gomod)?);
+    c.env("GOMODCACHE", format!("/{}", sandbox::GOMOD_AT));
+    c.env("GOPROXY", "off");
+    c.env("GOFLAGS", "-modcacherw");
+    c.env("GOTOOLCHAIN", "local");
     let prune = p.dir.join("symbol-prune").is_file() && !t.ends_with("gnu");
     if prune {
         c.env("KIRY_PRUNE", "1");
@@ -2700,9 +2713,10 @@ fn jobs() -> usize {
 }
 
 // the shallowest lock of each tree only. a workspace has one at its top, and one below
-// it (fuzz/, a vendored crate) is often stale, which --locked would fail the build on
-fn lockfiles(dir: &Path, depth: usize) -> Vec<PathBuf> {
-    let here = dir.join("Cargo.lock");
+// it (fuzz/, a vendored crate, a go example) is often stale, which a locked fetch would
+// fail the build on
+fn shallowest(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
+    let here = dir.join(name);
     if here.is_file() {
         return vec![here];
     }
@@ -2712,10 +2726,25 @@ fn lockfiles(dir: &Path, depth: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for e in rd.flatten() {
         if depth > 0 && e.file_type().is_ok_and(|k| k.is_dir()) {
-            out.extend(lockfiles(&e.path(), depth - 1));
+            out.extend(shallowest(&e.path(), name, depth - 1));
         }
     }
     out
+}
+
+// a fetch the sandbox cannot do, run out here. its last line of stderr is the error
+fn prefetch(c: &mut Command, lock: &Path) -> Result<(), String> {
+    let what = c.get_program().to_string_lossy().into_owned();
+    let o = c
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{what} for {}: {e}", lock.display()))?;
+    if o.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&o.stderr);
+    let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    Err(format!("{what} for {}: {last}", lock.display()))
 }
 
 fn unpacked(src: &Path) -> PathBuf {
@@ -8299,6 +8328,7 @@ fn stats_cmd(args: &[String]) {
         ("log", "var/kiry/log"),
         ("lto", "var/kiry/lto"),
         ("cargo", "var/kiry/cargo"),
+        ("gomod", "var/kiry/gomod"),
     ] {
         out.push(format!("{what} {}", size(weigh(&root.join(at)))));
     }

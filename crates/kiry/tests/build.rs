@@ -3028,7 +3028,8 @@ fn a_cargo_lock_is_fetched_outside_and_the_build_finds_it_offline() {
         &at,
         "x86_64-musl",
         &format!(
-            "[ \"$CARGO_NET_OFFLINE\" = true ] || exit 1\n\
+            "options=\"!check net\"\n\
+             [ \"$CARGO_NET_OFFLINE\" = true ] || exit 1\n\
              [ -e \"$CARGO_HOME/registry/fetched\" ] || exit 1\n{GOOD}"
         ),
     );
@@ -3077,7 +3078,8 @@ fn a_go_sum_is_fetched_outside_and_the_build_finds_it_offline() {
         &at,
         "x86_64-musl",
         &format!(
-            "[ \"$GOPROXY\" = off ] && [ \"$GOTOOLCHAIN\" = local ] || exit 1\n\
+            "true || go mod download\n\
+             [ \"$GOPROXY\" = off ] && [ \"$GOTOOLCHAIN\" = local ] || exit 1\n\
              [ -e \"$GOMODCACHE/cache/fetched\" ] || exit 1\n{GOOD}"
         ),
     );
@@ -3114,6 +3116,47 @@ fn a_go_sum_is_fetched_outside_and_the_build_finds_it_offline() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let args = fs::read_to_string(at.join("args")).unwrap();
     assert_eq!(args, "mod download hello-1.0 local\n");
+}
+
+// a lock alone fetches nothing: go's own tree and firefox's carry one and build from
+// what they ship. this recipe downloads go modules and never crates, and its modules
+// are vendored, so neither tool may run and both would fail if they did
+#[test]
+fn a_lock_the_recipe_never_fetches_for_runs_no_host_tool() {
+    let at = scratch("nofetch");
+    let d = recipe(&at, "x86_64-musl", &format!("true || go mod download\n{GOOD}"));
+    let tree = at.join("src/hello-1.0");
+    fs::write(tree.join("Cargo.lock"), "version = 4\n").unwrap();
+    fs::write(tree.join("go.sum"), "").unwrap();
+    fs::create_dir_all(tree.join("vendor")).unwrap();
+    fs::write(tree.join("vendor/modules.txt"), "").unwrap();
+    let arc = tarball(&at);
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+    fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+
+    let bin = at.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for tool in ["cargo", "go"] {
+        let log = at.join("args");
+        fs::write(bin.join(tool), format!("#!/bin/sh\necho {tool} >> {}\nexit 1\n", log.display()))
+            .unwrap();
+        fs::set_permissions(bin.join(tool), std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!at.join("args").exists());
 }
 
 // clang gives a language it has no frontend for to gcc, and gcc is a link to clang, so

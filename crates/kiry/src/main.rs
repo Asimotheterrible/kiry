@@ -238,10 +238,15 @@ fn hue(code: &str, s: &str) -> String {
 }
 
 // the shape a package's result line has. a pipe gets it single spaced, a terminal gets
-// columns as wide as the batch's widest, and a name is never cut to fit
-fn row(name: &str, ver: &str, t: &str, status: &str, time: &str) -> String {
+// columns as wide as the batch's widest, and a name is never cut to fit. was is the
+// version installed on that target, which is all the upgrade colouring needs
+fn row(name: &str, ver: &str, was: Option<&str>, t: &str, status: &str, secs: Option<u64>) -> String {
+    let time = secs.map(clock).unwrap_or_default();
     if !tty() {
-        return format!("{name} {ver} {t} {status} {time}");
+        return match secs {
+            Some(_) => format!("{name} {ver} {t} {status} {time}"),
+            None => format!("{name} {ver} {t} {status}"),
+        };
     }
     let w = BATCH
         .lock()
@@ -260,14 +265,49 @@ fn row(name: &str, ver: &str, t: &str, status: &str, time: &str) -> String {
         "stuck" => "2;31",
         _ => "",
     };
-    format!(
-        "{}  {}  {}  {}  {}",
+    let head = format!(
+        "{}  {}  {}  ",
         hue("97", &format!("{name:<w$}", w = w[0])),
-        hue("2", &format!("{ver:<w$}", w = w[1])),
+        painted(ver, was, w[1]),
         hue(target, &format!("{t:<w$}", w = w[2])),
-        hue(state, &format!("{status:<6}")),
-        hue("2", &format!("{time:>6}")),
-    )
+    );
+    match secs {
+        Some(_) => format!("{head}{}  {}", hue(state, &format!("{status:<6}")), hue("2", &format!("{time:>6}"))),
+        None => format!("{head}{}", hue(state, status)),
+    }
+}
+
+// the components that moved since the installed version are bright and the rest dim,
+// so 25.2.1 over 25.2.0 reads as a patch before the number is read. a first install has
+// nothing to move from and stays dim
+fn painted(ver: &str, was: Option<&str>, w: usize) -> String {
+    let Some(was) = was.filter(|was| *was != ver) else {
+        return hue("2", &format!("{ver:<w$}"));
+    };
+    let sep = |c: char| !c.is_ascii_alphanumeric();
+    let old: Vec<&str> = was.split(sep).collect();
+    // runs of one brightness, so a line carries an escape per change and not per character
+    let mut runs: Vec<(bool, String)> = Vec::new();
+    for (i, piece) in ver.split_inclusive(sep).enumerate() {
+        let comp = piece.trim_end_matches(sep);
+        for (bright, text) in [(old.get(i) != Some(&comp), comp), (false, &piece[comp.len()..])] {
+            match runs.last_mut() {
+                Some((b, s)) if *b == bright => s.push_str(text),
+                _ if text.is_empty() => {}
+                _ => runs.push((bright, text.to_string())),
+            }
+        }
+    }
+    let mut out: String = runs.iter().map(|(b, s)| hue(if *b { "1" } else { "2" }, s)).collect();
+    out.push_str(&" ".repeat(w.saturating_sub(ver.len())));
+    out
+}
+
+// the version file alone. a whole record is its manifest too, and llvm's is 3500 lines
+// read to learn one word
+fn installed_version(root: &Path, t: &str, name: &str) -> Option<String> {
+    let text = fs::read_to_string(db::dir(root, t, name).join("version")).ok()?;
+    pkg::Version::parse(text.trim()).ok().map(|v| v.upstream)
 }
 
 // the key a build is known by on the live line and to the batch counting it
@@ -711,7 +751,8 @@ fn build(
             true => format!("  {n}"),
             false => format!(" {n}"),
         });
-        say!("{}{note}", row(&p.name, &p.version.upstream, t, "ok", &clock(secs)));
+        let was = installed_version(root, t, &p.name);
+        say!("{}{note}", row(&p.name, &p.version.upstream, was.as_deref(), t, "ok", Some(secs)));
         keep_time(root, p, t, secs);
         built.push((t.clone(), work, linked));
     }
@@ -1317,7 +1358,8 @@ fn unescaped(s: &str) -> String {
 // terminal already and wrote none
 fn failed(root: &Path, p: &Package, t: &str, log: Option<&Path>, secs: u64) {
     live_stop(&key(p, t));
-    loud!("{}", row(&p.name, &p.version.upstream, t, "failed", &clock(secs)));
+    let was = installed_version(root, t, &p.name);
+    loud!("{}", row(&p.name, &p.version.upstream, was.as_deref(), t, "failed", Some(secs)));
     let Some(log) = log else { return };
     let text = fs::read_to_string(log).unwrap_or_default();
     let rule = rules(root).ok().and_then(|rs| scan(&rs, &text));

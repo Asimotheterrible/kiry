@@ -1440,6 +1440,45 @@ fn a_pipe_gets_plain_lines_and_a_terminal_gets_colour_and_a_live_line() {
     assert!(!plain.contains("\x1b[0m") && !plain.contains("\x1b[32m"), "{plain:?}");
 }
 
+// an upgrade says which component moved: 1.0 installed and 1.1 built is the last digit
+// bright and the rest dim. a package nothing installed yet is dim all through, and the
+// colour is the only difference between that and a pipe
+#[test]
+fn the_component_an_upgrade_moved_is_bright() {
+    let Some((at, root, repo)) = workshop("upgrade-colour") else {
+        return;
+    };
+    buildable(&at, &repo, "tool", "");
+    buildable(&at, &repo, "other", "");
+    let r = root.to_str().unwrap();
+    let o = kiry(&["i", "--root", r, "tool"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    fs::write(repo.join("tool/version"), "1.1 1\n").unwrap();
+
+    let tty = on_tty(120, &format!("env -u NO_COLOR {KIRY} b --root {r} tool"));
+    let ok = tty.lines().find(|l| l.contains("\x1b[32mok")).unwrap_or_else(|| panic!("{tty:?}"));
+    assert!(ok.contains("\x1b[2m1.\x1b[0m\x1b[1m1\x1b[0m"), "{ok:?}");
+
+    let tty = on_tty(120, &format!("env -u NO_COLOR {KIRY} b --root {r} other"));
+    let ok = tty.lines().find(|l| l.contains("\x1b[32mok")).unwrap_or_else(|| panic!("{tty:?}"));
+    assert!(ok.contains("\x1b[2m1.0\x1b[0m") && !ok.contains("\x1b[1m"), "{ok:?}");
+
+    // built again under the same key, the repro note follows the row it belongs to
+    let again = on_tty(120, &format!("env -u NO_COLOR {KIRY} b --root {r} tool"));
+    let ok = again.lines().find(|l| l.contains("\x1b[32mok")).unwrap_or_else(|| panic!("{again:?}"));
+    assert!(ok.contains("\x1b[1m1\x1b[0m") && ok.ends_with("  same bytes"), "{ok:?}");
+
+    // NO_COLOR at a terminal keeps the columns and loses only the brightness
+    let plain = on_tty(120, &format!("NO_COLOR= {KIRY} b --root {r} tool"));
+    assert!(plain.contains("tool  1.1  x86_64-musl  ok"), "{plain:?}");
+    assert!(!plain.contains("\x1b[1m") && !plain.contains("\x1b[2m"), "{plain:?}");
+
+    let o = kiry(&["b", "--root", r, "tool"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.lines().any(|l| l.starts_with("tool 1.1 x86_64-musl ok ")), "{out}");
+    assert!(!out.contains('\x1b'), "{out:?}");
+}
+
 // -q is for a script or a cron job that only wants to hear about trouble. the art is a
 // person's, and a person who asked for quiet does not get it either
 #[test]

@@ -585,21 +585,38 @@ fn body(text: &str, name: &str) -> Option<String> {
 
 // kiry never runs check(), and a test suite it builds anyway is one more thing to fail:
 // mbedtls2, glm and cxxopts all stopped on clang's -Werror inside their tests. a word at a
-// time, so the whitespace and the line continuations stay as they were
+// time, so the whitespace and the line continuations stay as they were. the same walk
+// takes alpine's lto words out
 fn untested(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut word = String::new();
     for c in body.chars() {
         if c.is_whitespace() {
-            out.push_str(&off(&word));
+            out.push_str(&off(&unlto(&word)));
             word.clear();
             out.push(c);
         } else {
             word.push(c);
         }
     }
-    out.push_str(&off(&word));
+    out.push_str(&off(&unlto(&word)));
     out
+}
+
+// alpine's -flto=auto is gcc's full lto spelled for clang, and it rides on top of the LTO
+// knob kiry's flags already carry: full lto where the knob says thin, and never through
+// the thinlto cache. gone, the knob decides here like it does everywhere else. only the
+// whole word, give or take its quotes: perl's `s| -flto=auto||g` has it inside a longer
+// one, and taking it out of there turns the sed into one that strips every space
+fn unlto(word: &str) -> String {
+    let inner = word.trim_start_matches(['"', '\'']);
+    let bare = inner.trim_end_matches(['"', '\'']);
+    match bare {
+        "-flto=auto" | "-ffat-lto-objects" => {
+            format!("{}{}", &word[..word.len() - inner.len()], &inner[bare.len()..])
+        }
+        _ => word.to_string(),
+    }
 }
 
 // the same word switched off, or as it was. an --enable- with a value is left alone: the

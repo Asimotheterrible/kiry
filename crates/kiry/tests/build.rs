@@ -3030,6 +3030,36 @@ fn a_compile_fed_on_stdin_gets_one_go() {
     assert!(!String::from_utf8_lossy(&o.stdout).contains("again at"));
 }
 
+// clang gives a language it has no frontend for to gcc, and gcc is a link to clang, so
+// an ada probe forked until something killed the build. this clang hands over the way
+// the real one does, and this gcc only says it ran
+const HANDOFF: &str =
+    "g=gcc; p=; for a do [ \"$p\" = -ccc-gcc-name ] && g=$a; p=$a; done; exec \"$g\" \"$@\"";
+
+#[test]
+fn a_language_clang_hands_to_gcc_does_not_come_back_to_clang() {
+    let at = scratch("adaloop");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "{}printf '%s\\n' '#!/bin/sh' 'echo gcc >> /src/ran; exit 1' >/src/bin/gcc\n\
+             chmod +x /src/bin/gcc\n\
+             kirycc -c conftest.adb -o x.o && exit 1\n\
+             [ -e /src/ran ] && exit 1\n{GOOD}",
+            fake_clang("*.adb*", HANDOFF)
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
 // the wrapper already tried every rung on that file, so a restart would only walk the
 // same ladder over the whole package. the table's crash row included
 #[test]

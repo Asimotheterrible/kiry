@@ -1803,7 +1803,8 @@ fn compile(
 
     // abuild's split: a recipe with an unpack() of its own is handed the sources as they
     // arrived and extracts what it wants, which is how libyuv hashes the tree it untars
-    let own_unpack = fs::read_to_string(&script).is_ok_and(|s| s.contains("\nunpack()"));
+    let text = fs::read_to_string(&script).unwrap_or_default();
+    let own_unpack = text.contains("\nunpack()");
     for (name, path, _) in srcs {
         let name = name.as_str();
         if tarball(name) && !own_unpack {
@@ -1829,11 +1830,18 @@ fn compile(
     // the sandbox has no network and 363 recipes cargo fetch in prepare, so the fetch
     // happens out here. Cargo.lock pins every crate by sha256 the way checksums pins a
     // tarball, and the recipe's own fetch then finds them all in CARGO_HOME. a patch
-    // that moves Cargo.lock in prepare comes after this and still fails offline
+    // that moves Cargo.lock in prepare comes after this and still fails offline.
+    // only a recipe that fetches gets it: go's own tree and firefox's carry locks too,
+    // build from what they ship, and have no host tool to fetch with while bootstrapping
+    let net = text.lines().any(|l| {
+        l.strip_prefix("options=")
+            .is_some_and(|o| o.trim_matches(['"', '\'']).split_whitespace().any(|w| w == "net"))
+    });
     let cargo = root.join("var/kiry/cargo");
     mkdirs(&cargo)?;
     mkdirs(&sysroot.join(sandbox::CARGO_AT))?;
-    for lock in shallowest(&src, "Cargo.lock", 3) {
+    let fetches = net || text.contains("cargo fetch");
+    for lock in shallowest(&src, "Cargo.lock", 3).into_iter().filter(|_| fetches) {
         let mut c = Command::new("cargo");
         c.arg("fetch")
             .arg("--locked")
@@ -1847,7 +1855,11 @@ fn compile(
     let gomod = root.join("var/kiry/gomod");
     mkdirs(&gomod)?;
     mkdirs(&sysroot.join(sandbox::GOMOD_AT))?;
-    for sum in shallowest(&src, "go.sum", 3) {
+    let downloads = net || text.contains("go mod download");
+    for sum in shallowest(&src, "go.sum", 3).into_iter().filter(|_| downloads) {
+        if sum.with_file_name("vendor/modules.txt").is_file() {
+            continue;
+        }
         let mut c = Command::new("go");
         c.arg("mod")
             .arg("download")

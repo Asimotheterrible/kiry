@@ -432,6 +432,8 @@ pub fn tied(c: &mut Command) -> &mut Command {
 pub const LTO_AT: &str = "var/cache/kiry-lto";
 // and /var/kiry/cargo, which the build gets as CARGO_HOME
 pub const CARGO_AT: &str = "var/cache/kiry-cargo";
+// and /var/kiry/gomod, its GOMODCACHE
+pub const GOMOD_AT: &str = "var/cache/kiry-gomod";
 
 // a freshly exec'd process has exactly one thread, and CLONE_NEWUSER refuses to unshare
 // from a process that has more than one. that is why the build enters through a new kiry
@@ -474,12 +476,15 @@ pub fn init() -> Result<(), String> {
 
     mount::mount_bind(work.join("src"), root.join("src")).map_err(|e| format!("src: {e}"))?;
     mount::mount_bind(work.join("dest"), root.join("dest")).map_err(|e| format!("dest: {e}"))?;
-    // the thinlto and cargo caches, the two places a build writes that outlive it
+    // the thinlto, cargo and go caches, the places a build writes that outlive it
     if let Ok(d) = std::env::var("KIRY_LTO_CACHE") {
         mount::mount_bind(&d, root.join(LTO_AT)).map_err(|e| format!("lto cache: {e}"))?;
     }
     if let Ok(d) = std::env::var("KIRY_CARGO") {
         mount::mount_bind(&d, root.join(CARGO_AT)).map_err(|e| format!("cargo cache: {e}"))?;
+    }
+    if let Ok(d) = std::env::var("KIRY_GOMOD") {
+        mount::mount_bind(&d, root.join(GOMOD_AT)).map_err(|e| format!("go modules: {e}"))?;
     }
     // a fresh procfs wants CAP_SYS_ADMIN in the user namespace owning the pid namespace,
     // and there is none here, so the host's is bound in. recursive because a user
@@ -537,6 +542,7 @@ pub fn init() -> Result<(), String> {
         // a host path, and nothing in a build has any use for it
         .env_remove("KIRY_LTO_CACHE")
         .env_remove("KIRY_CARGO")
+        .env_remove("KIRY_GOMOD")
         .status()
         .map_err(|e| format!("sh: {e}"))?;
     std::process::exit(s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)))

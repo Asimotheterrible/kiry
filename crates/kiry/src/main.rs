@@ -1321,11 +1321,7 @@ fn note(at: &Path, line: &str, why: &str) -> Result<(), String> {
     }
     let gap = if had.is_empty() || had.ends_with('\n') { "" } else { "\n" };
     fs::write(at, format!("{had}{gap}# {} {why}\n{line}\n", today()))
-        .map_err(|e| format!("{}: {e}", at.display()))?;
-    if !line.is_empty() {
-        say!("{} {line}", at.display());
-    }
-    Ok(())
+        .map_err(|e| format!("{}: {e}", at.display()))
 }
 
 fn stuck(p: &Package, t: &str, why: &str) -> String {
@@ -1403,6 +1399,7 @@ fn unescaped(s: &str) -> String {
 // the failure, and the first real complaint rather than the log. -v had the log on the
 // terminal already and wrote none
 fn failed(root: &Path, p: &Package, t: &str, log: Option<&Path>, secs: u64) {
+    SHOWN.with(|s| s.set(true));
     live_stop(&key(p, t));
     let was = installed_version(root, t, &p.name);
     batch_took(&key(p, t), secs);
@@ -1411,13 +1408,19 @@ fn failed(root: &Path, p: &Package, t: &str, log: Option<&Path>, secs: u64) {
     let text = fs::read_to_string(log).unwrap_or_default();
     let rule = rules(root).ok().and_then(|rs| scan(&rs, &text));
     loud!("  phase  {}", phase(&text));
-    loud!("  rule   {}", rule.map_or("none matched".to_string(), |f| f.rule));
+    loud!("  rule   {}", rule.map_or("none matched".to_string(), |f| format!("{} -> {}", f.rule, f.act)));
     loud!("  log    {}", log.display());
     let first = blame(&text);
     match (tty(), columns()) {
         (true, c) if c > 2 => loud!("  {}", first.chars().take(c - 2).collect::<String>()),
         _ => loud!("  {first}"),
     }
+}
+
+thread_local! {
+    // failed() printed its block for the build that just ended on this thread, so the
+    // error that comes back after it says nothing the block did not
+    static SHOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // build fails, read the log, fix it, build again. three signature retries and never the
@@ -1444,6 +1447,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
     };
 
     loop {
+        SHOWN.with(|s| s.set(false));
         match build(root, p, &one, verbose, false, at_once) {
             // first.log is only there once this run has failed
             Ok(_) if first.exists() => {
@@ -1451,6 +1455,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
                 return Ok(());
             }
             Ok(_) => return Ok(()),
+            Err(_) if SHOWN.with(|s| s.get()) => {}
             Err(e) => loud!("{e}"),
         }
         let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
@@ -1477,8 +1482,8 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
                 }
                 if !tried.contains(&f.act) {
                     tried.push(f.act.clone());
-                    if write_fix(root, &p.dir, &p.name, &f, &log)? {
-                        loud!("  retry  {}/3", tried.len());
+                    if let Some(wrote) = write_fix(root, &p.dir, &p.name, &f, &log)? {
+                        loud!("  retry  {}/3  {wrote}", tried.len());
                         continue;
                     }
                 }
@@ -1520,6 +1525,7 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
         // rung with only its phase on it cannot be judged once the log is overwritten
         let why = format!("rung {rung} after {} failed on {t}\n#   {}", phase(&log), blame(&log));
         note(&at, line, &why)?;
+        loud!("  retry  rung {rung}/{}  {line} in {}", LADDER.len(), at.display());
     }
 }
 
@@ -4423,8 +4429,9 @@ fn scan(rules: &[Rule], log: &str) -> Option<Fix> {
 }
 
 // drop, append and filter-lto are the recipe's to carry; set is the machine's opinion
-// about one package and belongs beside the other settings
-fn write_fix(root: &Path, dir: &Path, name: &str, f: &Fix, log: &str) -> Result<bool, String> {
+// about one package and belongs beside the other settings. what comes back is the line
+// and where it went, for the retry to say
+fn write_fix(root: &Path, dir: &Path, name: &str, f: &Fix, log: &str) -> Result<Option<String>, String> {
     let mut w = f.act.split_whitespace();
     let verb = w.next().unwrap_or("");
     let rest: Vec<&str> = w.collect();
@@ -4459,7 +4466,7 @@ fn write_fix(root: &Path, dir: &Path, name: &str, f: &Fix, log: &str) -> Result<
                 format!("{k} {v}"),
             )
         }
-        "notaflag" => return Ok(false),
+        "notaflag" => return Ok(None),
         _ => return Err(format!("{verb} is not an action")),
     };
 
@@ -4467,7 +4474,7 @@ fn write_fix(root: &Path, dir: &Path, name: &str, f: &Fix, log: &str) -> Result<
     // never the same fix twice: a rule that fired and did not help fires again on the
     // next log, and an entry appended each time would grow without bound
     if had.lines().any(|l| l.split('#').next().unwrap_or("").trim() == line) {
-        return Ok(false);
+        return Ok(None);
     }
     if let Some(d) = at.parent() {
         fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -4481,8 +4488,7 @@ fn write_fix(root: &Path, dir: &Path, name: &str, f: &Fix, log: &str) -> Result<
         f.line,
     );
     fs::write(&at, body).map_err(|e| format!("{}: {e}", at.display()))?;
-    say!("{} {}", at.display(), line);
-    Ok(true)
+    Ok(Some(format!("{line} in {}", at.display())))
 }
 
 // civil-from-days, for the one date a provenance line needs. a calendar crate to format

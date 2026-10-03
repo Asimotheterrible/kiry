@@ -1479,6 +1479,54 @@ fn the_component_an_upgrade_moved_is_bright() {
     assert!(!out.contains('\x1b'), "{out:?}");
 }
 
+// a package the cache answers prints the same columns and colours as one that built, an
+// install that builds nothing included, and a pipe still reads name version target cached
+#[test]
+fn a_cached_line_has_the_columns_and_colours_of_a_built_one() {
+    let Some((at, root, repo)) = workshop("cached-colour") else {
+        return;
+    };
+    buildable(&at, &repo, "a", "");
+    buildable(&at, &repo, "longername", "");
+    buildable(&at, &repo, "c", "");
+    buildable(&at, &repo, "top", "c\n");
+    let r = root.to_str().unwrap();
+    let o = kiry(&["b", "--root", r, "a", "longername", "c"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let plain = |l: &str| {
+        let mut esc = false;
+        l.chars()
+            .filter(|&c| {
+                let keep = !esc && c != '\x1b';
+                esc = if esc { !c.is_ascii_alphabetic() } else { c == '\x1b' };
+                keep
+            })
+            .collect::<String>()
+    };
+
+    // every member cached, so no batch starts and the widths come from the set alone
+    let tty = on_tty(120, &format!("env -u NO_COLOR {KIRY} i --root {r} a longername"));
+    let rows: Vec<&str> = tty.lines().filter(|l| l.contains("cached")).collect();
+    assert_eq!(rows.len(), 2, "{tty:?}");
+    for l in &rows {
+        assert!(l.contains("\x1b[97m") && l.contains("\x1b[36mx86_64-musl"), "{l:?}");
+    }
+    let at_target: Vec<Option<usize>> = rows.iter().map(|l| plain(l).find("x86_64-musl")).collect();
+    assert_eq!(at_target[0], at_target[1], "{tty:?}");
+
+    // a cached member of a batch that still builds something
+    let tty = on_tty(120, &format!("env -u NO_COLOR {KIRY} i --root {r} top"));
+    let row = tty.lines().find(|l| l.contains("cached")).unwrap_or_else(|| panic!("{tty:?}"));
+    assert!(row.contains("\x1b[97mc") && row.contains("\x1b[36mx86_64-musl"), "{row:?}");
+
+    let o = kiry(&["r", "--root", r, "a"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = kiry(&["i", "--root", r, "a"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.lines().any(|l| l == "a 1.0 x86_64-musl cached"), "{out}");
+    assert!(!out.contains('\x1b'), "{out:?}");
+}
+
 // the time that goes yellow is the one the batch spent itself on. a build on its own has
 // nothing to be slow next to, however long it took
 #[test]

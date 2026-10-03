@@ -1831,8 +1831,9 @@ fn compile(
     // happens out here. Cargo.lock pins every crate by sha256 the way checksums pins a
     // tarball, and the recipe's own fetch then finds them all in CARGO_HOME. a patch
     // that moves Cargo.lock in prepare comes after this and still fails offline.
-    // only a recipe that fetches gets it: go's own tree and firefox's carry locks too,
-    // build from what they ship, and have no host tool to fetch with while bootstrapping
+    // only a recipe that fetches with that tool gets it: go's own tree and firefox's
+    // carry locks and build from what they ship, and a go.sum inside a vendored crate is
+    // no go build. options net alone is every npm and pip recipe too
     let net = text.lines().any(|l| {
         l.strip_prefix("options=")
             .is_some_and(|o| o.trim_matches(['"', '\'']).split_whitespace().any(|w| w == "net"))
@@ -1840,7 +1841,7 @@ fn compile(
     let cargo = root.join("var/kiry/cargo");
     mkdirs(&cargo)?;
     mkdirs(&sysroot.join(sandbox::CARGO_AT))?;
-    let fetches = net || text.contains("cargo fetch");
+    let fetches = text.contains("cargo fetch") || net && names(&text, "cargo");
     for lock in shallowest(&src, "Cargo.lock", 3).into_iter().filter(|_| fetches) {
         let mut c = Command::new("cargo");
         c.arg("fetch")
@@ -1855,7 +1856,7 @@ fn compile(
     let gomod = root.join("var/kiry/gomod");
     mkdirs(&gomod)?;
     mkdirs(&sysroot.join(sandbox::GOMOD_AT))?;
-    let downloads = net || text.contains("go mod download");
+    let downloads = text.contains("go mod download") || net && names(&text, "go");
     for sum in shallowest(&src, "go.sum", 3).into_iter().filter(|_| downloads) {
         if sum.with_file_name("vendor/modules.txt").is_file() {
             continue;
@@ -2742,6 +2743,11 @@ fn shallowest(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+// the tool as a word of its own, so CARGO_HOME and cargo-home are not cargo
+fn names(text: &str, tool: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || "_-./$".contains(c))).any(|w| w == tool)
 }
 
 // a fetch the sandbox cannot do, run out here. its last line of stderr is the error

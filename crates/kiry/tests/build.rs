@@ -3029,6 +3029,7 @@ fn a_cargo_lock_is_fetched_outside_and_the_build_finds_it_offline() {
         "x86_64-musl",
         &format!(
             "options=\"!check net\"\n\
+             true || cargo build\n\
              [ \"$CARGO_NET_OFFLINE\" = true ] || exit 1\n\
              [ -e \"$CARGO_HOME/registry/fetched\" ] || exit 1\n{GOOD}"
         ),
@@ -3119,12 +3120,16 @@ fn a_go_sum_is_fetched_outside_and_the_build_finds_it_offline() {
 }
 
 // a lock alone fetches nothing: go's own tree and firefox's carry one and build from
-// what they ship. this recipe downloads go modules and never crates, and its modules
-// are vendored, so neither tool may run and both would fail if they did
+// what they ship. this recipe wants the network and go modules, never crates, and its
+// modules are vendored, so neither tool may run and both would fail if they did
 #[test]
 fn a_lock_the_recipe_never_fetches_for_runs_no_host_tool() {
     let at = scratch("nofetch");
-    let d = recipe(&at, "x86_64-musl", &format!("true || go mod download\n{GOOD}"));
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!("options=net\n: \"$CARGO_HOME\" cargo-home\ntrue || go mod download\n{GOOD}"),
+    );
     let tree = at.join("src/hello-1.0");
     fs::write(tree.join("Cargo.lock"), "version = 4\n").unwrap();
     fs::write(tree.join("go.sum"), "").unwrap();

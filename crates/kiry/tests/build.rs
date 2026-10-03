@@ -3186,6 +3186,27 @@ fn a_build_does_not_count_its_own_thinlto_objects_as_hits() {
     assert!(said.contains(" thinlto 0%"), "{said}");
 }
 
+// an entry only ever comes back for the same package under the same llvm, so gc takes
+// the rest: a directory for another llvm, and one for a package nothing builds any more
+#[test]
+fn gc_drops_thinlto_caches_nothing_can_read_again() {
+    let Some((at, root, repo)) = workshop("lto-gc") else {
+        return;
+    };
+    buildable(&at, &repo, "kept", "");
+    let lto = root.join("var/kiry/lto");
+    for d in ["kept/none", "kept/23.1.1-2", "gone/none"] {
+        fs::create_dir_all(lto.join(d)).unwrap();
+        fs::write(lto.join(d).join("llvmcache-a"), "o").unwrap();
+    }
+
+    let o = kiry(&["gc", "--root", root.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(lto.join("kept/none/llvmcache-a").is_file(), "the live cache went");
+    assert!(!lto.join("kept/23.1.1-2").exists(), "another llvm's cache stayed");
+    assert!(!lto.join("gone").exists(), "a cache for no recipe stayed");
+}
+
 const RUNG: &str = "# 2026-09-12 rung 1 after compile failed on x86_64-musl\nfilter-lto\n";
 const TABLE: &str =
     "# 2026-09-20 link failed, recompile with -fPIC\n#   recompile with -fPIC\nappend-flags -fPIC\n";

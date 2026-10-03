@@ -729,6 +729,37 @@ fn test_suites_the_build_asks_for_are_switched_off() {
     }
 }
 
+// alpine's -flto=auto is full lto on top of kiry's own LTO knob, and never goes through
+// the thinlto cache. the words go and the quotes and continuations around them stay,
+// and the same text inside a longer word is left alone
+#[test]
+fn alpines_lto_words_come_out_and_the_line_stays_whole() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("unlto");
+    let (d, _) = convert(
+        &at,
+        "pkgname=thing\npkgver=1.0\npkgrel=0\n\
+         build() {\n\tCFLAGS=\"$CFLAGS -O2 -flto=auto\" \\\n\
+         \tCXXFLAGS=\"$CXXFLAGS -flto=auto -ffat-lto-objects -DNDEBUG\" \\\n\
+         \t./configure --prefix=/usr\n\
+         \texport LDFLAGS=\"$LDFLAGS -flto=auto\"\n}\n\
+         package() {\n\tsed -i -e \"s| -flto=auto||g\" Config_heavy.pl\n\
+         \tmake install DESTDIR=\"$pkgdir\"\n}\n",
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    for want in [
+        "CFLAGS=\"$CFLAGS -O2 \" \\\n",
+        "CXXFLAGS=\"$CXXFLAGS   -DNDEBUG\" \\\n",
+        "export LDFLAGS=\"$LDFLAGS \"\n",
+        // inside a longer word it is something else, here what perl's own sed removes
+        "sed -i -e \"s| -flto=auto||g\" Config_heavy.pl\n",
+    ] {
+        assert!(script.contains(want), "no {want:?} in\n{script}");
+    }
+}
+
 // a false positive switches off something the package installs, which is worse than a
 // suite built for nothing. each of these is a real flag from a real apkbuild
 #[test]

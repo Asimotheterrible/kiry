@@ -1352,7 +1352,9 @@ fn compiled(log: &str) -> bool {
 // usually not it -- mozbuild signs off with where it wrote a profile, four lines under the
 // ValueError that stopped it -- and make, ninja, clang and collect2 all sign off with a
 // line that only says something above it failed. not found is a weaker kind, since a
-// build script probing for which or git says it on the way to working
+// build script probing for which or git says it on the way to working. a warning is never
+// it, and past all of those the line make's first failure comes right after is: rrdtool's
+// was `The setup requires setuptools.`, with no word in it to look for
 fn blame(log: &str) -> String {
     let lines: Vec<String> = log
         .lines()
@@ -1370,11 +1372,16 @@ fn blame(log: &str) -> String {
     let hit = |words: &[&str]| {
         lines.iter().find(|l| {
             let s = l.to_lowercase();
-            !summary(l) && !s.starts_with("checking ") && words.iter().any(|w| s.contains(w))
+            !summary(l)
+                && !s.starts_with("checking ")
+                && !s.contains("warning:")
+                && words.iter().any(|w| s.contains(w))
         })
     };
+    let stopped = lines.iter().position(|l| summary(l) && !l.ends_with("(ignored)"));
     hit(&["error:", "fatal error", "undefined reference", "undefined symbol"])
         .or_else(|| hit(&["not found", "no such file"]))
+        .or_else(|| lines[..stopped?].iter().rev().find(|l| !l.to_lowercase().contains("warning:")))
         .or_else(|| lines.iter().rev().find(|l| !summary(l) && l.to_lowercase().contains("error")))
         .or_else(|| lines.last())
         .map_or("the log is empty".to_string(), String::clone)
@@ -9767,6 +9774,19 @@ Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.e
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    // rrdtool's python binding died on a line with no keyword in it, and the warning above
+    // it said not found
+    #[test]
+    fn blame_takes_the_line_before_makes_first_failure_over_a_warning() {
+        let log = "configure.ac:320: warning: macro 'AM_GNU_GETTEXT_VERSION' not found in library\n\
+                   make[3]: *** [Makefile:9: doc] Error 1 (ignored)\n\
+                   CC       librrdupd_la-rrd_error.lo\n\
+                   The setup requires setuptools.\n\
+                   make[2]: *** [Makefile:781: python/wheel.stamp] Error 1\n\
+                   make: *** [Makefile:513: all-recursive] Error 1\n";
+        assert_eq!(blame(log), "The setup requires setuptools.");
+    }
 
     fn hit(pat: &str, hay: &str) -> Option<Vec<String>> {
         Rx::new(pat).unwrap().find(hay)

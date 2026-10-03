@@ -1820,11 +1820,35 @@ fn compile(
     let deps: Vec<Dep> = p.depends.iter().filter(|d| d.applies(t)).cloned().collect();
     let members = sandbox::closure(root, t, &deps)?;
     sandbox::assemble(root, t, &members, &sysroot)?;
-    // the one thing a build writes that outlives it. mounted in rather than kept in the
-    // stage dir, which the next build of the package starts by deleting
+    // this and the crates below are what a build writes that outlives it. mounted in
+    // rather than kept in the stage dir, which the next build of the package deletes
     let lto = lto_cache(root, &p.name);
     mkdirs(&lto)?;
     mkdirs(&sysroot.join(sandbox::LTO_AT))?;
+
+    // the sandbox has no network and 363 recipes cargo fetch in prepare, so the fetch
+    // happens out here. Cargo.lock pins every crate by sha256 the way checksums pins a
+    // tarball, and the recipe's own fetch then finds them all in CARGO_HOME. a patch
+    // that moves Cargo.lock in prepare comes after this and still fails offline
+    let cargo = root.join("var/kiry/cargo");
+    mkdirs(&cargo)?;
+    mkdirs(&sysroot.join(sandbox::CARGO_AT))?;
+    for lock in lockfiles(&src, 3) {
+        let o = Command::new("cargo")
+            .arg("fetch")
+            .arg("--locked")
+            .arg("--manifest-path")
+            .arg(lock.with_file_name("Cargo.toml"))
+            .env("CARGO_HOME", abs(&cargo)?)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("cargo fetch: {e}"))?;
+        if !o.status.success() {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+            return Err(format!("cargo fetch for {}: {last}", lock.display()));
+        }
+    }
 
     fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
     let share = sysroot.join("usr/share/kiry");
@@ -2022,6 +2046,9 @@ fn compile(
     // only this side knows and has to say
     c.env("KIRY_SHARE", at_once.to_string());
     c.env("KIRY_LTO_CACHE", abs(&lto)?);
+    c.env("KIRY_CARGO", abs(&cargo)?);
+    c.env("CARGO_HOME", format!("/{}", sandbox::CARGO_AT));
+    c.env("CARGO_NET_OFFLINE", "true");
     let prune = p.dir.join("symbol-prune").is_file() && !t.ends_with("gnu");
     if prune {
         c.env("KIRY_PRUNE", "1");
@@ -2670,6 +2697,25 @@ fn jobs() -> usize {
         Some(n) if n > 0 => n,
         _ => std::thread::available_parallelism().map_or(1, |n| n.get()),
     }
+}
+
+// the shallowest lock of each tree only. a workspace has one at its top, and one below
+// it (fuzz/, a vendored crate) is often stale, which --locked would fail the build on
+fn lockfiles(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    let here = dir.join("Cargo.lock");
+    if here.is_file() {
+        return vec![here];
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        if depth > 0 && e.file_type().is_ok_and(|k| k.is_dir()) {
+            out.extend(lockfiles(&e.path(), depth - 1));
+        }
+    }
+    out
 }
 
 fn unpacked(src: &Path) -> PathBuf {
@@ -8252,6 +8298,7 @@ fn stats_cmd(args: &[String]) {
         ("stage", "var/kiry/stage"),
         ("log", "var/kiry/log"),
         ("lto", "var/kiry/lto"),
+        ("cargo", "var/kiry/cargo"),
     ] {
         out.push(format!("{what} {}", size(weigh(&root.join(at)))));
     }

@@ -3019,6 +3019,55 @@ fn a_compile_fed_on_stdin_gets_one_go() {
     assert!(!String::from_utf8_lossy(&o.stdout).contains("again at"));
 }
 
+// the sandbox has no network, so the crates come in before it starts. this cargo leaves
+// a file where CARGO_HOME says, and the build has to find it there and be told offline
+#[test]
+fn a_cargo_lock_is_fetched_outside_and_the_build_finds_it_offline() {
+    let at = scratch("cargo");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "[ \"$CARGO_NET_OFFLINE\" = true ] || exit 1\n\
+             [ -e \"$CARGO_HOME/registry/fetched\" ] || exit 1\n{GOOD}"
+        ),
+    );
+    fs::write(at.join("src/hello-1.0/Cargo.lock"), "version = 4\n").unwrap();
+    let arc = tarball(&at);
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+    fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+
+    let bin = at.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("cargo"),
+        format!(
+            "#!/bin/sh\necho \"$*\" >> {}\nmkdir -p \"$CARGO_HOME/registry\"\n\
+             touch \"$CARGO_HOME/registry/fetched\"\n",
+            at.join("args").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("cargo"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let args = fs::read_to_string(at.join("args")).unwrap();
+    assert!(args.starts_with("fetch --locked --manifest-path "), "{args}");
+    assert!(args.trim_end().ends_with("hello-1.0/Cargo.toml"), "{args}");
+}
+
 // clang gives a language it has no frontend for to gcc, and gcc is a link to clang, so
 // an ada probe forked until something killed the build. this clang hands over the way
 // the real one does, and this gcc only says it ran

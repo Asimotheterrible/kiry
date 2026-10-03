@@ -1479,6 +1479,41 @@ fn the_component_an_upgrade_moved_is_bright() {
     assert!(!out.contains('\x1b'), "{out:?}");
 }
 
+// the time that goes yellow is the one the batch spent itself on. a build on its own has
+// nothing to be slow next to, however long it took
+#[test]
+fn the_slowest_tenth_of_a_batch_is_yellow() {
+    let Some((at, root, repo)) = workshop("slow-decile") else {
+        return;
+    };
+    buildable(&at, &repo, "fast", "");
+    buildable(&at, &repo, "slow", "");
+    let b = repo.join("slow/build");
+    fs::write(&b, format!("sleep 2\n{}", fs::read_to_string(&b).unwrap())).unwrap();
+    let r = root.to_str().unwrap();
+
+    let tty = on_tty(120, &format!("env -u NO_COLOR {KIRY} b --root {r} fast slow"));
+    let ok = |name: &str| {
+        tty.lines()
+            .find(|l| l.contains(name) && l.contains("\x1b[32mok"))
+            .unwrap_or_else(|| panic!("{tty:?}"))
+            .to_string()
+    };
+    // the time is the only yellow a result line has
+    assert!(ok("slow").contains("\x1b[33m"), "{tty:?}");
+    assert!(!ok("fast").contains("\x1b[33m"), "{tty:?}");
+
+    let alone = on_tty(120, &format!("env -u NO_COLOR {KIRY} b --root {r} slow"));
+    let row = alone.lines().find(|l| l.contains("\x1b[32mok")).unwrap_or_else(|| panic!("{alone:?}"));
+    assert!(!row.contains("\x1b[33m"), "{alone:?}");
+
+    // a pipe has the same time in words, which is all the yellow was saying
+    let o = kiry(&["b", "--root", r, "fast"]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.lines().any(|l| l.starts_with("fast 1.0 x86_64-musl ok ") && l.ends_with('s')), "{out}");
+    assert!(!out.contains('\x1b'), "{out:?}");
+}
+
 // -q is for a script or a cron job that only wants to hear about trouble. the art is a
 // person's, and a person who asked for quiet does not get it either
 #[test]

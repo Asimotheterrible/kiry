@@ -1659,6 +1659,83 @@ fn a_rung_note_quotes_the_first_real_error() {
     assert!(!pkg.contains("Error 1"), "{pkg}");
 }
 
+// a recovered failure reads as one block: the row, where it died, the rule and what it
+// does, and the retry with what it wrote where. then the retry's own row. nothing else
+// in between, the build's own error line included, which says what the block already did
+#[test]
+fn a_recovered_failure_is_one_block_ending_in_its_retry() {
+    let at = scratch("retry-block");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "case \"$CFLAGS\" in\n\
+             *-flto*) echo 'ld.lld: error: Not a valid object file' >&2; exit 1 ;;\n\
+             esac\n{GOOD}"
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    let lines: Vec<&str> = out.lines().collect();
+    let i = lines.iter().position(|l| l.starts_with("hello 1.0 x86_64-musl failed ")).expect(&out);
+    let log = format!("  log    {}", root.join("var/kiry/log/hello-1.0-1.x86_64-musl.log").display());
+    let retry = format!("  retry  1/3  filter-lto in {}", d.join("filter").display());
+    assert_eq!(
+        lines[i + 1..i + 6],
+        [
+            "  phase  link",
+            "  rule   (Not a valid object file|invalid bitcode) -> filter-lto",
+            log.as_str(),
+            "  ld.lld: error: Not a valid object file",
+            retry.as_str(),
+        ],
+        "{out}"
+    );
+    let ok = lines.iter().position(|l| l.starts_with("hello 1.0 x86_64-musl ok ")).expect(&out);
+    assert!(ok > i + 5, "{out}");
+    assert!(!out.contains("build failed"), "{out}");
+}
+
+// a rung is a retry too, and says which rung of how many and what it wrote where
+#[test]
+fn each_ladder_rung_says_it_is_retrying() {
+    let at = scratch("retry-rung");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!("case \"$CFLAGS\" in\n*-O3*) echo 'foo.c:3:9: error: displeased' >&2; exit 1 ;;\nesac\n{GOOD}"),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O3\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    let lines: Vec<&str> = out.lines().collect();
+    let pkg = root.join("etc/kiry/pkg/hello");
+    let rungs = [
+        format!("  retry  rung 1/4  filter-lto in {}", d.join("filter").display()),
+        format!("  retry  rung 2/4  OPT -O2 in {}", pkg.display()),
+    ];
+    for r in &rungs {
+        let at = lines.iter().position(|l| l == r).unwrap_or_else(|| panic!("no {r:?} in {out}"));
+        assert_eq!(lines[at - 1], "  foo.c:3:9: error: displeased", "{out}");
+    }
+    assert!(!out.contains("build failed"), "{out}");
+}
+
 // curl redraws its meter with \r on stderr, which in a pipe is junk in someone's log
 #[test]
 fn a_fetch_in_a_pipe_draws_no_meter() {

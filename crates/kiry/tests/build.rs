@@ -57,17 +57,6 @@ fn kiry(args: &[&str]) -> Output {
     Command::new(KIRY).args(args).output().unwrap()
 }
 
-// the seed is this machine's busybox and this machine runs glibc, so a fixture whose
-// packages are gnu has a gnu host too. everything else here is musl on musl, where the
-// two are the same answer and saying so changes nothing
-fn kiry_on(host: &str, args: &[&str]) -> Output {
-    Command::new(KIRY)
-        .args(args)
-        .env("KIRY_HOST", host)
-        .output()
-        .unwrap()
-}
-
 fn cache(root: &Path, suffix: &str) -> Vec<String> {
     let Ok(rd) = fs::read_dir(root.join("var/kiry/cache")) else {
         return Vec::new();

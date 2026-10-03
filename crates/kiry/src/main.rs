@@ -248,11 +248,13 @@ fn row(name: &str, ver: &str, was: Option<&str>, t: &str, status: &str, secs: Op
             None => format!("{name} {ver} {t} {status}"),
         };
     }
-    let w = BATCH
+    let (w, slow) = BATCH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map_or([0; 3], |b| b.wide);
+        .map_or(([0; 3], false), |b| {
+            (b.wide, secs.is_some_and(|s| slowest(b, &format!("{name} {ver} {t}"), s)))
+        });
     let target = match t {
         t if t.ends_with("musl") => "36",
         t if t.ends_with("gnu") => "35",
@@ -272,7 +274,11 @@ fn row(name: &str, ver: &str, was: Option<&str>, t: &str, status: &str, secs: Op
         hue(target, &format!("{t:<w$}", w = w[2])),
     );
     match secs {
-        Some(_) => format!("{head}{}  {}", hue(state, &format!("{status:<6}")), hue("2", &format!("{time:>6}"))),
+        Some(_) => format!(
+            "{head}{}  {}",
+            hue(state, &format!("{status:<6}")),
+            hue(if slow { "33" } else { "2" }, &format!("{time:>6}"))
+        ),
         None => format!("{head}{}", hue(state, status)),
     }
 }
@@ -325,10 +331,13 @@ struct Batch {
     seen: HashSet<String>,
     recovered: bool,
     // the live line's [i/n] counts builds, a package per target, and n is only those
-    // the cache cannot answer
-    builds: usize,
+    // the cache cannot answer. each is its key()
+    builds: Vec<String>,
     runs: HashMap<String, usize>,
     wide: [usize; 3],
+    // what history says each build takes, and what the finished ones took this time
+    eta: HashMap<String, u64>,
+    took: HashMap<String, u64>,
 }
 
 static BATCH: std::sync::Mutex<Option<Batch>> = std::sync::Mutex::new(None);
@@ -338,10 +347,18 @@ fn tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
-// rows is every name, version and target the batch could print, for the widths
-fn batch_begin(root: &Path, total: usize, builds: usize, rows: &[[&str; 3]]) {
+// rows is every name, version and target the batch could print, for the widths, and
+// builds is the ones of them that compile
+fn batch_begin(root: &Path, total: usize, builds: &[[&str; 3]], rows: &[[&str; 3]]) {
     if !tty() || total == 0 {
         return;
+    }
+    let past = history(root);
+    let mut eta = HashMap::new();
+    for [n, v, t] in builds {
+        if let Some(s) = past.get(&(n.to_string(), t.to_string())) {
+            eta.insert(format!("{n} {v} {t}"), *s);
+        }
     }
     let mut wide = [0; 3];
     for r in rows {
@@ -357,10 +374,32 @@ fn batch_begin(root: &Path, total: usize, builds: usize, rows: &[[&str; 3]]) {
         total,
         seen: HashSet::new(),
         recovered: false,
-        builds,
+        builds: builds.iter().map(|[n, v, t]| format!("{n} {v} {t}")).collect(),
         runs: HashMap::new(),
         wide,
+        eta,
+        took: HashMap::new(),
     });
+}
+
+fn batch_took(key: &str, secs: u64) {
+    if let Some(b) = BATCH.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        b.took.insert(key.to_string(), secs);
+    }
+}
+
+// the batch's slowest tenth, rounded up: no more of its builds than that took as long,
+// counting the ones still to finish at what they took last time. one known time is no
+// batch to be slow in, so a lone build stays dim
+fn slowest(b: &Batch, key: &str, secs: u64) -> bool {
+    let known: Vec<u64> = b
+        .builds
+        .iter()
+        .filter_map(|k| b.took.get(k).or_else(|| b.eta.get(k)).copied())
+        .collect();
+    b.took.get(key) == Some(&secs)
+        && known.len() >= 2
+        && known.iter().filter(|&&v| v >= secs).count() <= known.len().div_ceil(10)
 }
 
 // where a build falls in the batch. a retry is the same build and keeps its number
@@ -369,7 +408,7 @@ fn batch_run(key: &str) -> Option<(usize, usize)> {
     let b = g.as_mut()?;
     let next = b.runs.len() + 1;
     let i = *b.runs.entry(key.to_string()).or_insert(next);
-    Some((i, b.builds.max(i)))
+    Some((i, b.builds.len().max(i)))
 }
 
 fn batch_title(pkg: &str) {
@@ -627,7 +666,7 @@ fn build_cmd(args: &[String]) {
             ts.iter().map(move |t| [n.as_str(), v, t.as_str()])
         })
         .collect();
-    batch_begin(&root, todo.len(), builds, &rows);
+    batch_begin(&root, todo.len(), &rows, &rows);
     for (name, targets) in &todo {
         let p = &recipes[name];
         let r = match fix {
@@ -752,6 +791,7 @@ fn build(
             false => format!(" {n}"),
         });
         let was = installed_version(root, t, &p.name);
+        batch_took(&key(p, t), secs);
         say!("{}{note}", row(&p.name, &p.version.upstream, was.as_deref(), t, "ok", Some(secs)));
         keep_time(root, p, t, secs);
         built.push((t.clone(), work, linked));
@@ -1359,6 +1399,7 @@ fn unescaped(s: &str) -> String {
 fn failed(root: &Path, p: &Package, t: &str, log: Option<&Path>, secs: u64) {
     live_stop(&key(p, t));
     let was = installed_version(root, t, &p.name);
+    batch_took(&key(p, t), secs);
     loud!("{}", row(&p.name, &p.version.upstream, was.as_deref(), t, "failed", Some(secs)));
     let Some(log) = log else { return };
     let text = fs::read_to_string(log).unwrap_or_default();
@@ -4525,30 +4566,32 @@ fn history(root: &Path) -> HashMap<(String, String), u64> {
 }
 
 // said before any of it starts, because the whole value of an estimate is deciding
-// whether to wait, and that is a decision made at the beginning
-fn forecast(root: &Path, todo: &[(String, String)], recipes: &HashMap<String, Package>) -> usize {
+// whether to wait, and that is a decision made at the beginning. what comes back is
+// which of todo compile, by position
+fn forecast(root: &Path, todo: &[(String, String)], recipes: &HashMap<String, Package>) -> Vec<usize> {
     let past = history(root);
-    let (mut n, mut secs, mut new) = (0, 0u64, 0);
-    for (name, t) in todo {
+    let (mut builds, mut secs, mut new) = (Vec::new(), 0u64, 0);
+    for (i, (name, t)) in todo.iter().enumerate() {
         let Some(p) = recipes.get(name) else { continue };
         if cached(root, p, t).is_some() {
             continue;
         }
-        n += 1;
+        builds.push(i);
         match past.get(&(name.clone(), t.clone())) {
             Some(s) => secs += s,
             None => new += 1,
         }
     }
+    let n = builds.len();
     if n < 2 {
-        return n;
+        return builds;
     }
     let note = match new {
         0 => String::new(),
         u => format!("  {u} never built here"),
     };
     say!("{n} builds  ~{}{note}", clock(secs));
-    n
+    builds
 }
 
 fn install_cmd(args: &[String]) {
@@ -4732,7 +4775,8 @@ fn install_cmd(args: &[String]) {
         .iter()
         .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
         .collect();
-    batch_begin(&root, names.len(), builds, &rows);
+    let building: Vec<[&str; 3]> = builds.iter().map(|&i| rows[i]).collect();
+    batch_begin(&root, names.len(), &building, &rows);
     for level in plan {
         // grouped by package, because every target of one builds before any of it is
         // packed. a musl mesa installed beside a gnu mesa that failed is exactly the
@@ -6332,7 +6376,7 @@ fn rebuild_cmd(args: &[String]) {
         .iter()
         .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
         .collect();
-    batch_begin(&root, names.len(), want.len(), &rows);
+    batch_begin(&root, names.len(), &rows, &rows);
     for level in plan {
         // every member of a level compiles before any of it is installed, and the level
         // below it is already in place, so each one links against what it will run with

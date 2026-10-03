@@ -2289,9 +2289,14 @@ if test \"$datarootdir\" = '${prefix}/share'; then datarootdir=@DATADIR@; fi
 //
 // under KIRY_PRUNE every shared link is written down as it was run, so prune_pass can
 // run it again with a version script once the build is over
+//
+// clang hands a language it has no frontend for (ada, fortran) to `gcc`, and toollinks
+// makes gcc a link to clang, so gdb's configure asking whether the driver knows ada
+// forked about 1700 clangs in 25s. -ccc-gcc-name points the handoff at a name nothing
+// has, so that compile just fails and configure says no
 const CC_WRAPPER: &str = "\
 #!/bin/sh
-run() { @REAL@ --target=@TRIPLE@@SYSROOT@@EXTRA@ \"$@\"; }
+run() { @REAL@ --target=@TRIPLE@ -ccc-gcc-name kiry-no-gcc@SYSROOT@@EXTRA@ \"$@\"; }
 case \" $* \" in *\" - \"*) run \"$@\"; exit ;; esac
 if [ -n \"$KIRY_PRUNE\" ]; then
 \tcase \" $* \" in *\" -shared \"*) { printf '%s\\0' \"$PWD\" \"$PATH\" \"${0##*/}\" \"$@\"; printf '\\n'; } >>/src/.kiry-links ;; esac

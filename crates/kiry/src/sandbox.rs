@@ -428,6 +428,9 @@ pub fn tied(c: &mut Command) -> &mut Command {
     }
 }
 
+// where a build finds /var/kiry/lto/<pkg>/<llvm>, relative to the sysroot
+pub const LTO_AT: &str = "var/cache/kiry-lto";
+
 // a freshly exec'd process has exactly one thread, and CLONE_NEWUSER refuses to unshare
 // from a process that has more than one. that is why the build enters through a new kiry
 // rather than through this one, which is free to grow threads later
@@ -469,6 +472,10 @@ pub fn init() -> Result<(), String> {
 
     mount::mount_bind(work.join("src"), root.join("src")).map_err(|e| format!("src: {e}"))?;
     mount::mount_bind(work.join("dest"), root.join("dest")).map_err(|e| format!("dest: {e}"))?;
+    // the thinlto cache, the one place a build writes that outlives it
+    if let Ok(d) = std::env::var("KIRY_LTO_CACHE") {
+        mount::mount_bind(&d, root.join(LTO_AT)).map_err(|e| format!("lto cache: {e}"))?;
+    }
     // a fresh procfs wants CAP_SYS_ADMIN in the user namespace owning the pid namespace,
     // and there is none here, so the host's is bound in. recursive because a user
     // namespace locks the mounts it inherited and refuses to bind one on its own
@@ -522,6 +529,8 @@ pub fn init() -> Result<(), String> {
     process::chdir(&cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
 
     let s = tied(Command::new("sh").arg("-e").arg("/build"))
+        // a host path, and nothing in a build has any use for it
+        .env_remove("KIRY_LTO_CACHE")
         .status()
         .map_err(|e| format!("sh: {e}"))?;
     std::process::exit(s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)))

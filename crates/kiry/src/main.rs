@@ -792,10 +792,12 @@ fn build(
         live_stop(&key(p, t));
         let (work, linked) = r?;
         let secs = start.elapsed().as_secs();
-        let note = again(root, p, t, &work, verbose).map_or_else(String::new, |n| match tty() {
-            true => format!("  {n}"),
-            false => format!(" {n}"),
-        });
+        let gap = if tty() { "  " } else { " " };
+        let note: String = [cache_rate(root, p, t, &work), again(root, p, t, &work, verbose)]
+            .into_iter()
+            .flatten()
+            .map(|n| format!("{gap}{n}"))
+            .collect();
         let was = installed_version(root, t, &p.name);
         batch_took(&key(p, t), secs);
         say!("{}{note}", row(&p.name, &p.version.upstream, was.as_deref(), t, "ok", Some(secs)));
@@ -1818,6 +1820,11 @@ fn compile(
     let deps: Vec<Dep> = p.depends.iter().filter(|d| d.applies(t)).cloned().collect();
     let members = sandbox::closure(root, t, &deps)?;
     sandbox::assemble(root, t, &members, &sysroot)?;
+    // the one thing a build writes that outlives it. mounted in rather than kept in the
+    // stage dir, which the next build of the package starts by deleting
+    let lto = lto_cache(root, &p.name);
+    mkdirs(&lto)?;
+    mkdirs(&sysroot.join(sandbox::LTO_AT))?;
 
     fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
     let share = sysroot.join("usr/share/kiry");
@@ -1901,7 +1908,8 @@ fn compile(
     };
     let cc = CC_WRAPPER
         .replace("@TRIPLE@", triple(t))
-        .replace("@SYSROOT@", sysroot_arg);
+        .replace("@SYSROOT@", sysroot_arg)
+        .replace("@LTO@", LTO_CACHE);
     // no directory means no c++ in this closure, which a c package is entitled to. the
     // flags come out empty and a c++ compile then fails at its first include, which says
     // more than a wrapper that refused to be written
@@ -2013,6 +2021,7 @@ fn compile(
     // the build is its own process, so the number of them running at once is something
     // only this side knows and has to say
     c.env("KIRY_SHARE", at_once.to_string());
+    c.env("KIRY_LTO_CACHE", abs(&lto)?);
     let prune = p.dir.join("symbol-prune").is_file() && !t.ends_with("gnu");
     if prune {
         c.env("KIRY_PRUNE", "1");
@@ -2029,7 +2038,13 @@ fn compile(
         c.stdout(out).stderr(err);
     }
 
-    match c.status() {
+    let watching = watch(&lto);
+    let status = c.status();
+    // stopped ahead of prune_pass, whose relinks take a version script and miss on purpose
+    if let Some((hits, misses)) = watching.and_then(Watch::stop).filter(|(h, m)| h + m > 0) {
+        let _ = fs::write(work.join("thinlto"), format!("{hits} {misses}\n"));
+    }
+    match status {
         Ok(s) if s.success() => {
             // a file the wrapper stepped down built with less than the record says, and
             // the log is the only other place that knows
@@ -2260,6 +2275,97 @@ if test \"$includedir\" = '${prefix}/include'; then includedir=@INCLUDEDIR@; fi
 if test \"$datarootdir\" = '${prefix}/share'; then datarootdir=@DATADIR@; fi
 ";
 
+// lld keys an entry on the module, the link's settings and llvm's version string, so
+// what comes back is what this link would have made. a gig per package and a month,
+// pruned by lld at the end of a link. noatime here, so the month runs from when an
+// entry was written rather than from when it was last read
+const LTO_CACHE: &str = " --start-no-unused-arguments -Wl,--thinlto-cache-dir=/var/cache/kiry-lto \
+-Wl,--thinlto-cache-policy=cache_size_bytes=1g:prune_after=720h --end-no-unused-arguments";
+
+// llvm's version string survives a rebuild of llvm, and a patched one would hand back
+// objects its predecessor compiled. the package that ships clang and lld names the
+// directory instead, and gc drops the others
+fn lto_tag(root: &Path) -> String {
+    db::read(root, &sandbox::host(), "llvm")
+        .map_or_else(|_| "none".into(), |r| format!("{}-{}", r.version.upstream, r.version.rev))
+}
+
+fn lto_cache(root: &Path, name: &str) -> PathBuf {
+    root.join("var/kiry/lto").join(name).join(lto_tag(root))
+}
+
+// lld says nothing about its cache and a hit leaves no mark on the file, so the dir is
+// watched while the build runs: an entry opened that the build did not rename in is a
+// hit, one renamed in is a miss. an overflowed queue is no number rather than a wrong one
+struct Watch {
+    fd: std::sync::Arc<rustix::fd::OwnedFd>,
+    wd: i32,
+    seen: std::thread::JoinHandle<Option<(usize, usize)>>,
+}
+
+fn watch(dir: &Path) -> Option<Watch> {
+    use rustix::fs::inotify;
+    let fd = std::sync::Arc::new(inotify::init(inotify::CreateFlags::CLOEXEC).ok()?);
+    let wd = inotify::add_watch(&*fd, dir, inotify::WatchFlags::OPEN | inotify::WatchFlags::MOVED_TO).ok()?;
+    let r = fd.clone();
+    let seen = std::thread::spawn(move || {
+        let mut buf = [std::mem::MaybeUninit::uninit(); 8192];
+        let mut events = inotify::Reader::new(&*r, &mut buf);
+        let (mut opened, mut made) = (HashSet::new(), HashSet::new());
+        loop {
+            let e = match events.next() {
+                Ok(e) => e,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(_) => return None,
+            };
+            let f = e.events();
+            if f.contains(inotify::ReadFlags::QUEUE_OVERFLOW) {
+                return None;
+            }
+            // removing the watch is how stop() says the build is over
+            if f.contains(inotify::ReadFlags::IGNORED) {
+                break;
+            }
+            let Some(n) = e.file_name().and_then(|n| n.to_str().ok()) else { continue };
+            if !n.starts_with("llvmcache-") {
+                continue;
+            }
+            match f.contains(inotify::ReadFlags::MOVED_TO) {
+                true => made.insert(n.to_string()),
+                false => opened.insert(n.to_string()),
+            };
+        }
+        Some((opened.difference(&made).count(), made.len()))
+    });
+    Some(Watch { fd, wd, seen })
+}
+
+impl Watch {
+    fn stop(self) -> Option<(usize, usize)> {
+        let _ = rustix::fs::inotify::remove_watch(&*self.fd, self.wd);
+        self.seen.join().ok().flatten()
+    }
+}
+
+// the ok row's note, and a line in log/thinlto for stats. green past half, the point
+// where the cache hands back more than it had to write
+fn cache_rate(root: &Path, p: &Package, t: &str, work: &Path) -> Option<String> {
+    let got = fs::read_to_string(work.join("thinlto")).ok()?;
+    let mut w = got.split_whitespace().map(|n| n.parse::<usize>().ok());
+    let (hits, misses) = (w.next()??, w.next()??);
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let _ = mkdirs(&root.join("var/kiry/log"));
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("var/kiry/log/thinlto"))
+        .and_then(|mut f| writeln!(f, "{} {t} {hits} {misses} {now}", p.name));
+    let pct = hits * 100 / (hits + misses).max(1);
+    Some(hue(if pct > 50 { "32" } else { "2" }, &format!("thinlto {pct}%")))
+}
+
 // cc is clang and clang defaults to the triple it was built for. a plain ./configure
 // and a plain Makefile call cc and never look at CHOST, so a gnu build without this
 // links musl and installs into usr/lib and says it worked
@@ -2296,7 +2402,7 @@ if test \"$datarootdir\" = '${prefix}/share'; then datarootdir=@DATADIR@; fi
 // has, so that compile just fails and configure says no
 const CC_WRAPPER: &str = "\
 #!/bin/sh
-run() { @REAL@ --target=@TRIPLE@ -ccc-gcc-name kiry-no-gcc@SYSROOT@@EXTRA@ \"$@\"; }
+run() { @REAL@ --target=@TRIPLE@ -ccc-gcc-name kiry-no-gcc@SYSROOT@@EXTRA@@LTO@ \"$@\"; }
 case \" $* \" in *\" - \"*) run \"$@\"; exit ;; esac
 if [ -n \"$KIRY_PRUNE\" ]; then
 \tcase \" $* \" in *\" -shared \"*) { printf '%s\\0' \"$PWD\" \"$PATH\" \"${0##*/}\" \"$@\"; printf '\\n'; } >>/src/.kiry-links ;; esac
@@ -8145,6 +8251,7 @@ fn stats_cmd(args: &[String]) {
         ("sources", "var/kiry/cache/sources"),
         ("stage", "var/kiry/stage"),
         ("log", "var/kiry/log"),
+        ("lto", "var/kiry/lto"),
     ] {
         out.push(format!("{what} {}", size(weigh(&root.join(at)))));
     }
@@ -8164,6 +8271,19 @@ fn stats_cmd(args: &[String]) {
     if !rows.is_empty() {
         let same = rows.iter().filter(|l| l.split(' ').nth(3) == Some("same")).count();
         out.push(format!("rebuilt {}, {same} to the same bytes", rows.len()));
+    }
+    // modules whose object came out of the cache over every module a link needed, from
+    // each build that linked through it
+    let lto = fs::read_to_string(root.join("var/kiry/log/thinlto")).unwrap_or_default();
+    let (hit, all) = lto
+        .lines()
+        .filter_map(|l| {
+            let w: Vec<&str> = l.split(' ').collect();
+            Some((w.get(2)?.parse::<u64>().ok()?, w.get(3)?.parse::<u64>().ok()?))
+        })
+        .fold((0, 0), |(h, a), (x, y)| (h + x, a + x + y));
+    if all > 0 {
+        out.push(format!("thinlto {}% of {all} modules", hit * 100 / all));
     }
     with_art(&root, "idle", &out);
 }

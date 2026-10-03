@@ -3115,6 +3115,77 @@ fn a_killed_link_goes_again_with_half_the_lto_jobs() {
     assert!(said.contains("x was killed, again with half the lto jobs"), "{said}");
 }
 
+// lld against a thinlto cache, as far as kiry can see it: each module's object is opened
+// out of the dir when it is there, and written to a temp name and renamed in when not
+const LLD: &str = "mkdir -p /src/bin\n\
+cat > /src/bin/clang <<'X'\n\
+#!/bin/sh\n\
+for a do case $a in -Wl,--thinlto-cache-dir=*) d=${a#*=} ;; esac; done\n\
+[ -n \"$d\" ] || exit 0\n\
+for k in a b; do\n\
+\tif [ -e \"$d/llvmcache-$k\" ]; then cat \"$d/llvmcache-$k\" >/dev/null\n\
+\telse echo o > \"$d/Thin-$k.tmp.o\" && mv \"$d/Thin-$k.tmp.o\" \"$d/llvmcache-$k\"; fi\n\
+done\n\
+X\n\
+chmod +x /src/bin/clang\n\
+export PATH=/src/bin:$PATH\n\
+[ -z \"$KIRY_LTO_CACHE\" ] || exit 1\n\
+kirycc $LDFLAGS -o x x.o\n";
+
+// the objects a link made last time come back out of the cache the next time, and the
+// rate says so on the ok row and in stats, a pipe getting the same words a tty does
+#[test]
+fn a_second_build_takes_its_thinlto_objects_from_the_cache() {
+    let at = scratch("lto-cache");
+    let d = recipe(&at, "x86_64-musl", &format!("{LLD}{GOOD}"));
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let (r, dir) = (root.to_str().unwrap(), d.to_str().unwrap());
+
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    let ok = said.lines().find(|l| l.contains(" ok ")).unwrap_or_default();
+    assert!(ok.ends_with(" thinlto 0%") || ok.contains(" thinlto 0% "), "{said}");
+
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    let ok = said.lines().find(|l| l.contains(" ok ")).unwrap_or_default();
+    assert!(ok.contains(" thinlto 100%"), "{said}");
+    assert!(!ok.contains('\x1b'), "{ok}");
+
+    let log = fs::read_to_string(root.join("var/kiry/log/thinlto")).unwrap();
+    let rows: Vec<Vec<&str>> = log.lines().map(|l| l.split(' ').collect()).collect();
+    assert_eq!(rows.len(), 2, "{log}");
+    assert_eq!(&rows[0][..4], ["hello", "x86_64-musl", "0", "2"], "{log}");
+    assert_eq!(&rows[1][..4], ["hello", "x86_64-musl", "2", "0"], "{log}");
+
+    let o = kiry(&["stats", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("thinlto 50% of 4 modules"), "{said}");
+}
+
+// a link that runs twice in one build, the way kirycc relinks after a kill, reads back
+// what the first run wrote. those objects were made by this build, not saved for it
+#[test]
+fn a_build_does_not_count_its_own_thinlto_objects_as_hits() {
+    let at = scratch("lto-twice");
+    let d = recipe(&at, "x86_64-musl", &format!("{LLD}kirycc $LDFLAGS -o x x.o\n{GOOD}"));
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains(" thinlto 0%"), "{said}");
+}
+
 const RUNG: &str = "# 2026-09-12 rung 1 after compile failed on x86_64-musl\nfilter-lto\n";
 const TABLE: &str =
     "# 2026-09-20 link failed, recompile with -fPIC\n#   recompile with -fPIC\nappend-flags -fPIC\n";

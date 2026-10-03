@@ -8446,9 +8446,11 @@ fn gc_cmd(args: &[String]) {
     // a log for a version no recipe builds any more. kiry log answers for the current
     // one, and nothing reads the others
     let mut now_building: HashSet<String> = HashSet::new();
+    let mut named: HashSet<String> = HashSet::new();
     for r in repos(&root) {
         for d in listing(&r) {
             if let Ok(p) = read_recipe(&d) {
+                named.insert(p.name.clone());
                 now_building.insert(format!(
                     "{}-{}-{}.",
                     p.name, p.version.upstream, p.version.rev
@@ -8466,6 +8468,26 @@ fn gc_cmd(args: &[String]) {
             })
         });
     sweep("log", old, kept.len());
+
+    // an entry is only ever read by the next build of the same package under the same
+    // llvm, so a directory for another llvm or for a package no recipe builds is dead.
+    // inside a live one lld prunes for itself
+    let tag = lto_tag(&root);
+    let (mut dead, mut warm) = (Vec::new(), 0);
+    for d in listing(&var.join("lto")) {
+        let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if !named.contains(&name) {
+            dead.push(d);
+            continue;
+        }
+        for g in listing(&d) {
+            match g.file_name().is_some_and(|n| n == tag.as_str()) {
+                true => warm += 1,
+                false => dead.push(g),
+            }
+        }
+    }
+    sweep("lto", dead, warm);
 
     // a preserved library goes when nothing names its soname any more and nothing
     // running still has it open. either alone is the wrong answer: a library no

@@ -248,13 +248,12 @@ fn row(name: &str, ver: &str, was: Option<&str>, t: &str, status: &str, secs: Op
             None => format!("{name} {ver} {t} {status}"),
         };
     }
-    let (w, slow) = BATCH
+    let w = *WIDE.lock().unwrap_or_else(|e| e.into_inner());
+    let slow = BATCH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map_or(([0; 3], false), |b| {
-            (b.wide, secs.is_some_and(|s| slowest(b, &format!("{name} {ver} {t}"), s)))
-        });
+        .is_some_and(|b| secs.is_some_and(|s| slowest(b, &format!("{name} {ver} {t}"), s)));
     let target = match t {
         t if t.ends_with("musl") => "36",
         t if t.ends_with("gnu") => "35",
@@ -334,13 +333,26 @@ struct Batch {
     // the cache cannot answer. each is its key()
     builds: Vec<String>,
     runs: HashMap<String, usize>,
-    wide: [usize; 3],
     // what history says each build takes, and what the finished ones took this time
     eta: HashMap<String, u64>,
     took: HashMap<String, u64>,
 }
 
 static BATCH: std::sync::Mutex<Option<Batch>> = std::sync::Mutex::new(None);
+
+// the columns of every result line kiry is about to print, batch or not. an install
+// that takes everything from the cache starts no batch and still lines up
+static WIDE: std::sync::Mutex<[usize; 3]> = std::sync::Mutex::new([0; 3]);
+
+fn widths(rows: &[[&str; 3]]) {
+    let mut wide = [0; 3];
+    for r in rows {
+        for (w, c) in wide.iter_mut().zip(r) {
+            *w = (*w).max(c.len());
+        }
+    }
+    *WIDE.lock().unwrap_or_else(|e| e.into_inner()) = wide;
+}
 
 fn tty() -> bool {
     use std::io::IsTerminal;
@@ -360,12 +372,7 @@ fn batch_begin(root: &Path, total: usize, builds: &[[&str; 3]], rows: &[[&str; 3
             eta.insert(format!("{n} {v} {t}"), *s);
         }
     }
-    let mut wide = [0; 3];
-    for r in rows {
-        for (w, c) in wide.iter_mut().zip(r) {
-            *w = (*w).max(c.len());
-        }
-    }
+    widths(rows);
     // the title the terminal had goes on its stack, so the end can put it back
     print!("\x1b[22;0t");
     *BATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Batch {
@@ -376,7 +383,6 @@ fn batch_begin(root: &Path, total: usize, builds: &[[&str; 3]], rows: &[[&str; 3
         recovered: false,
         builds: builds.iter().map(|[n, v, t]| format!("{n} {v} {t}")).collect(),
         runs: HashMap::new(),
-        wide,
         eta,
         took: HashMap::new(),
     });
@@ -4759,8 +4765,13 @@ fn install_cmd(args: &[String]) {
     settle(&root, &set, live);
     let builds = forecast(&root, &set, &recipes);
     if let Some(all) = ready {
-        for (n, t) in &set {
-            say!("{n} {} {t} cached", recipes[n].version.upstream);
+        let rows: Vec<[&str; 3]> = set
+            .iter()
+            .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
+            .collect();
+        widths(&rows);
+        for [n, v, t] in rows {
+            say!("{}", row(n, v, installed_version(&root, t, n).as_deref(), t, "cached", None));
         }
         let _w = writer(&root);
         apply_batch(&root, &all, force);
@@ -4806,7 +4817,8 @@ fn install_cmd(args: &[String]) {
                 .iter()
                 .filter(|t| match cached(&root, p, t) {
                     Some(_) => {
-                        say!("{} {} {t} cached", p.name, p.version.upstream);
+                        let was = installed_version(&root, t, &p.name);
+                        say!("{}", row(&p.name, &p.version.upstream, was.as_deref(), t, "cached", None));
                         false
                     }
                     None => true,

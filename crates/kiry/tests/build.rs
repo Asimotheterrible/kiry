@@ -1775,6 +1775,44 @@ fn a_rebuild_that_changed_nothing_is_logged_as_the_same() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("rebuilt 1, 1 to the same bytes"));
 }
 
+// whatever is in core drags its closure in with it, so a core recipe naming a package
+// only extra has is refused before anything builds, and says which edge it was
+#[test]
+fn a_core_recipe_that_depends_on_extra_is_refused() {
+    let at = scratch("core-extra");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let arc = tarball(&at);
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+    let repos = at.join("repos");
+    for (repo, name, dep) in [("core", "a", "b\n"), ("extra", "b", "")] {
+        let d = repos.join(repo).join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("version"), "1.0 1\n").unwrap();
+        fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+        fs::write(d.join("sources"), "../../../hello-1.0.tar\n").unwrap();
+        fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+        fs::write(d.join("depends"), dep).unwrap();
+        fs::write(d.join("build"), GOOD).unwrap();
+    }
+    let list = |rs: &[&str]| rs.iter().map(|r| format!("{}\n", repos.join(r).display())).collect::<String>();
+    fs::write(root.join("etc/kiry/repos"), list(&["core", "extra"])).unwrap();
+    let r = root.to_str().unwrap();
+
+    let o = kiry(&["i", "-n", "--root", r, "a"]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("core/a depends on extra/b"), "{err}");
+
+    // the same dep from core is fine
+    fs::rename(repos.join("extra/b"), repos.join("core/b")).unwrap();
+    let o = kiry(&["i", "-n", "--root", r, "a"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
 // one package out of a storm failing leaves the rest to build. what needs it is skipped,
 // not built against the old one, and both stay queued for the next drain
 #[test]

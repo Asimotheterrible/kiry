@@ -221,6 +221,24 @@ fn a_path_another_member_picks_up_survives_the_drop() {
     assert!(rec.manifest.iter().any(|e| e.path == "usr/share/x"));
 }
 
+// a taken path and a missing dep in one batch used to be two runs, the conflicts first
+// and the dep only once they were fixed
+#[test]
+fn one_plan_names_the_conflicts_and_the_missing_deps_together() {
+    let (d, root) = rooted("both");
+    run(&root, &[pack(&d, "procps-ng", &[], &["usr/bin/top"])], false).unwrap();
+
+    let bb = pack(&d, "busybox", &["libnope"], &["usr/bin/top"]);
+    match install::plan(&root, &[bb.clone()], false) {
+        Err(Error::Refused { owned, missing }) => {
+            assert_eq!(owned, [("usr/bin/top".to_string(), "procps-ng".to_string())]);
+            assert_eq!(missing, [("busybox".to_string(), "libnope".to_string())]);
+        }
+        other => panic!("wanted both refused at once, got {other:?}"),
+    }
+    assert!(install::plan(&root, &[bb], true).is_ok());
+}
+
 #[test]
 fn a_dependent_blocks_removal() {
     let (d, root) = rooted("needed");

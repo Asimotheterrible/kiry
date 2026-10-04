@@ -42,9 +42,12 @@ pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, 
         });
     }
 
+    // both checks before refusing, or a batch with each kind takes a run per kind
     if !force {
-        paths(root, &jobs)?;
-        deps(root, &jobs)?;
+        let (owned, missing) = (paths(root, &jobs)?, deps(root, &jobs)?);
+        if !owned.is_empty() || !missing.is_empty() {
+            return Err(Error::Refused { owned, missing });
+        }
     }
     Ok(jobs)
 }
@@ -52,7 +55,7 @@ pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, 
 // there is one filesystem and the targets share it, so a gnu package taking a musl
 // package's path is the same collision as two musl packages doing it. checked per
 // target, glibc quietly wrote its own stdio.h over musl's and nothing said a word
-fn paths(root: &Path, jobs: &[Job]) -> Result<(), Error> {
+fn paths(root: &Path, jobs: &[Job]) -> Result<Vec<(String, String)>, Error> {
     let replacing: Vec<(&str, &str)> = jobs
         .iter()
         .map(|j| (j.name.as_str(), j.target.as_str()))
@@ -86,13 +89,10 @@ fn paths(root: &Path, jobs: &[Job]) -> Result<(), Error> {
             }
         }
     }
-    match at.is_empty() {
-        true => Ok(()),
-        false => Err(Error::Conflict { at }),
-    }
+    Ok(at)
 }
 
-fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
+fn deps(root: &Path, jobs: &[Job]) -> Result<Vec<(String, String)>, Error> {
     let mut at = Vec::new();
     for j in jobs {
         let have = db::installed(root, &j.target)?;
@@ -106,10 +106,7 @@ fn deps(root: &Path, jobs: &[Job]) -> Result<(), Error> {
             at.push((j.name.clone(), d.name.clone()));
         }
     }
-    match at.is_empty() {
-        true => Ok(()),
-        false => Err(Error::MissingDep { at }),
-    }
+    Ok(at)
 }
 
 // TODO: a failure partway through leaves the earlier jobs applied
@@ -629,13 +626,10 @@ mod tests {
         let root = scratch("owned");
         record(&root, "foo", &["usr/bin/x"]);
 
-        match paths(&root, &[job("bar", &[], &["usr/bin/x"])]) {
-            Err(Error::Conflict { at }) => assert_eq!(
-                at,
-                vec![("usr/bin/x".to_string(), "foo".to_string())]
-            ),
-            other => panic!("wanted Conflict, got {other:?}"),
-        }
+        assert_eq!(
+            paths(&root, &[job("bar", &[], &["usr/bin/x"])]).unwrap(),
+            vec![("usr/bin/x".to_string(), "foo".to_string())]
+        );
     }
 
     // the targets are two databases over one filesystem. glibc installed usr/include
@@ -647,13 +641,10 @@ mod tests {
 
         let mut j = job("glibc", &[], &["usr/include/stdio.h"]);
         j.target = "x86_64-gnu".to_string();
-        match paths(&root, &[j]) {
-            Err(Error::Conflict { at }) => assert_eq!(
-                at,
-                vec![("usr/include/stdio.h".to_string(), "musl".to_string())]
-            ),
-            other => panic!("wanted Conflict, got {other:?}"),
-        }
+        assert_eq!(
+            paths(&root, &[j]).unwrap(),
+            vec![("usr/include/stdio.h".to_string(), "musl".to_string())]
+        );
     }
 
     // the same name on both targets is one recipe built twice, not a package taking its
@@ -669,12 +660,12 @@ mod tests {
             &["usr/x86_64-linux-gnu/usr/include/linux/fs.h"],
         );
         j.target = "x86_64-gnu".to_string();
-        assert!(paths(&root, &[j]).is_ok());
+        assert!(paths(&root, &[j]).unwrap().is_empty());
 
         let mut clash = job("linux-headers", &[], &["usr/include/linux/fs.h"]);
         clash.target = "x86_64-gnu".to_string();
         assert!(
-            matches!(paths(&root, &[clash]), Err(Error::Conflict { .. })),
+            !paths(&root, &[clash]).unwrap().is_empty(),
             "the musl build's path was taken without a word"
         );
     }
@@ -685,20 +676,17 @@ mod tests {
         let a = job("foo", &[], &["usr/bin/x"]);
         let b = job("bar", &[], &["usr/bin/x"]);
 
-        assert!(matches!(paths(&root, &[a, b]), Err(Error::Conflict { .. })));
+        assert!(!paths(&root, &[a, b]).unwrap().is_empty());
     }
 
     #[test]
     fn a_missing_dependency_stops_the_batch() {
         let root = scratch("dep");
 
-        match deps(&root, &[job("foo", &["libbar"], &["usr/bin/foo"])]) {
-            Err(Error::MissingDep { at }) => assert_eq!(
-                at,
-                vec![("foo".to_string(), "libbar".to_string())]
-            ),
-            other => panic!("wanted MissingDep, got {other:?}"),
-        }
+        assert_eq!(
+            deps(&root, &[job("foo", &["libbar"], &["usr/bin/foo"])]).unwrap(),
+            vec![("foo".to_string(), "libbar".to_string())]
+        );
     }
 
     // busybox took vmstat, top and free from procps-ng and the batch named vmstat, so
@@ -714,29 +702,27 @@ mod tests {
             &[],
             &["usr/bin/vmstat", "usr/bin/sh", "usr/bin/top", "usr/bin/free"],
         );
-        match paths(&root, &[taking]) {
-            Err(Error::Conflict { at }) => {
-                let took: Vec<&str> = at.iter().map(|(p, _)| p.as_str()).collect();
-                assert_eq!(took, ["usr/bin/vmstat", "usr/bin/top", "usr/bin/free"]);
-                assert!(at.iter().all(|(_, o)| o == "procps-ng"), "{at:?}");
-            }
-            other => panic!("wanted Conflict, got {other:?}"),
-        }
+        let at = paths(&root, &[taking]).unwrap();
+        let took: Vec<&str> = at.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(took, ["usr/bin/vmstat", "usr/bin/top", "usr/bin/free"]);
+        assert!(at.iter().all(|(_, o)| o == "procps-ng"), "{at:?}");
     }
 
     // and they print one per line, since die prefixes each and a run of them is what
     // gets grepped
     #[test]
     fn several_findings_are_a_line_each() {
-        let e = Error::Conflict {
-            at: vec![
+        let e = Error::Refused {
+            owned: vec![
                 ("usr/bin/vmstat".to_string(), "procps-ng".to_string()),
                 ("usr/bin/top".to_string(), "procps-ng".to_string()),
             ],
+            missing: vec![("busybox".to_string(), "musl".to_string())],
         };
         assert_eq!(
             e.to_string(),
-            "usr/bin/vmstat is owned by procps-ng\nusr/bin/top is owned by procps-ng"
+            "usr/bin/vmstat is owned by procps-ng\nusr/bin/top is owned by procps-ng\n\
+             busybox needs musl"
         );
     }
 
@@ -746,13 +732,9 @@ mod tests {
         let one = job("foo", &["libbar", "libbaz"], &["usr/bin/foo"]);
         let two = job("qux", &["libquux"], &["usr/bin/qux"]);
 
-        match deps(&root, &[one, two]) {
-            Err(Error::MissingDep { at }) => {
-                let want: Vec<&str> = at.iter().map(|(_, d)| d.as_str()).collect();
-                assert_eq!(want, ["libbar", "libbaz", "libquux"]);
-            }
-            other => panic!("wanted MissingDep, got {other:?}"),
-        }
+        let at = deps(&root, &[one, two]).unwrap();
+        let want: Vec<&str> = at.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(want, ["libbar", "libbaz", "libquux"]);
     }
 
     #[test]
@@ -761,8 +743,8 @@ mod tests {
         let dep = job("libbar", &[], &["usr/lib/libbar.so"]);
         let app = job("foo", &["libbar"], &["usr/bin/foo"]);
 
-        assert!(deps(&root, &[app.clone(), dep.clone()]).is_ok());
-        assert!(deps(&root, &[dep, app]).is_ok());
+        assert!(deps(&root, &[app.clone(), dep.clone()]).unwrap().is_empty());
+        assert!(deps(&root, &[dep, app]).unwrap().is_empty());
     }
 
     #[test]
@@ -770,7 +752,7 @@ mod tests {
         let root = scratch("again");
         record(&root, "foo", &["usr/bin/foo"]);
 
-        assert!(paths(&root, &[job("foo", &[], &["usr/bin/foo"])]).is_ok());
+        assert!(paths(&root, &[job("foo", &[], &["usr/bin/foo"])]).unwrap().is_empty());
     }
 
     #[test]

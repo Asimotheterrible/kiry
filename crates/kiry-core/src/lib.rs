@@ -63,23 +63,11 @@ pub enum Error {
     Archive { path: String, why: &'static str },
     // an elf kiry could not make sense of
     Elf { path: String, why: &'static str },
-    // every collision in the batch, not the first: a busybox carrying three applets
-    // real packages own answered one rebuild at a time otherwise
-    Conflict { at: Vec<(String, String)> },
+    // every finding in the batch, not the first: a busybox carrying three applets real
+    // packages own answered one rebuild at a time otherwise
+    Refused { owned: Vec<(String, String)>, missing: Vec<(String, String)> },
     Targets(PathBuf),
-    MissingDep { at: Vec<(String, String)> },
     Needed { pkg: String, by: String },
-}
-
-// one finding per line, so a batch with three of them says so once rather than over three
-// runs. die prefixes every line it is handed
-fn rows(
-    f: &mut fmt::Formatter<'_>,
-    at: &[(String, String)],
-    say: impl Fn(&str, &str) -> String,
-) -> fmt::Result {
-    let lines: Vec<String> = at.iter().map(|(a, b)| say(a, b)).collect();
-    write!(f, "{}", lines.join("\n"))
 }
 
 impl fmt::Display for Error {
@@ -98,9 +86,14 @@ impl fmt::Display for Error {
             Error::BadPath(p) => write!(f, "cannot record this path: {p:?}"),
             Error::Archive { path, why } => write!(f, "{path}: {why}"),
             Error::Elf { path, why } => write!(f, "{path}: {why}"),
-            Error::Conflict { at } => rows(f, at, |p, o| format!("{p} is owned by {o}")),
+            // one finding per line, since die prefixes each and a run of them is what
+            // gets grepped
+            Error::Refused { owned, missing } => {
+                let o = owned.iter().map(|(p, o)| format!("{p} is owned by {o}"));
+                let m = missing.iter().map(|(p, d)| format!("{p} needs {d}"));
+                write!(f, "{}", o.chain(m).collect::<Vec<_>>().join("\n"))
+            }
             Error::Targets(p) => write!(f, "{} must hold exactly one target", p.display()),
-            Error::MissingDep { at } => rows(f, at, |p, d| format!("{p} needs {d}")),
             Error::Needed { pkg, by } => write!(f, "{by} still needs {pkg}"),
         }
     }

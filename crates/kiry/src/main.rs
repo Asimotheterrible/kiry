@@ -6207,6 +6207,20 @@ fn load(root: &Path, at: &Path) -> Result<Package, String> {
             }
         }
     }
+    // core/ may never depend on extra/: whatever is in core drags its closure in with it,
+    // and nothing said so while python3 named libffi and xz named gettext-tiny
+    let repo = |d: &Path| d.parent().and_then(|r| r.file_name()).map(|n| n.to_string_lossy().into_owned());
+    if repo(&p.dir).as_deref() == Some("core") {
+        for d in &out {
+            let Some(at) = recipe(root, &d.name) else { continue };
+            if let Some(r) = repo(&at).filter(|r| r == "extra" || r == "testing") {
+                return Err(format!(
+                    "core/{} depends on {r}/{}, and core may never depend on extra",
+                    p.name, d.name
+                ));
+            }
+        }
+    }
     p.depends = out;
     Ok(p)
 }

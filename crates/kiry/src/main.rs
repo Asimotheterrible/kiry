@@ -801,7 +801,8 @@ fn build(
         let was = installed_version(root, t, &p.name);
         batch_took(&key(p, t), secs);
         say!("{}{note}", row(&p.name, &p.version.upstream, was.as_deref(), t, "ok", Some(secs)));
-        keep_time(root, p, t, secs);
+        let cpu = fs::read_to_string(work.join("cpu")).ok().and_then(|c| c.trim().parse().ok());
+        keep_time(root, p, t, secs, cpu);
         built.push((t.clone(), work, linked));
     }
 
@@ -2097,7 +2098,12 @@ fn compile(
     }
 
     let watching = watch(&lto);
-    let status = c.status();
+    let status = c.spawn().and_then(|mut ch| {
+        if let Some(cpu) = cpu_of(&ch) {
+            let _ = fs::write(work.join("cpu"), format!("{cpu}\n"));
+        }
+        ch.wait()
+    });
     // stopped ahead of prune_pass, whose relinks take a version script and miss on purpose
     if let Some((hits, misses)) = watching.and_then(Watch::stop).filter(|(h, m)| h + m > 0) {
         let _ = fs::write(work.join("thinlto"), format!("{hits} {misses}\n"));
@@ -4807,16 +4813,33 @@ fn times(root: &Path) -> PathBuf {
     root.join("var/kiry/times")
 }
 
+// cpu seconds a build used, itself and every descendant waited for, which is the whole
+// tree: the sandbox init reaps what it spawned. read after it exits and before it is
+// reaped, while /proc still has it. utime stime cutime cstime are fields 14-17, in
+// USER_HZ, which is 100 on x86. rustix has no getrusage, and RUSAGE_CHILDREN here would
+// add up every build running in parallel
+fn cpu_of(ch: &std::process::Child) -> Option<u64> {
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+    let pid = Pid::from_raw(ch.id() as i32)?;
+    waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT).ok()?;
+    let stat = fs::read_to_string(format!("/proc/{}/stat", ch.id())).ok()?;
+    // comm is in parens and may hold spaces, so the fields count from its close
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let f: Vec<u64> = rest.split(' ').skip(11).take(4).filter_map(|v| v.parse().ok()).collect();
+    (f.len() == 4).then(|| f.iter().sum::<u64>() / 100)
+}
+
 // appended rather than rewritten, so a batch that dies partway through has still
 // recorded what it finished. a line per build rather than per package keeps it honest
 // about what a package used to cost, and a few thousand of them is a hundred kilobytes
-fn keep_time(root: &Path, p: &Package, t: &str, secs: u64) {
+fn keep_time(root: &Path, p: &Package, t: &str, secs: u64, cpu: Option<u64>) {
     let at = times(root);
     let Some(up) = at.parent() else { return };
     if mkdirs(up).is_err() {
         return;
     }
-    let line = format!("{} {} {t} {secs} {}\n", p.name, p.version.upstream, today());
+    let cpu = cpu.map_or(String::new(), |c| format!(" {c}"));
+    let line = format!("{} {} {t} {secs} {}{cpu}\n", p.name, p.version.upstream, today());
     let _ = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -8493,11 +8516,47 @@ fn stats_cmd(args: &[String]) {
     if !past.is_empty() {
         let mut rows: Vec<(&(String, String), &u64)> = past.iter().collect();
         rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let names: HashSet<&str> = past.keys().map(|(n, _)| n.as_str()).collect();
+        out.push(format!("built {} packages", names.len()));
         // the sum of everything's last build, which is what building it all again costs
         out.push(format!("world ~{}", clock(rows.iter().map(|(_, s)| **s).sum())));
         for ((n, t), s) in rows.iter().take(3) {
             out.push(format!("slowest {n} {t} {}", clock(**s)));
         }
+    }
+    // every build since they were first recorded, not the last of each like world
+    let cpu: Vec<u64> = plain(&times(&root))
+        .iter()
+        .filter_map(|l| l.split_whitespace().nth(5)?.parse().ok())
+        .collect();
+    if !cpu.is_empty() {
+        out.push(format!("cpu {} over {} builds", clock(cpu.iter().sum()), cpu.len()));
+    }
+    // the last note recovery wrote in each filter or settings file says how that package
+    // ended: a rung it built at, or stuck. notes a person wrote are neither
+    let mut files: Vec<PathBuf> = repos(&root)
+        .iter()
+        .flat_map(|r| fs::read_dir(r).into_iter().flatten().flatten())
+        .map(|e| e.path().join("filter"))
+        .collect();
+    let pkg = fs::read_dir(root.join("etc/kiry/pkg"));
+    files.extend(pkg.into_iter().flatten().flatten().map(|e| e.path()));
+    let (mut recovered, mut stuck) = (0, 0);
+    for f in files {
+        let text = fs::read_to_string(&f).unwrap_or_default();
+        let last = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("# ")?.split_once(' ').map(|(_, w)| w))
+            .filter(|w| w.starts_with("rung ") || w.starts_with("stuck on "))
+            .last();
+        match last {
+            Some(w) if w.starts_with("stuck") => stuck += 1,
+            Some(_) => recovered += 1,
+            None => {}
+        }
+    }
+    if recovered + stuck > 0 {
+        out.push(format!("failures {recovered} recovered, {stuck} stuck"));
     }
     out.push(format!("queued {}", db::read_queue(&root).unwrap_or_default().len()));
     let log = fs::read_to_string(root.join("var/kiry/log/rebuilds")).unwrap_or_default();

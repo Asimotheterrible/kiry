@@ -1841,6 +1841,11 @@ fn compile(
     let cargo = root.join("var/kiry/cargo");
     mkdirs(&cargo)?;
     mkdirs(&sysroot.join(sandbox::CARGO_AT))?;
+    let patches: Vec<PathBuf> = srcs
+        .iter()
+        .map(|(name, ..)| src.join(name))
+        .filter(|f| f.extension().is_some_and(|e| e == "patch") && edits_lock(f))
+        .collect();
     let fetches = text.contains("cargo fetch") || net && names(&text, "cargo");
     for lock in shallowest(&src, "Cargo.lock", 3).into_iter().filter(|_| fetches) {
         let mut c = Command::new("cargo");
@@ -1849,7 +1854,7 @@ fn compile(
             .arg("--manifest-path")
             .arg(lock.with_file_name("Cargo.toml"))
             .env("CARGO_HOME", abs(&cargo)?);
-        prefetch(&mut c, &lock)?;
+        prefetch(&mut c, &lock, &patches)?;
     }
     // go's modules the same way, go.sum being its lock. GOTOOLCHAIN=local on both sides,
     // or a go.mod asking for a newer go downloads one
@@ -1868,7 +1873,7 @@ fn compile(
             .env("GOMODCACHE", abs(&gomod)?)
             .env("GOFLAGS", "-modcacherw")
             .env("GOTOOLCHAIN", "local");
-        prefetch(&mut c, &sum)?;
+        prefetch(&mut c, &sum, &patches)?;
     }
 
     fs::copy(&script, sysroot.join("build")).map_err(|e| format!("build script: {e}"))?;
@@ -2321,11 +2326,15 @@ options_has() { case \" $options \" in *\" $1 \"*) return 0 ;; esac; return 1; }
 // system default, which is how librewolf's gyp read ended up with an include of '%'
 // the strings compared are autoconf's own defaults, still unexpanded at this point
 // each one is an if rather than a && so the file cannot end on a false test, which
-// autoconf 2.71 treats as the site script having failed
+// autoconf 2.71 treats as the site script having failed. only for --prefix=/usr: a
+// configure nested in a build with a prefix of its own, jemalloc under a cargo build
+// script, keeps its defaults or installs into the read-only /usr
 const CONFIG_SITE: &str = "\
+if test \"$prefix\" = /usr; then
 if test \"$libdir\" = '${exec_prefix}/lib'; then libdir=@LIBDIR@; fi
 if test \"$includedir\" = '${prefix}/include'; then includedir=@INCLUDEDIR@; fi
 if test \"$datarootdir\" = '${prefix}/share'; then datarootdir=@DATADIR@; fi
+fi
 ";
 
 // lld keys an entry on the module, the link's settings and llvm's version string, so
@@ -2745,18 +2754,51 @@ fn shallowest(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
     out
 }
 
+fn edits_lock(patch: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(patch) else {
+        return false;
+    };
+    text.lines().filter_map(|l| l.strip_prefix("+++ ")).any(|l| {
+        let f = l.split_whitespace().next().unwrap_or("");
+        ["Cargo.lock", "Cargo.toml", "go.sum", "go.mod"].iter().any(|n| f.ends_with(n))
+    })
+}
+
 // the tool as a word of its own, so CARGO_HOME and cargo-home are not cargo
 fn names(text: &str, tool: &str) -> bool {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || "_-./$".contains(c))).any(|w| w == tool)
 }
 
-// a fetch the sandbox cannot do, run out here. its last line of stderr is the error
-fn prefetch(c: &mut Command, lock: &Path) -> Result<(), String> {
+// a fetch the sandbox cannot do, run out here. its last line of stderr is the error.
+// a patch that edits the lock changes what there is to fetch, and default_prepare only
+// applies it inside the sandbox, so it goes on for the fetch and comes back off after,
+// leaving prepare the tree it expects. one that will not apply here is skipped and the
+// build fails offline the way it would have
+fn prefetch(c: &mut Command, lock: &Path, patches: &[PathBuf]) -> Result<(), String> {
     let what = c.get_program().to_string_lossy().into_owned();
-    let o = c
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("{what} for {}: {e}", lock.display()))?;
+    let dir = lock.parent().unwrap_or(lock);
+    let patch = |p: &Path, flag: Option<&str>| {
+        Command::new("patch")
+            .args(["-p1", "-s", "--no-backup-if-mismatch", "-d"])
+            .arg(dir)
+            .arg("-i")
+            .arg(p)
+            .args(flag)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let on: Vec<&PathBuf> =
+        patches.iter().filter(|p| patch(p, Some("--dry-run")) && patch(p, None)).collect();
+    let o = c.stdin(Stdio::null()).output();
+    for p in on.iter().rev() {
+        if !patch(p, Some("-R")) {
+            return Err(format!("{}: would not come back off {}", p.display(), dir.display()));
+        }
+    }
+    let o = o.map_err(|e| format!("{what} for {}: {e}", lock.display()))?;
     if o.status.success() {
         return Ok(());
     }

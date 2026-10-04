@@ -607,12 +607,14 @@ fn untested(body: &str) -> String {
 // knob kiry's flags already carry: full lto where the knob says thin, and never through
 // the thinlto cache. gone, the knob decides here like it does everywhere else. only the
 // whole word, give or take its quotes: perl's `s| -flto=auto||g` has it inside a longer
-// one, and taking it out of there turns the sed into one that strips every space
+// one, and taking it out of there turns the sed into one that strips every space.
+// -Db_lto=true is muon's plain -flto ahead of the knob's: thin wins by coming last, and
+// where filter-lto took the knob's out, full lto is what is left
 fn unlto(word: &str) -> String {
     let inner = word.trim_start_matches(['"', '\'']);
     let bare = inner.trim_end_matches(['"', '\'']);
     match bare {
-        "-flto=auto" | "-ffat-lto-objects" => {
+        "-flto=auto" | "-ffat-lto-objects" | "-Db_lto=true" => {
             format!("{}{}", &word[..word.len() - inner.len()], &inner[bare.len()..])
         }
         _ => word.to_string(),

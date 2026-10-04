@@ -2118,6 +2118,15 @@ fn compile(
             if staged(&dest) == 0 {
                 return Err(format!("{} {t}: built and staged nothing", p.name));
             }
+            // DESTDIR said twice: `make PREFIX="$DESTDIR"/usr` into a Makefile that also
+            // honours $(DESTDIR). pciutils installed to /dest/usr on the live root that way
+            if dest.join("dest").exists() {
+                return Err(format!(
+                    "{} {t}: staged under dest/, so DESTDIR went in twice. a PREFIX or \
+                     prefix naming $DESTDIR on a make that honours DESTDIR too",
+                    p.name
+                ));
+            }
             // clang drops the counts of a function whose cfg moved and compiles it cold,
             // so an old profile costs speed, never correctness. retraining is hours for
             // some packages, which is why this says so and does nothing. the count the

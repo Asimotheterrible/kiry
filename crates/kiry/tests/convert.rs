@@ -770,7 +770,8 @@ fn alpines_lto_words_come_out_and_the_line_stays_whole() {
          build() {\n\tCFLAGS=\"$CFLAGS -O2 -flto=auto\" \\\n\
          \tCXXFLAGS=\"$CXXFLAGS -flto=auto -ffat-lto-objects -DNDEBUG\" \\\n\
          \t./configure --prefix=/usr\n\
-         \texport LDFLAGS=\"$LDFLAGS -flto=auto\"\n}\n\
+         \texport LDFLAGS=\"$LDFLAGS -flto=auto\"\n\
+         \tabuild-meson -Db_lto=true -Dfoo=true . output\n}\n\
          package() {\n\tsed -i -e \"s| -flto=auto||g\" Config_heavy.pl\n\
          \tmake install DESTDIR=\"$pkgdir\"\n}\n",
     );
@@ -779,6 +780,7 @@ fn alpines_lto_words_come_out_and_the_line_stays_whole() {
         "CFLAGS=\"$CFLAGS -O2 \" \\\n",
         "CXXFLAGS=\"$CXXFLAGS   -DNDEBUG\" \\\n",
         "export LDFLAGS=\"$LDFLAGS \"\n",
+        "abuild-meson  -Dfoo=true . output\n",
         // inside a longer word it is something else, here what perl's own sed removes
         "sed -i -e \"s| -flto=auto||g\" Config_heavy.pl\n",
     ] {

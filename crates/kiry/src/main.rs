@@ -6648,7 +6648,30 @@ fn rebuild_cmd(args: &[String]) {
         .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
         .collect();
     batch_begin(&root, names.len(), &rows, &rows);
+    // one stuck package out of a storm leaves the rest to build. what needs it, directly
+    // or through something skipped, is skipped rather than built against the old one
+    let host = sandbox::host();
+    let mut failed: Vec<usize> = Vec::new();
     for level in plan {
+        let level: Vec<(usize, bool)> = level
+            .into_iter()
+            .filter(|(i, _)| {
+                let (name, target) = &want[*i];
+                let p = &recipes[name];
+                let gone = failed.iter().copied().find(|j| {
+                    want[*j].0 == *name
+                        || p.depends.iter().any(|x| {
+                            let t = if x.host { &host } else { target };
+                            x.applies(target) && x.name == want[*j].0 && *t == want[*j].1
+                        })
+                });
+                if let Some(j) = gone {
+                    say!("{name} {} {target} skip  {} failed", p.version.upstream, want[j].0);
+                    failed.push(*i);
+                }
+                gone.is_none()
+            })
+            .collect();
         // every member of a level compiles before any of it is installed, and the level
         // below it is already in place, so each one links against what it will run with
         // a package at a time, its targets one after another: a recovery rewrites the
@@ -6660,30 +6683,48 @@ fn rebuild_cmd(args: &[String]) {
             }
         }
         let w = width().min(names.len().max(1));
-        let built = parallel(&names, w, |name| {
+        let errs: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+        let _ = parallel(&names, w, |name| {
             let p = &recipes[*name];
             for (i, boot) in level.iter().filter(|(i, _)| want[*i].0 == **name) {
                 let target = &want[*i].1;
                 // a bootstrap pass is a stand-in that exists to be replaced, so it is
                 // built straight rather than put through the recovery loop
-                match boot {
-                    true => build(&root, p, std::slice::from_ref(target), false, true, w).map(|_| ())?,
-                    false => recover(&root, p, target, false, w)?,
+                let r = match boot {
+                    true => {
+                        build(&root, p, std::slice::from_ref(target), false, true, w).map(|_| ())
+                    }
+                    false => recover(&root, p, target, false, w),
+                };
+                if let Err(e) = r {
+                    errs.lock().unwrap_or_else(|e| e.into_inner()).push(((*name).clone(), e));
+                    break;
                 }
             }
             Ok(())
         });
-        if let Err(e) = built {
-            die(e);
+        let errs = errs.into_inner().unwrap_or_else(|e| e.into_inner());
+        for (_, e) in &errs {
+            for l in e.lines() {
+                complain(l);
+            }
         }
         let mut made = Vec::new();
         for (i, _) in &level {
             let (name, target) = &want[*i];
             let p = &recipes[name];
+            // a package's targets go in together or not at all
+            if errs.iter().any(|(n, _)| n == name) {
+                failed.push(*i);
+                continue;
+            }
             match cached(&root, p, target) {
                 Some(a) => made.push(a),
                 None => die(format!("{} {target}: built nothing", p.name)),
             }
+        }
+        if made.is_empty() {
+            continue;
         }
         let w = writer(&root);
         let jobs = match install::plan(&root, &made, false) {
@@ -6723,11 +6764,15 @@ fn rebuild_cmd(args: &[String]) {
 
     let _w = writer(&root);
     // a rebuild that ran is off the queue whether or not it fixed anything, or the next
-    // drain starts from the same list. what these rebuilds queued in turn stays
+    // drain starts from the same list. what these rebuilds queued in turn stays, and so
+    // does what failed or was skipped, which never ran to the end
     let left_over: Vec<db::Queued> = db::read_queue(&root)
         .unwrap_or_default()
         .into_iter()
-        .filter(|q| !want.contains(&(q.name.clone(), q.target.clone())))
+        .filter(|q| {
+            let k = (q.name.clone(), q.target.clone());
+            !want.contains(&k) || failed.iter().any(|i| want[*i] == k)
+        })
         .collect();
     if let Err(e) = db::write_queue(&root, &left_over) {
         die(e.to_string());
@@ -6740,8 +6785,8 @@ fn rebuild_cmd(args: &[String]) {
             left += 1;
         }
     }
-    batch_end(left == 0);
-    if left > 0 {
+    batch_end(left == 0 && failed.is_empty());
+    if left > 0 || !failed.is_empty() {
         std::process::exit(1);
     }
 }

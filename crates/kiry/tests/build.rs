@@ -1775,6 +1775,58 @@ fn a_rebuild_that_changed_nothing_is_logged_as_the_same() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("rebuilt 1, 1 to the same bytes"));
 }
 
+// one package out of a storm failing leaves the rest to build. what needs it is skipped,
+// not built against the old one, and both stay queued for the next drain
+#[test]
+fn a_failed_rebuild_skips_what_needs_it_and_builds_the_rest() {
+    let at = scratch("rebuild-skip");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let arc = tarball(&at);
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+    let repo = at.join("repo");
+    let r = root.to_str().unwrap();
+    for (name, dep) in [("bad", ""), ("user", "bad\n"), ("fine", "")] {
+        let d = repo.join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("version"), "1.0 1\n").unwrap();
+        fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+        fs::write(d.join("sources"), "../../hello-1.0.tar\n").unwrap();
+        fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+        fs::write(d.join("depends"), dep).unwrap();
+        fs::write(
+            d.join("build"),
+            format!("mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/{name}\"\n"),
+        )
+        .unwrap();
+        let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let a = root.join(format!("var/kiry/cache/{name}-1.0-1.x86_64-musl.tar.zst"));
+        assert!(kiry(&["i", "--root", r, a.to_str().unwrap()]).status.success());
+    }
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+    fs::write(repo.join("bad/build"), "exit 1\n").unwrap();
+    fs::write(
+        root.join("usr/lib/kiry/db/queue"),
+        "x86_64-musl libx.so.1 bad\nx86_64-musl libx.so.1 user\nx86_64-musl libx.so.1 fine\n",
+    )
+    .unwrap();
+
+    let o = kiry(&["rebuild", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(!o.status.success());
+    assert!(said.contains("fine 1.0 x86_64-musl rebuilt"), "{said}");
+    assert!(said.contains("user 1.0 x86_64-musl skip  bad failed"), "{said}");
+    assert!(!said.contains("user 1.0 x86_64-musl rebuilt"), "{said}");
+    let left = queued(&root);
+    assert!(left.iter().any(|l| queued_pkg(l) == "bad"), "{left:?}");
+    assert!(left.iter().any(|l| queued_pkg(l) == "user"), "{left:?}");
+    assert!(!left.iter().any(|l| queued_pkg(l) == "fine"), "{left:?}");
+}
+
 // two broken consumers where alpha links beta, so the order the dependency asks for is
 // the reverse of the order they are found in. that is the whole point: a package cannot
 // compile against a dependency that has not been rebuilt and reinstalled yet

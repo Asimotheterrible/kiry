@@ -7467,6 +7467,18 @@ fn sync_cmd(args: &[String]) {
             holds += 1;
             continue;
         }
+        // a bump waiting in testing/ that someone has edited since sync wrote it is the
+        // review in progress. converting over it would throw that away, so it waits for
+        // a promote or a delete. one nobody touched is converted again as before, and
+        // one with no record of what sync wrote is taken as edited
+        let wrote = fs::read_to_string(converted(&root, &r.name).join("testing")).ok();
+        let now = fs::read_to_string(fresh.join("build")).ok();
+        if now.is_some() && now != wrote {
+            say!("{:w$} {:v$} -> {:u$}  held", r.name, r.ours, up.version);
+            say!("  {} edited since sync wrote it, promote or delete it first", fresh.display());
+            holds += 1;
+            continue;
+        }
 
         if dry {
             say!(
@@ -7563,6 +7575,10 @@ fn sync_cmd(args: &[String]) {
                     }
                 }
             }
+        }
+        // what testing/ holds now, carried and all, so the next sync can tell an edit
+        if let Ok(b) = fs::read_to_string(fresh.join("build")) {
+            let _ = fs::write(conv.join("testing"), b);
         }
         say!(
             "{:w$} {:v$} -> {:u$}  {}",

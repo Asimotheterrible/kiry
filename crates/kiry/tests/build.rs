@@ -3070,6 +3070,58 @@ fn a_cargo_lock_is_fetched_outside_and_the_build_finds_it_offline() {
     assert!(args.trim_end().ends_with("hello-1.0/Cargo.toml"), "{args}");
 }
 
+// tree-sitter's patch bumps crates in Cargo.lock, and default_prepare applies it only
+// inside the sandbox. the fetch has to see the lock as patched, and prepare has to find
+// it unpatched or its own patch run refuses
+#[test]
+fn a_patch_that_edits_the_lock_is_fetched_for_and_taken_back_off() {
+    let at = scratch("lockpatch");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            ". /usr/share/kiry/lib.sh\nsrcdir=/src\n\
+             source=\"../hello-1.0.tar lock.patch\"\noptions=net\ntrue || cargo build\n\
+             default_prepare\ngrep -q moved Cargo.lock || exit 1\n{GOOD}"
+        ),
+    );
+    fs::write(at.join("src/hello-1.0/Cargo.lock"), "version = 4\n").unwrap();
+    let arc = tarball(&at);
+    fs::write(
+        d.join("lock.patch"),
+        "--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1,2 @@\n version = 4\n+# moved\n",
+    )
+    .unwrap();
+    fs::write(d.join("sources"), "../hello-1.0.tar\nlock.patch\n").unwrap();
+    let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
+    let psum = kiry_core::sha256(fs::File::open(d.join("lock.patch")).unwrap()).unwrap();
+    fs::write(d.join("checksums"), format!("{sum}\n{psum}\n")).unwrap();
+
+    let bin = at.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("cargo"),
+        format!("#!/bin/sh\ncat \"$(dirname \"$4\")/Cargo.lock\" >> {}\n", at.join("args").display()),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("cargo"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let o = Command::new(KIRY)
+        .args(["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(at.join("args")).unwrap(), "version = 4\n# moved\n");
+}
+
 // go.sum is go's lock, and the modules come in the same way the crates do. this go
 // writes where GOMODCACHE says, from the directory the go.sum is in
 #[test]
@@ -3117,6 +3169,32 @@ fn a_go_sum_is_fetched_outside_and_the_build_finds_it_offline() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let args = fs::read_to_string(at.join("args")).unwrap();
     assert_eq!(args, "mod download hello-1.0 local\n");
+}
+
+// the site file moves a gnu libdir under --prefix=/usr and nothing else. a configure
+// nested in a build with its own prefix, jemalloc under a cargo build script, keeps
+// its defaults
+#[test]
+fn config_site_leaves_a_prefix_other_than_usr_alone() {
+    let at = scratch("configsite");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "prefix=/tmp/x; libdir='${{exec_prefix}}/lib'; . \"$CONFIG_SITE\"\n\
+             [ \"$libdir\" = '${{exec_prefix}}/lib' ] || exit 1\n\
+             prefix=/usr; . \"$CONFIG_SITE\"\n\
+             [ \"$libdir\" = /usr/lib ] || exit 1\n{GOOD}"
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
 
 // a lock alone fetches nothing: go's own tree and firefox's carry one and build from

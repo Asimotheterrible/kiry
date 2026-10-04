@@ -4065,6 +4065,40 @@ fn sync_names_a_file_the_bump_and_a_hand_both_wrote() {
     assert_eq!(build, "# hand written\nmake\n");
 }
 
+// a bump waiting in testing/ that somebody edited is a review in progress. the next sync
+// leaves it alone and says why, and one nobody touched is converted again
+#[test]
+fn sync_does_not_convert_over_an_edited_bump_in_testing() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncedited");
+    offer(&repo, "moved", "1.0");
+    fs::write(repo.join("moved/build"), "# hand written\nmake\n").unwrap();
+    aport(&root, "main", "moved", "pkgname=moved\npkgver=1.1\npkgrel=0\npackage() {\n\t:\n}\n");
+    let r = root.to_str().unwrap();
+    assert!(kiry(&["sync", "--root", r]).status.success());
+
+    // untouched, a second sync converts it again
+    let o = kiry(&["sync", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(!said.contains("edited since sync wrote it"), "{said}");
+
+    let at = testing.join("moved/build");
+    let edited = format!("{}# reviewed\n", fs::read_to_string(&at).unwrap());
+    fs::write(&at, &edited).unwrap();
+    let o = kiry(&["sync", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("edited since sync wrote it"), "{said}");
+    assert_eq!(fs::read_to_string(&at).unwrap(), edited);
+
+    // with no record of what sync wrote, nothing says it was not edited
+    fs::remove_file(root.join("var/kiry/converted/moved/testing")).unwrap();
+    fs::write(&at, "# reviewed before the record existed\n").unwrap();
+    let o = kiry(&["sync", "--root", r]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("edited since sync wrote it"));
+}
+
 // carry keeps this tree's build and takes alpine's sources, so a release tarball becoming
 // a git archive leaves ours configuring a tree that has no configure in it. naming the
 // file alpine's build is in is not enough -- libfm was held with the file named and

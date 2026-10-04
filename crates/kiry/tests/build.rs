@@ -5867,6 +5867,29 @@ fn a_build_that_stages_nothing_is_not_ok() {
     assert!(artifacts(&root).is_empty());
 }
 
+// PREFIX="$DESTDIR"/usr on a Makefile that honours DESTDIR too lands the package under
+// /dest/usr, which installs cleanly onto the live root and resolves nothing
+#[test]
+fn a_build_that_stages_under_dest_twice_is_refused() {
+    let at = scratch("destdest");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        "mkdir -p \"$DESTDIR$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("DESTDIR went in twice"), "{said}");
+    assert!(artifacts(&root).is_empty());
+}
+
 // RLIMIT_DATA is per process, so the cap has to know how many builds hold one: two
 // builds each allowed half the machine is the whole machine. only this side of the exec
 // knows the number, so it crosses by name the way KIRY_MEM does

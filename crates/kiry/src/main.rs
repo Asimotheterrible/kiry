@@ -2690,11 +2690,12 @@ fn triple(t: &str) -> &'static str {
 
 // how many builds of one level run at once. each is already at -j nproc, so what this
 // buys is the serial stretches -- configure, the final link, one slow codegen unit --
-// where a single build leaves most of the machine idle. KIRY_PARALLEL=1 is one at a time
+// where a single build leaves most of the machine idle. one unless KIRY_PARALLEL says
+// more: navi has no memcg and no swap, and two at once froze it during the app campaign
 fn width() -> usize {
     match std::env::var("KIRY_PARALLEL").ok().and_then(|v| v.parse().ok()) {
         Some(n) if n > 0 => n,
-        _ => 2,
+        _ => 1,
     }
 }
 
@@ -6541,6 +6542,16 @@ mod order {
         })
         .unwrap();
         assert_eq!(*seen.lock().unwrap(), ["slow", "mid", "quick"]);
+    }
+
+    // the only test that touches KIRY_PARALLEL, so setting it here races nothing
+    #[test]
+    fn one_build_at_a_time_unless_asked() {
+        std::env::remove_var("KIRY_PARALLEL");
+        assert_eq!(width(), 1);
+        std::env::set_var("KIRY_PARALLEL", "3");
+        assert_eq!(width(), 3);
+        std::env::remove_var("KIRY_PARALLEL");
     }
 
     #[test]

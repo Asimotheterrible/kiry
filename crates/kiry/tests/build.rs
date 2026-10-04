@@ -5270,6 +5270,42 @@ fn sync_at(root: &Path) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
+// a patch alpine stopped listing goes with the bump; one this tree added itself stays.
+// the last conversion is what tells them apart
+#[test]
+fn a_bump_keeps_the_trees_own_patch_and_lets_alpines_dropped_one_go() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, _) = tree("syncpatch");
+    converted_offer(&repo, "pat", "1.0", "\tmake\n");
+    let d = repo.join("pat");
+    fs::write(d.join("sources"), "a.patch\nmine.patch\n").unwrap();
+    // what an empty file hashes to, so the offline conversion finds alpine's patch intact
+    let empty = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
+    fs::write(d.join("checksums"), format!("{empty}\n{}\n", "2".repeat(64))).unwrap();
+    let with = |body: &str, src: &str, sums: &str, v: &str| {
+        aport(
+            &root,
+            "main",
+            "pat",
+            &format!(
+                "pkgname=pat\npkgver={v}\npkgrel=0\nsource=\"{src}\"\nbuild() {{\n{body}}}\n\
+                 package() {{\n\t:\n}}\nsha512sums=\"{sums}\"\n"
+            ),
+        )
+    };
+    with("\tmake\n", "a.patch", &format!("{empty}  a.patch"), "1.0");
+    fs::write(root.join("var/kiry/aports/main/pat/a.patch"), "").unwrap();
+    let first = sync_at(&root);
+    assert!(first.contains("1 measured"), "{first}");
+
+    with("\tmake\n", "", "", "1.1");
+    let said = sync_at(&root);
+    assert!(said.contains("kept mine.patch in sources"), "{said}");
+    assert!(!said.contains("kept a.patch"), "{said}");
+}
+
 // the common bump moves a version and nothing else, and the old answer was to hand back
 // the whole recipe regenerated so that every decision this tree ever made read as a
 // deletion. what alpine changed is the question, and it is answerable

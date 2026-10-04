@@ -7988,7 +7988,20 @@ fn seed(root: &Path, rows: &[Row], alias: &HashMap<String, String>, list: &[Path
 // named here and nowhere else, so a conversion writing sources fresh is what drops it --
 // openntpd's nitro-run went that way and took its package step with it. the build's own
 // $source is rewritten to match, because default_prepare walks that and not the file
-fn keep_local(old: &Path, fresh: &Path) -> Result<Vec<String>, String> {
+// a local source the bump lacks is this tree's own, unless the last conversion had it
+// too, in which case alpine dropped it and it goes. with no last conversion to ask, it
+// stays: a lost patch fails loudly, a kept one alpine dropped usually just re-applies
+fn keep_local(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Vec<String>, String> {
+    let alpines: Vec<String> = base
+        .and_then(|b| fs::read_to_string(b).ok())
+        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("source=").map(String::from)))
+        .map(|l| {
+            l.trim_matches('"')
+                .split_whitespace()
+                .map(|w| w.split_once("::").map_or(w, |(n, _)| n).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     let rows = |d: &Path| -> Result<Vec<(String, String)>, String> {
         let read = |n: &str| -> Result<Vec<String>, String> {
             Ok(fs::read_to_string(d.join(n))
@@ -8014,7 +8027,7 @@ fn keep_local(old: &Path, fresh: &Path) -> Result<Vec<String>, String> {
     let (was, mut now) = (rows(old)?, rows(fresh)?);
     let mut kept = Vec::new();
     for (s, c) in was {
-        if s.contains("://") || now.iter().any(|(n, _)| *n == s) {
+        if s.contains("://") || now.iter().any(|(n, _)| *n == s) || alpines.contains(&s) {
             continue;
         }
         kept.push(s.clone());
@@ -8085,7 +8098,7 @@ struct Bump {
 fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> {
     // before the walk, so the build arm below reheads against a source assignment that
     // already names everything sources holds
-    let kept = keep_local(old, fresh)?;
+    let kept = keep_local(old, fresh, base)?;
     let rd = fs::read_dir(old).map_err(|e| format!("{}: {e}", old.display()))?;
     let (mut names, mut dirs): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     for e in rd.flatten() {

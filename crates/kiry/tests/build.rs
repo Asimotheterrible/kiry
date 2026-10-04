@@ -3023,14 +3023,22 @@ fn a_compile_fed_on_stdin_gets_one_go() {
 // a file where CARGO_HOME says, and the build has to find it there and be told offline
 #[test]
 fn a_cargo_lock_is_fetched_outside_and_the_build_finds_it_offline() {
-    let at = scratch("cargo");
+    cargo_fetched("cargo", "options=\"!check net\"\ntrue || cargo build\n");
+}
+
+// a recipe that runs cargo fetch itself wants the crates whether or not it says net
+#[test]
+fn a_recipe_that_runs_cargo_fetch_gets_its_crates_without_net() {
+    cargo_fetched("cargofetch", "true || cargo fetch --locked\n");
+}
+
+fn cargo_fetched(name: &str, head: &str) {
+    let at = scratch(name);
     let d = recipe(
         &at,
         "x86_64-musl",
         &format!(
-            "options=\"!check net\"\n\
-             true || cargo build\n\
-             [ \"$CARGO_NET_OFFLINE\" = true ] || exit 1\n\
+            "{head}[ \"$CARGO_NET_OFFLINE\" = true ] || exit 1\n\
              [ -e \"$CARGO_HOME/registry/fetched\" ] || exit 1\n{GOOD}"
         ),
     );

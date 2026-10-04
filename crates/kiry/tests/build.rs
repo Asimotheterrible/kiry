@@ -1865,6 +1865,37 @@ fn a_failed_rebuild_skips_what_needs_it_and_builds_the_rest() {
     assert!(!left.iter().any(|l| queued_pkg(l) == "fine"), "{left:?}");
 }
 
+// stats counts what the times file and the filter notes already hold: cpu from each
+// build's own process tree, and how each package that needed recovery ended
+#[test]
+fn stats_says_cpu_time_and_how_recoveries_ended() {
+    let at = scratch("stats-cpu");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let d = recipe(&at, "x86_64-musl", &format!("i=0\nwhile [ $i -lt 300000 ]; do i=$((i+1)); done\n{GOOD}"));
+    fs::write(d.join("filter"), "# 2026-09-12 rung 1 after compile failed on x86_64-musl\nfilter-lto\n")
+        .unwrap();
+    let r = root.to_str().unwrap();
+    let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let times = fs::read_to_string(root.join("var/kiry/times")).unwrap();
+    let cpu = times.lines().last().and_then(|l| l.split(' ').nth(5)).unwrap_or("");
+    assert!(cpu.parse::<u64>().is_ok(), "no cpu column: {times}");
+
+    fs::create_dir_all(root.join("etc/kiry/pkg")).unwrap();
+    fs::write(root.join("etc/kiry/pkg/other"), "# 2026-09-24 stuck on x86_64-musl: the ladder ran out\n")
+        .unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", at.display())).unwrap();
+    let o = kiry(&["stats", "-q", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("built 1 packages"), "{said}");
+    assert!(said.contains(" over 1 builds"), "{said}");
+    assert!(said.contains("failures 1 recovered, 1 stuck"), "{said}");
+}
+
 // two broken consumers where alpha links beta, so the order the dependency asks for is
 // the reverse of the order they are found in. that is the whole point: a package cannot
 // compile against a dependency that has not been rebuilt and reinstalled yet

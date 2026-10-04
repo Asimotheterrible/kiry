@@ -626,7 +626,8 @@ fn off(word: &str) -> String {
     let bare = inner.trim_end_matches(['"', '\'']);
     let (lead, tail) = (&word[..word.len() - inner.len()], &inner[bare.len()..]);
     let flipped = if let Some(name) = bare.strip_prefix("--enable-") {
-        (!name.contains('=') && tests(name)).then(|| format!("--disable-{name}"))
+        (!name.contains('=') && (tests(name) || dropped(name)))
+            .then(|| format!("--disable-{name}"))
     } else if let Some((name, val)) = bare.strip_prefix("-D").and_then(|r| r.split_once('='))
     {
         let no = match val {
@@ -643,8 +644,8 @@ fn off(word: &str) -> String {
             "enabled" => Some("disabled"),
             _ => None,
         };
-        no.filter(|_| tests(name.split(':').next().unwrap_or(name)))
-            .map(|no| format!("-D{name}={no}"))
+        let name_only = name.split(':').next().unwrap_or(name);
+        no.filter(|_| tests(name_only) || dropped(name_only)).map(|no| format!("-D{name}={no}"))
     } else {
         None
     };
@@ -652,6 +653,15 @@ fn off(word: &str) -> String {
         Some(f) => format!("{lead}{f}{tail}"),
         None => word.to_string(),
     }
+}
+
+// core/aliases maps gobject-introspection, vala and gtk-doc to nothing, so a switch that
+// forces one on can only stop the configure: libgudev asks for g-ir-scanner and vapigen
+fn dropped(name: &str) -> bool {
+    let up = name.to_ascii_uppercase().replace('-', "_");
+    up.contains("INTROSPECTION")
+        || up.contains("GTK_DOC")
+        || up.split('_').any(|s| matches!(s, "VAPI" | "VALA" | "GIR"))
 }
 
 // whether an option names a test suite. a bare singular TEST is too often a library the

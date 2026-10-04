@@ -729,6 +729,32 @@ fn test_suites_the_build_asks_for_are_switched_off() {
     }
 }
 
+// gobject-introspection, vala and gtk-doc are dropped in core/aliases, so a switch the
+// build forces on for one of them is switched off with it
+#[test]
+fn switches_for_what_the_aliases_drop_are_switched_off() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("undropped");
+    let (d, _) = convert(
+        &at,
+        "pkgname=thing\npkgver=1.0\npkgrel=0\n\
+         build() {\n\tmeson setup build -Dintrospection=enabled -Dvapi=true \\\n\
+         \t\t-Dgtk_doc=true -Dgir=true -Dfoo=true\n\
+         \t./configure --enable-introspection --enable-vala --enable-gtk-doc=yes\n}\n\
+         package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    for want in [
+        "-Dintrospection=disabled -Dvapi=false \\\n",
+        "-Dgtk_doc=false -Dgir=false -Dfoo=true\n",
+        "--disable-introspection --disable-vala --enable-gtk-doc=yes\n",
+    ] {
+        assert!(script.contains(want), "no {want:?} in\n{script}");
+    }
+}
+
 // alpine's -flto=auto is full lto on top of kiry's own LTO knob, and never goes through
 // the thinlto cache. the words go and the quotes and continuations around them stay,
 // and the same text inside a longer word is left alone

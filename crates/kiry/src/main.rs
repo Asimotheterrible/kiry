@@ -676,7 +676,7 @@ fn build_cmd(args: &[String]) {
     for (name, targets) in &todo {
         let p = &recipes[name];
         let r = match fix {
-            true => targets.iter().try_for_each(|t| recover(&root, p, t, verbose, 1)),
+            true => recover(&root, p, targets, verbose, 1),
             false => build(&root, p, targets, verbose, false, 1).map(|_| ()),
         };
         if let Err(e) = r {
@@ -1434,15 +1434,17 @@ thread_local! {
 }
 
 // build fails, read the log, fix it, build again. three signature retries and never the
-// same action twice, then the ladder, then it is stuck and says why
-fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> Result<(), String> {
+// same action twice, then the ladder, then it is stuck and says why. every attempt is the
+// whole target set: a fix lands in the package's filter, which the other targets build
+// with too, and nothing packs until all of them compile
+fn recover(root: &Path, p: &Package, ts: &[String], verbose: bool, at_once: usize) -> Result<(), String> {
     let rs = rules(root)?;
-    let one = [t.to_string()];
     let mut tried: Vec<String> = Vec::new();
     let mut rung = 0;
     // so a first.log that is there is always this run's
-    let first = firstlog(root, p, t);
-    let _ = fs::remove_file(&first);
+    for t in ts {
+        let _ = fs::remove_file(firstlog(root, p, t));
+    }
     // a run that ends stuck proved none of what it wrote fixes anything, and left behind
     // it reads as a fix. retroarch kept filter-lto and a march rung that way
     let files = [p.dir.join("filter"), root.join("etc/kiry/pkg").join(&p.name)];
@@ -1458,16 +1460,25 @@ fn recover(root: &Path, p: &Package, t: &str, verbose: bool, at_once: usize) -> 
 
     loop {
         SHOWN.with(|s| s.set(false));
-        match build(root, p, &one, verbose, false, at_once) {
+        let e = match build(root, p, ts, verbose, false, at_once) {
             // first.log is only there once this run has failed
-            Ok(_) if first.exists() => {
+            Ok(_) if ts.iter().any(|t| firstlog(root, p, t).exists()) => {
                 batch_recovered();
                 return Ok(());
             }
             Ok(_) => return Ok(()),
-            Err(_) if SHOWN.with(|s| s.get()) => {}
-            Err(e) => loud!("{e}"),
+            Err(e) => e,
+        };
+        if !SHOWN.with(|s| s.get()) {
+            loud!("{e}");
         }
+        // build() stops at the first target that fails and its errors lead with it
+        let t = ts
+            .iter()
+            .find(|t| e.starts_with(&format!("{} {t}:", p.name)))
+            .or(ts.first())
+            .map_or("", String::as_str);
+        let first = firstlog(root, p, t);
         let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
         // every retry truncates the log, so without this the failure that started it all
         // is gone by the time anyone reads it and the rung that fixed it cannot be judged
@@ -1578,7 +1589,7 @@ fn bisect_cmd(args: &[String]) {
             say!("{} carries no rung", p.name);
             continue;
         }
-        if let Err(e) = p.targets.iter().try_for_each(|t| recover(&root, &p, t, false, 1)) {
+        if let Err(e) = recover(&root, &p, &p.targets, false, 1) {
             // stuck from the full flags says nothing about the rungs it had, so the
             // package goes back to exactly what it built with before
             for (f, h) in files.iter().zip(&had) {
@@ -5122,7 +5133,7 @@ fn install_cmd(args: &[String]) {
             }
             match (boot, fix) {
                 (true, _) => build(&root, p, &need, verbose, true, w).map(|_| ()),
-                (false, true) => need.iter().try_for_each(|t| recover(&root, p, t, verbose, w)),
+                (false, true) => recover(&root, p, &need, verbose, w),
                 (false, false) => build(&root, p, &need, verbose, false, w).map(|_| ()),
             }
         });
@@ -6743,20 +6754,24 @@ fn rebuild_cmd(args: &[String]) {
         let errs: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
         let _ = parallel(&names, w, |name| {
             let p = &recipes[*name];
-            for (i, boot) in level.iter().filter(|(i, _)| want[*i].0 == **name) {
-                let target = &want[*i].1;
-                // a bootstrap pass is a stand-in that exists to be replaced, so it is
-                // built straight rather than put through the recovery loop
-                let r = match boot {
-                    true => {
-                        build(&root, p, std::slice::from_ref(target), false, true, w).map(|_| ())
-                    }
-                    false => recover(&root, p, target, false, w),
-                };
-                if let Err(e) = r {
-                    errs.lock().unwrap_or_else(|e| e.into_inner()).push(((*name).clone(), e));
-                    break;
-                }
+            let mine: Vec<(String, bool)> = level
+                .iter()
+                .filter(|(i, _)| want[*i].0 == **name)
+                .map(|(i, boot)| (want[*i].1.clone(), *boot))
+                .collect();
+            // a bootstrap pass is a stand-in that exists to be replaced, so it is
+            // built straight rather than put through the recovery loop
+            let rest: Vec<String> = mine.iter().filter(|(_, b)| !b).map(|(t, _)| t.clone()).collect();
+            let r = mine
+                .iter()
+                .filter(|(_, b)| *b)
+                .try_for_each(|(t, _)| build(&root, p, std::slice::from_ref(t), false, true, w).map(|_| ()))
+                .and_then(|()| match rest.is_empty() {
+                    true => Ok(()),
+                    false => recover(&root, p, &rest, false, w),
+                });
+            if let Err(e) = r {
+                errs.lock().unwrap_or_else(|e| e.into_inner()).push(((*name).clone(), e));
             }
             Ok(())
         });

@@ -4381,6 +4381,56 @@ fn a_tracked_bump_moves_the_version_and_hashes_only_what_moved() {
     assert_eq!(fs::read_to_string(d.join("checksums")).unwrap(), format!("{want}\nkeepme\n"));
 }
 
+fn git(dir: &Path, args: &[&str], date: &str) {
+    let o = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@localhost", "-C"])
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+// a two week old clone made sync -n say one bump where there were 47, and nothing in it
+// said the feed was the reason. --net pulls it, and the dry run says how old it is
+#[test]
+fn sync_says_how_old_the_feed_is_and_net_pulls_it() {
+    let (root, repo, _) = tree("syncfeed");
+    let at = root.parent().unwrap();
+    let (up, work, feed) = (at.join("up.git"), at.join("work"), root.join("var/kiry/aports"));
+    let old = "2020-01-01T00:00:00Z";
+    git(at, &["init", "-q", "--bare", up.to_str().unwrap()], old);
+    git(at, &["clone", "-q", up.to_str().unwrap(), work.to_str().unwrap()], old);
+    let apk = |v: &str| {
+        fs::create_dir_all(work.join("main/moved")).unwrap();
+        fs::write(work.join("main/moved/APKBUILD"), format!("pkgver={v}\n")).unwrap();
+        git(&work, &["add", "."], old);
+        git(&work, &["commit", "-qm", v], old);
+        git(&work, &["push", "-q", "origin", "HEAD"], old);
+    };
+    apk("1.0");
+    fs::create_dir_all(feed.parent().unwrap()).unwrap();
+    git(at, &["clone", "-q", up.to_str().unwrap(), feed.to_str().unwrap()], old);
+    apk("1.1");
+    offer(&repo, "moved", "1.0");
+
+    let o = kiry(&["sync", "-n", "--root", root.to_str().unwrap()]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("aports last moved"), "{said}");
+    assert!(said.contains("0 would be re-converted"), "{said}");
+
+    let o = Command::new(KIRY)
+        .args(["sync", "--net", "--root", root.to_str().unwrap(), "nothing-asked"])
+        .env("KIRY_GENTOO", format!("{}/md5-cache/", root.display()))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(!said.contains("not pulled"), "{said}");
+    assert_eq!(fs::read_to_string(feed.join("main/moved/APKBUILD")).unwrap(), "pkgver=1.1\n");
+}
+
 // alpine carries wlroots0.19 and wlroots0.20 side by side, and its llvm is a meta
 // package pointing at whichever llvm is current rather than at ours. neither name is
 // derivable from the one this tree uses

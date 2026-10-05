@@ -7486,6 +7486,20 @@ fn sync_cmd(args: &[String]) {
     let list = repos(&root);
     let into = named_repo(&list, "testing");
 
+    // a clone two weeks old answers every question with "you are up to date". nothing
+    // else pulls it, and -n never reaches out, so the age is said where it is not fixed
+    let feed = root.join("var/kiry/aports");
+    if net && !dry && feed.join(".git").exists() {
+        let mut c = Command::new("git");
+        c.arg("-c").arg(format!("safe.directory={}", feed.display()));
+        c.arg("-C").arg(&feed).args(["pull", "-q", "--ff-only"]);
+        if let Err(e) = run(as_owner(&mut c, &feed), "git pull") {
+            say!("aports not pulled, {e}");
+        }
+    } else if let Some(days) = feed_age(&feed).filter(|d| *d >= 3) {
+        say!("aports last moved {days} days ago, sync --net pulls it");
+    }
+
     let all = survey(&root, &want, net);
     let rows: Vec<&Row> = all.iter().filter(|r| r.status == "behind").collect();
     let w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
@@ -7831,16 +7845,41 @@ fn materialise(aports: &Path, rel: &str) -> Result<(), String> {
     // default. the path is the one kiry was going to read either way
     let mut safe = std::ffi::OsString::from("safe.directory=");
     safe.push(aports);
-    run(
-        Command::new("git")
-            .arg("-c")
-            .arg(safe)
-            .arg("-C")
-            .arg(aports)
-            .args(["sparse-checkout", "add", rel])
-            .stdout(Stdio::null()),
-        "git sparse-checkout",
-    )
+    let mut c = Command::new("git");
+    c.arg("-c").arg(safe).arg("-C").arg(aports).args(["sparse-checkout", "add", rel]);
+    run(as_owner(&mut c, aports).stdout(Stdio::null()), "git sparse-checkout")
+}
+
+// git run as root writes root's files into somebody's clone, and their next pull then
+// cannot replace them. 67 checked-out files in navi's aports were root's that way
+fn as_owner<'a>(c: &'a mut Command, dir: &Path) -> &'a mut Command {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+    let Ok(m) = fs::metadata(dir) else { return c };
+    if rustix::process::geteuid().is_root() && m.uid() != 0 {
+        // git reads $HOME's config, and root's is one the owner cannot open
+        c.uid(m.uid()).gid(m.gid()).env("HOME", dir).env_remove("XDG_CONFIG_HOME");
+    }
+    c
+}
+
+// days since the clone's last commit, which is how far behind alpine it can be at most
+fn feed_age(feed: &Path) -> Option<u64> {
+    if !feed.join(".git").exists() {
+        return None;
+    }
+    let out = Command::new("git")
+        .arg("-c")
+        .arg(format!("safe.directory={}", feed.display()))
+        .arg("-C")
+        .arg(feed)
+        .args(["log", "-1", "--format=%ct"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let then: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    Some(now.saturating_sub(then) / 86400)
 }
 
 // a tracked recipe is a published binary or tarball, so its bump is the same files with

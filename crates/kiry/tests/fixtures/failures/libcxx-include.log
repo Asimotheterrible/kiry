@@ -1,0 +1,8 @@
+[412/1873] Building CXX object Source/Core/Common/CMakeFiles/common.dir/Logging/LogManager.cpp.o
+FAILED: Source/Core/Common/CMakeFiles/common.dir/Logging/LogManager.cpp.o
+In file included from /src/dolphin-2606a/Source/Core/Common/Logging/LogManager.cpp:12:
+/usr/include/fmt/format.h:747:28: error: use of undeclared identifier 'malloc'
+  747 |     T* p = static_cast<T*>(malloc(n * sizeof(T)));
+      |                            ^~~~~~
+1 error generated.
+ninja: build stopped: subcommand failed.

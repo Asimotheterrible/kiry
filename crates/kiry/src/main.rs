@@ -4615,7 +4615,8 @@ LLVM ERROR: out of memory.*lto               set LTO thin
 unknown argument: '(-[fm][\\w=-]+)'          drop $1
 recompile with -fPIC                         append -fPIC
 undefined symbol: __\\w+_chk                  append -U_FORTIFY_SOURCE
-error: instruction requires:                 set CFLAGS_MARCH x86-64
+use of undeclared identifier '(malloc|calloc|realloc|free|abort|exit|getenv)'  append -include stdlib.h
+error: instruction requires:                set CFLAGS_MARCH x86-64
 undefined reference to `__isoc99_            notaflag musl-portability
 PLEASE submit a bug report                   set OPT -O2
 ";

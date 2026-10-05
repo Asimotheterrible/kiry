@@ -7678,8 +7678,15 @@ fn sync_cmd(args: &[String]) {
                         if !b.carried.is_empty() {
                             notes.push(format!("carried {}", b.carried.join(" ")));
                         }
+                        let gone = match b.kept.is_empty() {
+                            true => Vec::new(),
+                            false => vet(&root, &fresh, &b.kept, &mut notes),
+                        };
                         for k in &b.kept {
-                            notes.push(format!("kept {k} in sources, alpine no longer lists it"));
+                            match gone.contains(k) {
+                                true => notes.push(format!("dropped {k}, the new tarball already has it")),
+                                false => notes.push(format!("kept {k} in sources, alpine no longer lists it")),
+                            }
                         }
                         for f in &b.differ {
                             match f.as_str() {
@@ -8269,6 +8276,81 @@ fn keep_local(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Vec<Strin
     fs::write(fresh.join("checksums"), column(|r| &r.1)).map_err(|e| format!("checksums: {e}"))?;
     resource(&fresh.join("build"), &now)?;
     Ok(kept)
+}
+
+// keep_local cannot tell a patch of ours from one of alpine's that alpine just retired,
+// and glib 2.90 then stopped in prepare on projectsdir.patch, a backport 2.90 ships. a
+// kept patch that applies backwards to the new tarball is upstream now and goes. one
+// that applies neither way stays: a lost patch of ours builds quietly wrong, a stale one
+// fails in prepare where somebody reads it
+fn vet(root: &Path, fresh: &Path, kept: &[String], notes: &mut Vec<String>) -> Vec<String> {
+    let patches: Vec<&String> = kept.iter().filter(|k| k.ends_with(".patch") || k.ends_with(".diff")).collect();
+    let rows: Vec<(String, String)> =
+        plain(&fresh.join("sources")).into_iter().zip(plain(&fresh.join("checksums"))).collect();
+    if patches.is_empty() || rows.is_empty() {
+        return Vec::new();
+    }
+    let tmp = root.join("var/kiry/stage").join(format!(".vet-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let unpacked_ok = (|| -> Result<(), String> {
+        mkdirs(&tmp)?;
+        let cache = root.join("var/kiry/cache/sources");
+        mkdirs(&cache)?;
+        for (s, _) in &rows {
+            let (name, from) = filename(s)?;
+            if !from.contains("://") || !tarball(name) {
+                continue;
+            }
+            let dst = cache.join(name);
+            if !dst.exists() {
+                fetch(from, &dst, true)?;
+            }
+            untar(&dst, &tmp, name)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = unpacked_ok {
+        notes.push(format!("kept patches not checked against the new tarball, {e}"));
+        let _ = fs::remove_dir_all(&tmp);
+        return Vec::new();
+    }
+    let tree = unpacked(&tmp);
+    let build = fs::read_to_string(fresh.join("build")).unwrap_or_default();
+    let args = build
+        .lines()
+        .find_map(|l| l.strip_prefix("patch_args="))
+        .map_or("-p1".to_string(), |a| a.trim_matches('"').to_string());
+    let applies = |p: &str, back: bool| {
+        let mut c = Command::new("patch");
+        c.args(["--dry-run", "-s", "-f", "-N"]).args(args.split_whitespace());
+        if back {
+            c.arg("-R");
+        }
+        c.arg("-d").arg(&tree).arg("-i").arg(fresh.join(p));
+        c.stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    };
+    let gone: Vec<String> =
+        patches.into_iter().filter(|p| !applies(p, false) && applies(p, true)).cloned().collect();
+    let _ = fs::remove_dir_all(&tmp);
+    if gone.is_empty() {
+        return gone;
+    }
+    let now: Vec<(String, String)> = rows.into_iter().filter(|(s, _)| !gone.contains(s)).collect();
+    let column = |pick: fn(&(String, String)) -> &String| -> String {
+        now.iter().map(|r| pick(r).clone() + "\n").collect()
+    };
+    let wrote = fs::write(fresh.join("sources"), column(|r| &r.0))
+        .and_then(|()| fs::write(fresh.join("checksums"), column(|r| &r.1)))
+        .map_err(|e| e.to_string())
+        .and_then(|()| resource(&fresh.join("build"), &now));
+    if let Err(e) = wrote {
+        notes.push(format!("dropping retired patches failed, {e}"));
+        return Vec::new();
+    }
+    for g in &gone {
+        let _ = fs::remove_file(fresh.join(g));
+    }
+    gone
 }
 
 // the source assignment inside a converted build, rewritten to name what sources now

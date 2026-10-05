@@ -5030,6 +5030,28 @@ fn a_dep_wanted_on_a_target_it_lacks_names_who_wants_it() {
     assert!(said.contains("the line ending in musl"), "{said}");
 }
 
+// rsync's failed run left a filter holding only "stuck ... the ladder ran out", and once
+// --disable-idn fixed it stats still counted it stuck. building is what disproves it
+#[test]
+fn a_build_that_succeeds_takes_its_stuck_note_back_out() {
+    let Some((at, root, repo)) = workshop("unstuck") else {
+        return;
+    };
+    buildable(&at, &repo, "alone", "");
+    buildable(&at, &repo, "mixed", "");
+    let stuck = "# 2026-09-24 stuck on x86_64-musl: the ladder ran out\n\n";
+    fs::write(repo.join("alone/filter"), stuck).unwrap();
+    let real = "# 2026-09-24 rung 1 after compile failed on x86_64-musl\nfilter-lto\n";
+    fs::write(repo.join("mixed/filter"), format!("{real}{stuck}")).unwrap();
+
+    for n in ["alone", "mixed"] {
+        let o = kiry(&["b", "--root", root.to_str().unwrap(), n]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    assert!(!repo.join("alone/filter").exists());
+    assert_eq!(fs::read_to_string(repo.join("mixed/filter")).unwrap(), real);
+}
+
 // asking whether something needs a reboot should not be the same act as rebooting for it
 #[test]
 fn install_dash_n_says_the_plan_and_writes_nothing() {

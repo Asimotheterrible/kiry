@@ -825,6 +825,7 @@ fn build(
     for (_, work, _) in &built {
         let _ = fs::remove_dir_all(work);
     }
+    unstuck(&p.dir.join("filter"), targets);
     Ok(ready.into_iter().map(|(_, (art, _), _)| art).collect())
 }
 
@@ -1330,6 +1331,38 @@ fn note(at: &Path, line: &str, why: &str) -> Result<(), String> {
 fn stuck(p: &Package, t: &str, why: &str) -> String {
     let _ = note(&p.dir.join("filter"), "", &format!("stuck on {t}: {why}"));
     format!("{} {t}: stuck, {why}", p.name)
+}
+
+// a stuck note is true until the target builds, and then it is a stuck package in stats
+// with nothing wrong. rsync's filter held nothing else after --disable-idn fixed it. a
+// note for a target this build did not reach stays, and so does every real filter line
+fn unstuck(at: &Path, targets: &[String]) {
+    let Ok(text) = fs::read_to_string(at) else { return };
+    let mine = |l: &str| {
+        l.strip_prefix("# ")
+            .and_then(|r| r.split_once(' '))
+            .and_then(|(_, w)| w.strip_prefix("stuck on "))
+            .is_some_and(|w| targets.iter().any(|t| w.starts_with(&format!("{t}:"))))
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if mine(lines[i]) {
+            // note() writes the line it was given under its comment, and a stuck note's is ""
+            i += if lines.get(i + 1) == Some(&"") { 2 } else { 1 };
+            continue;
+        }
+        kept.push(lines[i]);
+        i += 1;
+    }
+    if kept.len() == lines.len() {
+        return;
+    }
+    let _ = match kept.iter().all(|l| l.trim().is_empty()) {
+        true => fs::remove_file(at),
+        false => fs::write(at, kept.join("\n") + "\n"),
+    };
 }
 
 // a flag can only be the reason if a toolchain got far enough to have an opinion. a zip

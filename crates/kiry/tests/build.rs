@@ -362,6 +362,52 @@ fn one_target_failing_cancels_the_other() {
     assert!(artifacts(&root).is_empty(), "{:?}", artifacts(&root));
 }
 
+// --recover used to go a target at a time, so musl packed before gnu went stuck
+#[test]
+fn a_recovery_that_ends_stuck_packs_no_target() {
+    let at = scratch("atomic-recover");
+    let script = format!("{GOOD}[ \"$KIRY_TARGET\" = x86_64-musl ] || exit 1\n");
+    let d = recipe(&at, "x86_64-musl x86_64-gnu", &script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(!o.status.success());
+    assert!(artifacts(&root).is_empty(), "{:?}", artifacts(&root));
+}
+
+// the fix gnu needed goes in the package's filter, and musl packed ahead of it was a
+// build of a recipe that no longer exists
+#[test]
+fn a_fix_one_target_needed_is_what_both_build_with() {
+    let at = scratch("atomic-fix");
+    let d = recipe(
+        &at,
+        "x86_64-musl x86_64-gnu",
+        "case \"$KIRY_TARGET $CFLAGS\" in\n\
+         *gnu*-flto*) echo 'ld.lld: error: Not a valid object file' >&2; exit 1 ;;\n\
+         esac\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n",
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    config(&root, None, "OPT -O2\nLTO thin\n");
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(fs::read_to_string(d.join("filter")).unwrap().contains("filter-lto"));
+    let cache = root.join("var/kiry/cache");
+    let musl = fs::read_to_string(cache.join("hello-1.0-1.x86_64-musl.tar.zst.meta/hash")).unwrap();
+    let gnu = fs::read_to_string(cache.join("hello-1.0-1.x86_64-gnu.tar.zst.meta/hash")).unwrap();
+    assert_eq!(musl, gnu);
+}
+
 #[test]
 fn targets_agree_on_the_hash() {
     let at = scratch("hash");

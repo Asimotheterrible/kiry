@@ -5011,6 +5011,25 @@ fn a_root_without_its_toolchain_takes_the_cached_one_first() {
     assert!(db::read(&root, "x86_64-musl", "top").is_ok(), "top never went in");
 }
 
+// pcre2's gnu half named bsd-compat-headers, which builds for musl alone, and the plan
+// said only that bsd-compat-headers does not build for gnu. who asked and what fixes it
+// are the two things the line has to carry
+#[test]
+fn a_dep_wanted_on_a_target_it_lacks_names_who_wants_it() {
+    let Some((at, root, repo)) = workshop("wrongtarget") else {
+        return;
+    };
+    buildable(&at, &repo, "top", "base\n");
+    buildable(&at, &repo, "base", "");
+    fs::write(repo.join("top/targets"), "x86_64-musl x86_64-gnu\n").unwrap();
+
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), "top"]);
+    assert!(!o.status.success());
+    let said = String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("top wants base for x86_64-gnu"), "{said}");
+    assert!(said.contains("the line ending in musl"), "{said}");
+}
+
 // asking whether something needs a reboot should not be the same act as rebooting for it
 #[test]
 fn install_dash_n_says_the_plan_and_writes_nothing() {
@@ -5728,6 +5747,43 @@ fn a_bump_through_a_pin_lands_under_the_recipes_own_name() {
     assert_eq!(fs::read_to_string(landed.join("version")).unwrap(), "1.1 0\n", "{said}");
     assert!(landed.join("bootstrap").exists(), "{said}");
     assert!(fs::read_to_string(landed.join("build")).unwrap().contains("pkgname=\"tool\""), "{said}");
+}
+
+// rsync's one new libidn2 was printed among every dep this tree cut on purpose, which is
+// a list nobody reads. against the last conversion only what alpine just added shows,
+// and a line resolved under the target gets the target word when its dep lacks one
+#[test]
+fn alpine_now_wants_only_what_it_added_and_says_the_target() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, _) = tree("syncwants");
+    converted_offer(&repo, "pc", "1.0", "\tmake\n");
+    fs::write(repo.join("pc/targets"), "x86_64-musl x86_64-gnu\n").unwrap();
+    fs::write(repo.join("pc/depends"), "zlib make\n").unwrap();
+    for n in ["zlib", "pulse", "idn2"] {
+        offer(&repo, n, "1.0");
+    }
+    offer(&repo, "hdr", "1.0");
+    let apk = |v: &str, make: &str, deps: &str| {
+        aport(
+            &root,
+            "main",
+            "pc",
+            &format!(
+                "pkgname=pc\npkgver={v}\npkgrel=0\ndepends=\"{deps}\"\nmakedepends=\"{make}\"\n\
+                 build() {{\n\tmake\n}}\npackage() {{\n\t:\n}}\n"
+            ),
+        )
+    };
+    apk("1.0", "zlib-dev pulse-dev", "");
+    assert!(sync_at(&root).contains("1 measured"));
+
+    apk("1.1", "zlib-dev pulse-dev idn2-dev", "hdr");
+    let said = sync_at(&root);
+    assert!(said.contains("alpine now wants idn2 make"), "{said}");
+    assert!(said.contains("alpine now wants hdr musl"), "{said}");
+    assert!(!said.contains("wants pulse"), "{said}");
 }
 
 // rust's build has no pkgver= and says cd /src/rustc-1.98.1-src, so a bump kept it as it

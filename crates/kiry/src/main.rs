@@ -8014,6 +8014,24 @@ fn moved_upstream(was: &str, is: &str) -> Vec<String> {
     out
 }
 
+// the last conversion with today's word rules run over it, which is what convert would
+// have written then. 27 bumps were held on "alpine changed build()" and most of the lines
+// were ours: introspection off, -flto=auto out, tests off, arriving after the baseline.
+// only function bodies, the same part convert rewrites; a variable it copies as written
+fn reconverted(was: &str) -> String {
+    let assigns = |l: &str| {
+        l.split_once('=')
+            .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    };
+    was.lines()
+        .map(|l| match assigns(l) {
+            true => l.to_string(),
+            false => convert::untested(l),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // prepare runs against whatever sources fetched, so the two move together and carry
 // splits them: sources comes from the conversion and build stays this tree's. alpine
 // swapping a release tarball for a git archive puts the bootstrap step in their prepare
@@ -8389,7 +8407,7 @@ fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> 
                             }
                         }
                         Some(was) => {
-                            upstream = moved_upstream(&was, &made);
+                            upstream = moved_upstream(&reconverted(&was), &made);
                             settled = upstream.is_empty();
                         }
                     }

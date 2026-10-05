@@ -587,7 +587,7 @@ fn body(text: &str, name: &str) -> Option<String> {
 // mbedtls2, glm and cxxopts all stopped on clang's -Werror inside their tests. a word at a
 // time, so the whitespace and the line continuations stay as they were. the same walk
 // takes alpine's lto words out
-fn untested(body: &str) -> String {
+pub fn untested(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut word = String::new();
     for c in body.chars() {

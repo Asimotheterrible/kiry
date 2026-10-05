@@ -9590,6 +9590,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
     let mut linked: HashSet<usize> = HashSet::new();
     let mut needs: Vec<Vec<usize>> = vec![Vec::new(); elves.len()];
     let mut open: Vec<(usize, String)> = Vec::new();
+    let mut asked_as: Vec<(usize, &str, usize)> = Vec::new();
     for (i, (path, o)) in elves.iter().enumerate() {
         let where_ = search(o, path, dirs);
         for want in &o.needed {
@@ -9597,6 +9598,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
                 Some(j) => {
                     linked.insert(j);
                     needs[i].push(j);
+                    asked_as.push((i, want, j));
                     // musl ignores symbol versions, so a gnu binary that reaches into
                     // the musl tree binds to whatever has the right name and nothing
                     // errors. loader paths keep them apart until an rpath crosses over
@@ -9619,11 +9621,30 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
     // because the jvm is already in the process when System.loadLibrary opens them. an
     // executable gets no such pass -- nothing is loaded ahead of it -- and neither does a
     // library some other package links, which is what the search path is for
+    //
+    // a plugin nothing links at all is only ever dlopened, into a program that has what it
+    // names mapped already, and both loaders reuse a loaded library by the name it was
+    // asked for. irssi's perl modules name libperl.so, which sits in perl's CORE/ where
+    // the loader never looks, and perl has it in the process before DynaLoader opens them.
+    // so a name some program's closure loads under counts for those, whoever owns it
+    let mut hosted = vec![false; elves.len()];
+    let mut walk: Vec<usize> = (0..elves.len()).filter(|&i| elves[i].1.interp).collect();
+    while let Some(i) = walk.pop() {
+        if !std::mem::replace(&mut hosted[i], true) {
+            walk.extend(needs[i].iter().copied());
+        }
+    }
+    let loaded: HashMap<&str, usize> =
+        asked_as.into_iter().filter(|(i, _, _)| hosted[*i]).map(|(_, w, j)| (w, j)).collect();
     for (i, want) in open {
         let theirs = |k: usize| owners[k] == owners[i];
         let inside = !elves[i].1.interp && (0..elves.len()).all(|k| !needs[k].contains(&i) || theirs(k));
-        let j = (0..elves.len()).find(|&j| theirs(j) && elves[j].1.soname.as_deref() == Some(want.as_str()));
-        match j.filter(|_| inside) {
+        let plugin = !elves[i].1.interp && (0..elves.len()).all(|k| !needs[k].contains(&i));
+        let j = (0..elves.len())
+            .find(|&j| theirs(j) && elves[j].1.soname.as_deref() == Some(want.as_str()))
+            .filter(|_| inside)
+            .or_else(|| loaded.get(want.as_str()).copied().filter(|_| plugin));
+        match j {
             Some(j) => {
                 linked.insert(j);
                 needs[i].push(j);

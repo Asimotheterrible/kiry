@@ -1412,6 +1412,83 @@ fn another_package_or_an_executable_gets_no_such_pass() {
     assert!(out.contains(&format!("usr/lib/jvm/j/bin/exe {TARGET} unresolved libjvm.so")), "{out}");
 }
 
+// a shared object with no runpath naming a nameless library bare, which is what an xs
+// module is: perl dlopens it and it asks for libperl.so
+fn plugin(at: &Path, name: &str, extra: &[&str], against: &Path) -> PathBuf {
+    let src = at.join(format!("{name}.c"));
+    fs::write(&src, "void p(void);\nvoid q(void){p();}\n").unwrap();
+    let out = at.join(name);
+    let mut c = cc();
+    c.args(["-shared", "-fPIC", "-nostdlib"]).args(extra);
+    let ok = c
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .arg(format!("-L{}", against.parent().unwrap().display()))
+        .arg(format!("-l:{}", against.file_name().unwrap().to_str().unwrap()))
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    out
+}
+
+// irssi's perl modules name libperl.so, which only perl's runpath finds. perl has it
+// mapped before DynaLoader opens them and the loader reuses it by that name
+#[test]
+fn a_plugin_nothing_links_may_lean_on_what_a_program_loads() {
+    if skip("hosted plugin") {
+        return;
+    }
+    let at = scratch("hosted");
+    let root = at.join("root");
+    let libperl = nameless(&at.join("core"), "libperl.so");
+    let perl = against_name(&at, "perl", &libperl, "libperl.so", Some("/usr/lib64/perl5/CORE"));
+    let xs = plugin(&at, "Irssi.so", &[], &libperl);
+    install(&root, "perl", &[("usr/lib64/perl5/CORE/libperl.so", &libperl), ("usr/bin/perl", &perl)]);
+    install(&root, "irssi", &[("usr/lib64/perl5/vendor_perl/auto/Irssi/Irssi.so", &xs)]);
+
+    let (_, out) = doctor(&root);
+    assert!(!out.contains("unresolved"), "{out}");
+}
+
+// no program loading it, or a program of the plugin's own package linking it, and the
+// name has to be found the ordinary way
+#[test]
+fn a_plugin_gets_no_pass_for_what_no_program_loads() {
+    if skip("hosted plugin") {
+        return;
+    }
+    let at = scratch("unhosted");
+    let root = at.join("root");
+    let libperl = nameless(&at.join("core"), "libperl.so");
+    let xs = plugin(&at, "Irssi.so", &[], &libperl);
+    let helper = plugin(&at, "libhelper.so", &["-Wl,-soname,libhelper.so"], &libperl);
+    // resolves libperl.so itself, but is dlopened too, so it loads nothing ahead of anyone
+    let core = plugin(&at, "libperl_core.so", &["-Wl,-rpath,/usr/lib64/perl5/CORE"], &libperl);
+    let perl = against_name(&at, "perl", &libperl, "libperl.so", Some("/usr/lib64/perl5/CORE"));
+    let irssi = binsrc(&at, "irssi", "void q(void);\nvoid _start(void){q();}\n", &helper, Some("/usr/lib64/irssi"));
+    install(&root, "perl", &[("usr/lib64/perl5/CORE/libperl.so", &libperl)]);
+    install(
+        &root,
+        "irssi",
+        &[
+            ("usr/lib64/perl5/vendor_perl/auto/Irssi/Irssi.so", &xs),
+            ("usr/lib64/irssi/libhelper.so", &helper),
+            ("usr/lib64/irssi/modules/libperl_core.so", &core),
+            ("usr/bin/irssi", &irssi),
+        ],
+    );
+    let (_, out) = doctor(&root);
+    assert!(out.contains(&format!("auto/Irssi/Irssi.so {TARGET} unresolved libperl.so")), "{out}");
+    assert!(out.contains(&format!("usr/lib64/irssi/libhelper.so {TARGET} unresolved libperl.so")), "{out}");
+
+    // perl arriving hosts the plugin, and still not a library an executable links
+    install(&root, "perl", &[("usr/lib64/perl5/CORE/libperl.so", &libperl), ("usr/bin/perl", &perl)]);
+    let (_, out) = doctor(&root);
+    assert!(!out.contains(&format!("Irssi.so {TARGET} unresolved")), "{out}");
+    assert!(out.contains(&format!("usr/lib64/irssi/libhelper.so {TARGET} unresolved libperl.so")), "{out}");
+}
+
 fn remove(root: &Path, args: &[&str]) -> Output {
     Command::new(KIRY)
         .arg("r")

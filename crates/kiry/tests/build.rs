@@ -4039,6 +4039,30 @@ fn ahead_says_when_a_local_recipe_turned_up_in_aports() {
     assert!(said.contains("now in aports"), "{said}");
 }
 
+// local/openjdk8 repacks alpine's binary apks, and the drop check's aport became its bump:
+// alpine's icedtea source recipe converted over it, failing in five seconds. saying the
+// name turned up is the check's whole job, and a pin is how a local recipe asks for more
+#[test]
+fn a_local_recipe_without_a_pin_is_reported_not_bumped() {
+    let at = scratch("syncdrop");
+    let root = at.join("root");
+    let (repo, testing) = (at.join("local"), at.join("testing"));
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::create_dir_all(&testing).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n{}\n", repo.display(), testing.display())).unwrap();
+    offer(&repo, "mine", "1.0");
+    aport(&root, "community", "mine", "pkgver=1.1\n");
+
+    let r = root.to_str().unwrap();
+    let said = String::from_utf8_lossy(&kiry(&["sync", "-n", "--root", r]).stdout).into_owned();
+    assert!(said.contains("0 would be re-converted"), "{said}");
+    assert!(ahead_of(&root).contains("now in aports/community/mine 1.1"));
+
+    fs::write(repo.join("mine/pin"), "alpine/community\n").unwrap();
+    let said = String::from_utf8_lossy(&kiry(&["sync", "-n", "--root", r]).stdout).into_owned();
+    assert!(said.contains("1 would be re-converted"), "{said}");
+}
+
 // a tracker is a fetch, so a report that did not ask for the network has to say it did
 // not look rather than report the package as having no upstream at all
 #[test]

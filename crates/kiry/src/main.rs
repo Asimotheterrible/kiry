@@ -7375,6 +7375,11 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
             let tracked = d.join("tracker").is_file();
 
             let mut why = "no source";
+            // and saying so is all it is. local/openjdk8 repacks alpine's binary apks, and
+            // the bump converted their icedtea source recipe over it. a pin is how a local
+            // recipe asks to follow the aport
+            let seen = aport.as_ref().map(|u| format!("now in {} {}", u.from, u.version));
+            let aport = aport.filter(|_| !(dropped && pin.is_none()));
             let up = match aport {
                 Some(u) => Some(u),
                 // a pin is a statement about where to look, so falling back to looking
@@ -7414,8 +7419,11 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
                 None if none && !tracked => ("untracked", String::new()),
                 None => ("unknown", why.to_string()),
             };
-            if dropped {
-                note = format!("{note} now in aports");
+            if let Some(seen) = seen.filter(|_| dropped) {
+                note = match up.is_some() {
+                    true => format!("{note} now in aports"),
+                    false => seen,
+                };
             }
             rows.push(Row {
                 name: p.name.clone(),

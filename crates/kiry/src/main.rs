@@ -5307,7 +5307,15 @@ fn wanted(
         }
         let p = &recipes[&name];
         if !p.targets.contains(&t) {
-            die(format!("{name} is wanted for {t} and does not build for it"));
+            let ends: Vec<&str> = p.targets.iter().filter_map(|x| x.rsplit('-').next()).collect();
+            match by.get(&name) {
+                Some(who) => die(format!(
+                    "{who} wants {name} for {t}, which {name} does not build for\n\
+                     the line ending in {} keeps it to the targets {name} has",
+                    ends.join(" or ")
+                )),
+                None => die(format!("{name} is wanted for {t} and does not build for it")),
+            }
         }
         // a built artifact is installed, which asks for its runtime deps alone. walking
         // its build deps too closed llvm, cmake and python3 into a cycle on an empty
@@ -7649,6 +7657,7 @@ fn sync_cmd(args: &[String]) {
         let mut outcome = format!("held      {}", fresh.display());
         if let Err(e) = mkdirs(&conv)
             .and_then(|()| fs::write(conv.join("pending"), &generated).map_err(|e| e.to_string()))
+            .and_then(|()| fs::copy(fresh.join("depends"), conv.join("pending.depends")).map_err(|e| e.to_string()))
         {
             notes.push(format!("nothing recorded to measure the next bump against {e}"));
         }
@@ -7691,7 +7700,7 @@ fn sync_cmd(args: &[String]) {
                             notes.push("alpine's prepare does what ours does not".into());
                             notes.extend(b.missing.iter().map(|l| format!("  {l}")));
                         }
-                        notes.extend(b.moved);
+                        notes.extend(b.moved.into_iter().map(|d| wants(&root, &old, d)));
                         if !b.upstream.is_empty() {
                             notes.push("alpine changed build()".into());
                             notes.extend(b.upstream.iter().map(|l| format!("  {l}")));
@@ -8153,7 +8162,8 @@ fn seed(root: &Path, rows: &[Row], alias: &HashMap<String, String>, list: &[Path
     let mut done = 0;
     for r in rows {
         let conv = converted(root, &r.name);
-        if r.status != "ok" || pending.contains(r.name.as_str()) || conv.join("build").is_file() {
+        let had = conv.join("build").is_file();
+        if r.status != "ok" || pending.contains(r.name.as_str()) || (had && conv.join("depends").is_file()) {
             continue;
         }
         let Some(rel) = r.up.as_ref().and_then(|u| u.from.strip_prefix("aports/")) else {
@@ -8169,9 +8179,11 @@ fn seed(root: &Path, rows: &[Row], alias: &HashMap<String, String>, list: &[Path
         let Ok(rep) = convert::recipe(&at, &scratch, false, alias, list) else {
             continue;
         };
-        if mkdirs(&conv).is_ok()
-            && fs::copy(scratch.join(&rep.name).join("build"), conv.join("build")).is_ok()
-        {
+        let made = scratch.join(&rep.name);
+        // a baseline already here is the conversion somebody accepted, which a fresh one
+        // at the same version could quietly move. only what it lacks is filled in
+        let _ = mkdirs(&conv).map(|()| fs::copy(made.join("depends"), conv.join("depends")));
+        if !had && fs::copy(made.join("build"), conv.join("build")).is_ok() {
             done += 1;
         }
     }
@@ -8269,7 +8281,8 @@ struct Bump {
     carried: Vec<String>,
     kept: Vec<String>,
     differ: Vec<String>,
-    moved: Vec<String>,
+    // the lines alpine added since the last conversion, as convert wrote them
+    moved: Vec<Dep>,
     upstream: Vec<String>,
     missing: Vec<String>,
     settled: bool,
@@ -8326,11 +8339,21 @@ fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> 
             // elf and never writes it in an apkbuild, so nearly everything this recipe
             // carries is missing from alpine's list and always was -- reading that as
             // alpine having dropped it is eighty lines of saying nothing
+            //
+            // and against the last conversion where there is one: ours minus a cut is
+            // every deliberate cut again, and rsync's one new libidn2 sat among
+            // pipewire's twenty-five dropped backends where nobody read it
             let (ours, theirs) = (dep_names(&from)?, dep_names(&to)?);
+            let last = base.map(|b| b.with_file_name("depends")).filter(|d| d.is_file());
+            let had = match &last {
+                Some(d) => dep_names(d)?,
+                None => ours.clone(),
+            };
+            let lines = pkg::depends_from(pkg::lines(&to).map_err(|e| e.to_string())?);
             moved.extend(
-                theirs
-                    .difference(&ours)
-                    .map(|d| format!("alpine now wants {d}")),
+                lines
+                    .into_iter()
+                    .filter(|d| theirs.contains(&d.name) && !had.contains(&d.name) && !ours.contains(&d.name)),
             );
             fs::copy(&from, &to).map_err(|e| format!("{n}: {e}"))?;
             carried.push(n);
@@ -8389,6 +8412,22 @@ fn carry(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Bump, String> 
         carried.push(d);
     }
     Ok(Bump { carried, kept, differ, moved, upstream, missing, settled })
+}
+
+// a line alpine added, written the way it would have to go in. a dep resolved under the
+// target needs that target built, and pcre2's gnu half then refused to plan over
+// bsd-compat-headers, which is musl's sys/cdefs.h and has no gnu build to give
+fn wants(root: &Path, old: &Path, mut d: Dep) -> String {
+    let ours: Vec<String> = plain(&old.join("targets")).join(" ").split_whitespace().map(String::from).collect();
+    let theirs: Vec<String> = match recipe(root, &d.name) {
+        Some(at) if !d.host => plain(&at.join("targets")).join(" ").split_whitespace().map(String::from).collect(),
+        _ => ours.clone(),
+    };
+    let both: Vec<&String> = ours.iter().filter(|t| theirs.contains(t)).collect();
+    if let ([one], false) = (both.as_slice(), both.len() == ours.len()) {
+        d.only = one.rsplit('-').next().map(String::from);
+    }
+    format!("alpine now wants {d}")
 }
 
 fn tree_copy(from: &Path, to: &Path) -> Result<(), String> {
@@ -8470,6 +8509,7 @@ fn promote_one(root: &Path, list: &[PathBuf], n: &str) -> Result<PathBuf, String
     // against, so a decision taken here is not asked about a second time
     let conv = converted(root, n);
     let _ = fs::rename(conv.join("pending"), conv.join("build"));
+    let _ = fs::rename(conv.join("pending.depends"), conv.join("depends"));
     Ok(to)
 }
 

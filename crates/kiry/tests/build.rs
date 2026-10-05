@@ -5581,6 +5581,30 @@ fn a_bump_alpine_moved_is_held_and_names_the_line() {
     assert!(waiting.contains("pkgver=\"1.1\""), "{waiting}");
 }
 
+// a baseline converted before convert learned to switch introspection off and take
+// alpine's lto words out reads, against today's conversion, as alpine having changed
+// both lines. 27 bumps were held on that and most of it was ours
+#[test]
+fn a_rule_convert_learned_since_the_baseline_is_not_alpine_moving() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, _) = tree("syncrules");
+    converted_offer(&repo, "rules", "1.0", "\tmake\n");
+    let body = "\tmeson setup -Dintrospection=true -Db_lto=true build\n";
+    upstream_at(&root, "rules", "1.0", body);
+    sync_at(&root);
+    let base = root.join("var/kiry/converted/rules/build");
+    let then = fs::read_to_string(&base).unwrap();
+    assert!(then.contains("-Dintrospection=false  build"), "{then}");
+    fs::write(&base, then.replace("-Dintrospection=false  build", "-Dintrospection=true -Db_lto=true build")).unwrap();
+
+    upstream_at(&root, "rules", "1.1", body);
+    let said = sync_at(&root);
+    assert!(!said.contains("alpine changed build()"), "{said}");
+    assert!(said.contains("promoted"), "{said}");
+}
+
 // a decision costs one reading, not one per bump forever. promoting is what says the
 // conversion was looked at, so the next bump is measured from there
 #[test]

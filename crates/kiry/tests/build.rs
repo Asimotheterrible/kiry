@@ -5605,6 +5605,67 @@ fn a_rule_convert_learned_since_the_baseline_is_not_alpine_moving() {
     assert!(said.contains("promoted"), "{said}");
 }
 
+// glib 2.90 ships the XDG_PROJECTS_DIR backport alpine carried as projectsdir.patch, so
+// alpine dropped it and keep_local kept it, and prepare stopped on a reversed patch. one
+// that applies backwards to the new tarball goes; one of ours that still applies stays
+#[test]
+fn a_kept_patch_the_new_tarball_already_has_is_dropped() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncretired");
+    let at = root.parent().unwrap();
+    let dist = at.join("dist");
+    fs::create_dir_all(dist.join("pat-1.1")).unwrap();
+    fs::write(dist.join("pat-1.1/a.txt"), "new\n").unwrap();
+    let tgz = dist.join("pat-1.1.tar.gz");
+    assert!(Command::new("tar")
+        .arg("czf")
+        .arg(&tgz)
+        .arg("-C")
+        .arg(&dist)
+        .arg("pat-1.1")
+        .status()
+        .unwrap()
+        .success());
+    let sum = kiry_core::sha512(fs::File::open(&tgz).unwrap()).unwrap();
+    aport(
+        &root,
+        "main",
+        "pat",
+        &format!(
+            "pkgname=pat\npkgver=1.1\npkgrel=0\nsource=\"https://example.invalid/pat-$pkgver.tar.gz\"\n\\
+             build() {{\n\tmake\n}}\npackage() {{\n\t:\n}}\nsha512sums=\"{sum}  pat-1.1.tar.gz\"\n"
+        ),
+    );
+
+    converted_offer(&repo, "pat", "1.0", "\tmake\n");
+    let d = repo.join("pat");
+    fs::write(d.join("retired.patch"), "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
+    fs::write(d.join("ours.patch"), "--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1 @@\n+ours\n").unwrap();
+    fs::write(d.join("sources"), "https://example.invalid/pat-1.0.tar.gz\nretired.patch\nours.patch\n").unwrap();
+    fs::write(d.join("checksums"), format!("{}\n{}\n{}\n", "1".repeat(64), "2".repeat(64), "3".repeat(64))).unwrap();
+
+    let fetch = root.join("fetch.sh");
+    fs::write(&fetch, format!("#!/bin/sh\ncp {}/\"${{1##*/}}\" \"$2\"\n", dist.display())).unwrap();
+    Command::new("chmod").arg("+x").arg(&fetch).status().unwrap();
+    let o = Command::new(KIRY)
+        .args(["sync", "--root", root.to_str().unwrap()])
+        .env("KIRY_FETCH", format!("{} %u %o", fetch.display()))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("dropped retired.patch, the new tarball already has it"), "{said}");
+    assert!(said.contains("kept ours.patch"), "{said}");
+    let landed = if testing.join("pat").exists() { testing.join("pat") } else { d };
+    let src = fs::read_to_string(landed.join("sources")).unwrap();
+    assert!(!src.contains("retired.patch") && src.contains("ours.patch"), "{src}");
+    let sums = fs::read_to_string(landed.join("checksums")).unwrap();
+    assert_eq!(src.lines().count(), sums.lines().count(), "{src}{sums}");
+    assert!(sums.contains("3333") && !sums.contains("2222"), "{sums}");
+}
+
 // a decision costs one reading, not one per bump forever. promoting is what says the
 // conversion was looked at, so the next bump is measured from there
 #[test]

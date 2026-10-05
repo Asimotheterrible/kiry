@@ -5685,6 +5685,55 @@ fn a_hand_written_build_is_not_replaced_by_the_conversion() {
     assert!(!build.contains("pkgver="), "{build}");
 }
 
+// core/llvm is pinned to alpine's llvm23, and the bump landed as testing/llvm23: a new
+// package beside core/llvm that carried nothing, bootstrap and pgo build both missing
+#[test]
+fn a_bump_through_a_pin_lands_under_the_recipes_own_name() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("syncpinned");
+    converted_offer(&repo, "tool", "1.0", "\tmake\n");
+    fs::write(repo.join("tool/pin"), "alpine/main/tool9\n").unwrap();
+    fs::write(repo.join("tool/bootstrap"), "").unwrap();
+    upstream_at(&root, "tool9", "1.1", "\tmake\n");
+
+    let said = sync_at(&root);
+    assert!(!testing.join("tool9").exists(), "{said}");
+    let landed = if testing.join("tool").exists() { testing.join("tool") } else { repo.join("tool") };
+    assert_eq!(fs::read_to_string(landed.join("version")).unwrap(), "1.1 0\n", "{said}");
+    assert!(landed.join("bootstrap").exists(), "{said}");
+    assert!(fs::read_to_string(landed.join("build")).unwrap().contains("pkgname=\"tool\""), "{said}");
+}
+
+// rust's build has no pkgver= and says cd /src/rustc-1.98.1-src, so a bump kept it as it
+// was and paired it with alpine's 1.99 sources. a build that names its version is a hand
+// bump; one that globs its tree still moves on its own
+#[test]
+fn a_hand_build_that_names_its_version_is_held_for_a_hand_bump() {
+    if !have_busybox() {
+        return;
+    }
+    let (root, repo, testing) = tree("synchandver");
+    for (n, body) in [("named", "cd /src/named-1.0\nmake\n"), ("globbed", "cd /src/globbed-*\nmake\n")] {
+        let d = repo.join(n);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("build"), body).unwrap();
+        fs::write(d.join("version"), "1.0 0\n").unwrap();
+        fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+        fs::write(d.join("scheme"), "major minor patch\n").unwrap();
+        upstream_at(&root, n, "1.1", "\tmake\n");
+    }
+
+    let said = sync_at(&root);
+    assert!(said.contains("build names 1.0 and has no pkgver= to move"), "{said}");
+    assert!(!testing.join("named").exists(), "{said}");
+    assert_eq!(fs::read_to_string(repo.join("named/version")).unwrap(), "1.0 0\n");
+    let wrote = testing.join("globbed/version");
+    let wrote = if wrote.exists() { wrote } else { repo.join("globbed/version") };
+    assert_eq!(fs::read_to_string(wrote).unwrap(), "1.1 0\n", "{said}");
+}
+
 // promotion replaces the recipe wholesale. openntpd's nitro-run went that way
 #[test]
 fn a_recipe_subdirectory_comes_across_a_bump() {

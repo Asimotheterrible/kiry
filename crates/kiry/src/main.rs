@@ -7526,6 +7526,21 @@ fn sync_cmd(args: &[String]) {
             None => PathBuf::from(&up.from),
         };
         let fresh = into.join(&r.name);
+        let old = recipe(&root, &r.name).filter(|d| *d != fresh);
+        // a build with no pkgver= to rewrite comes across a bump untouched, which is right
+        // for one that globs its tree and half a bump for one that names it: rust's says
+        // cd /src/rustc-1.98.1-src, and got alpine's 1.99 sources under it
+        let pinned_to = old
+            .as_ref()
+            .filter(|_| up.from != "tracker")
+            .and_then(|d| fs::read_to_string(d.join("build")).ok())
+            .filter(|b| !b.lines().any(|l| l.starts_with("pkgver=")) && b.contains(r.ours.as_str()));
+        if pinned_to.is_some() {
+            say!("{:w$} {:v$} -> {:u$}  held", r.name, r.ours, up.version);
+            say!("  build names {} and has no pkgver= to move, bump it by hand", r.ours);
+            holds += 1;
+            continue;
+        }
         if let Some(why) = held(&root, &r.name, &fresh, &up.version) {
             say!(
                 "{:w$} {:v$} -> {:u$}  held",
@@ -7600,8 +7615,19 @@ fn sync_cmd(args: &[String]) {
             continue;
         }
 
-        let mut notes = match convert::recipe(&at, &into, true, &alias, &list) {
-            Ok(rep) => rep.notes,
+        // convert names the directory after alpine's pkgname, and a pin can say llvm23 for
+        // what this tree calls llvm. written there, the bump was a new extra/llvm23 that
+        // carried nothing. so it lands aside and moves to the recipe's own name
+        let aside = into.join(".bump");
+        let _ = fs::remove_dir_all(&aside);
+        let converted_to = convert::recipe(&at, &aside, true, &alias, &list).and_then(|rep| {
+            let _ = fs::remove_dir_all(&fresh);
+            fs::rename(aside.join(&rep.name), &fresh).map_err(|e| format!("{}: {e}", fresh.display()))?;
+            Ok(rep.notes)
+        });
+        let _ = fs::remove_dir_all(&aside);
+        let mut notes = match converted_to {
+            Ok(n) => n,
             Err(e) => {
                 say!("{} {} -> {}  failed {e}", r.name, r.ours, up.version);
                 failed += 1;

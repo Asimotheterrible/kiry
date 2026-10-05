@@ -4337,6 +4337,50 @@ fn a_tracker_outlives_a_pin_of_none() {
     assert!(line.contains("tracker not read"), "{line}");
 }
 
+// a tracker has no recipe upstream behind it, so the bump is ours with the version moved.
+// claude-code's went to the alpine converter as a file called tracker and died there
+#[test]
+fn a_tracked_bump_moves_the_version_and_hashes_only_what_moved() {
+    let (root, repo, _) = tree("synctracker");
+    offer(&repo, "tool", "1.0");
+    let d = repo.join("tool");
+    fs::write(d.join("pin"), "none\n").unwrap();
+    fs::write(d.join("scheme"), "major minor\n").unwrap();
+    fs::write(d.join("tracker"), "https://example.invalid/latest\n").unwrap();
+    fs::write(d.join("build"), "install -Dm755 tool-1.0 \"$DESTDIR/usr/bin/tool\"\n").unwrap();
+    fs::write(
+        d.join("sources"),
+        "tool-1.0::https://example.invalid/1.0/tool\nfixed.dat::https://example.invalid/fixed.dat\n",
+    )
+    .unwrap();
+    fs::write(d.join("checksums"), "old\nkeepme\n").unwrap();
+    let fetch = root.join("fetch.sh");
+    fs::write(
+        &fetch,
+        "#!/bin/sh\ncase $1 in\n*/latest) echo 1.1 > \"$2\" ;;\n*) echo \"bin for $1\" > \"$2\" ;;\nesac\n",
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&fetch).status().unwrap();
+
+    let o = Command::new(KIRY)
+        .args(["sync", "--net", "--root", root.to_str().unwrap()])
+        .env("KIRY_FETCH", format!("{} %u %o", fetch.display()))
+        .env("KIRY_GENTOO", format!("{}/md5-cache/", root.display()))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("promoted"), "{said}");
+    assert_eq!(fs::read_to_string(d.join("version")).unwrap(), "1.1 0\n");
+    assert!(fs::read_to_string(d.join("build")).unwrap().contains("tool-1.1 "));
+    assert_eq!(
+        fs::read_to_string(d.join("sources")).unwrap(),
+        "tool-1.1::https://example.invalid/1.1/tool\nfixed.dat::https://example.invalid/fixed.dat\n"
+    );
+    let want = kiry_core::sha256(&b"bin for https://example.invalid/1.1/tool\n"[..]).unwrap();
+    assert_eq!(fs::read_to_string(d.join("checksums")).unwrap(), format!("{want}\nkeepme\n"));
+}
+
 // alpine carries wlroots0.19 and wlroots0.20 side by side, and its llvm is a meta
 // package pointing at whichever llvm is current rather than at ours. neither name is
 // derivable from the one this tree uses

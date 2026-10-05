@@ -7557,6 +7557,35 @@ fn sync_cmd(args: &[String]) {
             }
         }
 
+        // a tracker answers a version and nothing else, so there is no recipe upstream to
+        // convert. the bump is this one with the version moved
+        if up.from == "tracker" {
+            let Some(old) = recipe(&root, &r.name).filter(|d| *d != fresh) else { continue };
+            if let Err(e) = restamp(&root, &old, &r.ours, &up.version, &fresh) {
+                say!("{} {} -> {}  failed {e}", r.name, r.ours, up.version);
+                failed += 1;
+                continue;
+            }
+            let conv = converted(&root, &r.name);
+            let mut outcome = format!("held      {}", fresh.display());
+            let mut note = None;
+            match policy_allows(&old, level(&old, &r.ours, &up.version)) {
+                Err(why) => note = Some(why),
+                Ok(()) => match promote_one(&root, &list, &r.name) {
+                    Ok(to) => outcome = format!("promoted  {}", to.display()),
+                    Err(e) => note = Some(format!("not promoted {e}")),
+                },
+            }
+            if let Ok(b) = fs::read_to_string(fresh.join("build")) {
+                let _ = mkdirs(&conv).map(|()| fs::write(conv.join("testing"), b));
+            }
+            say!("{:w$} {:v$} -> {:u$}  {}", r.name, r.ours, up.version, outcome);
+            if let Some(n) = note {
+                say!("  {n}");
+            }
+            continue;
+        }
+
         let mut notes = match convert::recipe(&at, &into, true, &alias, &list) {
             Ok(rep) => rep.notes,
             Err(e) => {
@@ -7812,6 +7841,41 @@ fn materialise(aports: &Path, rel: &str) -> Result<(), String> {
             .stdout(Stdio::null()),
         "git sparse-checkout",
     )
+}
+
+// a tracked recipe is a published binary or tarball, so its bump is the same files with
+// one version string swapped for the other. a source line that moved is fetched over
+// whatever the cache holds under that name and hashed again, the rest keep their sums
+fn restamp(root: &Path, old: &Path, was: &str, now: &str, fresh: &Path) -> Result<(), String> {
+    let _ = fs::remove_dir_all(fresh);
+    mkdirs(fresh)?;
+    for e in fs::read_dir(old).map_err(|e| format!("{}: {e}", old.display()))?.flatten() {
+        if e.path().is_file() {
+            fs::copy(e.path(), fresh.join(e.file_name())).map_err(|e| e.to_string())?;
+        }
+    }
+    for f in ["build", "sources"] {
+        if let Ok(t) = fs::read_to_string(fresh.join(f)) {
+            fs::write(fresh.join(f), t.replace(was, now)).map_err(|e| e.to_string())?;
+        }
+    }
+    fs::write(fresh.join("version"), format!("{now} 0\n")).map_err(|e| e.to_string())?;
+
+    let before = plain(&old.join("sources"));
+    let mut sums = plain(&old.join("checksums"));
+    let cache = root.join("var/kiry/cache/sources");
+    mkdirs(&cache)?;
+    for (i, s) in plain(&fresh.join("sources")).iter().enumerate() {
+        let (name, from) = filename(s)?;
+        if before.get(i) == Some(s) || !from.contains("://") {
+            continue;
+        }
+        let dst = cache.join(name);
+        fetch(from, &dst, true)?;
+        sums.resize(sums.len().max(i + 1), String::new());
+        sums[i] = sha(&dst)?;
+    }
+    fs::write(fresh.join("checksums"), sums.join("\n") + "\n").map_err(|e| e.to_string())
 }
 
 // the four assignments a version bump moves. one line each at the top of a build, which

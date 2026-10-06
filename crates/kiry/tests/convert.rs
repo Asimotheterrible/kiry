@@ -709,7 +709,7 @@ fn test_suites_the_build_asks_for_are_switched_off() {
          build() {\n\tcmake -B build -DBUILD_TESTING=ON \\\n\
          \t\t-DGLM_BUILD_TESTS=TRUE -DKDSoap_TESTS=true -DBUILD_TESTS:BOOL=1 \\\n\
          \t\t-DQUIC_BUILD_TEST=on -DENABLE_TESTING=Yes\n\
-         \tmeson setup build -Dtests=true -Dunit_tests=enabled -Dtest=true\n\t_conf\n}\n\
+         \tmeson setup build -Dtests=true -Dunit_tests=enabled -Dbuild-testsuite=true -Dtest=true\n\t_conf\n}\n\
          package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
     );
     let script = fs::read_to_string(d.join("build")).unwrap();
@@ -723,6 +723,7 @@ fn test_suites_the_build_asks_for_are_switched_off() {
         "-DENABLE_TESTING=No\n",
         "-Dtests=false ",
         "-Dunit_tests=disabled ",
+        "-Dbuild-testsuite=false ",
         "-Dtest=false\n",
     ] {
         assert!(script.contains(want), "no {want:?} in\n{script}");

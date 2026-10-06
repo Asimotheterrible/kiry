@@ -1891,8 +1891,18 @@ fn compile(
         .map(|(name, ..)| src.join(name))
         .filter(|f| f.extension().is_some_and(|e| e == "patch") && edits_lock(f))
         .collect();
-    let fetches = text.contains("cargo fetch") || net && names(&text, "cargo");
-    for lock in shallowest(&src, "Cargo.lock", 3).into_iter().filter(|_| fetches) {
+    // tokay and meowdict build from cargo vendor, which reads the same lock
+    let fetches = text.contains("cargo fetch") || text.contains("cargo vendor") || net && names(&text, "cargo");
+    let mut locks = shallowest(&src, "Cargo.lock", 3);
+    // cargo-c ships its lock as a source of its own, cargo-c-<ver>-Cargo.lock, and its
+    // prepare copies it in. copied in here first, the fetch has something to read
+    let top = unpacked(&src);
+    let apart = srcs.iter().find(|(n, ..)| n.ends_with("-Cargo.lock"));
+    if let Some((n, ..)) = apart.filter(|_| fetches && locks.is_empty() && top.join("Cargo.toml").is_file()) {
+        fs::copy(src.join(n), top.join("Cargo.lock")).map_err(|e| format!("{n}: {e}"))?;
+        locks.push(top.join("Cargo.lock"));
+    }
+    for lock in locks.into_iter().filter(|_| fetches) {
         let mut c = Command::new("cargo");
         c.arg("fetch")
             .arg("--locked")

@@ -3199,7 +3199,23 @@ fn a_recipe_that_runs_cargo_fetch_gets_its_crates_without_net() {
     cargo_fetched("cargofetch", "true || cargo fetch --locked\n");
 }
 
+// tokay and meowdict say cargo vendor, which reads the lock the same way a fetch does
+#[test]
+fn a_recipe_that_runs_cargo_vendor_gets_its_crates_too() {
+    cargo_fetched("cargovendor", "true || cargo vendor --locked\n");
+}
+
+// cargo-c's lock is a source of its own, cargo-c-<ver>-Cargo.lock, which prepare copies in
+#[test]
+fn a_lock_shipped_as_its_own_source_is_fetched_for() {
+    cargo_fetched_apart("cargoapart", "true || cargo fetch --locked\n", true);
+}
+
 fn cargo_fetched(name: &str, head: &str) {
+    cargo_fetched_apart(name, head, false);
+}
+
+fn cargo_fetched_apart(name: &str, head: &str, apart: bool) {
     let at = scratch(name);
     let d = recipe(
         &at,
@@ -3209,10 +3225,21 @@ fn cargo_fetched(name: &str, head: &str) {
              [ -e \"$CARGO_HOME/registry/fetched\" ] || exit 1\n{GOOD}"
         ),
     );
-    fs::write(at.join("src/hello-1.0/Cargo.lock"), "version = 4\n").unwrap();
+    let lock = match apart {
+        true => d.join("hello-1.0-Cargo.lock"),
+        false => at.join("src/hello-1.0/Cargo.lock"),
+    };
+    fs::write(&lock, "version = 4\n").unwrap();
+    fs::write(at.join("src/hello-1.0/Cargo.toml"), "[package]\n").unwrap();
     let arc = tarball(&at);
     let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
     fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
+    if apart {
+        let s = kiry_core::sha256(fs::File::open(&lock).unwrap()).unwrap();
+        let src = fs::read_to_string(d.join("sources")).unwrap();
+        fs::write(d.join("sources"), format!("{src}hello-1.0-Cargo.lock\n")).unwrap();
+        fs::write(d.join("checksums"), format!("{sum}\n{s}\n")).unwrap();
+    }
 
     let bin = at.join("bin");
     fs::create_dir_all(&bin).unwrap();

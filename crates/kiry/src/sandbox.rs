@@ -116,6 +116,22 @@ pub fn closure(root: &Path, target: &str, deps: &[Dep]) -> Result<Vec<Member>, S
         }
     }
 
+    // the gnu tier drops usr/bin, so a gnu glib brings no glib-mkenums and a gnu wayland
+    // no wayland-scanner, and mesa and pango each stopped on a find_program. the host's
+    // build of the same dep has them, so its programs come along with the libraries they
+    // load, and not its headers: those are musl's. a ` make` line does the same by hand
+    if target != host {
+        for d in deps.iter().filter(|d| !d.host) {
+            let at = (d.name.clone(), host.clone());
+            if seen.contains(&at) || !tools(root, &host, &d.name) || tools(root, target, &d.name) {
+                continue;
+            }
+            seen.insert(at.clone());
+            out.push(Member { name: d.name.clone(), direct: false, target: host.clone() });
+            queue.push(at);
+        }
+    }
+
     while let Some((name, t)) = queue.pop() {
         let rec = db::read(root, &t, &name).map_err(|e| e.to_string())?;
         // a library a host tool loads is a host library, and one the target links is the
@@ -132,6 +148,16 @@ pub fn closure(root: &Path, target: &str, deps: &[Dep]) -> Result<Vec<Member>, S
         }
     }
     Ok(out)
+}
+
+fn tools(root: &Path, t: &str, name: &str) -> bool {
+    db::read(root, t, name).is_ok_and(|r| r.manifest.iter().any(|e| e.path.starts_with("usr/bin/") && !config(&e.path)))
+}
+
+// a foo-config prints -I and -L for the tree it was built for. a gnu configure asking the
+// host's gets musl's include and lib dirs, and links musl's library into a gnu binary
+fn config(path: &str) -> bool {
+    path.starts_with("usr/bin/") && path.ends_with("-config")
 }
 
 // provides already records which installed files are shared libraries, so a transitive
@@ -208,7 +234,7 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
             .filter_map(|e| Some((e.path.strip_prefix(PRUNED)?, e.path.as_str())))
             .collect();
         for e in &rec.manifest {
-            if !whole && builds_against(&e.path) {
+            if !whole && (builds_against(&e.path) || (m.target != target && config(&e.path))) {
                 continue;
             }
             let base = e.path.rsplit('/').next().unwrap_or_default();
@@ -730,6 +756,33 @@ mod tests {
             }],
         )
         .unwrap();
+    }
+
+    // mesa's gnu build stopped at find_program('wayland-scanner'): the gnu wayland has no
+    // usr/bin and only a ` make` line brought the host's. the host build's programs come
+    // in for any gnu dep that has them, its -config scripts staying out
+    #[test]
+    fn a_gnu_build_gets_the_host_builds_programs_for_a_dep() {
+        let root = root("hosttools");
+        let h = host();
+        install(&root, T, "wayland", &[]);
+        install(&root, &h, "wayland", &[dep("ffi", false)]);
+        install(&root, &h, "ffi", &[]);
+        ships(&root, &h, "wayland", "usr/bin/wayland-scanner", "scanner");
+        ships(&root, &h, "wayland", "usr/bin/wayland-config", "-L/usr/lib");
+        install(&root, T, "zlib", &[]);
+        install(&root, &h, "zlib", &[]);
+
+        let c = closure(&root, T, &[dep("wayland", false), dep("zlib", false)]).unwrap();
+        let has = |n: &str, t: &str| c.iter().any(|m| m.name == n && m.target == t);
+        assert!(has("wayland", &h) && has("ffi", &h), "{:?}", declared(&c).iter().map(|m| (&m.name, &m.target)).collect::<Vec<_>>());
+        // a host build with no programs has nothing to offer a gnu build
+        assert!(!has("zlib", &h));
+
+        let into = root.join("sysroot");
+        assemble(&root, T, &c, &into).unwrap();
+        assert!(into.join("usr/bin/wayland-scanner").exists());
+        assert!(!into.join("usr/bin/wayland-config").exists());
     }
 
     #[test]

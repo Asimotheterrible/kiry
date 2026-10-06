@@ -4127,9 +4127,6 @@ fn recipe_for(root: &Path, atom: &str) -> Option<String> {
 // someone chose
 fn meson_args(src: &Path, use_flags: &[String]) -> String {
     let set = chosen(use_flags);
-    if set.is_empty() {
-        return String::new();
-    }
     // newer projects say meson.options and mesa has already moved, so looking only for
     // the old name finds nothing and says nothing
     let mut dirs = vec![src.to_path_buf()];
@@ -4150,8 +4147,16 @@ fn meson_args(src: &Path, use_flags: &[String]) -> String {
         return String::new();
     };
     let mut out = Vec::new();
-    for (name, kind, choices) in options(&text) {
-        let Some(&on) = set.get(name.as_str()) else { continue };
+    for (name, kind, choices, value) in options(&text) {
+        // a test suite meson builds by default is one more thing to fail, and alpine only
+        // turns off what it names: pango's build-testsuite fell to clang 23's new warning
+        // under its tests' -Werror, and the ladder spent four rungs on it. kiry runs no
+        // check(), so the suite and the examples go wherever the project has them on
+        let suite = convert::tests(&name) || name.to_ascii_uppercase().split(['_', '-']).any(|w| w == "EXAMPLES");
+        let Some(&on) = set.get(name.as_str()).or(suite.then_some(&false)) else { continue };
+        if !set.contains_key(name.as_str()) && !matches!(value.as_str(), "true" | "enabled" | "auto") {
+            continue;
+        }
         let has = |w: &[&'static str]| w.iter().copied().find(|c| choices.iter().any(|x| x == c));
         let v = match (kind.as_str(), on) {
             ("feature", true) => "enabled",
@@ -4175,7 +4180,7 @@ fn meson_args(src: &Path, use_flags: &[String]) -> String {
 
 // meson's option() calls as (name, type, choices). tokens rather than lines, because an
 // option spans several lines as often as not and a description can hold a quote or a #
-fn options(text: &str) -> Vec<(String, String, Vec<String>)> {
+fn options(text: &str) -> Vec<(String, String, Vec<String>, String)> {
     enum T {
         S(String),
         W(String),
@@ -4246,7 +4251,7 @@ fn options(text: &str) -> Vec<(String, String, Vec<String>)> {
             continue;
         }
         i += 2;
-        let (mut name, mut kind, mut choices) = (None, String::new(), Vec::new());
+        let (mut name, mut kind, mut choices, mut value) = (None, String::new(), Vec::new(), String::new());
         let mut depth = 1;
         while i < toks.len() && depth > 0 {
             match &toks[i] {
@@ -4258,6 +4263,10 @@ fn options(text: &str) -> Vec<(String, String, Vec<String>)> {
                         kind = t.clone();
                     }
                 }
+                T::W(w) if w == "value" => match toks.get(i + 2) {
+                    Some(T::S(v) | T::W(v)) => value = v.clone(),
+                    _ => {}
+                },
                 T::W(w) if w == "choices" => {
                     let mut j = i + 3;
                     while let Some(T::S(c)) = toks.get(j) {
@@ -4270,7 +4279,7 @@ fn options(text: &str) -> Vec<(String, String, Vec<String>)> {
             i += 1;
         }
         if let Some(n) = name {
-            out.push((n, kind, choices));
+            out.push((n, kind, choices, value));
         }
     }
     out
@@ -11401,7 +11410,7 @@ option('x11', type : 'boolean', value : true)
 option('platforms', type : 'array', choices : ['x11', 'wayland'])
 ";
         let got = options(text);
-        let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
+        let names: Vec<&str> = got.iter().map(|(n, _, _, _)| n.as_str()).collect();
         assert_eq!(names, vec!["glvnd", "glx", "x11", "platforms"]);
         assert_eq!(got[1].1, "combo");
         assert_eq!(got[1].2, vec!["auto", "disabled", "dri", "xlib"]);
@@ -11414,6 +11423,33 @@ option('platforms', type : 'array', choices : ['x11', 'wayland'])
         assert_eq!(args, "-Dglvnd=disabled -Dglx=disabled -Dx11=true");
         // on for a combo with no word for on is not a guess worth making
         assert_eq!(meson_args(&d, &set(&["glx"])), "");
+    }
+
+    // pango builds its test suite and examples unless told not to, alpine never says, and
+    // clang 23's new warning under the tests' -Werror stopped the gnu build. off wherever
+    // the project has them on; a flag somebody set still wins, and off already is left be
+    #[test]
+    fn a_test_suite_meson_builds_by_default_is_switched_off() {
+        let d = std::env::temp_dir().join(format!("kiry-mesontests-{}", std::process::id()));
+        let top = d.join("pango-1.57.0");
+        fs::create_dir_all(&top).unwrap();
+        fs::write(
+            top.join("meson_options.txt"),
+            "option('build-testsuite', type: 'boolean', value: true)\n\
+             option('build-examples', type: 'boolean', value: true)\n\
+             option('tests', type: 'feature', value: 'disabled')\n\
+             option('installed_tests', type: 'feature', value: 'auto')\n\
+             option('man-pages', type: 'boolean', value: true)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            meson_args(&d, &set(&[])),
+            "-Dbuild-testsuite=false -Dbuild-examples=false -Dinstalled_tests=disabled"
+        );
+        assert_eq!(
+            meson_args(&d, &set(&["build-examples"])),
+            "-Dbuild-testsuite=false -Dbuild-examples=true -Dinstalled_tests=disabled"
+        );
     }
 }
 

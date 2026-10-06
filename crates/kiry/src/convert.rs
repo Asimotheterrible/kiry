@@ -670,7 +670,7 @@ fn dropped(name: &str) -> bool {
 // package installs -- SDL_TEST is libSDL2_test, orc-test is liborc-test, kcapi-test is the
 // kcapi tool -- so it only counts on its own or right after BUILD, ENABLE, WITH or INCLUDE.
 // a gtest in the name is the system gtest to link, and NO_TESTS=ON already says off
-fn tests(name: &str) -> bool {
+pub fn tests(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
     let seg: Vec<&str> = up.split(['_', '-']).collect();
     if seg.iter().any(|s| {
@@ -681,7 +681,7 @@ fn tests(name: &str) -> bool {
     }) {
         return false;
     }
-    seg.iter().any(|s| matches!(*s, "TESTS" | "TESTING"))
+    seg.iter().any(|s| matches!(*s, "TESTS" | "TESTING" | "TESTSUITE"))
         || matches!(
             seg.as_slice(),
             ["TEST"] | [.., "BUILD" | "ENABLE" | "WITH" | "INCLUDE", "TEST"]

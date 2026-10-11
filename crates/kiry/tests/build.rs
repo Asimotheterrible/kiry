@@ -4432,6 +4432,49 @@ fn a_tracked_bump_moves_the_version_and_hashes_only_what_moved() {
     assert_eq!(fs::read_to_string(d.join("checksums")).unwrap(), format!("{want}\nkeepme\n"));
 }
 
+// both of alpine's indexes land under var as the plain APKINDEX, and the tarballs they
+// came in do not stay
+#[test]
+fn sync_fetches_both_apkindexes() {
+    let (root, _, _) = tree("apkindex");
+    let mirror = root.join("mirror");
+    for repo in ["main", "community"] {
+        let d = mirror.join(repo).join("x86_64");
+        fs::create_dir_all(&d).unwrap();
+        let src = root.join(format!("src-{repo}"));
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("APKINDEX"), format!("P:{repo}-pkg\no:{repo}-pkg\np:pc:{repo}=1\n\n")).unwrap();
+        let ok = Command::new("tar")
+            .arg("-czf")
+            .arg(d.join("APKINDEX.tar.gz"))
+            .arg("-C")
+            .arg(&src)
+            .arg("APKINDEX")
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    }
+    let fetch = root.join("fetch.sh");
+    fs::write(&fetch, "#!/bin/sh\ncp \"${1#file://}\" \"$2\"\n").unwrap();
+    Command::new("chmod").arg("+x").arg(&fetch).status().unwrap();
+
+    let o = Command::new(KIRY)
+        .args(["sync", "--root", root.to_str().unwrap()])
+        .env("KIRY_FETCH", format!("{} %u %o", fetch.display()))
+        .env("KIRY_APKINDEX", format!("file://{}", mirror.display()))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    let at = root.join("var/kiry/apkindex");
+    assert!(fs::read_to_string(at.join("main")).unwrap().contains("p:pc:main=1"), "{said}");
+    assert!(fs::read_to_string(at.join("community")).unwrap().contains("o:community-pkg"));
+    let mut left: Vec<String> =
+        fs::read_dir(&at).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left, vec!["community", "main"]);
+}
+
 fn git(dir: &Path, args: &[&str], date: &str) {
     let o = Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@localhost", "-C"])

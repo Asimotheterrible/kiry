@@ -1129,13 +1129,18 @@ fn miss(l: &str) -> Option<String> {
     }
     // make, perl and cargo each say a program is missing their own way
     if let Some(n) = l.strip_prefix("make: ").and_then(|r| r.strip_suffix(": No such file or directory")) {
-        return (!n.contains(['/', ' '])).then(|| format!("cmd:{n}"));
+        // @LIBTOOL@ is configure's substitution that never happened, not a program
+        return (!n.contains(['/', ' ', '@'])).then(|| format!("cmd:{n}"));
     }
     if let Some(n) = between("Can't exec \"", "\"") {
         return Some(format!("cmd:{n}"));
     }
     if let Some(n) = between("no such command: `", "`") {
         return Some(format!("cmd:cargo-{n}"));
+    }
+    // libtoolize: Please install GNU M4, or 'export M4=/path/to/gnu/m4'
+    if let Some(n) = between("install GNU ", ",").or_else(|| between("install GNU ", " ")) {
+        return Some(format!("cmd:{}", n.to_lowercase()));
     }
     // qt5's configure: You need perl in your PATH to make a build from GIT
     if let Some(n) = between("need ", " in your PATH") {
@@ -1145,6 +1150,13 @@ fn miss(l: &str) -> Option<String> {
     // names something absent -- lsof's Mksrc wants bash -- and discover() reads which
     let r = l.strip_suffix(": command not found").or_else(|| l.strip_suffix(": not found"))?;
     let n = r.rsplit(": ").next()?;
+    // a macro autoreconf left unexpanded, its .m4 never there: unibilium's LT_INIT
+    if n.starts_with("LT_") || n == "AC_PROG_LIBTOOL" {
+        return Some("cmd:libtool".to_string());
+    }
+    if n.starts_with("PKG_") {
+        return Some("cmd:pkg-config".to_string());
+    }
     let n = if n.starts_with("./") || n.starts_with("../") { n } else { n.rsplit('/').next()? };
     (!n.is_empty() && !n.contains(' ')).then(|| format!("cmd:{n}"))
 }
@@ -5389,6 +5401,8 @@ recompile with -fPIC                         append -fPIC
 undefined symbol: __\\w+_chk                  append -U_FORTIFY_SOURCE
 use of undeclared identifier '(malloc|calloc|realloc|free|abort|exit|getenv)'  append -include stdlib.h
 error: instruction requires:                set CFLAGS_MARCH x86-64
+does not allow 'register' storage class      append -Wno-register
+no template named 'auto_ptr' in namespace 'std'  append -D_LIBCPP_ENABLE_CXX17_REMOVED_AUTO_PTR
 undefined reference to `__isoc99_            notaflag musl-portability
 PLEASE submit a bug report                   set OPT -O2
 ";
@@ -12974,6 +12988,9 @@ mod misses_from_logs {
 
         assert_eq!(first("/usr/bin/libtool: eval: line 11083: kiry-cc: not found\n").as_deref(), Some("cmd:kiry-cc"));
         assert_eq!(first("foo.c:1:10: fatal error: 'sensors/sensors.h' file not found\n").as_deref(), Some("h:sensors/sensors.h"));
+        let unibilium = "./configure: line 1744: LT_INIT: not found\nconfig.status: creating Makefile\n\
+            make: LIBTOOL@: No such file or directory\nmake: *** [Makefile:78: unibilium.lo] Error 127\n";
+        assert_eq!(first(unibilium).as_deref(), Some("cmd:libtool"));
     }
 
     // the 2026-10-11 a/b run: each of these stopped a build discovery should have got past
@@ -12994,6 +13011,7 @@ mod misses_from_logs {
         assert_eq!(first("Can't exec \"aclocal\": No such file or directory at /usr/share/autoconf/Autom4te/FileUtils.pm line 297.\n").as_deref(), Some("cmd:aclocal"));
         assert_eq!(first("error: no such command: `auditable`\n").as_deref(), Some("cmd:cargo-auditable"));
         assert_eq!(first("You need perl in your PATH to make a build from GIT.\nCannot proceed.\n").as_deref(), Some("cmd:perl"));
+        assert_eq!(first("libtoolize:   error: Please install GNU M4, or 'export M4=/path/to/gnu/m4'.\n").as_deref(), Some("cmd:m4"));
         assert_eq!(first("-- Could NOT find Lua (missing: LUA_LIBRARIES LUA_INCLUDE_DIR)\nCMake Error at CMakeLists.txt:142 (message):\n").as_deref(), Some("cmake:Lua"));
         assert_eq!(first("./Configure: line 4978: ./lib/dialects/linux/Mksrc: not found\n").as_deref(), Some("cmd:./lib/dialects/linux/Mksrc"));
         let itstool = "checking for python module libxml2... not found\nconfigure: error: Python module libxml2 is needed to run this package\n";

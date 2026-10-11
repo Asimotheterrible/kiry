@@ -1,0 +1,15 @@
+In file included from Source/FreeImage/PluginEXR.cpp:33:
+In file included from Source/FreeImage/../OpenEXR/IlmImf/ImfOutputFile.h:49:
+In file included from Source/FreeImage/../OpenEXR/IlmImf/ImfGenericOutputFile.h:40:
+In file included from Source/FreeImage/../OpenEXR/IlmImf/ImfXdr.h:108:
+Source/OpenEXR/Half/half.h:462:2: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]
+  462 |         register int e = (x.i >> 23) & 0x000001ff;
+      |         ^~~~~~~~
+Source/OpenEXR/Half/half.h:473:6: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]
+  473 |             register int m = x.i & 0x007fffff;
+      |             ^~~~~~~~
+2 errors generated.
+make[1]: *** [Makefile.gnu:66: Source/FreeImage/PluginEXR.o] Error 1
+make[1]: *** Waiting for unfinished jobs....
+make[1]: Leaving directory '/src/FreeImage'
+make: *** [Makefile:21: default] Error 2

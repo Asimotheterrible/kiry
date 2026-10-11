@@ -4724,11 +4724,49 @@ fn an_extra_build_gets_the_dep_its_failure_names_and_nothing_else() {
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
     assert!(said.contains("app x86_64-musl needs hdr  h:hdr.h"), "{said}");
+    assert!(said.contains("app x86_64-musl skipped  unused"), "{said}");
     assert!(root.join("usr/bin/app").is_file());
     assert!(!root.join("usr/bin/unused").exists(), "{said}");
     assert!(db::read(&root, "x86_64-musl", "unused").is_err());
     let closure = fs::read_to_string(root.join("var/kiry/closure/x86_64-musl/app")).unwrap();
     assert_eq!(closure, "hdr build\n");
+}
+
+// a dep the build can do without is a flag away, and a flag against one it needs stops
+// the build with that said rather than a dep quietly coming back
+#[test]
+fn a_flag_named_after_a_listed_dep_puts_it_in_or_keeps_it_out() {
+    let Some((at, root, _)) = workshop("flagdep") else {
+        return;
+    };
+    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(&root, &at, "unused", "", "mkdir -p \"$DESTDIR/usr/bin\"\necho unused > \"$DESTDIR/usr/bin/unused\"\n");
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "hdr build\nunused build\n",
+        "[ -f /usr/include/hdr.h ] || { echo \"app.c:1:10: fatal error: 'hdr.h' file not found\"; exit 1; }\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n",
+    );
+    let r = root.to_str().unwrap();
+    fs::create_dir_all(root.join("etc/kiry/pkg")).unwrap();
+
+    fs::write(root.join("etc/kiry/pkg/app"), "flags -hdr\n").unwrap();
+    let o = kiry(&["i", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(!o.status.success(), "{said}");
+    assert!(said.contains("app x86_64-musl needs hdr for h:hdr.h, and a flag takes it out"), "{said}");
+
+    fs::write(root.join("etc/kiry/pkg/app"), "flags unused\n").unwrap();
+    let o = kiry(&["i", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    // both were build-only, so both leave once the batch is in. the closure is the record
+    assert!(said.contains("unused x86_64-musl left"), "{said}");
+    let closure = fs::read_to_string(root.join("var/kiry/closure/x86_64-musl/app")).unwrap();
+    assert_eq!(closure, "hdr build\n", "a flag puts unused in the build, not in the proof");
+    assert!(!said.contains("skipped"), "{said}");
 }
 
 // a dep that does not get the build past the failure it was added for comes back out,

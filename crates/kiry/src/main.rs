@@ -8179,9 +8179,41 @@ fn sync_cmd(args: &[String]) {
             Err(e) => say!("gentoo {e}"),
         }
     }
+    if !dry && (net || std::env::var_os("KIRY_APKINDEX").is_some()) {
+        if let Err(e) = refresh_apkindex(&root) {
+            say!("apkindex {e}");
+        }
+    }
     if failed > 0 {
         std::process::exit(1);
     }
+}
+
+const ALPINE: &str = "https://dl-cdn.alpinelinux.org/alpine/edge";
+
+// alpine's binary index: every package's origin and the pc:, so: and cmd: names it
+// provides. a build missing gtk4.pc is missing gtk4.0, and nothing installed can say so
+// before gtk4.0 has been built once. a few MB under var, plain text and regenerable, the
+// same kind of feed the aports clone is. KIRY_APKINDEX names another base, for the tests
+fn refresh_apkindex(root: &Path) -> Result<(), String> {
+    let at = root.join("var/kiry/apkindex");
+    mkdirs(&at)?;
+    let base = std::env::var("KIRY_APKINDEX").unwrap_or_else(|_| ALPINE.into());
+    let host = sandbox::host();
+    let arch = host.split('-').next().unwrap_or("x86_64");
+    for repo in ["main", "community"] {
+        let gz = at.join(format!("{repo}.tar.gz"));
+        fetch(&format!("{}/{repo}/{arch}/APKINDEX.tar.gz", base.trim_end_matches('/')), &gz, true)?;
+        let tmp = at.join(format!(".{repo}"));
+        let _ = fs::remove_dir_all(&tmp);
+        mkdirs(&tmp)?;
+        let r = run(Command::new("tar").arg("-xzf").arg(&gz).arg("-C").arg(&tmp).arg("APKINDEX"), "tar")
+            .and_then(|()| fs::rename(tmp.join("APKINDEX"), at.join(repo)).map_err(|e| format!("{repo}: {e}")));
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_file(&gz);
+        r?;
+    }
+    Ok(())
 }
 
 const PORTAGE: &str = "rsync://rsync.gentoo.org/gentoo-portage/metadata/md5-cache/";

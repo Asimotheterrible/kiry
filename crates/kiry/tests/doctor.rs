@@ -805,6 +805,22 @@ fn an_interpreter_reached_by_hardlink_is_there() {
     assert!(!out.contains("no-interpreter"), "{out}");
 }
 
+// newsboat's contrib scripts want php, ruby and babashka, and nobody runs them to use
+// newsboat. an example under the documentation is not something the package runs
+#[test]
+fn an_example_under_the_documentation_needs_no_interpreter() {
+    if skip("docscript") {
+        return;
+    }
+    let at = scratch("docscript");
+    let root = at.join("root");
+    let script = at.join("example.php");
+    fs::write(&script, "#!/usr/bin/env fictionphp\n<?php\n").unwrap();
+    install(&root, "thing", &[("usr/share/doc/thing/contrib/example.php", &script)]);
+    let (_, out) = doctor(&root);
+    assert!(!out.contains("no-interpreter"), "{out}");
+}
+
 // glibc ships tzselect and ldd as #!/bin/bash and the bash that answers is the musl
 // one. every target's files were being looked for inside that target alone, so five of
 // glibc's own scripts came back interpreterless on a root where /bin/sh runs fine

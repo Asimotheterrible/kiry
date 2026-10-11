@@ -1,0 +1,155 @@
+patching file gsk/gpu/gskvulkanimage.c
+args: ['muon', '-C.', 'setup', '-Db_largefile=auto', '-Db_clang_format=auto', '-Db_compiler_wrapper=auto', '-Dprefix=/usr', '-Dlibdir=/usr/lib', '-Dlibexecdir=/usr/libexec', '-Dbindir=/usr/bin', '-Dsbindir=/usr/sbin', '-Dincludedir=/usr/include', '-Ddatadir=/usr/share', '-Dmandir=/usr/share/man', '-Dlocaledir=/usr/share/locale', '-Dsysconfdir=/etc', '-Dlocalstatedir=/var', '-Dsharedstatedir=/var/lib', '-Dbuildtype=plain', '-Dauto_features=auto', '-Dwrap_mode=nodownload', '-Ddefault_library=shared', '-Db_lto=false', '-Db_staticpic=true', '-Db_pie=true', '-Dwerror=false', '-Dbuild-testsuite=false', '-Dbuild-examples=false', '-Dbuild-tests=false', '-Ddocumentation=true', '-Dintrospection=disabled', '-Dmedia-gstreamer=disabled', '-Dbroadway-backend=true', '-Dprint-cups=enabled', '-Dman-pages=true', '-Dbuild-tests=false', '-Dbuild-testsuite=false', 'output']
+muon 0.6.0
+c compiler: clang 23.1.2 (['/usr/bin/kirycc'])
+  linker: lld 23.1.2 (passed-through)
+  archiver: ar-posix (['/usr/bin/ar'])
+c build machine compiler: clang 23.1.2 (['/usr/bin/kirycc'])
+  linker: lld 23.1.2 (passed-through)
+  archiver: ar-posix (['/usr/bin/ar'])
+gtk version: 4.22.4
+c compiler: header dev/evdev/input.h found: NO
+c compiler: header ftw.h found: YES
+c compiler: header linux/input.h found: YES
+c compiler: header sys/mman.h found: YES
+c compiler: header sys/sysmacros.h found: YES
+c compiler: header sys/time.h found: YES
+c compiler: header unistd.h found: YES
+c compiler: library m found: YES
+c compiler: has function getpagesize: YES
+c compiler: has function getresuid: YES
+c compiler: has function madvise: YES
+c compiler: has function memfd_create: YES
+c compiler: has function mkostemp: YES
+c compiler: has function mlock: YES
+c compiler: has function mmap: YES
+c compiler: has function posix_fallocate: YES
+c compiler: has function sincos: YES
+c compiler: has function sincosf: YES
+c compiler: has function memmem: YES
+c compiler: sigsetjmp links: YES
+c compiler: __uint128_t available compiles: YES
+c compiler: has function backtrace: NO
+c compiler: supports argument '-fno-strict-aliasing': YES
+c compiler: supports argument '-Wno-c++11-extensions': YES
+c compiler: supports argument '-Wno-missing-include-dirs': YES
+c compiler: supports argument '-Wno-typedef-redefinition': YES
+c compiler: supports argument '-Wno-tautological-constant-out-of-range-compare': YES
+c compiler: supports argument '-Wduplicated-branches': NO
+c compiler: supports argument '-Wduplicated-cond': NO
+c compiler: supports argument '-Wformat=2': YES
+c compiler: supports argument '-Wformat-nonliteral': YES
+c compiler: supports argument '-Wformat-security': YES
+c compiler: supports argument '-Wignored-qualifiers': YES
+c compiler: supports argument '-Wimplicit-function-declaration': YES
+c compiler: supports argument '-Wlogical-op': NO
+c compiler: supports argument '-Wmisleading-indentation': YES
+c compiler: supports argument '-Wmissing-format-attribute': YES
+c compiler: supports argument '-Wmissing-include-dirs': YES
+c compiler: supports argument '-Wmissing-noreturn': YES
+c compiler: supports argument '-Wnested-externs': YES
+c compiler: supports argument '-Wold-style-definition': YES
+c compiler: supports argument '-Wpointer-arith': YES
+c compiler: supports argument '-Wshadow': YES
+c compiler: supports argument '-Wstrict-prototypes': YES
+c compiler: supports argument '-Wswitch-default': YES
+c compiler: supports argument '-Wswitch-enum': YES
+c compiler: supports argument '-Wundef': YES
+c compiler: supports argument '-Wuninitialized': YES
+c compiler: supports argument '-Wunused': YES
+c compiler: supports argument '-Waddress': YES
+c compiler: supports argument '-Warray-bounds': YES
+c compiler: supports argument '-Wempty-body': YES
+c compiler: supports argument '-Wenum-int-mismatch': NO
+c compiler: supports argument '-Wimplicit': YES
+c compiler: supports argument '-Wimplicit-fallthrough': YES
+c compiler: supports argument '-Wimplicit-fallthrough=5': NO
+c compiler: supports argument '-Winit-self': YES
+c compiler: supports argument '-Wint-to-pointer-cast': YES
+c compiler: supports argument '-Wmain': YES
+c compiler: supports argument '-Wmissing-braces': YES
+c compiler: supports argument '-Wmissing-declarations': YES
+c compiler: supports argument '-Wmissing-prototypes': YES
+c compiler: supports argument '-Wnonnull': YES
+c compiler: supports argument '-Woverride-init': YES
+c compiler: supports argument '-Wpointer-to-int-cast': YES
+c compiler: supports argument '-Wredundant-decls': YES
+c compiler: supports argument '-Wreturn-type': YES
+c compiler: supports argument '-Wsequence-point': YES
+c compiler: supports argument '-Wtrigraphs': YES
+c compiler: supports argument '-Wvla': YES
+c compiler: supports argument '-Wwrite-strings': YES
+c compiler: supports argument '-Wnull-dereference': YES
+c compiler: supports argument '-fvisibility=hidden': YES
+c compiler: supports argument '-Wl,-Bsymbolic': YES
+c compiler: supports argument '-Wl,-z,relro': YES
+c compiler: supports argument '-Wl,-z,now': YES
+dependency glib-2.0 version: 2.90.0 found: YES
+dependency gio-2.0 version: 2.90.0 found: YES
+dependency gobject-introspection-1.0 found: NO
+dependency gobject-2.0 version: 2.90.0 found: YES
+dependency gio-unix-2.0 version: 2.90.0 found: YES
+dependency gmodule-2.0 version: 2.90.0 found: YES
+dependency pango version: 1.58.2 found: YES
+dependency cairo version: 1.18.4 found: YES
+dependency cairo-gobject version: 1.18.4 found: YES
+dependency fribidi version: 1.0.16 found: YES
+dependency harfbuzz version: 14.2.1 found: YES
+dependency harfbuzz-subset version: 14.2.1 found: YES
+dependency pangoft2 version: 1.58.2 found: YES
+dependency pangocairo version: 1.58.2 found: YES
+dependency gdk-pixbuf-2.0 version: 2.44.8 found: YES
+dependency libpng version: 1.6.59 found: YES
+dependency libtiff-4 version: 4.7.2 found: YES
+dependency libjpeg version: 3.2.0 found: YES
+dependency epoxy version: 1.5.10 found: YES
+dependency xkbcommon version: 1.13.2 found: YES
+dependency graphene-gobject-1.0 version: 1.10.8 found: YES
+dependency iso-codes version: 4.20.1 found: YES
+dependency cairo-xlib version: 1.18.4 found: YES
+dependency cairo-script-interpreter version: 1.18.4 found: YES
+dependency wayland-client version: 1.26.0 found: YES
+dependency wayland-protocols version: 1.49 found: YES
+dependency wayland-egl version: 18.1.0 found: YES
+dependency xrandr version: 1.5.5 found: YES
+dependency x11 version: 1.8.13 found: YES
+dependency xrender version: 0.9.12 found: YES
+dependency xi version: 1.8.3 found: YES
+dependency xext version: 1.3.7 found: YES
+dependency xcursor version: 1.2.3 found: YES
+dependency xdamage version: 1.1.7 found: YES
+dependency xfixes version: 6.0.2 found: YES
+dependency fontconfig version: 2.18.1 found: YES
+c compiler: has function XkbQueryExtension: YES
+c compiler: has function XSyncQueryExtension: YES
+c compiler: has function XGetEventData: YES
+c compiler: header X11/extensions/XInput2.h found: YES
+c compiler: has function XIAllowTouchEvents: YES
+c compiler: struct XIScrollClassInfo has member number: YES
+c compiler: struct XIGesturePinchEvent has member type: YES
+dependency xinerama version: 1.1.6 found: YES
+c compiler: header X11/extensions/Xinerama.h has symbol XineramaQueryExtension: YES
+c compiler: has function ngettext: YES
+dependency vulkan version: 1.4.362 found: YES
+dependency libdrm version: 2.4.134 found: YES
+c compiler: header linux/dma-buf.h found: YES
+c compiler: header linux/udmabuf.h found: YES
+dependency accesskit-c-0.18 found: NO
+note Need aligned memory due to the use of SSE2 or GCC vector instructions 
+c compiler: F16C intrinsics compiles: NO
+dependency cups version: 2.4.19 found: YES
+configuring '/src/gtk-4.22.4/output/gdk/gdk.gresource.xml'
+configuring '/src/gtk-4.22.4/output/gdk/gdkconfig.h'
+c compiler: has function shm_open: YES
+/src/gtk-4.22.4/gdk/wayland/meson.build:182:16: error module not found
+182 | wlmod = import('unstable-wayland')
+                     ^_________________
+/src/gtk-4.22.4/gdk/wayland/meson.build:182:9: error in function 'import'
+182 | wlmod = import('unstable-wayland')
+              ^_________________________
+/src/gtk-4.22.4/gdk/meson.build:282:5: error in function 'subdir'
+282 |     subdir(backend)
+          ^______________
+/src/gtk-4.22.4/meson.build:905:1: error in function 'subdir'
+905 | subdir('gdk')
+      ^____________

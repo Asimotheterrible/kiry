@@ -4627,7 +4627,9 @@ fn the_built_in_repos_are_in_precedence_order() {
 // a root that can actually build, with a repo its recipes are reached by name through
 fn workshop(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
     let at = scratch(name);
-    let (root, repo) = (at.join("root"), at.join("extra"));
+    // local/ because these are about planning what a recipe declares, which is what a
+    // hand-written repo means. extra/ builds from what a build proves instead
+    let (root, repo) = (at.join("root"), at.join("local"));
     fs::create_dir_all(&root).unwrap();
     if !bootstrap(&root) {
         return None;
@@ -4686,6 +4688,65 @@ fn a_batch_missing_two_dependencies_prints_both_prefixed() {
         .filter(|l| l.starts_with("kiry: solo needs"))
         .collect();
     assert_eq!(got, ["kiry: solo needs alpha", "kiry: solo needs beta"], "{said}");
+}
+
+// an extra/ recipe and nothing to fetch, with whatever build it is given
+fn convert_made(root: &Path, at: &Path, name: &str, deps: &str, build: &str) {
+    let repo = at.join("extra");
+    let d = repo.join(name);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("version"), "1.0 1\n").unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(d.join("depends"), deps).unwrap();
+    fs::write(d.join("build"), build).unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
+}
+
+// app's recipe lists hdr and unused. the build only fails without hdr's header, so hdr is
+// what it gets, unused is never built, and the closure file says why app has hdr
+#[test]
+fn an_extra_build_gets_the_dep_its_failure_names_and_nothing_else() {
+    let Some((at, root, _)) = workshop("discover") else {
+        return;
+    };
+    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(&root, &at, "unused", "", "mkdir -p \"$DESTDIR/usr/bin\"\necho unused > \"$DESTDIR/usr/bin/unused\"\n");
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "hdr build\nunused build\n",
+        "[ -f /usr/include/hdr.h ] || { echo \"app.c:1:10: fatal error: 'hdr.h' file not found\"; exit 1; }\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n",
+    );
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("app x86_64-musl needs hdr  h:hdr.h"), "{said}");
+    assert!(root.join("usr/bin/app").is_file());
+    assert!(!root.join("usr/bin/unused").exists(), "{said}");
+    assert!(db::read(&root, "x86_64-musl", "unused").is_err());
+    let closure = fs::read_to_string(root.join("var/kiry/closure/x86_64-musl/app")).unwrap();
+    assert_eq!(closure, "hdr build\n");
+}
+
+// a dep that does not get the build past the failure it was added for comes back out,
+// and the failure is reported as the failure it is
+#[test]
+fn a_dep_that_does_not_move_the_failure_comes_back_out() {
+    let Some((at, root, _)) = workshop("undiscover") else {
+        return;
+    };
+    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(&root, &at, "app", "hdr build\n", "echo \"app.c:1:10: fatal error: 'hdr.h' file not found\"\nexit 1\n");
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(!o.status.success(), "{said}");
+    assert!(said.contains("app x86_64-musl hdr did not help with h:hdr.h, taken back out"), "{said}");
+    let closure = fs::read_to_string(root.join("var/kiry/closure/x86_64-musl/app")).unwrap_or_default();
+    assert!(!closure.contains("hdr"), "{closure}");
 }
 
 // b took a name and i took a path, so installing anything meant walking the dependency

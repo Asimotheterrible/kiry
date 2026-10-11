@@ -1,0 +1,45 @@
+>>> Building basic variant
+args: ['muon', '-C.', 'setup', '-Db_largefile=auto', '-Db_clang_format=auto', '-Db_compiler_wrapper=auto', '-Dprefix=/usr', '-Dlibdir=/usr/lib', '-Dlibexecdir=/usr/libexec', '-Dbindir=/usr/bin', '-Dsbindir=/usr/sbin', '-Dincludedir=/usr/include', '-Ddatadir=/usr/share', '-Dmandir=/usr/share/man', '-Dlocaledir=/usr/share/locale', '-Dsysconfdir=/etc', '-Dlocalstatedir=/var', '-Dsharedstatedir=/var/lib', '-Dbuildtype=plain', '-Dauto_features=auto', '-Dwrap_mode=nodownload', '-Ddefault_library=shared', '-Db_lto=false', '-Db_staticpic=true', '-Db_pie=true', '-Dwerror=false', '-Dgif=enabled', '-Dheif=enabled', '-Djpeg=enabled', '-Djp2=enabled', '-Djxl=enabled', '-Dpng=enabled', '-Dsvg=enabled', '-Dwebp=enabled', '-Dexif=enabled', '-Dbash=enabled', '-Dzsh=enabled', '-Dversion=5.5', '-Dheif=disabled', '-Djxl=disabled', '-Dsvg=disabled', '-Dwebp=disabled', 'output']
+muon 0.6.0
+c compiler: clang 23.1.2 (['/usr/bin/kirycc'])
+  linker: lld 23.1.2 (passed-through)
+  archiver: ar-posix (['/usr/bin/ar'])
+c build machine compiler: clang 23.1.2 (['/usr/bin/kirycc'])
+  linker: lld 23.1.2 (passed-through)
+  archiver: ar-posix (['/usr/bin/ar'])
+cpp compiler: clang 23.1.2 (['/usr/bin/kiryc++'])
+  linker: lld 23.1.2 (passed-through)
+  archiver: ar-posix (['/usr/bin/ar'])
+cpp build machine compiler: clang 23.1.2 (['/usr/bin/kiryc++'])
+  linker: lld 23.1.2 (passed-through)
+  archiver: ar-posix (['/usr/bin/ar'])
+swayimg version: 0.0.0
+dependency xkbcommon version: 1.13.2 found: YES
+dependency fontconfig version: 2.18.1 found: YES
+dependency freetype2 version: 26.6.20 found: YES
+dependency threads found: YES
+dependency luajit version: 2.1.1761786044 found: YES
+dependency wayland-client version: 1.26.0 found: YES
+dependency wayland-protocols version: 1.49 found: YES
+dependency wayland-scanner version: 1.26.0 (build) found: YES
+dependency libdrm version: 2.4.134 found: YES
+dependency OpenEXR version: 3.4.15 found: YES
+dependency libavif version: 1.4.2 found: YES
+dependency libjpeg version: 3.2.0 found: YES
+dependency libopenjp2 version: 2.5.4 found: YES
+dependency libpng version: 1.6.59 found: YES
+dependency libtiff-4 version: 4.7.2 found: YES
+dependency libsixel version: 1.10.5 found: YES
+dependency libraw version: 0.22.2 found: YES
+c compiler: library gif found: NO
+c compiler: library gif found: NO
+/src/swayimg-5.5/meson.build:114:13: error required library not found
+114 |             'gif',
+                  ^____
+/src/swayimg-5.5/meson.build:113:15: error in function 'find_library'
+113 | /         gif = cc.find_library(
+114 | |             'gif',
+115 | |             dirs: xkb.get_variable(pkgconfig: 'libdir'),
+116 | |             required: gif_opt,
+117 | |         )
+      |_________^

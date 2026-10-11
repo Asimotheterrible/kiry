@@ -1,0 +1,21 @@
+patching file runtime/ftplugin/lua.lua
+patching file runtime/ftplugin/query.lua
+patching file test/functional/core/main_spec.lua
+Hunk #1 succeeded at 250 (offset 4 lines).
+patching file test/functional/vimscript/has_spec.lua
+patching file test/functional/harness/harness_spec.lua
+patching file test/harness.lua
+-- The C compiler identification is Clang 23.1.2
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/kirycc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Found GNU Make at /usr/bin/make
+-- CMAKE_INSTALL_PREFIX=/usr
+-- CMAKE_BUILD_TYPE=MinSizeRel
+CMake Error at CMakeLists.txt:193 (message):
+  Failed to find a Lua 5.1-compatible interpreter
+
+
+-- Configuring incomplete, errors occurred!

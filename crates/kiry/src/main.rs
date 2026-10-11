@@ -4,7 +4,7 @@ mod sandbox;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -790,7 +790,7 @@ fn build(
         let start = Instant::now();
         let r = compile(root, p, t, &srcs, &f, verbose, boot, at_once);
         live_stop(&key(p, t));
-        let (work, linked) = r?;
+        let (work, linked, dropped) = r?;
         let secs = start.elapsed().as_secs();
         let gap = if tty() { "  " } else { " " };
         let note: String = [cache_rate(root, p, t, &work), again(root, p, t, &work, verbose)]
@@ -803,19 +803,19 @@ fn build(
         say!("{}{note}", row(&p.name, &p.version.upstream, was.as_deref(), t, "ok", Some(secs)));
         let cpu = fs::read_to_string(work.join("cpu")).ok().and_then(|c| c.trim().parse().ok());
         keep_time(root, p, t, secs, cpu);
-        built.push((t.clone(), work, linked));
+        built.push((t.clone(), work, (linked, dropped)));
     }
 
     let mut ready = Vec::new();
-    for (t, work, linked) in &built {
-        ready.push((t.clone(), pack(root, p, t, work)?, linked.clone()));
+    for (t, work, backed) in &built {
+        ready.push((t.clone(), pack(root, p, t, work)?, backed.clone()));
     }
 
     // sidecar lands after the rename. ahead of it, a target failing to tar leaves a
     // .meta for an artifact that never arrives
-    for (t, (art, part), linked) in &ready {
+    for (t, (art, part), (linked, dropped)) in &ready {
         fs::rename(part, art).map_err(|e| format!("{}: {e}", art.display()))?;
-        meta(root, p, t, &hash, &f, art, linked)?;
+        meta(root, p, t, &hash, &f, art, linked, dropped)?;
         if let Some((_, work, _)) = built.iter().find(|(bt, _, _)| bt == t) {
             let mut d = art.as_os_str().to_owned();
             d.push(".meta/layout");
@@ -1028,6 +1028,114 @@ fn undeclared(
                 "build-only"
             };
             Some((w, who.clone(), kind))
+        })
+        .collect()
+}
+
+// a declared runtime dep the artifact gives no reason for. alpine's depends and the -dev
+// chains converted into ours name libraries that arrive anyway through what does link
+// them, or that nothing links at all: 404 such lines across navi's records
+//
+// only a plain library can be judged. a dep that ships an executable is run rather than
+// linked (htop runs lsof, prism runs java out of usr/lib/jvm), and one that ships a module
+// -- a .so with no soname or an unversioned one -- is loaded by a directory scan or a
+// manifest: qt's platform plugins, mesa's drivers behind the vulkan icd json. nothing in
+// the consumer names either, so both stay what the recipe said
+//
+// a library is backed by DT_NEEDED or by its name sitting in a shipped file, which is what
+// a dlopen looks like from outside: htop carries the string libsensors.so.5
+fn unbacked(root: &Path, deps: &[Dep], t: &str, dest: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    under(dest, &mut files);
+    let needed: HashSet<String> = files
+        .iter()
+        .filter_map(|x| elf::read(x).ok())
+        .flat_map(|o| o.needed)
+        .collect();
+
+    let mut doubt: Vec<(String, Vec<String>)> = Vec::new();
+    for d in deps.iter().filter(|d| !d.make && d.applies(t)) {
+        let Ok(ps) = db::read_provides(root, t, &d.name) else { continue };
+        if ps.is_empty() || ps.iter().any(|p| needed.contains(&p.soname)) {
+            continue;
+        }
+        let Ok(rec) = db::read(root, t, &d.name) else { continue };
+        let more = rec.manifest.iter().any(|e| {
+            let db::Kind::File(_) = e.kind else { return false };
+            let so = e.path.ends_with(".so") || e.path.contains(".so.");
+            if !so {
+                return e.mode & 0o111 != 0;
+            }
+            e.path.ends_with(".so")
+                && elf::read(&root.join(&e.path))
+                    .is_ok_and(|o| !o.soname.is_some_and(|s| s.contains(".so.")))
+        });
+        if !more {
+            // libsensors.so.5 and the bare libsensors.so both count, a dlopen names either
+            let stems = ps.iter().map(|p| p.soname.split(".so").next().unwrap_or(&p.soname).to_string() + ".so");
+            doubt.push((d.name.clone(), stems.collect()));
+        }
+    }
+    if doubt.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for f in &files {
+        let Ok(bytes) = fs::read(f) else { continue };
+        for (name, stems) in &doubt {
+            if !seen.contains(name) && stems.iter().any(|s| bytes.windows(s.len()).any(|w| w == s.as_bytes())) {
+                seen.insert(name.clone());
+            }
+        }
+        if seen.len() == doubt.len() {
+            break;
+        }
+    }
+    doubt.into_iter().map(|(n, _)| n).filter(|n| !seen.contains(n)).collect()
+}
+
+// who ships the interpreter of each script the build installed, since the kernel will not
+// start a script whose #! is missing and that is the same edge DT_NEEDED is for an elf.
+// the documentation's examples are left out: newsboat ships php and babashka scripts
+// under usr/share/doc that nobody runs to use newsboat
+fn interpreters(root: &Path, t: &str, dest: &Path) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    under(dest, &mut files);
+    let mut want: BTreeSet<String> = BTreeSet::new();
+    for f in &files {
+        let rel = f.strip_prefix(dest).unwrap_or(f).to_string_lossy();
+        if rel.starts_with("usr/share/doc/") {
+            continue;
+        }
+        if !fs::metadata(f).is_ok_and(|m| m.permissions().mode() & 0o111 != 0) {
+            continue;
+        }
+        // the kernel reads 256 bytes of a shebang line and no more, so neither does this
+        let mut head = [0u8; 256];
+        let n = fs::File::open(f).and_then(|mut h| h.read(&mut head)).unwrap_or(0);
+        let Some(line) = head[..n].strip_prefix(b"#!") else { continue };
+        let line = line.split(|c| *c == b'\n').next().unwrap_or_default();
+        let words: Vec<String> = String::from_utf8_lossy(line).split_whitespace().map(str::to_string).collect();
+        if let Some(w) = interpreter(&words) {
+            want.insert(w);
+        }
+    }
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let own = owners(root);
+    want.into_iter()
+        .filter_map(|w| {
+            let cmd = ["usr/bin/", "usr/sbin/", "bin/", "sbin/"]
+                .iter()
+                .find_map(|d| w.strip_prefix(d))
+                .unwrap_or(&w);
+            if cmd.contains('/') {
+                return None;
+            }
+            let who = own.get(&(t.to_string(), format!("cmd:{cmd}")))?;
+            (!BASE.contains(&who.as_str())).then(|| (w.clone(), who.clone()))
         })
         .collect()
 }
@@ -1811,7 +1919,7 @@ fn compile(
     verbose: bool,
     boot: bool,
     at_once: usize,
-) -> Result<(PathBuf, Vec<String>), String> {
+) -> Result<(PathBuf, Vec<String>, Vec<String>), String> {
     let start = Instant::now();
     let work = root.join("var/kiry/stage").join(format!(
         "{}-{}-{}.{t}",
@@ -2236,7 +2344,16 @@ fn compile(
                 say!("{} {t} {kind} {who}  {soname}", p.name);
                 linked.insert(who);
             }
-            Ok((work, linked.into_iter().collect()))
+            for (path, who) in interpreters(root, t, &dest) {
+                if !deps.iter().any(|d| !d.make && d.name == who) && linked.insert(who.clone()) {
+                    say!("{} {t} interpreter {who}  {path}", p.name);
+                }
+            }
+            let dropped = unbacked(root, &deps, t, &dest);
+            for d in &dropped {
+                say!("{} {t} dropped {d}  nothing links or loads it", p.name);
+            }
+            Ok((work, linked.into_iter().collect(), dropped))
         }
         Ok(_) if verbose => {
             failed(root, p, t, None, start.elapsed().as_secs());
@@ -2918,26 +3035,32 @@ fn untar(path: &Path, into: &Path, name: &str) -> Result<(), String> {
         c
     };
 
-    if !(name.ends_with(".xz") || name.ends_with(".txz") || name.ends_with(".lzma")) {
+    // zstd for the same reason: busybox tar has no decoder, so it reads the stream as a
+    // tar and stops at the first header. --long=31 takes a window of any size a packer chose
+    let (prog, args): (&str, &[&str]) = if name.ends_with(".zst") || name.ends_with(".tzst") {
+        ("zstd", &["-dc", "--long=31"])
+    } else if name.ends_with(".xz") || name.ends_with(".txz") || name.ends_with(".lzma") {
+        ("xz", &["-dc"])
+    } else {
         return run(&mut tar(None), name);
-    }
+    };
 
-    let mut x = Command::new("xz")
-        .arg("-dc")
+    let mut x = Command::new(prog)
+        .args(args)
         .arg(path)
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{name}: xz: {e}"))?;
+        .map_err(|e| format!("{name}: {prog}: {e}"))?;
     let Some(pipe) = x.stdout.take() else {
-        return Err(format!("{name}: xz gave us no pipe"));
+        return Err(format!("{name}: {prog} gave us no pipe"));
     };
 
     let t = tar(Some(Stdio::from(pipe)))
         .status()
         .map_err(|e| format!("{name}: tar: {e}"))?;
-    let x = x.wait().map_err(|e| format!("{name}: xz: {e}"))?;
+    let x = x.wait().map_err(|e| format!("{name}: {prog}: {e}"))?;
     if !x.success() {
-        return Err(format!("{name}: xz: {x}"));
+        return Err(format!("{name}: {prog}: {x}"));
     }
     if !t.success() {
         return Err(format!("{name}: tar: {t}"));
@@ -3025,6 +3148,7 @@ fn meta(
     f: &Flags,
     art: &Path,
     linked: &[String],
+    dropped: &[String],
 ) -> Result<(), String> {
     let mut d = art.as_os_str().to_owned();
     d.push(".meta");
@@ -3054,9 +3178,15 @@ fn meta(
     // that includes a dep the recipe calls build-only. makedepends names the -dev half
     // of what gets linked, so imlib2 says libpng make and links libpng16.so.16, and a
     // record that kept the make would plan a cached imlib2 without libpng
+    //
+    // and the other way: a runtime line unbacked() found no reason for stays in the recipe
+    // and out of here, so installing the artifact does not bring it
     let mut deps = String::new();
     let mut said: HashSet<&str> = HashSet::new();
     for x in p.depends.iter().filter(|x| x.applies(t)) {
+        if !x.make && dropped.contains(&x.name) {
+            continue;
+        }
         if x.make && linked.contains(&x.name) {
             let run = Dep {
                 make: false,
@@ -5374,8 +5504,8 @@ fn wanted(
         // its build deps too closed llvm, cmake and python3 into a cycle on an empty
         // root with every one of them sitting in the cache
         let built = fresh(root, p, &t);
-        let next: Vec<(String, String)> = p
-            .depends
+        let deps = if built { planned(root, p, &t) } else { p.depends.clone() };
+        let next: Vec<(String, String)> = deps
             .iter()
             .filter(|d| d.applies(&t) && !(built && d.make))
             .map(|d| {
@@ -5392,6 +5522,17 @@ fn wanted(
         }
     }
     out
+}
+
+// what installing a built artifact asks for: its sidecar's depends, which is what the
+// build linked and ran rather than what the recipe expected before it. a sidecar from
+// before kiry wrote depends has none, and the recipe is all there is
+fn planned(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
+    let at = PathBuf::from(format!("{}.meta/depends", artifact(root, p, t).display()));
+    match pkg::lines(&at) {
+        Ok(ls) if at.is_file() => pkg::depends_from(ls),
+        _ => p.depends.clone(),
+    }
 }
 
 // the toolchain members the root lacks, with the runtime deps they bring, each from an
@@ -5643,6 +5784,10 @@ fn sidecar(art: &Path) -> Option<(String, String)> {
 // the kernel and the two libcs. what breaks when one of these is replaced under a running
 // system is not the file, which the loader already has open, but the next boot
 const SUBSTRATE: &[&str] = &["linux", "musl", "glibc"];
+
+// what every root starts from and no recipe names. an edge to one of these from every
+// script that says #!/bin/sh would be a thousand lines saying nothing
+const BASE: &[&str] = &["musl", "baselayout", "busybox", "ca-certificates"];
 
 // the root that is running is what a live install writes to, and BootOrder is what
 // decides which root comes back. the two are allowed to disagree, and when they do the
@@ -10114,19 +10259,7 @@ fn checks_without(root: &Path, gone: &[(String, String)]) -> (Vec<(String, Findi
     // the kernel will not start a script whose interpreter is not there, which is the
     // same failure DT_NEEDED describes and nothing was checking it
     for (t, (pkg, path, words)) in &scripts {
-        let mut want = words[0].trim_start_matches('/').to_string();
-        // env looks the real one up on PATH, so that is the name that has to exist
-        if want.ends_with("/env") || want == "env" {
-            // env takes its own options and VAR=value pairs first. -S is the common one
-            match words
-                .iter()
-                .skip(1)
-                .find(|w| !w.starts_with('-') && !w.contains('='))
-            {
-                Some(w) => want.clone_from(w),
-                None => continue,
-            }
-        }
+        let Some(want) = interpreter(words) else { continue };
         let there = if want.contains('/') {
             exists(&anywhere, &anylinks, &want)
         } else {
@@ -10146,6 +10279,21 @@ fn checks_without(root: &Path, gone: &[(String, String)]) -> (Vec<(String, Findi
         }
     }
     (out, waiting)
+}
+
+// what a shebang needs to exist: a path under the root, or a bare command for PATH
+fn interpreter(words: &[String]) -> Option<String> {
+    let want = words.first()?.trim_start_matches('/').to_string();
+    // env looks the real one up on PATH, so that is the name that has to exist
+    if want.ends_with("/env") || want == "env" {
+        // env takes its own options and VAR=value pairs first. -S is the common one
+        return words
+            .iter()
+            .skip(1)
+            .find(|w| !w.starts_with('-') && !w.contains('='))
+            .cloned();
+    }
+    Some(want)
 }
 
 // DT_NEEDED names a file, not a soname. the loader opens the first directory on the
@@ -10921,7 +11069,7 @@ mod sidecar {
             env: Vec::new(),
             from: Vec::new(),
         };
-        meta(&at, &p, "x86_64-gnu", "0", &f, &art, &linked).unwrap();
+        meta(&at, &p, "x86_64-gnu", "0", &f, &art, &linked, &[]).unwrap();
 
         let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-gnu.tar.zst.meta/depends")).unwrap();
         let lines: Vec<&str> = got.lines().collect();
@@ -10974,12 +11122,190 @@ mod sidecar {
             env: Vec::new(),
             from: Vec::new(),
         };
-        meta(&at, &p, "x86_64-musl", "0", &f, &art, &linked).unwrap();
+        meta(&at, &p, "x86_64-musl", "0", &f, &art, &linked, &[]).unwrap();
 
         let got =
             fs::read_to_string(at.join("thing-1.0-1.x86_64-musl.tar.zst.meta/depends")).unwrap();
         let lines: Vec<&str> = got.lines().collect();
         assert_eq!(lines, vec!["libpng", "cmake make", "argp musl"], "{got}");
+    }
+
+    const T: &str = "x86_64-musl";
+
+    fn scratch(what: &str) -> PathBuf {
+        let at = std::env::temp_dir().join(format!("kiry-meta-{}", std::process::id())).join(what);
+        let _ = fs::remove_dir_all(&at);
+        mkdirs(&at).unwrap();
+        at
+    }
+
+    fn dep(name: &str) -> pkg::Dep {
+        pkg::Dep { name: name.into(), make: false, host: false, only: None }
+    }
+
+    // a shared object out of clang, so the soname and DT_NEEDED are the linker's and not
+    // something written to look like them
+    fn so(out: &Path, soname: Option<&str>, links: &[&Path]) {
+        mkdirs(out.parent().unwrap()).unwrap();
+        let src = out.with_extension("c");
+        fs::write(&src, "int kiry_test_fn(void) { return 1; }\n").unwrap();
+        let mut c = Command::new("clang");
+        c.args(["-shared", "-fPIC", "-nostdlib", "-Wl,--no-as-needed", "-o"]).arg(out).arg(&src);
+        if let Some(s) = soname {
+            c.arg(format!("-Wl,-soname,{s}"));
+        }
+        c.args(links);
+        assert!(c.status().unwrap().success(), "clang failed for {}", out.display());
+        fs::remove_file(&src).unwrap();
+    }
+
+    // an installed package: its files written under the root, its manifest, its provides
+    fn installed(root: &Path, name: &str, files: &[(&str, u32)], sonames: &[&str]) {
+        let manifest = files
+            .iter()
+            .map(|(p, mode)| {
+                let f = root.join(p);
+                if !f.exists() {
+                    mkdirs(f.parent().unwrap()).unwrap();
+                    fs::write(&f, "x\n").unwrap();
+                }
+                db::Entry { mode: *mode, kind: db::Kind::File("0".repeat(64)), path: (*p).into() }
+            })
+            .collect();
+        db::write(
+            root,
+            &db::Installed {
+                name: name.into(),
+                target: T.into(),
+                version: pkg::Version::parse("1.0 1").unwrap(),
+                depends: Vec::new(),
+                manifest,
+                hash: String::new(),
+                users: Vec::new(),
+                flags: Vec::new(),
+            },
+        )
+        .unwrap();
+        let ps: Vec<db::Provide> = sonames
+            .iter()
+            .map(|s| db::Provide { soname: (*s).into(), path: format!("usr/lib/{s}"), versioned: false })
+            .collect();
+        db::write_provides(root, T, name, &ps).unwrap();
+    }
+
+    // the one thing the runtime record may now leave out, so every reason a declared dep
+    // stays gets its own case and only the plain unlinked library goes
+    #[test]
+    fn a_runtime_dep_stays_only_when_something_backs_it() {
+        let at = scratch("unbacked");
+        let root = at.join("root");
+        let dest = at.join("dest");
+
+        so(&root.join("usr/lib/libfoo.so.1"), Some("libfoo.so.1"), &[]);
+        installed(&root, "linked", &[("usr/lib/libfoo.so.1", 0o755)], &["libfoo.so.1"]);
+        installed(&root, "loaded", &[("usr/lib/libsensors.so.5", 0o755)], &["libsensors.so.5"]);
+        installed(&root, "plain", &[("usr/lib/libxau.so.6", 0o755)], &["libxau.so.6"]);
+        installed(&root, "tool", &[("usr/lib/libjvm.so.1", 0o755), ("usr/lib/jvm/bin/java", 0o755)], &["libjvm.so.1"]);
+        so(&root.join("usr/lib/qt6/plugins/libqwayland.so"), None, &[]);
+        installed(&root, "plugin", &[("usr/lib/libQt6Wl.so.6", 0o755), ("usr/lib/qt6/plugins/libqwayland.so", 0o755)], &["libQt6Wl.so.6"]);
+        installed(&root, "data", &[("usr/share/icons/hicolor/index.theme", 0o644)], &[]);
+
+        so(&dest.join("usr/bin/thing"), None, &[&root.join("usr/lib/libfoo.so.1")]);
+        mkdirs(&dest.join("usr/share/thing")).unwrap();
+        fs::write(dest.join("usr/share/thing/probe"), "dlopen(\"libsensors.so.5\")\n").unwrap();
+
+        let deps: Vec<pkg::Dep> =
+            ["linked", "loaded", "plain", "tool", "plugin", "data", "absent"].iter().map(|n| dep(n)).collect();
+        let mut make = dep("plainmake");
+        make.make = true;
+        installed(&root, "plainmake", &[("usr/lib/libz.so.1", 0o755)], &["libz.so.1"]);
+        let mut all = deps.clone();
+        all.push(make);
+
+        assert_eq!(unbacked(&root, &all, T, &dest), vec!["plain".to_string()]);
+    }
+
+    #[test]
+    fn a_dropped_dep_stays_out_of_the_sidecar() {
+        let at = scratch("dropped");
+        let recipe = at.join("thing");
+        mkdirs(&recipe).unwrap();
+        let p = Package {
+            name: "thing".into(),
+            dir: recipe,
+            version: pkg::Version::parse("1.0 1").unwrap(),
+            sources: Vec::new(),
+            checksums: Vec::new(),
+            depends: vec![dep("ncurses"), dep("libxau")],
+            targets: vec![T.into()],
+            users: Vec::new(),
+        };
+        let f = Flags {
+            cflags: String::new(),
+            cxxflags: String::new(),
+            ldflags: String::new(),
+            rustflags: String::new(),
+            use_flags: Vec::new(),
+            env: Vec::new(),
+            from: Vec::new(),
+        };
+        let art = at.join("thing-1.0-1.x86_64-musl.tar.zst");
+        meta(&at, &p, T, "0", &f, &art, &[], &["libxau".to_string()]).unwrap();
+        let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-musl.tar.zst.meta/depends")).unwrap();
+        assert_eq!(got.lines().collect::<Vec<_>>(), vec!["ncurses"], "{got}");
+    }
+
+    // python is who runs the script, so python is a runtime edge. the doc example's php is
+    // not, and the base's sh is everyone's
+    #[test]
+    fn a_script_brings_the_package_that_ships_its_interpreter() {
+        let at = scratch("interp");
+        let root = at.join("root");
+        let dest = at.join("dest");
+        installed(&root, "python3", &[("usr/bin/python3", 0o755)], &[]);
+        installed(&root, "php", &[("usr/bin/php", 0o755)], &[]);
+        installed(&root, "busybox", &[("bin/sh", 0o755)], &[]);
+
+        let script = |rel: &str, body: &str| {
+            let f = dest.join(rel);
+            mkdirs(f.parent().unwrap()).unwrap();
+            fs::write(&f, body).unwrap();
+            fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        script("usr/bin/tool", "#!/usr/bin/env -S python3 -u\nprint(1)\n");
+        script("usr/bin/wrap", "#!/bin/sh\nexec tool\n");
+        script("usr/share/doc/thing/example.php", "#!/usr/bin/env php\n<?php\n");
+
+        assert_eq!(
+            interpreters(&root, T, &dest),
+            vec![("python3".to_string(), "python3".to_string())]
+        );
+    }
+
+    // installing a cached artifact asks for what its sidecar says, which may be less than
+    // the recipe; with no sidecar depends the recipe is all there is
+    #[test]
+    fn a_cached_artifact_plans_from_its_own_depends() {
+        let at = scratch("planned");
+        let recipe = at.join("thing");
+        mkdirs(&recipe).unwrap();
+        let p = Package {
+            name: "thing".into(),
+            dir: recipe,
+            version: pkg::Version::parse("1.0 1").unwrap(),
+            sources: Vec::new(),
+            checksums: Vec::new(),
+            depends: vec![dep("ncurses"), dep("libxau")],
+            targets: vec![T.into()],
+            users: Vec::new(),
+        };
+        let names = |d: Vec<pkg::Dep>| d.into_iter().map(|d| d.name).collect::<Vec<_>>();
+        assert_eq!(names(planned(&at, &p, T)), vec!["ncurses", "libxau"]);
+
+        let side = PathBuf::from(format!("{}.meta", artifact(&at, &p, T).display()));
+        mkdirs(&side).unwrap();
+        fs::write(side.join("depends"), "ncurses\n").unwrap();
+        assert_eq!(names(planned(&at, &p, T)), vec!["ncurses"]);
     }
 }
 

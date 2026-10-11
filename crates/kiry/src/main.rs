@@ -1137,6 +1137,10 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("no such command: `", "`") {
         return Some(format!("cmd:cargo-{n}"));
     }
+    // qt5's configure: You need perl in your PATH to make a build from GIT
+    if let Some(n) = between("need ", " in your PATH") {
+        return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
     // a shell that went looking on PATH. a path that is not found is a script whose #!
     // names something absent -- lsof's Mksrc wants bash -- and discover() reads which
     let r = l.strip_suffix(": command not found").or_else(|| l.strip_suffix(": not found"))?;
@@ -1204,10 +1208,11 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
             }),
             "cmake" => {
                 let pl = path.to_lowercase();
+                // a Find module is the finder, not the package: cmake ships FindLua.cmake and
+                // lua-luv still has no lua
                 pl.contains(&format!("/cmake/{lower}/"))
                     || pl.ends_with(&format!("/{lower}config.cmake"))
                     || pl.ends_with(&format!("/{lower}-config.cmake"))
-                    || pl.ends_with(&format!("/find{lower}.cmake"))
             }
             _ => false,
         }
@@ -1256,10 +1261,18 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     }
 
     let stem = lower.trim_end_matches(".h").to_string();
-    [stem.clone(), format!("lib{stem}"), format!("py3-{stem}")]
+    let named = [stem.clone(), format!("lib{stem}"), format!("py3-{stem}")]
         .into_iter()
         .find(|c| fresh(c) && recipe(root, c).is_some())
-        .map(|c| (c, "name"))
+        .map(|c| (c, "name"));
+    if named.is_some() || k != "cmake" {
+        return named;
+    }
+    // a cmake package is named without the version a recipe carries: Lua is lua5.1 on a
+    // list that has lua5.1 to lua5.5, and the first one listed is the one taken
+    pool.iter()
+        .find(|c| c.strip_prefix(stem.as_str()).is_some_and(|r| !r.is_empty() && r.chars().all(|x| x.is_ascii_digit() || x == '.')) && fresh(c))
+        .map(|c| ((*c).to_string(), "name"))
 }
 
 enum Step {
@@ -2659,6 +2672,13 @@ fn compile(
         ("kirycc", cc.replace("@REAL@", "clang").replace("@EXTRA@", "")),
         (
             "kiryc++",
+            cc.replace("@REAL@", "clang++").replace("@EXTRA@", &cxx_extra),
+        ),
+        // the names these had once, which whatever was built then baked in: libtool on
+        // navi says CC="kiry-cc", and libvterm and libmpack died running it
+        ("kiry-cc", cc.replace("@REAL@", "clang").replace("@EXTRA@", "")),
+        (
+            "kiry-c++",
             cc.replace("@REAL@", "clang++").replace("@EXTRA@", &cxx_extra),
         ),
     ] {
@@ -12973,6 +12993,8 @@ mod misses_from_logs {
         assert_eq!(first(&late).as_deref(), Some("cmd:msgfmt"));
         assert_eq!(first("Can't exec \"aclocal\": No such file or directory at /usr/share/autoconf/Autom4te/FileUtils.pm line 297.\n").as_deref(), Some("cmd:aclocal"));
         assert_eq!(first("error: no such command: `auditable`\n").as_deref(), Some("cmd:cargo-auditable"));
+        assert_eq!(first("You need perl in your PATH to make a build from GIT.\nCannot proceed.\n").as_deref(), Some("cmd:perl"));
+        assert_eq!(first("-- Could NOT find Lua (missing: LUA_LIBRARIES LUA_INCLUDE_DIR)\nCMake Error at CMakeLists.txt:142 (message):\n").as_deref(), Some("cmake:Lua"));
         assert_eq!(first("./Configure: line 4978: ./lib/dialects/linux/Mksrc: not found\n").as_deref(), Some("cmd:./lib/dialects/linux/Mksrc"));
         let itstool = "checking for python module libxml2... not found\nconfigure: error: Python module libxml2 is needed to run this package\n";
         assert_eq!(first(itstool).as_deref(), Some("py:libxml2"));

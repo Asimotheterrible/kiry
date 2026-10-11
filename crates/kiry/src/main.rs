@@ -2382,6 +2382,7 @@ test-flags() {
 }
 
 want_check() { return 1; }
+subpackage_types_has() { return 1; }
 options_has() { case \" $options \" in *\" $1 \"*) return 0 ;; esac; return 1; }
 ";
 

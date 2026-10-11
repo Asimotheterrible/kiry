@@ -5117,9 +5117,14 @@ fn install_cmd(args: &[String]) {
     if names.is_empty() {
         die("nothing to install".into());
     }
+    // a name typed is a name asked for. @world and @outdated stand for what is already in
+    let typed: Vec<String> = names.iter().filter(|n| !n.starts_with('@')).cloned().collect();
     let names = expand(&root, names);
     if names.is_empty() {
         return;
+    }
+    if !dry {
+        seed_world(&root);
     }
 
     // an archive or a package. told apart by the suffix a built artifact always carries,
@@ -5132,6 +5137,8 @@ fn install_cmd(args: &[String]) {
         settle(&root, &going, live);
         let _w = writer(&root);
         apply_batch(&root, &paths, force);
+        wish(&root, &going.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+        leave(&root);
         skew(&root);
         return;
     }
@@ -5141,6 +5148,7 @@ fn install_cmd(args: &[String]) {
 
     let mut recipes: HashMap<String, Package> = HashMap::new();
     let mut seeds: Vec<(String, String)> = Vec::new();
+    let mut named: Vec<String> = Vec::new();
     for n in &asked {
         let at = match resolve(&root, n) {
             Ok(at) => at,
@@ -5165,9 +5173,15 @@ fn install_cmd(args: &[String]) {
                 _ => seeds.push((p.name.clone(), t)),
             }
         }
+        if typed.contains(n) {
+            named.push(p.name.clone());
+        }
         recipes.insert(p.name.clone(), p);
     }
     if seeds.is_empty() {
+        if !dry {
+            wish(&root, &named);
+        }
         return;
     }
 
@@ -5262,6 +5276,8 @@ fn install_cmd(args: &[String]) {
         }
         let _w = writer(&root);
         apply_batch(&root, &all, force);
+        wish(&root, &named);
+        leave(&root);
         skew(&root);
         return;
     }
@@ -5341,6 +5357,8 @@ fn install_cmd(args: &[String]) {
         drop(w);
     }
     let _w = writer(&root);
+    wish(&root, &named);
+    leave(&root);
     skew(&root);
     batch_end(true);
 }
@@ -6065,6 +6083,9 @@ fn remove_cmd(args: &[String]) {
         }
     }
     hooks(&root, plan.iter().map(|(t, _)| (*t).clone()).collect());
+    // what only the removed packages needed goes with them
+    unwish(&root, &names);
+    leave(&root);
     skew(&root);
 }
 
@@ -6091,16 +6112,8 @@ fn held_by(root: &Path, plan: &[(&String, Vec<String>)]) {
         .iter()
         .flat_map(|(t, mine)| mine.iter().map(|n| ((*t).clone(), n.clone())))
         .collect();
-    let row = |t: &String, f: &Finding| (t.clone(), f.path.clone(), f.what.to_string());
-    let before: HashSet<(String, String, String)> =
-        broken(root).iter().map(|(t, f)| row(t, f)).collect();
     let mut by: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-    for (t, f) in checks_without(root, &gone).0 {
-        // a preserved record keeps its package's name after the package is gone
-        let theirs = gone.contains(&(t.clone(), f.pkg.clone()));
-        if !f.what.breaks() || theirs || before.contains(&row(&t, &f)) {
-            continue;
-        }
+    for (t, f) in would_break(root, &gone) {
         by.entry((f.pkg.clone(), t)).or_default().insert(f.what.to_string());
     }
     for ((pkg, t), what) in by {
@@ -6110,6 +6123,211 @@ fn held_by(root: &Path, plan: &[(&String, Vec<String>)]) {
     if !held.is_empty() {
         die(held.join("\n"));
     }
+}
+
+// what doctor would newly find with these (target, name) gone, and nothing it finds today
+fn would_break(root: &Path, gone: &[(String, String)]) -> Vec<(String, Finding)> {
+    let row = |t: &String, f: &Finding| (t.clone(), f.path.clone(), f.what.to_string());
+    let before: HashSet<(String, String, String)> =
+        broken(root).iter().map(|(t, f)| row(t, f)).collect();
+    checks_without(root, gone)
+        .0
+        .into_iter()
+        // a preserved record keeps its package's name after the package is gone
+        .filter(|(t, f)| f.what.breaks() && !gone.contains(&(t.clone(), f.pkg.clone())) && !before.contains(&row(t, f)))
+        .collect()
+}
+
+// the names asked for, one per line, which is what keeps everything else installed. a
+// build dep comes in for a build and nothing ever took it back out: 19 of the 25 packages
+// thirteen app installs left behind were that. hand-edited like the rest of /etc/kiry --
+// take a name out and the next batch takes it, and what only it needed, away
+const WORLD: &str = "etc/kiry/world";
+
+fn asked_for(root: &Path) -> Option<Vec<String>> {
+    let text = fs::read_to_string(root.join(WORLD)).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|l| l.split('#').next()?.split_whitespace().next())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+// installed and needed by nothing else installed on its target, which is what somebody
+// asked for or what a build left behind, and from outside the two look the same
+fn leaves(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for t in db::targets(root).unwrap_or_default() {
+        let names = db::installed(root, &t).unwrap_or_default();
+        let mut used: HashSet<String> = HashSet::new();
+        for n in &names {
+            let Ok(r) = db::read(root, &t, n) else { continue };
+            used.extend(r.depends.iter().filter(|d| !d.make && d.applies(&t)).map(|d| d.name.clone()));
+        }
+        out.extend(names.into_iter().filter(|n| !used.contains(n)));
+    }
+    out
+}
+
+// a root that has never had a world gets one from its leaves, taken before the batch
+// installs anything, so the first batch removes only what it brought in itself. the
+// leftovers of every batch before that are in it too, and taking them out is a vi away
+fn seed_world(root: &Path) {
+    let at = root.join(WORLD);
+    if at.exists() {
+        return;
+    }
+    let all = leaves(root);
+    if all.is_empty() {
+        return;
+    }
+    let mut text = String::from("# what is asked for. everything else stays only while one of these needs it\n");
+    for n in &all {
+        text.push_str(n);
+        text.push('\n');
+    }
+    match mkdirs(at.parent().unwrap_or(root)).and_then(|()| put(&at, &text)) {
+        Ok(()) => say!("world seeded with {} packages nothing else needs, {}", all.len(), at.display()),
+        Err(e) => die(e),
+    }
+}
+
+fn wish(root: &Path, names: &[String]) {
+    let Some(have) = asked_for(root) else { return };
+    let new: Vec<&String> = names.iter().filter(|n| !have.contains(n)).collect();
+    if new.is_empty() {
+        return;
+    }
+    let at = root.join(WORLD);
+    let mut text = fs::read_to_string(&at).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for n in new {
+        text.push_str(n);
+        text.push('\n');
+    }
+    if let Err(e) = put(&at, &text) {
+        die(e);
+    }
+}
+
+fn unwish(root: &Path, names: &[String]) {
+    let at = root.join(WORLD);
+    let Ok(text) = fs::read_to_string(&at) else { return };
+    let kept: String = text
+        .lines()
+        .filter(|l| !l.split('#').next().and_then(|w| w.split_whitespace().next()).is_some_and(|w| names.iter().any(|n| n == w)))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    if kept != text {
+        if let Err(e) = put(&at, &kept) {
+            die(e);
+        }
+    }
+}
+
+// everything no runtime edge reaches from world, the base, the toolchain or kiry itself
+// goes. the toolchain is kept because no recipe names it and every build needs it, and
+// kiry because removing the package manager is a mistake nobody makes on purpose
+//
+// a record can still miss an edge that doctor sees -- a library linked but never written
+// down, a script's interpreter -- so whatever doctor says the removal would break stays,
+// with what it pulls in. a breakage that names no package here leaves everything alone and
+// says so, rather than guess which one it was
+fn leave(root: &Path) {
+    let Some(asked) = asked_for(root) else { return };
+    let host = sandbox::host();
+    let mut roots: Vec<String> = asked;
+    roots.extend(BASE.iter().chain(SUBSTRATE).map(|s| (*s).to_string()));
+    roots.extend(sandbox::toolchain(root).unwrap_or_default().into_iter().map(|d| d.name));
+    roots.push("kiry".into());
+
+    let targets = db::targets(root).unwrap_or_default();
+    let installed: HashSet<(String, String)> = targets
+        .iter()
+        .flat_map(|t| db::installed(root, t).unwrap_or_default().into_iter().map(move |n| (t.clone(), n)))
+        .collect();
+    let mut keep: HashSet<(String, String)> = HashSet::new();
+    let mut queue: Vec<(String, String)> = targets
+        .iter()
+        .flat_map(|t| roots.iter().map(move |n| (t.clone(), n.clone())))
+        .filter(|x| installed.contains(x))
+        .collect();
+    let reach = |queue: &mut Vec<(String, String)>, keep: &mut HashSet<(String, String)>| {
+        while let Some((t, n)) = queue.pop() {
+            if !keep.insert((t.clone(), n.clone())) {
+                continue;
+            }
+            let Ok(r) = db::read(root, &t, &n) else { continue };
+            for d in r.depends.iter().filter(|d| !d.make && d.applies(&t)) {
+                let dt = if d.host { host.clone() } else { t.clone() };
+                if installed.contains(&(dt.clone(), d.name.clone())) {
+                    queue.push((dt, d.name.clone()));
+                }
+            }
+        }
+    };
+    reach(&mut queue, &mut keep);
+
+    let mut gone: Vec<(String, String)> = installed.iter().filter(|x| !keep.contains(*x)).cloned().collect();
+    gone.sort();
+    if gone.is_empty() {
+        return;
+    }
+    // each round keeps what the last one showed was needed, and that can only shrink gone
+    loop {
+        let hurt = would_break(root, &gone);
+        if hurt.is_empty() {
+            break;
+        }
+        let own = owners(root);
+        let mut back: Vec<(String, String)> = Vec::new();
+        for (t, f) in &hurt {
+            let who = match &f.what {
+                What::Unresolved(so) => gone.iter().find(|(gt, n)| {
+                    gt == t && db::read_provides(root, gt, n).unwrap_or_default().iter().any(|p| &p.soname == so)
+                }),
+                What::NoInterpreter(w) => {
+                    let words: Vec<String> = w.split_whitespace().map(str::to_string).collect();
+                    let cmd = interpreter(&words).unwrap_or_default();
+                    let cmd = cmd.rsplit('/').next().unwrap_or_default().to_string();
+                    own.get(&(t.clone(), format!("cmd:{cmd}"))).and_then(|o| gone.iter().find(|(gt, n)| gt == t && n == o))
+                }
+                _ => None,
+            };
+            match who {
+                Some(x) => back.push(x.clone()),
+                None => {
+                    say!("left everything in place: removing {} breaks {} {t} {}", gone.len(), f.pkg, f.what);
+                    return;
+                }
+            }
+        }
+        let mut queue = back;
+        reach(&mut queue, &mut keep);
+        gone.retain(|x| !keep.contains(x));
+        if gone.is_empty() {
+            return;
+        }
+    }
+
+    for t in &targets {
+        let mine: Vec<String> = gone.iter().filter(|(gt, _)| gt == t).map(|(_, n)| n.clone()).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        match install::remove(root, t, &mine, false) {
+            Ok(done) => {
+                for (name, r) in done {
+                    say!("{name} {t} left, nothing asked for needs it  {} files", r.gone);
+                }
+            }
+            Err(e) => say!("{t}: not removed: {e}"),
+        }
+    }
+    hooks(root, targets.into_iter().collect());
 }
 
 fn list_cmd(args: &[String]) {
@@ -11130,22 +11348,22 @@ mod sidecar {
         assert_eq!(lines, vec!["libpng", "cmake make", "argp musl"], "{got}");
     }
 
-    const T: &str = "x86_64-musl";
+    pub(super) const T: &str = "x86_64-musl";
 
-    fn scratch(what: &str) -> PathBuf {
+    pub(super) fn scratch(what: &str) -> PathBuf {
         let at = std::env::temp_dir().join(format!("kiry-meta-{}", std::process::id())).join(what);
         let _ = fs::remove_dir_all(&at);
         mkdirs(&at).unwrap();
         at
     }
 
-    fn dep(name: &str) -> pkg::Dep {
+    pub(super) fn dep(name: &str) -> pkg::Dep {
         pkg::Dep { name: name.into(), make: false, host: false, only: None }
     }
 
     // a shared object out of clang, so the soname and DT_NEEDED are the linker's and not
     // something written to look like them
-    fn so(out: &Path, soname: Option<&str>, links: &[&Path]) {
+    pub(super) fn so(out: &Path, soname: Option<&str>, links: &[&Path]) {
         mkdirs(out.parent().unwrap()).unwrap();
         let src = out.with_extension("c");
         fs::write(&src, "int kiry_test_fn(void) { return 1; }\n").unwrap();
@@ -11160,7 +11378,7 @@ mod sidecar {
     }
 
     // an installed package: its files written under the root, its manifest, its provides
-    fn installed(root: &Path, name: &str, files: &[(&str, u32)], sonames: &[&str]) {
+    pub(super) fn installed(root: &Path, name: &str, files: &[(&str, u32)], sonames: &[&str]) {
         let manifest = files
             .iter()
             .map(|(p, mode)| {
@@ -11169,7 +11387,8 @@ mod sidecar {
                     mkdirs(f.parent().unwrap()).unwrap();
                     fs::write(&f, "x\n").unwrap();
                 }
-                db::Entry { mode: *mode, kind: db::Kind::File("0".repeat(64)), path: (*p).into() }
+                let sum = kiry_core::sha256(&fs::read(&f).unwrap()[..]).unwrap();
+                db::Entry { mode: *mode, kind: db::Kind::File(sum), path: (*p).into() }
             })
             .collect();
         db::write(
@@ -11961,5 +12180,93 @@ mod layouts {
             unplaced("struct (unnamed at /dest/x.h:3:1)::(unnamed at /dest/x.h:4:2) y"),
             "struct (unnamed)::(unnamed) y"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod leaving {
+    use super::sidecar::{dep, installed, scratch, so, T};
+    use super::*;
+
+    fn needs(root: &Path, name: &str, deps: &[pkg::Dep]) {
+        let mut r = db::read(root, T, name).unwrap();
+        r.depends = deps.to_vec();
+        db::write(root, &r).unwrap();
+    }
+
+    fn have(root: &Path) -> Vec<String> {
+        db::installed(root, T).unwrap()
+    }
+
+    // a root without a world gets its leaves, and a root with one keeps what it has
+    #[test]
+    fn a_world_is_seeded_from_what_nothing_else_needs() {
+        let root = scratch("seed");
+        installed(&root, "app", &[("usr/bin/app", 0o755)], &[]);
+        installed(&root, "lib", &[("usr/lib/liblib.so.1", 0o755)], &["liblib.so.1"]);
+        needs(&root, "app", &[dep("lib")]);
+
+        seed_world(&root);
+        assert_eq!(asked_for(&root).unwrap(), vec!["app"]);
+        fs::write(root.join(WORLD), "# mine\nother\n").unwrap();
+        seed_world(&root);
+        assert_eq!(asked_for(&root).unwrap(), vec!["other"]);
+    }
+
+    #[test]
+    fn asking_appends_and_removing_takes_the_line_out() {
+        let root = scratch("wish");
+        wish(&root, &["foot".into()]);
+        assert!(!root.join(WORLD).exists(), "no world, no file written behind anybody's back");
+
+        mkdirs(&root.join("etc/kiry")).unwrap();
+        fs::write(root.join(WORLD), "# what i want\nfoot  # the terminal\nmpv").unwrap();
+        wish(&root, &["foot".into(), "htop".into()]);
+        assert_eq!(fs::read_to_string(root.join(WORLD)).unwrap(), "# what i want\nfoot  # the terminal\nmpv\nhtop\n");
+        unwish(&root, &["foot".into()]);
+        assert_eq!(fs::read_to_string(root.join(WORLD)).unwrap(), "# what i want\nmpv\nhtop\n");
+    }
+
+    // the build dep goes; what world reaches through a runtime edge, the base and kiry stay
+    #[test]
+    fn what_nothing_asked_for_needs_leaves() {
+        let root = scratch("leave");
+        installed(&root, "app", &[("usr/bin/app", 0o755)], &[]);
+        installed(&root, "lib", &[("usr/lib/liblib.so.1", 0o755)], &["liblib.so.1"]);
+        installed(&root, "builddep", &[("usr/bin/builddep", 0o755)], &[]);
+        installed(&root, "busybox", &[("bin/busybox", 0o755)], &[]);
+        installed(&root, "kiry", &[("usr/bin/kiry", 0o755)], &[]);
+        needs(&root, "app", &[dep("lib")]);
+        mkdirs(&root.join("etc/kiry")).unwrap();
+        fs::write(root.join(WORLD), "app\n").unwrap();
+
+        leave(&root);
+        assert_eq!(have(&root), vec!["app", "busybox", "kiry", "lib"]);
+        assert!(!root.join("usr/bin/builddep").exists());
+    }
+
+    // app links libhidden and its record never said so. doctor sees it, so hidden stays
+    #[test]
+    fn a_library_linked_but_never_written_down_stays() {
+        let root = scratch("hidden");
+        so(&root.join("usr/lib/libhidden.so.1"), Some("libhidden.so.1"), &[]);
+        so(&root.join("usr/bin/app"), None, &[&root.join("usr/lib/libhidden.so.1")]);
+        installed(&root, "hidden", &[("usr/lib/libhidden.so.1", 0o755)], &["libhidden.so.1"]);
+        installed(&root, "app", &[("usr/bin/app", 0o755)], &[]);
+        installed(&root, "builddep", &[("usr/bin/builddep", 0o755)], &[]);
+        mkdirs(&root.join("etc/kiry")).unwrap();
+        fs::write(root.join(WORLD), "app\n").unwrap();
+
+        leave(&root);
+        assert_eq!(have(&root), vec!["app", "hidden"]);
+    }
+
+    #[test]
+    fn no_world_means_nothing_leaves() {
+        let root = scratch("noworld");
+        installed(&root, "builddep", &[("usr/bin/builddep", 0o755)], &[]);
+        leave(&root);
+        assert_eq!(have(&root), vec!["builddep"]);
     }
 }

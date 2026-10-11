@@ -1541,7 +1541,7 @@ fn a_cached_line_has_the_columns_and_colours_of_a_built_one() {
 
     // every member cached, so no batch starts and the widths come from the set alone
     let tty = on_tty(120, &format!("env -u NO_COLOR {KIRY} i --root {r} a longername"));
-    let rows: Vec<&str> = tty.lines().filter(|l| l.contains("cached")).collect();
+    let rows: Vec<&str> = tty.lines().filter(|l| l.ends_with("cached")).collect();
     assert_eq!(rows.len(), 2, "{tty:?}");
     for l in &rows {
         assert!(l.contains("\x1b[97m") && l.contains("\x1b[36mx86_64-musl"), "{l:?}");
@@ -7056,6 +7056,11 @@ fn a_struct_that_grows_queues_what_builds_against_it() {
     build_and_install("1.0", &bar_h(4, 7));
     record(&root, "baruser", &["libbar"], Vec::new());
     db::write_provides(&root, "x86_64-musl", "baruser", &[]).unwrap();
+    // installed by hand rather than by i, so it goes into world by hand too, or the next
+    // batch takes it away as something nobody asked for
+    let mut w = fs::read_to_string(root.join("etc/kiry/world")).unwrap();
+    w.push_str("baruser\n");
+    fs::write(root.join("etc/kiry/world"), w).unwrap();
 
     let said = build_and_install("1.1", &bar_h(4, 12));
     assert!(!said.contains("layout moved"), "{said}");

@@ -833,6 +833,19 @@ fn build(
         let was = installed_version(root, t, &p.name);
         batch_took(&key(p, t), secs);
         say!("{}{note}", row(&p.name, &p.version.upstream, was.as_deref(), t, "ok", Some(secs)));
+        // what the recipe lists that this build did without. each is a flag away: a line
+        // flags <name> in /etc/kiry/pkg puts it in the closure for the next build
+        if discovers(p) {
+            let off: Vec<&str> = p
+                .depends
+                .iter()
+                .filter(|d| d.make && d.applies(t) && !used.iter().any(|u| u.name == d.name))
+                .map(|d| d.name.as_str())
+                .collect();
+            if !off.is_empty() {
+                say!("{} {t} skipped  {}", p.name, off.join(" "));
+            }
+        }
         let cpu = fs::read_to_string(work.join("cpu")).ok().and_then(|c| c.trim().parse().ok());
         keep_time(root, p, t, secs, cpu);
         built.push((t.clone(), work, (linked, dropped, used)));
@@ -896,7 +909,10 @@ fn start(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
     let ls = pkg::lines(&closure_at(root, t, &p.name)).unwrap_or_default();
     let mut out: Vec<Dep> = Vec::new();
     if ls.iter().any(|l| l == "*") {
-        out.extend(p.depends.iter().cloned());
+        let no: Vec<String> = flags(root, &p.name, Some(&p.dir))
+            .map(|f| f.use_flags.iter().filter_map(|x| x.strip_prefix('-').map(String::from)).collect())
+            .unwrap_or_default();
+        out.extend(p.depends.iter().filter(|d| !no.contains(&d.name)).cloned());
     }
     let proven = pkg::depends_from(ls.into_iter().filter(|l| l != "*").collect());
     for d in proven.into_iter().chain(flagged(root, p)) {
@@ -907,19 +923,25 @@ fn start(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
     out
 }
 
-// deps a flag set on in the config brings in through the gentoo entry. a default in
-// IUSE brings nothing: features are off until somebody asks
+// deps a flag set on in the config brings in: one named after a package the recipe lists,
+// or what the gentoo entry puts under it. a default in IUSE brings nothing: features are
+// off until somebody asks
 fn flagged(root: &Path, p: &Package) -> Vec<Dep> {
-    let Some(g) = gentoo(&p.dir) else { return Vec::new() };
     let Ok(f) = flags(root, &p.name, Some(&p.dir)) else { return Vec::new() };
+    let mut out: Vec<Dep> = f
+        .use_flags
+        .iter()
+        .filter_map(|x| p.depends.iter().find(|d| d.name == *x).cloned())
+        .collect();
+    let Some(g) = gentoo(&p.dir) else { return out };
     let set = chosen(&f.use_flags);
-    g.wanted(&set)
-        .into_iter()
-        .filter_map(|(a, needs)| {
-            let n = recipe_for(root, &a)?;
-            (n != p.name).then_some(Dep { name: n, make: needs != Needs::Run, host: needs == Needs::Tool, only: None })
-        })
-        .collect()
+    for (a, needs) in g.wanted(&set) {
+        let Some(n) = recipe_for(root, &a) else { continue };
+        if n != p.name && !out.iter().any(|d| d.name == n) {
+            out.push(Dep { name: n, make: needs != Needs::Run, host: needs == Needs::Tool, only: None });
+        }
+    }
+    out
 }
 
 fn prove(root: &Path, t: &str, name: &str, line: &str) -> Result<(), String> {
@@ -1216,8 +1238,9 @@ fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Optio
 
     let have = start(root, p, t);
     let off = |d: &str| {
-        gentoo(&p.dir).is_some_and(|g| {
-            flags(root, &p.name, Some(&p.dir)).is_ok_and(|f| g.unwanted(&chosen(&f.use_flags), d))
+        flags(root, &p.name, Some(&p.dir)).is_ok_and(|f| {
+            f.use_flags.iter().any(|x| x.strip_prefix('-') == Some(d))
+                || gentoo(&p.dir).is_some_and(|g| g.unwanted(&chosen(&f.use_flags), d))
         })
     };
     let host = sandbox::host();
@@ -4033,10 +4056,17 @@ fn flags_with(
     // a flag means something only where this version's gentoo entry declares it, the way
     // portage reads USE against IUSE. without that a global -gtk would change the record
     // of every package installed and queue all of them for a rebuild that changes nothing
-    let declared: HashSet<String> = dir
+    //
+    // or where the recipe lists a package by that name. a converted build starts from what
+    // it proved it needs, so a dep it can do without -- htop's lm-sensors -- is off until a
+    // flag named after it puts it in the closure, and -name keeps one out
+    let mut declared: HashSet<String> = dir
         .and_then(gentoo)
         .map(|g| g.iuse.into_iter().map(|(n, _)| n).collect())
         .unwrap_or_default();
+    if let Some(d) = dir {
+        declared.extend(pkg::depends_from(pkg::lines(&d.join("depends")).unwrap_or_default()).into_iter().map(|x| x.name));
+    }
     use_flags.retain(|f| declared.contains(f.trim_start_matches('-')));
     use_flags.sort();
     Ok(Flags {

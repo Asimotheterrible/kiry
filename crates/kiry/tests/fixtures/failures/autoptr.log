@@ -1,0 +1,11 @@
+kiryc++ -O2 -march=znver3 -flto=thin -g0 -D_LIBCPP_KEEP_TRANSITIVE_INCLUDES_LLVM23 -Wno-register -fPIC -fexceptions -fvisibility=hidden -Wno-ctor-dtor-privacy -D__ANSI__ -I. -ISource -ISource/Metadata -ISource/FreeImageToolkit -ISource/LibJPEG -ISource/LibPNG -ISource/LibTIFF4 -ISource/ZLib -ISource/LibOpenJPEG -ISource/OpenEXR -ISource/OpenEXR/Half -ISource/OpenEXR/Iex -ISource/OpenEXR/IlmImf -ISource/OpenEXR/IlmThread -ISource/OpenEXR/Imath -ISource/OpenEXR/IexMath -ISource/LibRawLite -ISource/LibRawLite/dcraw -ISource/LibRawLite/internal -ISource/LibRawLite/libraw -ISource/LibRawLite/src -ISource/LibWebP -ISource/LibJXR -ISource/LibJXR/common/include -ISource/LibJXR/image/sys -ISource/LibJXR/jxrgluelib -fPIC -c Source/FreeImage/Conversion24.cpp -o Source/FreeImage/Conversion24.o
+In file included from Source/FreeImage/PluginRAW.cpp:22:
+In file included from Source/FreeImage/../LibRawLite/libraw/libraw.h:35:
+Source/FreeImage/../LibRawLite/libraw/libraw_datastream.h:121:8: error: no template named 'auto_ptr' in namespace 'std'
+  121 |   std::auto_ptr<std::streambuf> f;       /* will close() automatically through dtor */
+      |   ~~~~~^
+Source/FreeImage/../LibRawLite/libraw/libraw_datastream.h:122:8: error: no template named 'auto_ptr' in namespace 'std'
+  122 |   std::auto_ptr<std::streambuf> saved_f; /* when *f is a subfile, *saved_f is the master file */
+      |   ~~~~~^
+2 errors generated.
+make[1]: *** [Makefile.gnu:66: Source/FreeImage/PluginRAW.o] Error 1

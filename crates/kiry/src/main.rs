@@ -851,6 +851,9 @@ fn build(
         built.push((t.clone(), work, (linked, dropped, used)));
     }
 
+    // before anything records the recipe's hash: filter is part of it, and a stuck note
+    // taken out after the sidecar is written makes the artifact stale as it lands
+    unstuck(&p.dir.join("filter"), targets);
     let mut ready = Vec::new();
     for (t, work, backed) in &built {
         ready.push((t.clone(), pack(root, p, t, work)?, backed.clone()));
@@ -870,7 +873,6 @@ fn build(
     for (_, work, _) in &built {
         let _ = fs::remove_dir_all(work);
     }
-    unstuck(&p.dir.join("filter"), targets);
     Ok(ready.into_iter().map(|(_, (art, _), _)| art).collect())
 }
 
@@ -1005,6 +1007,11 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
             || l.ends_with(": not found")
             || l.ends_with(": command not found")
             || l.starts_with("ERROR:")
+            // make under -j and ninja keep printing after the step that failed, so the
+            // line that says which step it was is the anchor, not the end of the log:
+            // newsboat's msgfmt was line 44 of 252
+            || (l.contains("*** [") && l.contains("] Error "))
+            || l.starts_with("FAILED: ")
     };
     let f = lines.iter().position(|l| fatal(l)).unwrap_or(lines.len().saturating_sub(1));
     let mut out: Vec<String> = Vec::new();
@@ -1048,7 +1055,7 @@ fn lacking(log: &str) -> bool {
     }
     lines[f..(f + 4).min(lines.len())].iter().any(|l| {
         let l = l.to_lowercase();
-        ["not found", "find", "missing", "no package", "no such file"].iter().any(|w| l.contains(w))
+        ["not found", "find", "missing", "no package", "no such file", "needed", "required", "no module"].iter().any(|w| l.contains(w))
     })
 }
 
@@ -1095,9 +1102,13 @@ fn miss(l: &str) -> Option<String> {
     if let Some(r) = l.strip_prefix("Checking for command ").filter(|_| no) {
         return word(r).map(|n| format!("cmd:{}", n.trim_end_matches('.')));
     }
-    // the compiler, and autoconf asking it
-    if let Some(n) = between("fatal error: '", "' file not found") {
+    // the compiler, and autoconf asking it. clang leaves the fatal off when it can offer
+    // quotes instead: 'lzma.h' file not found with <angled> include
+    if let Some(n) = between("error: '", "' file not found") {
         return Some(format!("h:{n}"));
+    }
+    if let Some((_, r)) = l.split_once("unable to find library -l") {
+        return word(r).map(|n| format!("lib:{n}"));
     }
     if let Some(h) = l.strip_prefix("checking for ").and_then(|r| r.strip_suffix("... no")).filter(|h| h.ends_with(".h")) {
         return Some(format!("h:{h}"));
@@ -1109,10 +1120,43 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("provided by \"", "\"") {
         return Some(format!("cmake:{n}"));
     }
-    // a shell that went looking on PATH
+    // python, asked by a configure or found missing at run time
+    if let Some(r) = l.strip_prefix("checking for python module ").filter(|_| no) {
+        return word(r).map(|n| format!("py:{}", n.trim_end_matches('.')));
+    }
+    if let Some(n) = between("No module named '", "'") {
+        return n.split('.').next().map(|m| format!("py:{m}"));
+    }
+    // make, perl and cargo each say a program is missing their own way
+    if let Some(n) = l.strip_prefix("make: ").and_then(|r| r.strip_suffix(": No such file or directory")) {
+        return (!n.contains(['/', ' '])).then(|| format!("cmd:{n}"));
+    }
+    if let Some(n) = between("Can't exec \"", "\"") {
+        return Some(format!("cmd:{n}"));
+    }
+    if let Some(n) = between("no such command: `", "`") {
+        return Some(format!("cmd:cargo-{n}"));
+    }
+    // a shell that went looking on PATH. a path that is not found is a script whose #!
+    // names something absent -- lsof's Mksrc wants bash -- and discover() reads which
     let r = l.strip_suffix(": command not found").or_else(|| l.strip_suffix(": not found"))?;
-    let n = r.rsplit(": ").next()?.rsplit('/').next()?;
+    let n = r.rsplit(": ").next()?;
+    let n = if n.starts_with("./") || n.starts_with("../") { n } else { n.rsplit('/').next()? };
     (!n.is_empty() && !n.contains(' ')).then(|| format!("cmd:{n}"))
+}
+
+// a script the build tree has and the shell could not start: what its #! names instead
+fn shebang_of(src: &Path, rel: &str) -> Option<String> {
+    let rel = rel.trim_start_matches("./").trim_start_matches("../");
+    let mut files = Vec::new();
+    under(src, &mut files);
+    let f = files.iter().find(|f| f.to_string_lossy().ends_with(&format!("/{rel}")))?;
+    let mut head = [0u8; 256];
+    let n = fs::File::open(f).and_then(|mut h| h.read(&mut head)).ok()?;
+    let line = head[..n].strip_prefix(b"#!")?.split(|c| *c == b'\n').next()?;
+    let words: Vec<String> = String::from_utf8_lossy(line).split_whitespace().map(str::to_string).collect();
+    let w = interpreter(&words)?;
+    Some(w.rsplit('/').next()?.to_string())
 }
 
 // origin for every pc:, so: and cmd: name alpine's index lists, the first repo to name one
@@ -1155,6 +1199,9 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
             "cmd" => ["usr/bin/", "usr/sbin/", "bin/", "sbin/"].iter().any(|d| path.strip_prefix(d) == Some(n)),
             "lib" => path.strip_prefix(lib).and_then(|r| r.strip_prefix('/')).is_some_and(|f| f.starts_with(&format!("lib{n}.so"))),
             "h" => path.strip_prefix(inc).and_then(|r| r.strip_prefix('/')) == Some(n),
+            "py" => path.split_once("/site-packages/").is_some_and(|(_, f)| {
+                f == format!("{n}.py") || f.starts_with(&format!("{n}/")) || (f.starts_with(n) && f.ends_with(".so"))
+            }),
             "cmake" => {
                 let pl = path.to_lowercase();
                 pl.contains(&format!("/cmake/{lower}/"))
@@ -1187,6 +1234,12 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     let index = apkindex(root);
     let origin = match k {
         "pc" | "cmd" => index.get(m).cloned(),
+        "py" => {
+            let mut hits: Vec<&String> =
+                index.iter().filter(|(key, _)| key.starts_with("py3.") && key.ends_with(&format!(":{n}"))).map(|(_, o)| o).collect();
+            hits.sort();
+            hits.first().map(|o| (*o).clone())
+        }
         "lib" => {
             let pre = format!("so:lib{n}.so");
             let mut hits: Vec<&String> = index.iter().filter(|(key, _)| key.starts_with(&pre)).map(|(_, o)| o).collect();
@@ -1203,7 +1256,7 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     }
 
     let stem = lower.trim_end_matches(".h").to_string();
-    [stem.clone(), format!("lib{stem}")]
+    [stem.clone(), format!("lib{stem}"), format!("py3-{stem}")]
         .into_iter()
         .find(|c| fresh(c) && recipe(root, c).is_some())
         .map(|c| (c, "name"))
@@ -1223,7 +1276,13 @@ static WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Option<Step> {
     let text = fs::read_to_string(log).unwrap_or_default();
     let noted = fs::read_to_string(work.join("src/.kiry-missing")).unwrap_or_default();
-    let ms = misses(&text, &noted);
+    let ms: Vec<String> = misses(&text, &noted)
+        .into_iter()
+        .filter_map(|m| match m.strip_prefix("cmd:").filter(|c| c.starts_with('.')) {
+            Some(path) => shebang_of(&work.join("src"), path).map(|i| format!("cmd:{i}")),
+            None => Some(m),
+        })
+        .collect();
 
     // the dep added last round was for a miss that is still at the head: it did not help,
     // so it comes back out and this failure goes to whoever reads failures
@@ -3141,7 +3200,7 @@ trap 'rm -f \"$e\"' EXIT
 cc() { run \"$@\" 2>\"$e\"; s=$?; [ -s \"$e\" ] && cat \"$e\" >&2; return $s; }
 cc \"$@\" && exit
 s=$?
-sed -n \"s/.*fatal error: '\\\\([^']*\\\\)' file not found.*/h \\\\1/p\" \"$e\" >>/src/.kiry-missing 2>/dev/null
+sed -n -e \"s/.*error: '\\\\([^']*\\\\)' file not found.*/h \\\\1/p\" -e \"s/.*unable to find library -l\\\\([^ ]*\\\\).*/lib \\\\1/p\" \"$e\" >>/src/.kiry-missing 2>/dev/null
 o= p=
 for a do [ \"$p\" = -o ] && o=$a; p=$a; done
 o=${o:-$p}
@@ -11062,6 +11121,12 @@ fn checks_without(root: &Path, gone: &[(String, String)]) -> (Vec<(String, Findi
     // the kernel will not start a script whose interpreter is not there, which is the
     // same failure DT_NEEDED describes and nothing was checking it
     for (t, (pkg, path, words)) in &scripts {
+        // the same line interpreters() draws: an example under the documentation is not
+        // something the package runs, and newsboat's ruby and php ones kept ruby installed
+        // for nothing and printed a missing php on every root
+        if path.starts_with("usr/share/doc/") {
+            continue;
+        }
         let Some(want) = interpreter(words) else { continue };
         let there = if want.contains('/') {
             exists(&anywhere, &anylinks, &want)
@@ -12889,6 +12954,42 @@ mod misses_from_logs {
 
         assert_eq!(first("/usr/bin/libtool: eval: line 11083: kiry-cc: not found\n").as_deref(), Some("cmd:kiry-cc"));
         assert_eq!(first("foo.c:1:10: fatal error: 'sensors/sensors.h' file not found\n").as_deref(), Some("h:sensors/sensors.h"));
+    }
+
+    // the 2026-10-11 a/b run: each of these stopped a build discovery should have got past
+    #[test]
+    fn the_other_ways_a_build_says_a_program_or_library_is_missing() {
+        let first = |log: &str| misses(log, "").into_iter().next();
+        assert_eq!(
+            first("src/lib/compression/lzma/lzma.cpp:15:10: error: 'lzma.h' file not found with <angled> include; use \"quotes\" instead\n").as_deref(),
+            Some("h:lzma.h")
+        );
+        assert_eq!(first("ld.lld: error: unable to find library -lucontext\n").as_deref(), Some("lib:ucontext"));
+        assert_eq!(first("make: libtool: No such file or directory\nmake: *** [Makefile:60: src/encoding.lo] Error 127\n").as_deref(), Some("cmd:libtool"));
+        let mut late = String::from("msgfmt --check -o po/ca.mo po/ca.po\nmake: msgfmt: No such file or directory\nmake: *** [Makefile:281: po/ca.mo] Error 127\n");
+        for i in 0..200 {
+            late.push_str(&format!("   Compiling crate{i} v1.0.0\n"));
+        }
+        assert_eq!(first(&late).as_deref(), Some("cmd:msgfmt"));
+        assert_eq!(first("Can't exec \"aclocal\": No such file or directory at /usr/share/autoconf/Autom4te/FileUtils.pm line 297.\n").as_deref(), Some("cmd:aclocal"));
+        assert_eq!(first("error: no such command: `auditable`\n").as_deref(), Some("cmd:cargo-auditable"));
+        assert_eq!(first("./Configure: line 4978: ./lib/dialects/linux/Mksrc: not found\n").as_deref(), Some("cmd:./lib/dialects/linux/Mksrc"));
+        let itstool = "checking for python module libxml2... not found\nconfigure: error: Python module libxml2 is needed to run this package\n";
+        assert_eq!(first(itstool).as_deref(), Some("py:libxml2"));
+        assert!(lacking(itstool));
+        assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
+    }
+
+    #[test]
+    fn a_script_not_found_is_its_interpreter_missing() {
+        let at = std::env::temp_dir().join(format!("kiry-shebang-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&at);
+        let d = at.join("lsof-4.99.7/lib/dialects/linux");
+        mkdirs(&d).unwrap();
+        fs::write(d.join("Mksrc"), "#!/bin/bash\necho\n").unwrap();
+        assert_eq!(shebang_of(&at, "./lib/dialects/linux/Mksrc").as_deref(), Some("bash"));
+        fs::write(d.join("Mksrc"), "#!/usr/bin/env perl\n").unwrap();
+        assert_eq!(shebang_of(&at, "./lib/dialects/linux/Mksrc").as_deref(), Some("perl"));
     }
 
     // newsboat's own configure checks everything and then says it is unhappy, naming

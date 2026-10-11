@@ -5219,6 +5219,12 @@ fn a_build_that_succeeds_takes_its_stuck_note_back_out() {
     }
     assert!(!repo.join("alone/filter").exists());
     assert_eq!(fs::read_to_string(repo.join("mixed/filter")).unwrap(), real);
+
+    // and the artifact it just made is the one i takes. the note came out after the
+    // sidecar recorded the recipe's hash, so every one of these went stale as it landed
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), "alone", "mixed"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("alone 1.0 x86_64-musl cached") && said.contains("mixed 1.0 x86_64-musl cached"), "{said}");
 }
 
 // asking whether something needs a reboot should not be the same act as rebooting for it

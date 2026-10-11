@@ -1,0 +1,34 @@
+patching file Makefile
+patching file rust/libnewsboat/build.rs
+/usr/bin/pkg-config
+Checking for package sqlite3... not found
+
+You need package sqlite3 in order to compile this program.
+Please make sure it is installed.
+Checking for package libcurl... not found
+Checking for package libcurl using curl-config... found
+Checking for package libxml-2.0... not found
+Checking for package libxml2 using xml2-config... not found
+
+You need package libxml2 in order to compile this program.
+Please make sure it is installed.
+Checking for package stfl... not found
+
+You need package stfl in order to compile this program.
+Please make sure it is installed.
+Checking for command asciidoctor... not found
+Install asciidoctor if you plan to build the documentation
+Checking for command cargo... found
+Checking for package json... not found
+Checking for package json-c... not found
+
+You need package json-c in order to compile this program.
+Please make sure it is installed.
+Checking for package ncursesw... not found
+Checking for package ncursesw5 using ncursesw5-config... not found
+Checking for package ncursesw6 using ncursesw6-config... found
+curl was built with static libraries disabled
+curl was built with static libraries disabled
+
+One or more required dependencies couldn't be found. Please install
+these packages and retry compilation.

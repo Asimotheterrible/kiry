@@ -1,0 +1,29 @@
+patching file tests/TestEntryModel.cpp
+patching file src/gui/MainWindow.cpp
+Hunk #1 succeeded at 1221 (offset -7 lines).
+Hunk #2 succeeded at 1236 (offset -7 lines).
+-- The C compiler identification is Clang 23.1.2
+-- The CXX compiler identification is Clang 23.1.2
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/kirycc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/kiryc++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found Git HEAD Revision: 
+
+-- Setting up build for KeePassXC v2.7.12
+
+CMake Error at /usr/share/cmake-4.3/Modules/FindPackageHandleStandardArgs.cmake:290 (message):
+  Could NOT find Botan (missing: BOTAN_LIBRARY BOTAN_INCLUDE_DIR)
+Call Stack (most recent call first):
+  /usr/share/cmake-4.3/Modules/FindPackageHandleStandardArgs.cmake:654 (_FPHSA_FAILURE_MESSAGE)
+  cmake/FindBotan.cmake:50 (find_package_handle_standard_args)
+  CMakeLists.txt:216 (find_package)
+
+
+-- Configuring incomplete, errors occurred!

@@ -787,11 +787,43 @@ fn build(
             (false, Some(s)) => say!("{} building ~{}", key(p, t), clock(s)),
             (false, None) => say!("{} building -", key(p, t)),
         }
-        let start = Instant::now();
-        let r = compile(root, p, t, &srcs, &f, verbose, boot, at_once);
-        live_stop(&key(p, t));
-        let (work, linked, dropped) = r?;
-        let secs = start.elapsed().as_secs();
+        let begun = Instant::now();
+        let mut rounds = 0;
+        let ((work, linked, dropped), used) = loop {
+            let closure = start(root, p, t);
+            let r = compile(root, p, t, &srcs, &f, verbose, boot, at_once, &closure);
+            live_stop(&key(p, t));
+            match r {
+                Ok(x) => {
+                    set_last_round(root, t, &p.name, None);
+                    break (x, closure);
+                }
+                Err(Fail::Other(e)) => return Err(e),
+                Err(Fail::Build { log, work, secs }) => {
+                    rounds += 1;
+                    match log.as_deref().filter(|_| discovers(p)).and_then(|l| discover(root, p, t, l, &work)) {
+                        Some(Step::Again) if rounds < 60 => {
+                            if live {
+                                live_start(&key(p, t), eta);
+                            }
+                            continue;
+                        }
+                        Some(Step::Wait) => {
+                            WAITING.store(true, Ordering::Relaxed);
+                            return Err(format!("{} {t}: waits on a dependency", p.name));
+                        }
+                        _ => {
+                            failed(root, p, t, log.as_deref(), secs);
+                            return Err(match &log {
+                                Some(l) => format!("{} {t}: build failed, log is {}", p.name, l.display()),
+                                None => format!("{} {t}: build failed", p.name),
+                            });
+                        }
+                    }
+                }
+            }
+        };
+        let secs = begun.elapsed().as_secs();
         let gap = if tty() { "  " } else { " " };
         let note: String = [cache_rate(root, p, t, &work), again(root, p, t, &work, verbose)]
             .into_iter()
@@ -803,7 +835,7 @@ fn build(
         say!("{}{note}", row(&p.name, &p.version.upstream, was.as_deref(), t, "ok", Some(secs)));
         let cpu = fs::read_to_string(work.join("cpu")).ok().and_then(|c| c.trim().parse().ok());
         keep_time(root, p, t, secs, cpu);
-        built.push((t.clone(), work, (linked, dropped)));
+        built.push((t.clone(), work, (linked, dropped, used)));
     }
 
     let mut ready = Vec::new();
@@ -813,9 +845,9 @@ fn build(
 
     // sidecar lands after the rename. ahead of it, a target failing to tar leaves a
     // .meta for an artifact that never arrives
-    for (t, (art, part), (linked, dropped)) in &ready {
+    for (t, (art, part), (linked, dropped, used)) in &ready {
         fs::rename(part, art).map_err(|e| format!("{}: {e}", art.display()))?;
-        meta(root, p, t, &hash, &f, art, linked, dropped)?;
+        meta(root, p, t, &hash, &f, art, linked, dropped, used)?;
         if let Some((_, work, _)) = built.iter().find(|(bt, _, _)| bt == t) {
             let mut d = art.as_os_str().to_owned();
             d.push(".meta/layout");
@@ -827,6 +859,404 @@ fn build(
     }
     unstuck(&p.dir.join("filter"), targets);
     Ok(ready.into_iter().map(|(_, (art, _), _)| art).collect())
+}
+
+// what a build proves it needs. alpine's makedepends is what alpine builds with every
+// option on, and walked recursively it is most of a distro: htop declared lm-sensors,
+// lm-sensors declared rrdtool, rrdtool declared cairo, pango, groff and tcl, and htop
+// builds against ncurses alone. so a build starts from nothing it has not earned, and a
+// failure that names what it was missing -- a .pc, a header, a program, a cmake package
+// -- buys that one package and another go. a line stays only if the build got past the
+// failure it was added for. measured on navi first: 18% of declared make deps end up
+// linked into anything
+//
+// one dep line per thing a build of this package needed, in depends syntax, under var
+// because it is regenerable: lost, the next build finds the same things a configure at
+// a time. a line that is only * stands for the whole declared list, which is where a
+// build whose failure names nothing it lacks ends up
+const CLOSURE: &str = "var/kiry/closure";
+
+fn closure_at(root: &Path, t: &str, name: &str) -> PathBuf {
+    root.join(CLOSURE).join(t).join(name)
+}
+
+// only for the repos convert writes. alpine's lists are what alpine builds with every
+// option on; a recipe somebody wrote by hand in core/ or local/ lists what they meant,
+// and that list is the closure the way it always was
+fn discovers(p: &Package) -> bool {
+    p.dir.parent().and_then(Path::file_name).is_some_and(|r| r == "extra" || r == "testing")
+}
+
+// where a build starts: what earlier builds proved, and what a flag the config sets asks
+// for. nothing the recipe merely lists
+fn start(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
+    if !discovers(p) {
+        return p.depends.clone();
+    }
+    let ls = pkg::lines(&closure_at(root, t, &p.name)).unwrap_or_default();
+    let mut out: Vec<Dep> = Vec::new();
+    if ls.iter().any(|l| l == "*") {
+        out.extend(p.depends.iter().cloned());
+    }
+    let proven = pkg::depends_from(ls.into_iter().filter(|l| l != "*").collect());
+    for d in proven.into_iter().chain(flagged(root, p)) {
+        if !out.iter().any(|x| x.name == d.name) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+// deps a flag set on in the config brings in through the gentoo entry. a default in
+// IUSE brings nothing: features are off until somebody asks
+fn flagged(root: &Path, p: &Package) -> Vec<Dep> {
+    let Some(g) = gentoo(&p.dir) else { return Vec::new() };
+    let Ok(f) = flags(root, &p.name, Some(&p.dir)) else { return Vec::new() };
+    let set = chosen(&f.use_flags);
+    g.wanted(&set)
+        .into_iter()
+        .filter_map(|(a, needs)| {
+            let n = recipe_for(root, &a)?;
+            (n != p.name).then_some(Dep { name: n, make: needs != Needs::Run, host: needs == Needs::Tool, only: None })
+        })
+        .collect()
+}
+
+fn prove(root: &Path, t: &str, name: &str, line: &str) -> Result<(), String> {
+    let at = closure_at(root, t, name);
+    mkdirs(at.parent().unwrap_or(root))?;
+    let mut text = fs::read_to_string(&at).unwrap_or_default();
+    if text.lines().any(|l| l.trim() == line) {
+        return Ok(());
+    }
+    text.push_str(line);
+    text.push('\n');
+    put(&at, &text)
+}
+
+fn disprove(root: &Path, t: &str, name: &str, dep: &str) {
+    let at = closure_at(root, t, name);
+    let Ok(text) = fs::read_to_string(&at) else { return };
+    let kept: String = text
+        .lines()
+        .filter(|l| l.split_whitespace().next() != Some(dep))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let _ = put(&at, &kept);
+}
+
+// the miss the last round added a dep for and the dep, kept beside the closure so a round
+// that had to wait for the dep to be built still gets checked when it comes back
+fn last_round(root: &Path, t: &str, name: &str) -> Option<(String, String)> {
+    let text = fs::read_to_string(closure_at(root, t, &format!("{name}.last"))).ok()?;
+    let (m, d) = text.trim().split_once(' ')?;
+    Some((m.to_string(), d.to_string()))
+}
+
+fn set_last_round(root: &Path, t: &str, name: &str, round: Option<(&str, &str)>) {
+    let at = closure_at(root, t, &format!("{name}.last"));
+    match round {
+        Some((m, d)) => {
+            let _ = put(&at, &format!("{m} {d}\n"));
+        }
+        None => {
+            let _ = fs::remove_file(&at);
+        }
+    }
+}
+
+// what a failed build looked for and did not find, as kind:name -- pc, cmd, lib, h,
+// cmake -- the one at the point it failed first. the newest miss in the log is often an
+// optional probe: gtk4 printed gobject-introspection missing and then died on glslc, a
+// program it gives no "found: NO" line for. what the pkg-config wrapper and kirycc wrote
+// down comes last, newest first, for the build systems that send their probes nowhere a
+// log can see -- newsboat's own configure
+fn misses(log: &str, noted: &str) -> Vec<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    let fatal = |l: &str| {
+        l.contains(" error required dependency not found")
+            || l.contains(" error program not found")
+            || l.contains(" error required library not found")
+            || l.starts_with("configure: error")
+            || l.contains("CMake Error")
+            || l.contains("fatal error:")
+            || l.ends_with(": not found")
+            || l.ends_with(": command not found")
+            || l.starts_with("ERROR:")
+    };
+    let f = lines.iter().position(|l| fatal(l)).unwrap_or(lines.len().saturating_sub(1));
+    let mut out: Vec<String> = Vec::new();
+    // muon prints the failing call under its error: dependency('gtk4' or find_program('glslc'
+    if let Some(l) = lines.get(f) {
+        let kind = if l.contains("required dependency") {
+            Some("pc")
+        } else if l.contains("error program") {
+            Some("cmd")
+        } else if l.contains("required library") {
+            Some("lib")
+        } else {
+            None
+        };
+        if let Some(k) = kind {
+            if let Some(n) = lines.iter().skip(f + 1).take(3).find_map(|x| quoted(x)) {
+                out.push(format!("{k}:{n}"));
+            }
+        }
+    }
+    let to = (f + 3).min(lines.len());
+    out.extend(lines[f.saturating_sub(40)..to].iter().rev().filter_map(|l| miss(l)));
+    out.extend(noted.lines().rev().filter_map(|l| l.split_once(' ')).map(|(k, n)| format!("{k}:{}", n.trim())));
+    let mut seen = HashSet::new();
+    out.retain(|m| seen.insert(m.clone()));
+    out
+}
+
+// whether a failure is about something missing at all, read where it failed. neovim's
+// "Failed to find a Lua 5.1-compatible interpreter" is, and names nothing a package
+// ships. muon's "module not found" is muon lacking unstable-wayland, which no dependency
+// fixes, and gtk4 would have built its whole declared list to find that out
+fn lacking(log: &str) -> bool {
+    let lines: Vec<&str> = log.lines().collect();
+    let f = lines.iter().position(|l| {
+        l.starts_with("configure: error") || l.contains("CMake Error") || l.contains(" error ") || l.starts_with("ERROR:")
+    });
+    let Some(f) = f else { return false };
+    if lines[f].contains("module not found") {
+        return false;
+    }
+    lines[f..(f + 4).min(lines.len())].iter().any(|l| {
+        let l = l.to_lowercase();
+        ["not found", "find", "missing", "no package", "no such file"].iter().any(|w| l.contains(w))
+    })
+}
+
+fn quoted(l: &str) -> Option<String> {
+    let (_, r) = l.split_once('\'')?;
+    let (n, _) = r.split_once('\'')?;
+    (!n.is_empty() && !n.contains(' ')).then(|| n.to_string())
+}
+
+// one log line as a miss, in each of the forms the build systems in this tree print one
+fn miss(l: &str) -> Option<String> {
+    let l = l.trim();
+    let between = |a: &str, b: &str| -> Option<String> {
+        let (_, r) = l.split_once(a)?;
+        let (n, _) = r.split_once(b)?;
+        (!n.is_empty()).then(|| n.to_string())
+    };
+    let word = |s: &str| s.split([' ', ',', '(', ')', '\'', '"']).find(|w| !w.is_empty()).map(str::to_string);
+    let no = l.ends_with("found: NO") || l.ends_with("not found");
+    // muon, and meson
+    if let Some(r) = l.strip_prefix("dependency ").filter(|_| no) {
+        return word(r).map(|n| format!("pc:{n}"));
+    }
+    if let Some(n) = between("Dependency \"", "\"").filter(|_| no) {
+        return Some(format!("pc:{n}"));
+    }
+    if let Some(r) = l.strip_prefix("program ").or_else(|| l.strip_prefix("Program ")).filter(|_| no) {
+        return word(r).map(|n| format!("cmd:{n}"));
+    }
+    if let Some(r) = l.strip_prefix("library ").filter(|_| no) {
+        return word(r).map(|n| format!("lib:{n}"));
+    }
+    // pkg-config, called straight or through autoconf and cmake
+    if let Some(n) = between("No package '", "'") {
+        return Some(format!("pc:{n}"));
+    }
+    if l.starts_with("Package '") && l.ends_with("not found") {
+        return between("Package '", "'").map(|n| format!("pc:{n}"));
+    }
+    // a configure somebody wrote by hand, newsboat's
+    if let Some(r) = l.strip_prefix("Checking for package ").filter(|_| no) {
+        return word(r).map(|n| format!("pc:{}", n.trim_end_matches('.')));
+    }
+    if let Some(r) = l.strip_prefix("Checking for command ").filter(|_| no) {
+        return word(r).map(|n| format!("cmd:{}", n.trim_end_matches('.')));
+    }
+    // the compiler, and autoconf asking it
+    if let Some(n) = between("fatal error: '", "' file not found") {
+        return Some(format!("h:{n}"));
+    }
+    if let Some(h) = l.strip_prefix("checking for ").and_then(|r| r.strip_suffix("... no")).filter(|h| h.ends_with(".h")) {
+        return Some(format!("h:{h}"));
+    }
+    // cmake
+    if let Some((_, r)) = l.split_once("Could NOT find ") {
+        return word(r).map(|n| format!("cmake:{n}"));
+    }
+    if let Some(n) = between("provided by \"", "\"") {
+        return Some(format!("cmake:{n}"));
+    }
+    // a shell that went looking on PATH
+    let r = l.strip_suffix(": command not found").or_else(|| l.strip_suffix(": not found"))?;
+    let n = r.rsplit(": ").next()?.rsplit('/').next()?;
+    (!n.is_empty() && !n.contains(' ')).then(|| format!("cmd:{n}"))
+}
+
+// origin for every pc:, so: and cmd: name alpine's index lists, the first repo to name one
+// winning. empty when sync --net never fetched it
+fn apkindex(root: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for repo in ["main", "community"] {
+        let Ok(text) = fs::read_to_string(root.join("var/kiry/apkindex").join(repo)) else { continue };
+        let (mut origin, mut names): (String, Vec<String>) = (String::new(), Vec::new());
+        for l in text.lines().chain(std::iter::once("")) {
+            if l.is_empty() {
+                for n in names.drain(..) {
+                    out.entry(n).or_insert_with(|| origin.clone());
+                }
+                origin.clear();
+            } else if let Some(o) = l.strip_prefix("o:") {
+                origin = o.to_string();
+            } else if let Some(ps) = l.strip_prefix("p:") {
+                names.extend(ps.split_whitespace().map(|x| x.split(['=', '<', '>', '~']).next().unwrap_or(x).to_string()));
+            }
+        }
+    }
+    out
+}
+
+// the package a miss names: whatever ships the file here, then alpine's index, then a
+// recipe called what was asked for. the recipe's own list breaks a tie, the one thing it
+// still knows. a provider already in the closure answers nothing -- the file was there
+// and the build still failed -- so that miss is passed over
+fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(String, &'static str)> {
+    let (k, n) = m.split_once(':')?;
+    let host = sandbox::host();
+    let lower = n.to_lowercase();
+    let at: &str = if k == "cmd" { &host } else { t };
+    let inc = incdir(t).trim_start_matches('/');
+    let lib = libdir(t).trim_start_matches('/');
+    let ships = |path: &str| -> bool {
+        match k {
+            "pc" => path.ends_with(&format!("/pkgconfig/{n}.pc")),
+            "cmd" => ["usr/bin/", "usr/sbin/", "bin/", "sbin/"].iter().any(|d| path.strip_prefix(d) == Some(n)),
+            "lib" => path.strip_prefix(lib).and_then(|r| r.strip_prefix('/')).is_some_and(|f| f.starts_with(&format!("lib{n}.so"))),
+            "h" => path.strip_prefix(inc).and_then(|r| r.strip_prefix('/')) == Some(n),
+            "cmake" => {
+                let pl = path.to_lowercase();
+                pl.contains(&format!("/cmake/{lower}/"))
+                    || pl.ends_with(&format!("/{lower}config.cmake"))
+                    || pl.ends_with(&format!("/{lower}-config.cmake"))
+                    || pl.ends_with(&format!("/find{lower}.cmake"))
+            }
+            _ => false,
+        }
+    };
+    let fresh = |d: &str| d != p.name && !have.iter().any(|h| h.name == d);
+    let pool: Vec<&str> = p.depends.iter().map(|d| d.name.as_str()).collect();
+
+    let mut found: Vec<String> = Vec::new();
+    for name in db::installed(root, at).unwrap_or_default() {
+        let Ok(rec) = db::read(root, at, &name) else { continue };
+        if rec.manifest.iter().any(|e| ships(&e.path)) {
+            found.push(name);
+        }
+    }
+    // a provider already in the closure means the file was there and the build failed
+    // anyway, so this miss is not the one to act on
+    if found.iter().any(|f| !fresh(f)) {
+        return None;
+    }
+    if let Some(d) = found.iter().find(|f| pool.contains(&f.as_str())).or(found.first()) {
+        return Some((d.clone(), ""));
+    }
+
+    let index = apkindex(root);
+    let origin = match k {
+        "pc" | "cmd" => index.get(m).cloned(),
+        "lib" => {
+            let pre = format!("so:lib{n}.so");
+            let mut hits: Vec<&String> = index.iter().filter(|(key, _)| key.starts_with(&pre)).map(|(_, o)| o).collect();
+            hits.sort();
+            hits.first().map(|o| (*o).clone())
+        }
+        _ => None,
+    };
+    if let Some(o) = origin {
+        let o = called(root, &o, t).filter(|c| c != "-").unwrap_or(o);
+        if fresh(&o) && recipe(root, &o).is_some() {
+            return Some((o, "apkindex"));
+        }
+    }
+
+    let stem = lower.trim_end_matches(".h").to_string();
+    [stem.clone(), format!("lib{stem}")]
+        .into_iter()
+        .find(|c| fresh(c) && recipe(root, c).is_some())
+        .map(|c| (c, "name"))
+}
+
+enum Step {
+    // the dep is installed: the same build again
+    Again,
+    // the dep has to be built first, which is the planner's to do
+    Wait,
+}
+
+// set when a build stops to wait for a dep that is not installed, so the planner knows
+// the failure is its own to resolve and plans again rather than giving up
+static WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Option<Step> {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let noted = fs::read_to_string(work.join("src/.kiry-missing")).unwrap_or_default();
+    let ms = misses(&text, &noted);
+
+    // the dep added last round was for a miss that is still at the head: it did not help,
+    // so it comes back out and this failure goes to whoever reads failures
+    if let Some((m, d)) = last_round(root, t, &p.name) {
+        set_last_round(root, t, &p.name, None);
+        if ms.first() == Some(&m) {
+            disprove(root, t, &p.name, &d);
+            say!("{} {t} {d} did not help with {m}, taken back out", p.name);
+            return None;
+        }
+    }
+
+    let have = start(root, p, t);
+    let off = |d: &str| {
+        gentoo(&p.dir).is_some_and(|g| {
+            flags(root, &p.name, Some(&p.dir)).is_ok_and(|f| g.unwanted(&chosen(&f.use_flags), d))
+        })
+    };
+    let host = sandbox::host();
+    for m in &ms {
+        let Some((d, how)) = answers(root, t, m, p, &have) else { continue };
+        if off(&d) {
+            say!("{} {t} needs {d} for {m}, and a flag takes it out", p.name);
+            return None;
+        }
+        let kind = if m.starts_with("cmd:") { "make" } else { "build" };
+        if let Err(e) = prove(root, t, &p.name, &format!("{d} {kind}")) {
+            say!("{} {t} {e}", p.name);
+            return None;
+        }
+        set_last_round(root, t, &p.name, Some((m, &d)));
+        let via = if how.is_empty() { String::new() } else { format!(", by {how}") };
+        if db::read(root, if kind == "make" { &host } else { t }, &d).is_ok() {
+            say!("{} {t} needs {d}  {m}{via}", p.name);
+            return Some(Step::Again);
+        }
+        say!("{} {t} needs {d}  {m}{via}, not installed yet", p.name);
+        return Some(Step::Wait);
+    }
+
+    // nothing it said names a package. a configure that failed this way gets everything the
+    // recipe declares, once, which is how every build here ran before, and says so
+    let fell = pkg::lines(&closure_at(root, t, &p.name)).unwrap_or_default().iter().any(|l| l == "*");
+    let more = p.depends.iter().any(|d| d.applies(t) && !have.iter().any(|h| h.name == d.name));
+    if fell || !more || !lacking(&text) {
+        return None;
+    }
+    prove(root, t, &p.name, "*").ok()?;
+    say!("{} {t} names nothing it is missing, so it gets everything the recipe declares", p.name);
+    let all_in = p
+        .depends
+        .iter()
+        .filter(|d| d.applies(t))
+        .all(|d| db::read(root, if d.host { &host } else { t }, &d.name).is_ok());
+    Some(if all_in { Step::Again } else { Step::Wait })
 }
 
 // b of a package the cache already holds under the same key -- recipe, sources, flags,
@@ -1919,7 +2349,8 @@ fn compile(
     verbose: bool,
     boot: bool,
     at_once: usize,
-) -> Result<(PathBuf, Vec<String>, Vec<String>), String> {
+    closure: &[Dep],
+) -> Result<(PathBuf, Vec<String>, Vec<String>), Fail> {
     let start = Instant::now();
     let work = root.join("var/kiry/stage").join(format!(
         "{}-{}-{}.{t}",
@@ -1951,7 +2382,7 @@ fn compile(
         }
     }
     if !script.is_file() {
-        return Err(format!("{}: no build script", p.dir.display()));
+        return Err(format!("{}: no build script", p.dir.display()).into());
     }
 
     // abuild's split: a recipe with an unpack() of its own is handed the sources as they
@@ -1971,7 +2402,10 @@ fn compile(
     }
 
     let sysroot = work.join("sysroot");
-    let deps: Vec<Dep> = p.depends.iter().filter(|d| d.applies(t)).cloned().collect();
+    // the sandbox holds what this package's builds have proven they need, not what the
+    // recipe lists. the list is still what a runtime line gets judged against below
+    let deps: Vec<Dep> = closure.iter().filter(|d| d.applies(t)).cloned().collect();
+    let declared: Vec<Dep> = p.depends.iter().filter(|d| d.applies(t)).cloned().collect();
     let members = sandbox::closure(root, t, &deps)?;
     sandbox::assemble(root, t, &members, &sysroot)?;
     // this and the crates and modules below are what a build writes that outlives it,
@@ -2151,6 +2585,15 @@ fn compile(
         fs::set_permissions(&at, fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("{n}: {e}"))?;
     }
+    // a module pkg-config could not find is a miss discover() can name a package for, and
+    // plenty of configures send pkg-config's own complaint to /dev/null. the symlink goes
+    // first so the write lands on a new file and not through it onto pkgconf
+    if bin.join("pkgconf").is_file() {
+        let at = bin.join("pkg-config");
+        let _ = fs::remove_file(&at);
+        fs::write(&at, PKG_CONFIG).map_err(|e| format!("pkg-config: {e}"))?;
+        fs::set_permissions(&at, fs::Permissions::from_mode(0o755)).map_err(|e| format!("pkg-config: {e}"))?;
+    }
 
     // not current_exe(): once an install renames a new kiry over this one, that reads back
     // `/usr/bin/kiry (deleted)` and every later build of the batch fails to spawn. the
@@ -2284,7 +2727,7 @@ fn compile(
             // ahead of trim, which drops on policy rather than on the build having
             // failed, and would otherwise make the two indistinguishable
             if staged(&dest) == 0 {
-                return Err(format!("{} {t}: built and staged nothing", p.name));
+                return Err(format!("{} {t}: built and staged nothing", p.name).into());
             }
             // DESTDIR said twice: `make PREFIX="$DESTDIR"/usr` into a Makefile that also
             // honours $(DESTDIR). pciutils installed to /dest/usr on the live root that way
@@ -2293,7 +2736,7 @@ fn compile(
                     "{} {t}: staged under dest/, so DESTDIR went in twice. a PREFIX or \
                      prefix naming $DESTDIR on a make that honours DESTDIR too",
                     p.name
-                ));
+                ).into());
             }
             // clang drops the counts of a function whose cfg moved and compiles it cold,
             // so an old profile costs speed, never correctness. retraining is hours for
@@ -2340,30 +2783,44 @@ fn compile(
             }
             // after trim, so a gnu binary that gets dropped does not argue for a dep
             let mut linked = BTreeSet::new();
+            // everything in the closure is build-only until the build links it, so a
+            // build-only line is the ordinary case now and only a transitive one is news
             for (soname, who, kind) in undeclared(root, &members, &deps, t, &dest) {
-                say!("{} {t} {kind} {who}  {soname}", p.name);
+                if kind == "undeclared" {
+                    say!("{} {t} {kind} {who}  {soname}", p.name);
+                }
                 linked.insert(who);
             }
             for (path, who) in interpreters(root, t, &dest) {
-                if !deps.iter().any(|d| !d.make && d.name == who) && linked.insert(who.clone()) {
+                if !declared.iter().any(|d| !d.make && d.name == who) && linked.insert(who.clone()) {
                     say!("{} {t} interpreter {who}  {path}", p.name);
                 }
             }
-            let dropped = unbacked(root, &deps, t, &dest);
+            let dropped = unbacked(root, &declared, t, &dest);
             for d in &dropped {
                 say!("{} {t} dropped {d}  nothing links or loads it", p.name);
             }
             Ok((work, linked.into_iter().collect(), dropped))
         }
-        Ok(_) if verbose => {
-            failed(root, p, t, None, start.elapsed().as_secs());
-            Err(format!("{} {t}: build failed", p.name))
-        }
-        Ok(_) => {
-            failed(root, p, t, Some(&log), start.elapsed().as_secs());
-            Err(format!("{} {t}: build failed, log is {}", p.name, log.display()))
-        }
-        Err(e) => Err(format!("{} {t}: {e}", p.name)),
+        Ok(_) => Err(Fail::Build {
+            log: (!verbose).then_some(log),
+            work,
+            secs: start.elapsed().as_secs(),
+        }),
+        Err(e) => Err(Fail::Other(format!("{} {t}: {e}", p.name))),
+    }
+}
+
+// a build that ran and failed hands back what discover() reads before anything is
+// printed, so a round that only found a missing dependency is one line and not a block
+enum Fail {
+    Build { log: Option<PathBuf>, work: PathBuf, secs: u64 },
+    Other(String),
+}
+
+impl From<String> for Fail {
+    fn from(e: String) -> Self {
+        Fail::Other(e)
     }
 }
 
@@ -2661,6 +3118,7 @@ trap 'rm -f \"$e\"' EXIT
 cc() { run \"$@\" 2>\"$e\"; s=$?; [ -s \"$e\" ] && cat \"$e\" >&2; return $s; }
 cc \"$@\" && exit
 s=$?
+sed -n \"s/.*fatal error: '\\\\([^']*\\\\)' file not found.*/h \\\\1/p\" \"$e\" >>/src/.kiry-missing 2>/dev/null
 o= p=
 for a do [ \"$p\" = -o ] && o=$a; p=$a; done
 o=${o:-$p}
@@ -2697,6 +3155,19 @@ for r in filter-lto 'OPT -O2' CFLAGS_MARCH strip-flags; do
 \tgrep -q -e 'PLEASE submit a bug report' -e 'failed due to signal' \"$e\" || exit $s
 done
 echo \"kirycc: $o crashed clang at every rung\" >&2
+exit $s
+";
+
+// a version constraint rides in the same argument or the next one, 'gtk4 >= 4.10' or
+// gtk4 '>=' 4.10, and neither the operator nor the number is a module
+const PKG_CONFIG: &str = "\
+#!/bin/sh
+pkgconf \"$@\" && exit
+s=$?
+for a do
+\tcase $a in -*|[0-9]*|'<'*|'>'*|'='*|'!'*) continue ;; esac
+\techo \"pc ${a%% *}\" >>/src/.kiry-missing
+done 2>/dev/null
 exit $s
 ";
 
@@ -3149,6 +3620,7 @@ fn meta(
     art: &Path,
     linked: &[String],
     dropped: &[String],
+    closure: &[Dep],
 ) -> Result<(), String> {
     let mut d = art.as_os_str().to_owned();
     d.push(".meta");
@@ -3181,13 +3653,22 @@ fn meta(
     //
     // and the other way: a runtime line unbacked() found no reason for stays in the recipe
     // and out of here, so installing the artifact does not bring it
+    //
+    // the build-only lines are the closure the build ran in, which is what it proved it
+    // needs, and not the recipe's list of what alpine builds with
     let mut deps = String::new();
     let mut said: HashSet<&str> = HashSet::new();
-    for x in p.depends.iter().filter(|x| x.applies(t)) {
-        if !x.make && dropped.contains(&x.name) {
+    for x in p.depends.iter().filter(|x| x.applies(t) && !x.make) {
+        if dropped.contains(&x.name) || !said.insert(&x.name) {
             continue;
         }
-        if x.make && linked.contains(&x.name) {
+        deps.push_str(&format!("{x}\n"));
+    }
+    for x in closure.iter().filter(|x| x.applies(t) && x.make) {
+        if !said.insert(&x.name) {
+            continue;
+        }
+        if linked.contains(&x.name) {
             let run = Dep {
                 make: false,
                 host: false,
@@ -3197,7 +3678,6 @@ fn meta(
         } else {
             deps.push_str(&format!("{x}\n"));
         }
-        said.insert(&x.name);
     }
     for n in linked.iter().filter(|n| !said.contains(n.as_str())) {
         deps.push_str(&format!("{n}\n"));
@@ -5185,182 +5665,219 @@ fn install_cmd(args: &[String]) {
         return;
     }
 
-    let mut set = wanted(&root, &seeds, &mut recipes, &HashSet::new());
-    // a build runs on the toolchain, and no recipe names it. a root without it takes the
-    // cached one first, stale or not: it compiles the same, and nothing here can build a
-    // compiler without one
-    if set.iter().any(|(n, t)| !fresh(&root, &recipes[n], t)) {
-        let tools = first_tools(&root, &mut recipes);
-        if !tools.is_empty() {
-            for (n, t, _) in &tools {
-                say!("{n} {} {t} goes in first from the cache, for the toolchain", recipes[n].version.upstream);
-            }
-            if !dry {
-                let _w = writer(&root);
-                apply_batch(&root, &tools.iter().map(|x| x.2.clone()).collect::<Vec<_>>(), force);
-            }
-            let have: HashSet<(String, String)> = tools.into_iter().map(|(n, t, _)| (n, t)).collect();
-            set = wanted(&root, &seeds, &mut recipes, &have);
+    // planned again whenever a build turns up a dep that is not installed, or an artifact
+    // just built needs one at runtime: neither is known before the build. what is already
+    // built comes back cached the next time round, so each pass starts further along
+    let mut passes = 0;
+    'plan: loop {
+        passes += 1;
+        if passes > 500 {
+            die("planned 500 times without finishing, something keeps asking for itself".into());
         }
-    }
-    let built: Vec<bool> = set.iter().map(|(n, t)| fresh(&root, &recipes[n], t)).collect();
-    let mut plan = levels(&set, &recipes, &built);
-    longest_first(&mut plan, &set, &history(&root));
-    if dry {
-        let mut building = 0;
-        for (n, t) in &set {
-            let how = match cached(&root, &recipes[n], t) {
-                Some(_) => "cached",
-                None => {
-                    building += 1;
-                    "builds"
+        let mut set = wanted(&root, &seeds, &mut recipes, &HashSet::new());
+        // a build runs on the toolchain, and no recipe names it. a root without it takes the
+        // cached one first, stale or not: it compiles the same, and nothing here can build a
+        // compiler without one
+        if set.iter().any(|(n, t)| !fresh(&root, &recipes[n], t)) {
+            let tools = first_tools(&root, &mut recipes);
+            if !tools.is_empty() {
+                for (n, t, _) in &tools {
+                    say!("{n} {} {t} goes in first from the cache, for the toolchain", recipes[n].version.upstream);
                 }
-            };
-            say!("{n} {} {t} {how}", recipes[n].version.upstream);
-        }
-        // the denominator for what follows
-        if set.len() > 1 {
-            say!("{building} builds  {} cached", set.len() - building);
-        }
-        // an inherited makedepends line is a subtree, not a package: an optional vlc
-        // video source took obs from 13 builds to 311, and the number was here to read
-        // before the first one started. what a name costs is what goes away with it,
-        // which is the closure walked again without that edge
-        let mut alone: Vec<(usize, &str)> = Vec::new();
-        for (n, _) in &seeds {
-            for d in &recipes[n].depends {
-                if alone.iter().any(|(_, o)| *o == d.name) {
-                    continue;
+                if !dry {
+                    let _w = writer(&root);
+                    apply_batch(&root, &tools.iter().map(|x| x.2.clone()).collect::<Vec<_>>(), force);
                 }
-                // one is a package and it is already a line above. what is worth
-                // reading here is a name that takes others with it
-                match set.len() - without(&root, &seeds, &recipes, &d.name) {
-                    gone if gone > 1 => alone.push((gone, &d.name)),
-                    _ => {}
-                }
+                let have: HashSet<(String, String)> = tools.into_iter().map(|(n, t, _)| (n, t)).collect();
+                set = wanted(&root, &seeds, &mut recipes, &have);
             }
         }
-        alone.sort_unstable_by(|a, b| b.cmp(a));
-        let w = alone.iter().map(|(_, n)| n.len()).max().unwrap_or(0);
-        for (gone, name) in &alone {
-            say!("only via {name:w$}  {gone} builds");
+        let built: Vec<bool> = set.iter().map(|(n, t)| fresh(&root, &recipes[n], t)).collect();
+        let edges: Vec<Vec<Dep>> = set
+            .iter()
+            .zip(&built)
+            .map(|((n, t), b)| if *b { planned(&root, &recipes[n], t) } else { start(&root, &recipes[n], t) })
+            .collect();
+        let mut plan = levels(&set, &recipes, &built, &edges);
+        longest_first(&mut plan, &set, &history(&root));
+        if dry {
+            let mut building = 0;
+            for (n, t) in &set {
+                let how = match cached(&root, &recipes[n], t) {
+                    Some(_) => "cached",
+                    None => {
+                        building += 1;
+                        "builds"
+                    }
+                };
+                say!("{n} {} {t} {how}", recipes[n].version.upstream);
+            }
+            // the denominator for what follows
+            if set.len() > 1 {
+                say!("{building} builds  {} cached", set.len() - building);
+            }
+            // an inherited makedepends line is a subtree, not a package: an optional vlc
+            // video source took obs from 13 builds to 311, and the number was here to read
+            // before the first one started. what a name costs is what goes away with it,
+            // which is the closure walked again without that edge
+            let mut alone: Vec<(usize, &str)> = Vec::new();
+            for (n, _) in &seeds {
+                for d in &recipes[n].depends {
+                    if alone.iter().any(|(_, o)| *o == d.name) {
+                        continue;
+                    }
+                    // one is a package and it is already a line above. what is worth
+                    // reading here is a name that takes others with it
+                    match set.len() - without(&root, &seeds, &recipes, &d.name) {
+                        gone if gone > 1 => alone.push((gone, &d.name)),
+                        _ => {}
+                    }
+                }
+            }
+            alone.sort_unstable_by(|a, b| b.cmp(a));
+            let w = alone.iter().map(|(_, n)| n.len()).max().unwrap_or(0);
+            for (gone, name) in &alone {
+                say!("only via {name:w$}  {gone} builds");
+            }
+
+            // the same answer the real run would get, override included
+            let (risky, why) = route(&root, &set);
+            match (risky, live) {
+                (true, true) => say!("route live  --live, no fallback: {why}"),
+                (true, false) => say!("route live  fallback first: {why}"),
+                (false, _) => say!("route live  {why}"),
+            }
+            return;
+        }
+        // a level has to be in place before the one above it can build against it, which is
+        // what forces the install to happen a level at a time. when every member is already
+        // built that ordering buys nothing, so the set goes in as one transaction instead
+        let ready: Option<Vec<PathBuf>> = set
+            .iter()
+            .map(|(n, t)| cached(&root, &recipes[n], t))
+            .collect();
+        // decided once, before any of it is built, so a batch cannot change its mind halfway
+        settle(&root, &set, live);
+        let builds = forecast(&root, &set, &recipes);
+        if let Some(all) = ready {
+            let rows: Vec<[&str; 3]> = set
+                .iter()
+                .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
+                .collect();
+            widths(&rows);
+            for [n, v, t] in rows {
+                say!("{}", row(n, v, installed_version(&root, t, n).as_deref(), t, "cached", None));
+            }
+            let _w = writer(&root);
+            apply_batch(&root, &all, force);
+            wish(&root, &named);
+            leave(&root);
+            skew(&root);
+            return;
         }
 
-        // the same answer the real run would get, override included
-        let (risky, why) = route(&root, &set);
-        match (risky, live) {
-            (true, true) => say!("route live  --live, no fallback: {why}"),
-            (true, false) => say!("route live  fallback first: {why}"),
-            (false, _) => say!("route live  {why}"),
-        }
-        return;
-    }
-    // a level has to be in place before the one above it can build against it, which is
-    // what forces the install to happen a level at a time. when every member is already
-    // built that ordering buys nothing, so the set goes in as one transaction instead
-    let ready: Option<Vec<PathBuf>> = set
-        .iter()
-        .map(|(n, t)| cached(&root, &recipes[n], t))
-        .collect();
-    // decided once, before any of it is built, so a batch cannot change its mind halfway
-    settle(&root, &set, live);
-    let builds = forecast(&root, &set, &recipes);
-    if let Some(all) = ready {
+        let mut names: Vec<&String> = set.iter().map(|(n, _)| n).collect();
+        names.sort();
+        names.dedup();
         let rows: Vec<[&str; 3]> = set
             .iter()
             .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
             .collect();
-        widths(&rows);
-        for [n, v, t] in rows {
-            say!("{}", row(n, v, installed_version(&root, t, n).as_deref(), t, "cached", None));
+        let building: Vec<[&str; 3]> = builds.iter().map(|&i| rows[i]).collect();
+        batch_begin(&root, names.len(), &building, &rows);
+        for level in plan {
+            // grouped by package, because every target of one builds before any of it is
+            // packed. a musl mesa installed beside a gnu mesa that failed is exactly the
+            // drift a multi-target recipe exists to prevent
+            let mut order: Vec<&String> = Vec::new();
+            for (i, _) in &level {
+                let name = &set[*i].0;
+                if !order.contains(&name) {
+                    order.push(name);
+                }
+            }
+
+            // one package is the unit, so its targets still build together and a level
+            // runs width packages at a time. -v streams a build to the terminal, and two
+            // streams at once are one unreadable one
+            let targets_of = |name: &String| -> (bool, Vec<String>) {
+                let mine: Vec<&(usize, bool)> = level.iter().filter(|(i, _)| set[*i].0 == *name).collect();
+                let boot = mine.iter().any(|(_, b)| *b);
+                (boot, mine.iter().map(|(i, _)| set[*i].1.clone()).collect())
+            };
+            let w = if verbose { 1 } else { width().min(order.len().max(1)) };
+            let built = parallel(&order, w, |name| {
+                let p = &recipes[*name];
+                let (boot, targets) = targets_of(name);
+
+                let need: Vec<String> = targets
+                    .iter()
+                    .filter(|t| match cached(&root, p, t) {
+                        Some(_) => {
+                            let was = installed_version(&root, t, &p.name);
+                            say!("{}", row(&p.name, &p.version.upstream, was.as_deref(), t, "cached", None));
+                            false
+                        }
+                        None => true,
+                    })
+                    .cloned()
+                    .collect();
+                if need.is_empty() {
+                    return Ok(());
+                }
+                match (boot, fix) {
+                    (true, _) => build(&root, p, &need, verbose, true, w).map(|_| ()),
+                    (false, true) => recover(&root, p, &need, verbose, w),
+                    (false, false) => build(&root, p, &need, verbose, false, w).map(|_| ()),
+                }
+            });
+            if let Err(e) = built {
+                if WAITING.swap(false, Ordering::Relaxed) {
+                    continue 'plan;
+                }
+                die(e);
+            }
+
+            let mut made = Vec::new();
+            for name in order {
+                let p = &recipes[name];
+                let (_, targets) = targets_of(name);
+                for t in &targets {
+                    match cached(&root, p, t) {
+                        Some(a) => made.push(a),
+                        None => die(format!("{} {t}: built nothing", p.name)),
+                    }
+                }
+            }
+            // an artifact's runtime deps are known once it is built, and one that is neither
+            // installed nor in this level has to be planned before the level can go in
+            let host = sandbox::host();
+            let here: Vec<(String, String)> = made.iter().filter_map(|a| sidecar(a)).collect();
+            for a in &made {
+                let Some((n, t)) = sidecar(a) else { continue };
+                let side = PathBuf::from(format!("{}.meta/depends", a.display()));
+                for x in pkg::depends_from(pkg::lines(&side).unwrap_or_default()) {
+                    let dt = if x.host { host.clone() } else { t.clone() };
+                    if x.make || !x.applies(&t) || here.contains(&(x.name.clone(), dt.clone())) {
+                        continue;
+                    }
+                    if db::read(&root, &dt, &x.name).is_err() {
+                        say!("{n} {t} runs with {}, which is not installed yet", x.name);
+                        continue 'plan;
+                    }
+                }
+            }
+            let w = writer(&root);
+            apply_batch(&root, &made, force);
+            drop(w);
         }
         let _w = writer(&root);
-        apply_batch(&root, &all, force);
         wish(&root, &named);
         leave(&root);
         skew(&root);
+        batch_end(true);
         return;
     }
-
-    let mut names: Vec<&String> = set.iter().map(|(n, _)| n).collect();
-    names.sort();
-    names.dedup();
-    let rows: Vec<[&str; 3]> = set
-        .iter()
-        .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
-        .collect();
-    let building: Vec<[&str; 3]> = builds.iter().map(|&i| rows[i]).collect();
-    batch_begin(&root, names.len(), &building, &rows);
-    for level in plan {
-        // grouped by package, because every target of one builds before any of it is
-        // packed. a musl mesa installed beside a gnu mesa that failed is exactly the
-        // drift a multi-target recipe exists to prevent
-        let mut order: Vec<&String> = Vec::new();
-        for (i, _) in &level {
-            let name = &set[*i].0;
-            if !order.contains(&name) {
-                order.push(name);
-            }
-        }
-
-        // one package is the unit, so its targets still build together and a level
-        // runs width packages at a time. -v streams a build to the terminal, and two
-        // streams at once are one unreadable one
-        let targets_of = |name: &String| -> (bool, Vec<String>) {
-            let mine: Vec<&(usize, bool)> = level.iter().filter(|(i, _)| set[*i].0 == *name).collect();
-            let boot = mine.iter().any(|(_, b)| *b);
-            (boot, mine.iter().map(|(i, _)| set[*i].1.clone()).collect())
-        };
-        let w = if verbose { 1 } else { width().min(order.len().max(1)) };
-        let built = parallel(&order, w, |name| {
-            let p = &recipes[*name];
-            let (boot, targets) = targets_of(name);
-
-            let need: Vec<String> = targets
-                .iter()
-                .filter(|t| match cached(&root, p, t) {
-                    Some(_) => {
-                        let was = installed_version(&root, t, &p.name);
-                        say!("{}", row(&p.name, &p.version.upstream, was.as_deref(), t, "cached", None));
-                        false
-                    }
-                    None => true,
-                })
-                .cloned()
-                .collect();
-            if need.is_empty() {
-                return Ok(());
-            }
-            match (boot, fix) {
-                (true, _) => build(&root, p, &need, verbose, true, w).map(|_| ()),
-                (false, true) => recover(&root, p, &need, verbose, w),
-                (false, false) => build(&root, p, &need, verbose, false, w).map(|_| ()),
-            }
-        });
-        if let Err(e) = built {
-            die(e);
-        }
-
-        let mut made = Vec::new();
-        for name in order {
-            let p = &recipes[name];
-            let (_, targets) = targets_of(name);
-            for t in &targets {
-                match cached(&root, p, t) {
-                    Some(a) => made.push(a),
-                    None => die(format!("{} {t}: built nothing", p.name)),
-                }
-            }
-        }
-        let w = writer(&root);
-        apply_batch(&root, &made, force);
-        drop(w);
-    }
-    let _w = writer(&root);
-    wish(&root, &named);
-    leave(&root);
-    skew(&root);
-    batch_end(true);
 }
 
 // the resolve every consumer does at load, run against what just landed instead of left
@@ -5522,7 +6039,7 @@ fn wanted(
         // its build deps too closed llvm, cmake and python3 into a cycle on an empty
         // root with every one of them sitting in the cache
         let built = fresh(root, p, &t);
-        let deps = if built { planned(root, p, &t) } else { p.depends.clone() };
+        let deps = if built { planned(root, p, &t) } else { start(root, p, &t) };
         let next: Vec<(String, String)> = deps
             .iter()
             .filter(|d| d.applies(&t) && !(built && d.make))
@@ -6789,10 +7306,14 @@ fn resolve(root: &Path, arg: &str) -> Result<PathBuf, String> {
 // stands in for it until the real one can be built. it stays in the plan afterwards,
 // because a first pass is a stand-in and not the article
 // built says which members install from the cache, whose build deps order nothing
+// edges is index-aligned with want: what each member was planned with, so the order and
+// the plan agree on what depends on what. a recipe line the plan never followed is not an
+// edge -- alpine's lists alone make cycles the closure never has
 fn levels(
     want: &[(String, String)],
     recipes: &HashMap<String, Package>,
     built: &[bool],
+    edges: &[Vec<Dep>],
 ) -> Vec<Vec<(usize, bool)>> {
     let host = sandbox::host();
     let mut left: Vec<usize> = (0..want.len()).collect();
@@ -6803,7 +7324,7 @@ fn levels(
             .iter()
             .copied()
             .filter(|i| {
-                let deps = recipes.get(&want[*i].0).map(|p| &p.depends);
+                let deps = edges.get(*i);
                 !left.iter().any(|j| {
                     j != i
                         && !done.contains(j)
@@ -7039,7 +7560,8 @@ mod order {
             ("acl".to_string(), pkg("acl", vec![attr])),
             ("attr".to_string(), pkg("attr", Vec::new())),
         ]);
-        let plan = levels(&want, &recipes, &[false, false]);
+        let edges: Vec<Vec<Dep>> = want.iter().map(|(n, _)| recipes[n].depends.clone()).collect();
+        let plan = levels(&want, &recipes, &[false, false], &edges);
         let order: Vec<Vec<&str>> = plan
             .iter()
             .map(|l| l.iter().map(|(i, _)| want[*i].0.as_str()).collect())
@@ -7047,7 +7569,7 @@ mod order {
         assert_eq!(order, [["attr"], ["acl"]]);
 
         // acl is in the cache, so nothing builds with attr and neither waits
-        let plan = levels(&want, &recipes, &[true, false]);
+        let plan = levels(&want, &recipes, &[true, false], &edges);
         assert_eq!(plan.len(), 1, "{plan:?}");
     }
 }
@@ -7123,7 +7645,8 @@ fn rebuild_cmd(args: &[String]) {
         };
     }
 
-    let mut plan = levels(&want, &recipes, &vec![false; want.len()]);
+    let edges: Vec<Vec<Dep>> = want.iter().map(|(n, _)| recipes[n].depends.clone()).collect();
+    let mut plan = levels(&want, &recipes, &vec![false; want.len()], &edges);
     longest_first(&mut plan, &want, &history(&root));
     if dry {
         for (i, boot) in plan.into_iter().flatten() {
@@ -11319,7 +11842,7 @@ mod sidecar {
             env: Vec::new(),
             from: Vec::new(),
         };
-        meta(&at, &p, "x86_64-gnu", "0", &f, &art, &linked, &[]).unwrap();
+        meta(&at, &p, "x86_64-gnu", "0", &f, &art, &linked, &[], &p.depends).unwrap();
 
         let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-gnu.tar.zst.meta/depends")).unwrap();
         let lines: Vec<&str> = got.lines().collect();
@@ -11372,7 +11895,7 @@ mod sidecar {
             env: Vec::new(),
             from: Vec::new(),
         };
-        meta(&at, &p, "x86_64-musl", "0", &f, &art, &linked, &[]).unwrap();
+        meta(&at, &p, "x86_64-musl", "0", &f, &art, &linked, &[], &p.depends).unwrap();
 
         let got =
             fs::read_to_string(at.join("thing-1.0-1.x86_64-musl.tar.zst.meta/depends")).unwrap();
@@ -11501,7 +12024,7 @@ mod sidecar {
             from: Vec::new(),
         };
         let art = at.join("thing-1.0-1.x86_64-musl.tar.zst");
-        meta(&at, &p, T, "0", &f, &art, &[], &["libxau".to_string()]).unwrap();
+        meta(&at, &p, T, "0", &f, &art, &[], &["libxau".to_string()], &[]).unwrap();
         let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-musl.tar.zst.meta/depends")).unwrap();
         assert_eq!(got.lines().collect::<Vec<_>>(), vec!["ncurses"], "{got}");
     }
@@ -12300,5 +12823,68 @@ mod leaving {
         installed(&root, "builddep", &[("usr/bin/builddep", 0o755)], &[]);
         leave(&root);
         assert_eq!(have(&root), vec!["builddep"]);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod misses_from_logs {
+    use super::*;
+
+    // real logs from the 2026-10-11 discovery runs. the first miss is the one discover()
+    // acts on, so it is the one that has to be right
+    #[test]
+    fn the_miss_at_the_failure_comes_first() {
+        let first = |log: &str| misses(log, "").into_iter().next();
+        assert_eq!(first(include_str!("../tests/fixtures/misses/keepassxc.log")).as_deref(), Some("cmake:Botan"));
+        assert_eq!(first(include_str!("../tests/fixtures/misses/swayimg.log")).as_deref(), Some("lib:gif"));
+
+        // autoconf probes each spelling of the header and gives up on the last one
+        let htop = "checking for ncursesw/curses.h... no\nchecking for ncurses.h... no\n\
+                    checking for term.h... no\nconfigure: error: cannot find required curses header file\n";
+        assert_eq!(first(htop).as_deref(), Some("h:term.h"));
+
+        // muon says the call under its error, and the optional probe printed before it is
+        // not what failed: gtk4 died on glslc with gobject-introspection missing above it
+        let glslc = "dependency gobject-introspection-1.0 found: NO\n\
+                     /src/gtk-4.22.4/meson.build:709:22: error program not found\n\
+                     709 | glslc = find_program('glslc', required: vulkan_enabled)\n";
+        assert_eq!(misses(glslc, ""), vec!["cmd:glslc", "pc:gobject-introspection-1.0"]);
+        let girara = "dependency girara found: NO\n\
+                      /src/zathura/meson.build:47:21: error required dependency not found\n\
+                      47 | girara = dependency('girara', version: '>=2026.07.07')\n";
+        assert_eq!(first(girara).as_deref(), Some("pc:girara"));
+        let two = "dependency libtiff-4, tiff found: NO\n/src/gtk/meson.build:484:45: error required dependency not found\n";
+        assert_eq!(first(two).as_deref(), Some("pc:libtiff-4"));
+
+        assert_eq!(first("/usr/bin/libtool: eval: line 11083: kiry-cc: not found\n").as_deref(), Some("cmd:kiry-cc"));
+        assert_eq!(first("foo.c:1:10: fatal error: 'sensors/sensors.h' file not found\n").as_deref(), Some("h:sensors/sensors.h"));
+    }
+
+    // newsboat's own configure checks everything and then says it is unhappy, naming
+    // nothing at a failure line, so every miss it printed is a candidate
+    #[test]
+    fn a_hand_written_configure_still_reads() {
+        let all = misses(include_str!("../tests/fixtures/misses/newsboat.log"), "");
+        for want in ["pc:sqlite3", "pc:libcurl", "pc:json-c", "pc:stfl"] {
+            assert!(all.iter().any(|m| m == want), "{want} not in {all:?}");
+        }
+    }
+
+    // what the wrappers wrote comes after the log's own lines, newest first
+    #[test]
+    fn what_the_wrappers_noted_comes_last() {
+        let got = misses("configure: error: something went wrong\n", "pc foo\nh bar.h\n");
+        assert_eq!(got, vec!["h:bar.h", "pc:foo"]);
+    }
+
+    // neovim's lua and an autoconf failure are about something missing; muon lacking a
+    // module is not, and must not send gtk4 off to build its whole declared list
+    #[test]
+    fn only_a_failure_about_something_missing_falls_back() {
+        assert!(lacking(include_str!("../tests/fixtures/misses/neovim.log")));
+        assert!(lacking(include_str!("../tests/fixtures/misses/keepassxc.log")));
+        assert!(!lacking(include_str!("../tests/fixtures/misses/gtk4-module.log")));
+        assert!(!lacking("foo.c:12:5: error: use of undeclared identifier 'bar'\n"));
     }
 }

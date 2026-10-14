@@ -838,7 +838,12 @@ fn build(
                             WAITING.store(true, Ordering::Relaxed);
                             return Err(format!("{} {t}: waits on a dependency", p.name));
                         }
-                        _ => break (x, closure),
+                        _ => {
+                            if discovers(p) {
+                                unprove(root, p, t, &x.0, &x.1);
+                            }
+                            break (x, closure);
+                        }
                     }
                 }
                 Err(Fail::Other(e)) => return Err(e),
@@ -1024,6 +1029,79 @@ fn disprove(root: &Path, t: &str, name: &str, dep: &str) {
         .map(|l| format!("{l}\n"))
         .collect();
     let _ = put(&at, &kept);
+}
+
+// a proven line stays only while the build shows it: swayimg kept libheif, libjxl, librsvg
+// and libwebp from a full variant the recipe no longer builds. after an ok build a line
+// goes when its package ships headers, the build included none of them, and nothing
+// linked or loaded it. a discovered make line is a tool and a package with no headers
+// cannot be judged this way, so both stay. one try per upstream version: a line that
+// comes back after going stays until the next version, the way bisect takes a rung out
+// once to see if it is still needed. a * becomes the lines it stood for, judged the same,
+// except that a listed dep shipping a program may be one the build ran
+fn unprove(root: &Path, p: &Package, t: &str, work: &Path, linked: &[String]) {
+    let Ok(log) = fs::read_to_string(work.join("src/.kiry-headers")) else { return };
+    // nothing logged means nothing compiled through clang here: cargo, go, a scrubbed env
+    if log.trim().is_empty() {
+        return;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for l in log.lines() {
+        let Some((_, inc)) = l.split_once("\"includes\":[") else { continue };
+        let inc = inc.split(']').next().unwrap_or("");
+        seen.extend(inc.split(',').map(|h| h.trim().trim_matches('"').trim_start_matches('/')));
+    }
+    let at = closure_at(root, t, &p.name);
+    let ls = pkg::lines(&at).unwrap_or_default();
+    let star = ls.iter().any(|l| l == "*");
+    let mut deps = pkg::depends_from(ls.into_iter().filter(|l| l != "*").collect());
+    if star {
+        for d in p.depends.iter().filter(|d| d.applies(t)) {
+            if !deps.iter().any(|x| x.name == d.name) {
+                deps.push(d.clone());
+            }
+        }
+    }
+    let tried_at = closure_at(root, t, &format!("{}.pruned", p.name));
+    let tried = fs::read_to_string(&tried_at).unwrap_or_default();
+    let ver = &p.version.upstream;
+    let host = sandbox::host();
+    let inc = incdir(t).trim_start_matches('/').to_string() + "/";
+    let shared = datadir(t).trim_start_matches('/').to_string() + "/pkgconfig/";
+    let mut kept = String::new();
+    let mut gone: Vec<String> = Vec::new();
+    for d in &deps {
+        let listed = star && !p.depends.iter().all(|x| x.name != d.name);
+        let rec = db::read(root, if d.host { &host } else { t }, &d.name);
+        let heads: Vec<&str> = rec.iter().flat_map(|r| r.manifest.iter()).map(|e| e.path.as_str()).filter(|f| f.starts_with(&inc)).collect();
+        let runs = listed && rec.iter().flat_map(|r| r.manifest.iter()).any(|e| ["usr/bin/", "usr/sbin/", "bin/", "sbin/"].iter().any(|b| e.path.starts_with(b)));
+        // a .pc under share is an arch-independent package, wayland-protocols or xorgproto:
+        // its xml is found through a variable in the .pc and its headers come in through
+        // other headers, neither of which the log sees
+        let data = rec.iter().flat_map(|r| r.manifest.iter()).any(|e| e.path.starts_with(&shared));
+        let keep = (d.host && !listed)
+            || runs
+            || data
+            || linked.contains(&d.name)
+            || heads.is_empty()
+            || heads.iter().any(|h| seen.contains(h))
+            || tried.lines().any(|l| l == format!("{} {ver}", d.name));
+        if keep {
+            kept.push_str(&format!("{d}\n"));
+        } else {
+            gone.push(d.name.clone());
+        }
+    }
+    if gone.is_empty() && !star {
+        return;
+    }
+    let mut more = tried;
+    for n in &gone {
+        say!("{} {t} {n} out of the closure, nothing included or linked it", p.name);
+        more.push_str(&format!("{n} {ver}\n"));
+    }
+    let _ = put(&at, &kept);
+    let _ = put(&tried_at, &more);
 }
 
 // the miss the last round added a dep for and the dep, kept beside the closure so a round
@@ -2951,6 +3029,12 @@ fn compile(
         // clang either way and the point is the flags that come with it
         .env("CC", "kirycc")
         .env("CXX", "kiryc++")
+        // every system header a file of the project includes itself, which is what says a
+        // closure line was compiled against. muon asks libpkgconf in-process, so a
+        // pkg-config wrapper never sees its queries, and atime is locked in a user namespace
+        .env("CC_PRINT_HEADERS_FORMAT", "json")
+        .env("CC_PRINT_HEADERS_FILTERING", "only-direct-system")
+        .env("CC_PRINT_HEADERS_FILE", "/src/.kiry-headers")
         .env("KIRY_SRCDIR", "/src")
         .env("KIRY_TARGET", t)
         .env("KIRY_NAME", &p.name)

@@ -245,6 +245,55 @@ fn splits_that_install_run_when_package_installs_nothing() {
     assert!(!script.contains("amove"), "{script}");
 }
 
+// swayimg builds a full variant only its split installs, pinentry cds into a copy for its
+// libsecret split, dnsdist gates its jit build behind a return. package() here is the
+// recipe, so those builds go, and the lua shape above keeps every one of its dirs
+#[test]
+fn a_variant_only_a_split_installs_is_not_built() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("variants");
+    let (d, said) = convert(
+        &at,
+        "pkgname=thing\npkgver=1.0\npkgrel=0\nsubpackages=\"$pkgname-full:_full $pkgname-secret:_secret $pkgname-jit:_jit $pkgname-tool:_tool\"\n\
+         build() {\n\
+         \tabuild-meson -Dx=disabled . output\n\tmeson compile -C output\n\
+         \tabuild-meson \\\n\t\t-Dx=enabled \\\n\t\t. output-full\n\tmeson compile -C output-full\n\
+         \tcd \"$builddir-secret\"\n\tmake\n\
+         \tcd \"$builddir\"\n\tmake extra\n\tmake -C \"$builddir\"/contrib\n\
+         \t[ -d \"$builddir-jit\" ] || return 0\n\t_configure -jit\n}\n\
+         package() {\n\tDESTDIR=\"$pkgdir\" meson install --no-rebuild -C output\n}\n\
+         _full() {\n\tDESTDIR=\"$subpkgdir\" meson install --no-rebuild -C output-full\n}\n\
+         _secret() {\n\tinstall -D \"$builddir-secret\"/pin \"$subpkgdir\"/usr/bin/pin\n}\n\
+         _jit() {\n\tinstall -D \"$builddir-jit\"/x \"$subpkgdir\"/usr/bin/x\n}\n\
+         _tool() {\n\tinstall -D \"$builddir\"/contrib/tool \"$subpkgdir\"/usr/bin/tool\n}\n",
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    let build = &script[script.find("build() {").unwrap()..];
+    let build = &build[..build.find("\n}\n").unwrap()];
+    assert!(build.contains(". output\n\tmeson compile -C output\n"), "{build}");
+    assert!(build.contains("cd \"$builddir\"\n\tmake extra"), "{build}");
+    // a path into the tree a split installs from is not a variant dir
+    assert!(build.contains("make -C \"$builddir\"/contrib"), "{build}");
+    for gone in ["output-full", "-Dx=enabled", "builddir-secret", "\tmake\n", "builddir-jit", "_configure -jit"] {
+        assert!(!build.contains(gone), "{gone}: {build}");
+    }
+    assert!(said.contains("leaves out the variant only a split installs"), "{said}");
+
+    // the lua shape: package() installs nothing, so every dir is the payload
+    let at = scratch("variants-lua");
+    let (d, _) = convert(
+        &at,
+        "pkgname=thing\npkgver=1.0\npkgrel=0\nsubpackages=\"lua5.1-$pkgname:_sub\"\n\
+         build() {\n\tmake -C \"$builddir-luajit\"\n}\n\
+         package() {\n\tmkdir -p \"$pkgdir\"\n}\n\
+         _sub() {\n\tmake -C \"$builddir-luajit\" DESTDIR=\"$subpkgdir\" install\n}\n",
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    assert!(script.contains("make -C \"$builddir-luajit\"\n}"), "{script}");
+}
+
 // a version constraint, a ! for a conflict and a -dev suffix are all alpine spellings
 // with no kiry equivalent. what cannot be carried is reported rather than invented. a
 // so: name is carried as it is: which package it means is decided when the recipe is

@@ -1,0 +1,3 @@
+In file included from Source/OpenEXR/IlmImf/ImfAttribute.cpp:44:
+Source/OpenEXR/IlmImf/ImfAttribute.cpp:66:26: error: no template named 'binary_function' in namespace 'std'; did you mean '__binary_function'?
+1 error generated.

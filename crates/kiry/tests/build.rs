@@ -4753,6 +4753,24 @@ fn a_cmake_name_finds_the_listed_binding_named_for_it() {
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
     assert!(said.contains("app x86_64-musl needs lua-hdr  cmake:Hdr"), "{said}");
+
+    // libjxl's Could NOT find JPEG is libjpeg-turbo, and the ijg jpeg extra/ also carries
+    // is not, which the aliases say
+    convert_made(&root, &at, "libjpg-turbo", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define JPG 1' > \"$DESTDIR/usr/include/jpg.h\"\n");
+    convert_made(&root, &at, "jpg", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define IJG 1' > \"$DESTDIR/usr/include/ijg.h\"\n");
+    fs::write(at.join("extra/aliases"), "jpg\tlibjpg-turbo\n").unwrap();
+    convert_made(
+        &root,
+        &at,
+        "viewer",
+        "libjpg-turbo build\n",
+        "[ -f /usr/include/jpg.h ] || { echo 'CMake Error at cmake/FindJPG.cmake:12 (message):'; echo '  Could NOT find JPG (missing: JPG_LIBRARY)'; exit 1; }\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho viewer > \"$DESTDIR/usr/bin/viewer\"\n",
+    );
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "viewer"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("viewer x86_64-musl needs libjpg-turbo  cmake:JPG"), "{said}");
 }
 
 // a build waiting on a dep the planner hasn't built yet is not a failure flags can fix,
@@ -4781,6 +4799,116 @@ fn recover_waits_for_a_discovered_dep_instead_of_climbing_the_ladder() {
     assert!(!said.contains("rung"), "{said}");
     assert!(root.join("usr/bin/app").is_file());
     assert!(!at.join("extra/app/filter").exists());
+}
+
+// swayimg built ok without wayland-client and opened no window. a listed dep an ok build
+// looked for and did not find goes in when it is already built, and the package builds
+// again. one nothing has built stays a skipped name, and the toolchain is never skipped
+#[test]
+fn an_ok_build_that_missed_a_listed_dep_gets_it_and_builds_again() {
+    let Some((at, root, _)) = workshop("could") else {
+        return;
+    };
+    convert_made(&root, &at, "opt", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define OPT 1' > \"$DESTDIR/usr/include/opt.h\"\n");
+    convert_made(&root, &at, "never", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define NEVER 1' > \"$DESTDIR/usr/include/never.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "opt build\nnever build\nbusybox make\n",
+        "if [ -f /usr/include/opt.h ]; then w=with; else echo 'dependency opt found: NO'; w=without; fi\n\
+         [ -f /usr/include/never.h ] || echo 'dependency never found: NO'\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho $w > \"$DESTDIR/usr/bin/app\"\n",
+    );
+    let r = root.to_str().unwrap();
+    let o = kiry(&["b", "--root", r, "opt"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let o = kiry(&["i", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("app x86_64-musl could use opt  pc:opt, from the cache"), "{said}");
+    assert_eq!(fs::read_to_string(root.join("usr/bin/app")).unwrap(), "with\n", "{said}");
+    let skipped = said.lines().find(|l| l.starts_with("app x86_64-musl skipped")).unwrap_or_default();
+    assert_eq!(skipped, "app x86_64-musl skipped  never", "{said}");
+    let closure = fs::read_to_string(root.join("var/kiry/closure/x86_64-musl/app")).unwrap();
+    assert_eq!(closure, "opt build\n");
+
+    // flags -opt keeps it out, proven or not
+    fs::create_dir_all(root.join("etc/kiry/pkg")).unwrap();
+    fs::write(root.join("etc/kiry/pkg/app"), "flags -opt\n").unwrap();
+    let o = kiry(&["b", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!said.contains("could use"), "{said}");
+}
+
+// leave() takes a build-only dep out after the batch, so b and rebuild have to bring it
+// back: kiry b newsboat stopped on asciidoctor before compiling anything. and a flag set
+// against a dep after it was proven keeps it out of the next build
+#[test]
+fn b_brings_back_a_proven_dep_that_left_and_a_flag_still_takes_it_out() {
+    let Some((at, root, _)) = workshop("bring") else {
+        return;
+    };
+    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "hdr build\n",
+        "[ -f /usr/include/hdr.h ] || { echo \"app.c:1:10: fatal error: 'hdr.h' file not found\"; exit 1; }\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n",
+    );
+    let r = root.to_str().unwrap();
+    let o = kiry(&["i", "--root", r, "app"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(db::read(&root, "x86_64-musl", "hdr").is_err(), "hdr is build-only and should have left");
+
+    let o = kiry(&["b", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("app x86_64-musl wants hdr first"), "{said}");
+    assert!(db::read(&root, "x86_64-musl", "hdr").is_err(), "hdr came in for the build and stayed: {said}");
+
+    fs::create_dir_all(root.join("etc/kiry/pkg")).unwrap();
+    fs::write(root.join("etc/kiry/pkg/app"), "flags -hdr\n").unwrap();
+    let o = kiry(&["b", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(!o.status.success(), "{said}");
+    assert!(said.contains("app x86_64-musl needs hdr for h:hdr.h, and a flag takes it out"), "{said}");
+}
+
+// the storm case: a queued consumer whose proven build dep left with the last batch
+#[test]
+fn rebuild_brings_back_a_proven_dep_that_left() {
+    let Some((at, root, _)) = workshop("rebring") else {
+        return;
+    };
+    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "hdr build\n",
+        "[ -f /usr/include/hdr.h ] || { echo \"app.c:1:10: fatal error: 'hdr.h' file not found\"; exit 1; }\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n",
+    );
+    let r = root.to_str().unwrap();
+    let o = kiry(&["i", "--root", r, "app"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(db::read(&root, "x86_64-musl", "hdr").is_err());
+
+    db::write_queue(
+        &root,
+        &[db::Queued { target: "x86_64-musl".into(), name: "app".into(), soname: "libgone.so.1".into(), changed: Vec::new() }],
+    )
+    .unwrap();
+    let o = kiry(&["rebuild", "--root", r]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("app x86_64-musl wants hdr first"), "{said}");
+    assert!(db::read(&root, "x86_64-musl", "hdr").is_err(), "hdr came in for the rebuild and stayed: {said}");
 }
 
 // a dep the build can do without is a flag away, and a flag against one it needs stops

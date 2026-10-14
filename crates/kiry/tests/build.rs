@@ -4732,6 +4732,34 @@ fn an_extra_build_gets_the_dep_its_failure_names_and_nothing_else() {
     assert_eq!(closure, "hdr build\n");
 }
 
+// a build waiting on a dep the planner hasn't built yet is not a failure flags can fix,
+// so --recover hands it back to the planner instead of walking the ladder
+#[test]
+fn recover_waits_for_a_discovered_dep_instead_of_climbing_the_ladder() {
+    let Some((at, root, _)) = workshop("discover-recover") else {
+        return;
+    };
+    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "hdr build\n",
+        "[ -f /usr/include/hdr.h ] || { echo \"app.c:1:10: fatal error: 'hdr.h' file not found\"; exit 1; }\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n",
+    );
+    // with lto on, the ladder's first rung has something to take away
+    fs::create_dir_all(root.join("etc/kiry")).unwrap();
+    fs::write(root.join("etc/kiry/config"), "LTO thin\n").unwrap();
+
+    let o = kiry(&["i", "--recover", "--root", root.to_str().unwrap(), "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!said.contains("rung"), "{said}");
+    assert!(root.join("usr/bin/app").is_file());
+    assert!(!at.join("extra/app/filter").exists());
+}
+
 // a dep the build can do without is a flag away, and a flag against one it needs stops
 // the build with that said rather than a dep quietly coming back
 #[test]

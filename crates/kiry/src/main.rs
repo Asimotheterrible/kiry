@@ -2145,6 +2145,12 @@ fn recover(root: &Path, p: &Package, ts: &[String], verbose: bool, at_once: usiz
                 return Ok(());
             }
             Ok(_) => return Ok(()),
+            // the build is short a package that isn't built yet, and the planner builds it.
+            // no flag here is wrong, so the ladder would only write rungs to undo
+            Err(e) if WAITING.load(Ordering::Relaxed) => {
+                undo();
+                return Err(e);
+            }
             Err(e) => e,
         };
         if !SHOWN.with(|s| s.get()) {
@@ -5402,7 +5408,7 @@ undefined symbol: __\\w+_chk                  append -U_FORTIFY_SOURCE
 use of undeclared identifier '(malloc|calloc|realloc|free|abort|exit|getenv)'  append -include stdlib.h
 error: instruction requires:                set CFLAGS_MARCH x86-64
 does not allow 'register' storage class      append -Wno-register
-no template named 'auto_ptr' in namespace 'std'  append -D_LIBCPP_ENABLE_CXX17_REMOVED_AUTO_PTR
+no (template|member) named '(auto_ptr|binary_function|unary_function|bind1st|bind2nd|ptr_fun|random_shuffle)' in namespace 'std'  append -D_LIBCPP_ENABLE_CXX17_REMOVED_AUTO_PTR -D_LIBCPP_ENABLE_CXX17_REMOVED_BINDERS -D_LIBCPP_ENABLE_CXX17_REMOVED_RANDOM_SHUFFLE -D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION
 undefined reference to `__isoc99_            notaflag musl-portability
 PLEASE submit a bug report                   set OPT -O2
 ";

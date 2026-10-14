@@ -4879,6 +4879,89 @@ fn b_brings_back_a_proven_dep_that_left_and_a_flag_still_takes_it_out() {
     assert!(said.contains("app x86_64-musl needs hdr for h:hdr.h, and a flag takes it out"), "{said}");
 }
 
+// swayimg's closure kept four image libraries after the variant that used them was gone.
+// a line whose headers nothing included and that nothing links goes after an ok build, once
+// per version: when the build turns out to need it after all it comes back and stays. the
+// build writes the header log itself here, the way clang does under CC_PRINT_HEADERS_FILE
+#[test]
+fn a_proven_line_the_build_did_not_use_goes_once_per_version() {
+    let Some((at, root, _)) = workshop("unprove") else {
+        return;
+    };
+    let header = |n: &str| format!("mkdir -p \"$DESTDIR/usr/include\"\necho '#define X 1' > \"$DESTDIR/usr/include/{n}.h\"\n");
+    convert_made(&root, &at, "hdr", "", &header("hdr"));
+    convert_made(&root, &at, "unused", "", &header("unused"));
+    let app = |needs: &[&str]| {
+        let mut s = String::new();
+        for n in needs {
+            s.push_str(&format!("[ -f /usr/include/{n}.h ] || {{ echo \"app.c:1:10: fatal error: '{n}.h' file not found\"; exit 1; }}\n"));
+        }
+        let inc: Vec<String> = needs.iter().map(|n| format!("\\\"/usr/include/{n}.h\\\"")).collect();
+        s.push_str(&format!("echo \"{{\\\"source\\\":\\\"/src/app.c\\\",\\\"includes\\\":[{}]}}\" > /src/.kiry-headers\n", inc.join(",")));
+        s.push_str("mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n");
+        s
+    };
+    convert_made(&root, &at, "app", "hdr build\nunused build\n", &app(&["hdr"]));
+    let closure = root.join("var/kiry/closure/x86_64-musl");
+    fs::create_dir_all(&closure).unwrap();
+    fs::write(closure.join("app"), "hdr build\nunused build\n").unwrap();
+
+    let r = root.to_str().unwrap();
+    let o = kiry(&["i", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("app x86_64-musl unused out of the closure, nothing included or linked it"), "{said}");
+    assert_eq!(fs::read_to_string(closure.join("app")).unwrap(), "hdr build\n");
+
+    // the next build needs it after all: back in, and it stays this version
+    convert_made(&root, &at, "app", "hdr build\nunused build\n", &app(&["hdr", "unused"]));
+    let o = kiry(&["b", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("app x86_64-musl needs unused  h:unused.h"), "{said}");
+    convert_made(&root, &at, "app", "hdr build\nunused build\n", &app(&["hdr"]));
+    let o = kiry(&["b", "--root", r, "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!said.contains("out of the closure"), "{said}");
+    let lines = fs::read_to_string(closure.join("app")).unwrap();
+    assert!(lines.contains("unused build"), "{lines}");
+}
+
+// a * stands for the whole list once and then becomes what the build showed it used. a
+// listed dep that ships a program may be one the build ran, so it stays
+#[test]
+fn a_star_becomes_the_lines_the_build_used() {
+    let Some((at, root, _)) = workshop("unstar") else {
+        return;
+    };
+    let header = |n: &str| format!("mkdir -p \"$DESTDIR/usr/include\" \"$DESTDIR/usr/bin\"\necho '#define X 1' > \"$DESTDIR/usr/include/{n}.h\"\n");
+    convert_made(&root, &at, "hdr", "", &header("hdr"));
+    convert_made(&root, &at, "unused", "", &header("unused"));
+    convert_made(&root, &at, "tool", "", &format!("{}echo x > \"$DESTDIR/usr/bin/tool\"\nchmod +x \"$DESTDIR/usr/bin/tool\"\n", header("tool")));
+    // no headers, so nothing here says whether it was used
+    convert_made(&root, &at, "data", "", "mkdir -p \"$DESTDIR/usr/share/data\"\necho x > \"$DESTDIR/usr/share/data/x\"\n");
+    // headers, and a .pc under share: wayland-protocols, used through its xml
+    convert_made(&root, &at, "protos", "", &format!("{}mkdir -p \"$DESTDIR/usr/share/pkgconfig\"\necho 'Name: protos' > \"$DESTDIR/usr/share/pkgconfig/protos.pc\"\n", header("protos")));
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "hdr build\nunused build\ntool make\ndata build\nprotos build\n",
+        "echo '{\"source\":\"/src/app.c\",\"includes\":[\"/usr/include/hdr.h\"]}' > /src/.kiry-headers\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n",
+    );
+    let closure = root.join("var/kiry/closure/x86_64-musl");
+    fs::create_dir_all(&closure).unwrap();
+    fs::write(closure.join("app"), "*\n").unwrap();
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    let lines = fs::read_to_string(closure.join("app")).unwrap();
+    assert_eq!(lines, "hdr build\ntool make\ndata build\nprotos build\n", "{said}");
+}
+
 // the storm case: a queued consumer whose proven build dep left with the last batch
 #[test]
 fn rebuild_brings_back_a_proven_dep_that_left() {

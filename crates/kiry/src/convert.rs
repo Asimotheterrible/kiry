@@ -403,6 +403,30 @@ pub fn recipe(
     if !had {
         return Err(format!("{name}: no build() or package() to convert"));
     }
+    // a package() that installs nothing leaves the payload to the splits: lua-mpack builds
+    // a module per lua and each lua$v-mpack installs its own. folded into one recipe, those
+    // run into $DESTDIR. a split that moves files out of $pkgdir would have nothing to move
+    let empty = body(&text, "package").is_none_or(|b| {
+        b.lines().all(|l| {
+            let l = l.trim();
+            l.is_empty() || l.starts_with('#') || (l.starts_with("mkdir -p") && l.contains("pkgdir"))
+        })
+    });
+    if empty {
+        for entry in v.get("subpackages").map(String::as_str).unwrap_or("").split_whitespace() {
+            let sub = entry.split(':').next().unwrap_or("");
+            let Some(f) = subpackage_funcs(&name, entry).pop() else { continue };
+            let Some(b) = body(&text, &f) else { continue };
+            if !b.contains("subpkgdir") || b.contains("$pkgdir") || b.contains("${pkgdir}") || b.contains("amove") {
+                continue;
+            }
+            if !wrote.contains(&f) {
+                wrote.push(f.clone());
+                script.push_str(&format!("\n{f}() {{\n{}}}\n", untested(&b)));
+            }
+            script.push_str(&format!("cd \"$builddir\"\nsubpkgname=\"{sub}\" subpkgdir=\"$DESTDIR\"\n{f}\n"));
+        }
+    }
     // what abuild strips after package(). the info index is generated from the pages
     // beside it, so 395 recipes would each claim the same file, and a .la names build
     // paths that are gone by the time anything reads them

@@ -1277,8 +1277,14 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
         .into_iter()
         .find(|c| fresh(c) && recipe(root, c).is_some())
         .map(|c| (c, "name"));
-    if named.is_some() || k != "cmake" {
+    if named.is_some() {
         return named;
+    }
+    // a binding is named for what it binds, Lpeg is lua-lpeg. a whole word of a name on the
+    // recipe's own list, never a guess across the tree
+    let word = pool.iter().find(|c| c.split('-').any(|w| w == stem) && fresh(c)).map(|c| ((*c).to_string(), "name"));
+    if word.is_some() || k != "cmake" {
+        return word;
     }
     // a cmake package is named without the version a recipe carries: Lua is lua5.1 on a
     // list that has lua5.1 to lua5.5, and the first one listed is the one taken
@@ -3077,6 +3083,8 @@ test-flags() {
 
 want_check() { return 1; }
 subpackage_types_has() { return 1; }
+# a split that also installs, lua-compat53's dev, moves first. into the same package here
+default_dev() { :; }; default_doc() { :; }; default_libs() { :; }; default_static() { :; }
 options_has() { case \" $options \" in *\" $1 \"*) return 0 ;; esac; return 1; }
 ";
 

@@ -4732,6 +4732,29 @@ fn an_extra_build_gets_the_dep_its_failure_names_and_nothing_else() {
     assert_eq!(closure, "hdr build\n");
 }
 
+// cmake's Could NOT find Lpeg names the library, and the recipe lists the binding,
+// lua-lpeg. a whole word of a listed name answers it
+#[test]
+fn a_cmake_name_finds_the_listed_binding_named_for_it() {
+    let Some((at, root, _)) = workshop("discover-word") else {
+        return;
+    };
+    convert_made(&root, &at, "lua-hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "lua-hdr build\n",
+        "[ -f /usr/include/hdr.h ] || { echo 'CMake Error at cmake/FindHdr.cmake:12 (message):'; echo '  Could NOT find Hdr (missing: HDR_LIBRARY)'; exit 1; }\n\
+         mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n",
+    );
+
+    let o = kiry(&["i", "--root", root.to_str().unwrap(), "app"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(said.contains("app x86_64-musl needs lua-hdr  cmake:Hdr"), "{said}");
+}
+
 // a build waiting on a dep the planner hasn't built yet is not a failure flags can fix,
 // so --recover hands it back to the planner instead of walking the ladder
 #[test]

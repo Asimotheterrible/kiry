@@ -116,6 +116,8 @@ fn deps(root: &Path, jobs: &[Job]) -> Result<Vec<(String, String)>, Error> {
 pub struct Broke {
     pub target: String,
     pub soname: String,
+    // the file, since a soname is not one: plex ships its own libssl.so.3 beside openssl's
+    pub path: String,
     // empty when the soname itself went with the version going out
     pub changed: Vec<elf::Change>,
 }
@@ -192,6 +194,7 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
                     broke.push(Broke {
                         target: j.target.clone(),
                         soname: soname.clone(),
+                        path: path.clone(),
                         changed,
                     });
                 }
@@ -247,6 +250,7 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
                 broke.push(Broke {
                     target: j.target.clone(),
                     soname: so.clone(),
+                    path: path.clone(),
                     changed: Vec::new(),
                 });
                 stayed.push(so.clone());
@@ -483,6 +487,12 @@ pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Seen)>, 
         let n = f.read(&mut head).unwrap_or(0);
         let head = &head[..n];
 
+        // another machine's elf is data here: go's arm64 .syso, qemu's sparc firmware
+        let ours = head.len() > 19 && head[4] == 2 && head[5] == 1 && head[18..20] == [62, 0];
+        if head.starts_with(&elf::MAGIC) && !ours {
+            out.push((e.path.clone(), Seen::Other));
+            continue;
+        }
         if head.starts_with(&elf::MAGIC) {
             let Ok(bytes) = elf::bytes(&f) else {
                 out.push((e.path.clone(), Seen::Bad));

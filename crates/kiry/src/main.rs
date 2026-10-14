@@ -1045,12 +1045,7 @@ fn unprove(root: &Path, p: &Package, t: &str, work: &Path, linked: &[String]) {
     if log.trim().is_empty() {
         return;
     }
-    let mut seen: HashSet<&str> = HashSet::new();
-    for l in log.lines() {
-        let Some((_, inc)) = l.split_once("\"includes\":[") else { continue };
-        let inc = inc.split(']').next().unwrap_or("");
-        seen.extend(inc.split(',').map(|h| h.trim().trim_matches('"').trim_start_matches('/')));
-    }
+    let seen = included(&log);
     let at = closure_at(root, t, &p.name);
     let ls = pkg::lines(&at).unwrap_or_default();
     let star = ls.iter().any(|l| l == "*");
@@ -1102,6 +1097,21 @@ fn unprove(root: &Path, p: &Package, t: &str, work: &Path, linked: &[String]) {
     }
     let _ = put(&at, &kept);
     let _ = put(&tried_at, &more);
+}
+
+// how clang is asked to write down what each file included, and the reading of it. one
+// json object a line, the system headers a file of the project named itself
+const HEADER_LOG: [(&str, &str); 2] =
+    [("CC_PRINT_HEADERS_FORMAT", "json"), ("CC_PRINT_HEADERS_FILTERING", "only-direct-system")];
+
+fn included(log: &str) -> HashSet<&str> {
+    let mut seen = HashSet::new();
+    for l in log.lines() {
+        let Some((_, inc)) = l.split_once("\"includes\":[") else { continue };
+        let inc = inc.split(']').next().unwrap_or("");
+        seen.extend(inc.split(',').map(|h| h.trim().trim_matches('"').trim_start_matches('/')));
+    }
+    seen
 }
 
 // the miss the last round added a dep for and the dep, kept beside the closure so a round
@@ -1807,7 +1817,7 @@ fn unbacked(root: &Path, deps: &[Dep], t: &str, dest: &Path) -> Vec<String> {
     for f in &files {
         let Ok(bytes) = fs::read(f) else { continue };
         for (name, stems) in &doubt {
-            if !seen.contains(name) && stems.iter().any(|s| bytes.windows(s.len()).any(|w| w == s.as_bytes())) {
+            if !seen.contains(name) && stems.iter().any(|s| mentions(&bytes, s)) {
                 seen.insert(name.clone());
             }
         }
@@ -1845,12 +1855,27 @@ fn loaded(root: &Path, deps: &[Dep], t: &str, dest: &Path, linked: &BTreeSet<Str
             if out.iter().any(|(n, _)| n == name) {
                 continue;
             }
-            if let Some(s) = stems.iter().find(|s| bytes.windows(s.len()).any(|w| w == s.as_bytes())) {
+            if let Some(s) = stems.iter().find(|s| mentions(&bytes, s)) {
                 out.push((name.clone(), s.clone()));
             }
         }
     }
     out
+}
+
+// the name standing as a word of its own. binutils ships ar and every file with "start" or
+// "libarchive" in it would have backed it, so a dep shipping a short program never went.
+// a dot after is still the end, libfoo.so.1 names libfoo.so, and a dot before is not:
+// .xz is a suffix and not the program
+fn mentions(bytes: &[u8], name: &str) -> bool {
+    let word = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+');
+    let n = name.len();
+    !name.is_empty()
+        && bytes.windows(n).enumerate().any(|(i, w)| {
+            w == name.as_bytes()
+                && (i == 0 || !(word(bytes[i - 1]) || bytes[i - 1] == b'.'))
+                && bytes.get(i + n).is_none_or(|b| !word(*b))
+        })
 }
 
 // what a dep is, for unbacked(): its sonames, whether it ships a module (a .so with no
@@ -3032,8 +3057,7 @@ fn compile(
         // every system header a file of the project includes itself, which is what says a
         // closure line was compiled against. muon asks libpkgconf in-process, so a
         // pkg-config wrapper never sees its queries, and atime is locked in a user namespace
-        .env("CC_PRINT_HEADERS_FORMAT", "json")
-        .env("CC_PRINT_HEADERS_FILTERING", "only-direct-system")
+        .envs(HEADER_LOG)
         .env("CC_PRINT_HEADERS_FILE", "/src/.kiry-headers")
         .env("KIRY_SRCDIR", "/src")
         .env("KIRY_TARGET", t)
@@ -3497,6 +3521,10 @@ fn cache_rate(root: &Path, p: &Package, t: &str, work: &Path) -> Option<String> 
 // under KIRY_PRUNE every shared link is written down as it was run, so prune_pass can
 // run it again with a version script once the build is over
 //
+// libtool links a c++ library -nostdlib and puts back what `clang++ -v` showed it as -l
+// flags, which drops the builtins archive since that is a path. libopenmpt then needed
+// __muldc3 and nothing loaded it. the archive goes last, and gives only what is missing
+//
 // clang hands a language it has no frontend for (ada, fortran) to `gcc`, and toollinks
 // makes gcc a link to clang, so gdb's configure asking whether the driver knows ada
 // forked about 1700 clangs in 25s. -ccc-gcc-name points the handoff at a name nothing
@@ -3508,6 +3536,9 @@ case \" $* \" in *\" - \"*) run \"$@\"; exit ;; esac
 if [ -n \"$KIRY_PRUNE\" ]; then
 \tcase \" $* \" in *\" -shared \"*) { printf '%s\\0' \"$PWD\" \"$PATH\" \"${0##*/}\" \"$@\"; printf '\\n'; } >>/src/.kiry-links ;; esac
 fi
+case \" $* \" in *\" -nostdlib \"*) case \" $* \" in *\" -shared \"*)
+\trt=$(run -print-libgcc-file-name 2>/dev/null) && [ -f \"$rt\" ] && set -- \"$@\" \"$rt\" ;;
+esac ;; esac
 e=/tmp/.kirycc.$$
 trap 'rm -f \"$e\"' EXIT
 cc() { run \"$@\" 2>\"$e\"; s=$?; [ -s \"$e\" ] && cat \"$e\" >&2; return $s; }
@@ -7698,10 +7729,21 @@ fn called(root: &Path, name: &str, t: &str) -> Option<String> {
 // as well, to the package that ships it there
 fn owners(root: &Path) -> HashMap<(String, String), String> {
     let mut out = HashMap::new();
+    // a copy under a package's own directory is that package's: electron ships a
+    // libvulkan.so.1, and electron sorts before vulkan-loader
+    let mut private: HashSet<(String, String)> = HashSet::new();
     for t in db::targets(root).unwrap_or_default() {
+        let dirs = defaults(&t).unwrap_or_default();
         for name in db::installed(root, &t).unwrap_or_default() {
             for pv in db::read_provides(root, &t, &name).unwrap_or_default() {
-                out.entry((t.clone(), format!("so:{}", pv.soname))).or_insert_with(|| name.clone());
+                let key = (t.clone(), format!("so:{}", pv.soname));
+                let shared = dirs.contains(&dirname(&fold(&pv.path)));
+                if !out.contains_key(&key) || shared && private.remove(&key) {
+                    out.insert(key.clone(), name.clone());
+                    if !shared {
+                        private.insert(key);
+                    }
+                }
             }
             let Ok(rec) = db::read(root, &t, &name) else { continue };
             for e in &rec.manifest {
@@ -8355,13 +8397,15 @@ fn affected(
             let Ok(seen) = install::scan(root, &rec.manifest) else {
                 continue;
             };
+            let own = bundles(rec.manifest.iter().map(|e| e.path.as_str()), &b.target);
             // a soname that left has no symbol to filter by, and a consumer that can
             // dlsym reaches names its undefined set never shows. both go whole
-            let uses = seen.iter().any(|(_, s)| {
+            let uses = seen.iter().any(|(at, s)| {
                 let install::Seen::Elf(o) = s else {
                     return false;
                 };
                 o.needed.contains(&b.soname)
+                    && reaches(root, o, at, &b.target, &b.soname, &b.path, &own)
                     && (b.changed.is_empty()
                         || o.undefined.iter().any(|u| DL.contains(&u.name.as_str()))
                         || o.undefined
@@ -8379,6 +8423,35 @@ fn affected(
         }
     }
     out
+}
+
+// whether the loader, looking for name from the elf at at, ends up in the directory of the
+// library at lib. plex ships its own libssl.so.3 and finds it through $ORIGIN, so its copy
+// changing says nothing about what links openssl's, and openssl's says nothing about plex
+fn reaches(root: &Path, o: &elf::Elf, at: &str, target: &str, name: &str, lib: &str, own: &[(String, String)]) -> bool {
+    let Some(dirs) = defaults(target) else { return true };
+    let want = fold(dirname(&fold(lib)));
+    for d in searched(o, at, dirs, own) {
+        let (mut d, mut f) = (fold(&d), name.to_string());
+        // a chain of eight is past anything real and short of looping forever
+        for _ in 0..8 {
+            let Ok(m) = fs::symlink_metadata(root.join(&d).join(&f)) else { break };
+            if !m.file_type().is_symlink() {
+                return d == want;
+            }
+            let Ok(t) = fs::read_link(root.join(&d).join(&f)) else { break };
+            let t = t.to_string_lossy();
+            let full = match t.strip_prefix('/') {
+                Some(abs) => fold(abs),
+                None => fold(&format!("{d}/{t}")),
+            };
+            d = dirname(&full).to_string();
+            f = full.rsplit('/').next().unwrap_or_default().to_string();
+        }
+    }
+    // nothing on its path carries the name, which is the soname leaving: everything that
+    // names it is the consumer
+    true
 }
 
 // an entry records the names that left. if the library exports all of them again the
@@ -11234,6 +11307,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
     // nothing has to go back to disk for a depends the scan already read
     let mut deps: HashMap<String, Vec<Dep>> = HashMap::new();
     let mut users: Vec<(String, Vec<String>)> = Vec::new();
+    let mut own: Vec<(String, String)> = Vec::new();
 
     for (name, one) in names.iter().zip(scans(root, target, &names)) {
         let (mut rec, seen) = match one {
@@ -11246,6 +11320,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
         // resolution. musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1
         // points at the loader itself
         index(&rec.manifest, &mut present, &mut links);
+        own.extend(bundles(rec.manifest.iter().map(|e| e.path.as_str()), target));
 
         let mut mine = Vec::new();
         for (path, what) in seen {
@@ -11325,7 +11400,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
     let mut open: Vec<(usize, String)> = Vec::new();
     let mut asked_as: Vec<(usize, &str, usize)> = Vec::new();
     for (i, (path, o)) in elves.iter().enumerate() {
-        let where_ = search(o, path, dirs);
+        let where_ = searched(o, path, dirs, &own);
         for want in &o.needed {
             match provider(&here, &links, want, &where_) {
                 Some(j) => {
@@ -11417,7 +11492,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
         if !asked.contains(&i) {
             continue;
         }
-        for want in missing(&elves, &sets, &here, &links, dirs, i) {
+        for want in missing(&elves, &sets, &here, &links, dirs, &own, i) {
             out.push(Finding {
                 pkg: owners[i].clone(),
                 path: path.clone(),
@@ -11656,6 +11731,7 @@ fn missing(
     here: &HashMap<String, usize>,
     links: &HashMap<String, String>,
     dirs: &[&str],
+    own: &[(String, String)],
     root: usize,
 ) -> Vec<String> {
     let mut seen = HashSet::from([root]);
@@ -11664,7 +11740,7 @@ fn missing(
 
     while let Some(i) = queue.pop() {
         let (path, o) = &elves[i];
-        let where_ = search(o, path, dirs);
+        let where_ = searched(o, path, dirs, own);
         for want in &o.needed {
             if let Some(j) = provider(here, links, want, &where_) {
                 if seen.insert(j) {
@@ -11720,6 +11796,42 @@ fn search(o: &elf::Elf, path: &str, dirs: &[&str]) -> Vec<String> {
         .map(|d| fold(&d.replace("${ORIGIN}", own).replace("$ORIGIN", own)))
         .collect();
     out.extend(dirs.iter().map(|d| (*d).to_string()));
+    out
+}
+
+// a bundle that brings its own loader, plex's lib/ld-musl-x86_64.so.1, runs its programs
+// through it with its own library directory first, which no elf in it says. each entry is
+// the directory the bundle lives under and the one its loader searches
+fn bundles<'a>(paths: impl Iterator<Item = &'a str>, target: &str) -> Vec<(String, String)> {
+    let sys = defaults(target).unwrap_or_default();
+    paths
+        .map(fold)
+        .filter(|p| {
+            let base = p.rsplit('/').next().unwrap_or_default();
+            (base.starts_with("ld-musl-") || base.starts_with("ld-linux")) && base.contains(".so.")
+        })
+        .filter_map(|p| {
+            let dir = dirname(&p).to_string();
+            if sys.contains(&dir.as_str()) {
+                return None;
+            }
+            let top = match dir.rsplit_once('/') {
+                Some((up, "lib" | "lib64")) if !sys.contains(&up) => up.to_string(),
+                _ => dir.clone(),
+            };
+            Some((top, dir))
+        })
+        .collect()
+}
+
+// search() for an elf inside a bundle: the bundle's directory goes first
+fn searched(o: &elf::Elf, path: &str, dirs: &[&str], bundles: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = bundles
+        .iter()
+        .filter(|(top, _)| fold(path).starts_with(&format!("{top}/")))
+        .map(|(_, d)| d.clone())
+        .collect();
+    out.extend(search(o, path, dirs));
     out
 }
 
@@ -12475,6 +12587,8 @@ mod sidecar {
         installed(&root, "data", &[("usr/share/icons/hicolor/index.theme", 0o644)], &[]);
         // a library with a cli nobody here runs, the way bzip2 and libxml2 ship one
         installed(&root, "cli", &[("usr/lib/libxml9.so.2", 0o755), ("usr/bin/xmllint9", 0o755)], &["libxml9.so.2"]);
+        // a program with a short name, which "start" and a .ar suffix do not name
+        installed(&root, "short", &[("usr/lib/libshort.so.1", 0o755), ("usr/bin/ar", 0o755)], &["libshort.so.1"]);
 
         // not installed, and judged from the listing of its artifact: a plain library
         // nothing names goes, one whose program something runs stays
@@ -12501,10 +12615,10 @@ mod sidecar {
 
         so(&dest.join("usr/bin/thing"), None, &[&root.join("usr/lib/libfoo.so.1")]);
         mkdirs(&dest.join("usr/share/thing")).unwrap();
-        fs::write(dest.join("usr/share/thing/probe"), "dlopen(\"libsensors.so.5\")\nexec java\nexec wwctl\n").unwrap();
+        fs::write(dest.join("usr/share/thing/probe"), "dlopen(\"libsensors.so.5\")\nexec java\nexec wwctl\nstart the bar, x.ar archive\n").unwrap();
 
         let deps: Vec<pkg::Dep> =
-            ["linked", "loaded", "plain", "tool", "plugin", "data", "cli", "unbuiltplain", "unbuilttool", "absent"]
+            ["linked", "loaded", "plain", "tool", "plugin", "data", "cli", "short", "unbuiltplain", "unbuilttool", "absent"]
                 .iter()
                 .map(|n| dep(n))
                 .collect();
@@ -12516,7 +12630,7 @@ mod sidecar {
 
         assert_eq!(
             unbacked(&root, &all, T, &dest),
-            vec!["plain".to_string(), "cli".to_string(), "unbuiltplain".to_string()]
+            vec!["plain".to_string(), "cli".to_string(), "short".to_string(), "unbuiltplain".to_string()]
         );
     }
 
@@ -12545,6 +12659,87 @@ mod sidecar {
         let mut linked = BTreeSet::new();
         linked.insert("wayland".to_string());
         assert!(loaded(&root, &deps, T, &dest, &linked).is_empty());
+    }
+
+    // a soname is answered by the package whose copy the loader finds by name. electron's
+    // own libvulkan.so.1 sits under usr/lib/electron, and electron sorts first
+    #[test]
+    fn a_soname_belongs_to_the_copy_the_loader_finds() {
+        let root = scratch("owners");
+        let private = |name: &str, path: &str, soname: &str| {
+            installed(&root, name, &[(path, 0o755)], &[]);
+            let pv = db::Provide { soname: soname.into(), path: path.into(), versioned: false };
+            db::write_provides(&root, T, name, &[pv]).unwrap();
+        };
+        private("electron", "usr/lib/electron/libvulkan.so.1", "libvulkan.so.1");
+        installed(&root, "vulkan-loader", &[("usr/lib/libvulkan.so.1", 0o755)], &["libvulkan.so.1"]);
+        installed(&root, "aaa", &[("usr/lib/libz9.so.1", 0o755)], &["libz9.so.1"]);
+        private("zzz", "usr/lib/zzz/libz9.so.1", "libz9.so.1");
+        // a private copy is still the answer when it is the only one
+        private("plex", "usr/lib/plex/libonly.so.1", "libonly.so.1");
+        let own = owners(&root);
+        let who = |so: &str| own.get(&(T.to_string(), format!("so:{so}"))).cloned();
+        assert_eq!(who("libvulkan.so.1").as_deref(), Some("vulkan-loader"));
+        assert_eq!(who("libz9.so.1").as_deref(), Some("aaa"));
+        assert_eq!(who("libonly.so.1").as_deref(), Some("plex"));
+    }
+
+    // the log is clang's own, asked for the way the sandbox asks: what the project's file
+    // included from a system directory, and not what that header included in turn
+    #[test]
+    fn the_header_log_reads_what_clang_writes() {
+        let at = scratch("headerlog");
+        let inc = at.join("inc");
+        mkdirs(&inc).unwrap();
+        fs::write(inc.join("hdr.h"), "#include <inner.h>\n").unwrap();
+        fs::write(inc.join("inner.h"), "#define INNER 1\n").unwrap();
+        fs::write(at.join("local.h"), "#define LOCAL 1\n").unwrap();
+        fs::write(at.join("a.c"), "#include <hdr.h>\n#include \"local.h\"\nint a;\n").unwrap();
+        let log = at.join("log");
+        let ok = Command::new("clang")
+            .envs(HEADER_LOG)
+            .env("CC_PRINT_HEADERS_FILE", &log)
+            .arg("-isystem")
+            .arg(&inc)
+            .arg("-c")
+            .arg(at.join("a.c"))
+            .arg("-o")
+            .arg(at.join("a.o"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let text = fs::read_to_string(&log).unwrap();
+        let seen = included(&text);
+        let hdr = inc.join("hdr.h").to_string_lossy().trim_start_matches('/').to_string();
+        assert!(seen.contains(hdr.as_str()), "{text}");
+        assert!(!seen.iter().any(|h| h.ends_with("inner.h") || h.ends_with("local.h")), "{text}");
+    }
+
+    // a line goes when its headers went unread and nothing links it. a library reached
+    // only through another header, or a .pc chain, is linked and not included
+    #[test]
+    fn a_linked_line_stays_in_the_closure_with_no_header_read() {
+        let at = scratch("unprove");
+        let root = at.join("root");
+        installed(&root, "hdr", &[("usr/include/hdr.h", 0o644)], &[]);
+        installed(&root, "lib", &[("usr/include/lib.h", 0o644), ("usr/lib/liblib.so.1", 0o755)], &["liblib.so.1"]);
+        installed(&root, "unused", &[("usr/include/unused.h", 0o644)], &[]);
+        let d = root.join(REPOS_AT).join("extra/app");
+        mkdirs(&d).unwrap();
+        fs::write(d.join("version"), "1.0 1\n").unwrap();
+        fs::write(d.join("targets"), format!("{T}\n")).unwrap();
+        fs::write(d.join("build"), "true\n").unwrap();
+        fs::write(d.join("depends"), "hdr make\nlib make\nunused make\n").unwrap();
+        let p = load(&root, &d).unwrap();
+        let at_ = closure_at(&root, T, "app");
+        mkdirs(at_.parent().unwrap()).unwrap();
+        fs::write(&at_, "hdr build\nlib build\nunused build\n").unwrap();
+        let work = at.join("work");
+        mkdirs(&work.join("src")).unwrap();
+        fs::write(work.join("src/.kiry-headers"), "{\"source\":\"/src/a.c\",\"includes\":[\"/usr/include/hdr.h\"]}\n").unwrap();
+
+        unprove(&root, &p, T, &work, &["lib".to_string()]);
+        assert_eq!(fs::read_to_string(&at_).unwrap(), "hdr build\nlib build\n");
     }
 
     #[test]
@@ -12597,10 +12792,24 @@ mod sidecar {
         script("usr/bin/tool", "#!/usr/bin/env -S python3 -u\nprint(1)\n");
         script("usr/bin/wrap", "#!/bin/sh\nexec tool\n");
         script("usr/share/doc/thing/example.php", "#!/usr/bin/env php\n<?php\n");
+        // named by its path rather than through env
+        installed(&root, "lua", &[("usr/bin/lua5.4", 0o755)], &[]);
+        script("usr/bin/luatool", "#!/usr/bin/lua5.4\nprint(1)\n");
+        // not executable, so the kernel never reads its #! and nothing runs it that way
+        installed(&root, "ruby", &[("usr/bin/ruby", 0o755)], &[]);
+        script("usr/lib/thing/lib.rb", "#!/usr/bin/ruby\n");
+        fs::set_permissions(dest.join("usr/lib/thing/lib.rb"), fs::Permissions::from_mode(0o644)).unwrap();
+        // nothing installed ships it, and a path outside the bin dirs names no command
+        script("usr/bin/perltool", "#!/usr/bin/perl\n");
+        script("usr/bin/private", "#!/usr/lib/thing/run\n");
+        installed(&root, "thingrun", &[("usr/lib/thing/run", 0o755)], &[]);
 
         assert_eq!(
             interpreters(&root, T, &dest),
-            vec![("python3".to_string(), "python3".to_string())]
+            vec![
+                ("python3".to_string(), "python3".to_string()),
+                ("usr/bin/lua5.4".to_string(), "lua".to_string()),
+            ]
         );
     }
 
@@ -12791,6 +13000,16 @@ mod deps {
                 .any(|(s, who, k)| *s == want && who == "carrier" && *k == "undeclared"),
             "{got:?}"
         );
+    }
+
+    // the package ships a library by that name and links its own, which a closure member
+    // happening to carry the same soname says nothing about
+    #[test]
+    fn a_library_the_package_ships_itself_is_not_reported() {
+        let (root, members, dest, want) = fixture("self");
+        super::sidecar::so(&dest.join("usr/lib/own.so"), Some(&want), &[]);
+        let deps = [dep("carrier", true)];
+        assert!(undeclared(&root, &members, &deps, T, &dest).is_empty());
     }
 
     // the worse one. nothing installs a make dep because something links it, so this

@@ -325,6 +325,54 @@ fn a_library_off_the_search_path_does_not_count_as_provided() {
     assert!(ldd_finds(&root.join("usr/bin/rp"), "libp.so.1"));
 }
 
+// plex ships its own loader beside its libraries and runs everything through it, so its
+// programs find what is in lib/ with nothing in them saying so
+#[test]
+fn a_bundle_with_its_own_loader_resolves_through_it() {
+    if skip("bundle") {
+        return;
+    }
+    let at = scratch("bundle");
+    let root = at.join("root");
+    let l = lib(&at, "libp.so.1");
+    let b = bin(&at, "app", &l, None);
+    let loader = at.join("loader");
+    fs::write(&loader, "x\n").unwrap();
+    install(
+        &root,
+        "plex",
+        &[
+            ("usr/lib64/plex/lib/ld-linux-x86-64.so.2", &loader),
+            ("usr/lib64/plex/lib/libp.so.1", &l),
+            ("usr/lib64/plex/bin/app", &b),
+        ],
+    );
+    install(&root, "bare", &[("usr/bin/bare", &b)]);
+
+    let (_, out) = doctor(&root);
+    assert!(!out.contains("usr/lib64/plex/bin/app "), "{out}");
+    assert!(out.contains(&format!("usr/bin/bare {TARGET} unresolved libp.so.1")), "{out}");
+}
+
+// an elf for another machine is a file this loader never opens: go ships arm64 .syso
+// objects and qemu big-endian firmware
+#[test]
+fn an_elf_for_another_machine_is_not_unreadable() {
+    if skip("foreign elf") {
+        return;
+    }
+    let at = scratch("foreign");
+    let root = at.join("root");
+    let mut bytes = fs::read(lib(&at, "libp.so.1")).unwrap();
+    bytes[5] = 2;
+    let f = at.join("firmware");
+    fs::write(&f, bytes).unwrap();
+    install(&root, "qemu", &[("usr/share/qemu/openbios-ppc", &f)]);
+
+    let (ok, out) = doctor(&root);
+    assert!(ok && out.is_empty(), "{out}");
+}
+
 #[test]
 fn a_manifest_file_that_vanished_is_reported_rather_than_skipped() {
     if skip("vanished file") {

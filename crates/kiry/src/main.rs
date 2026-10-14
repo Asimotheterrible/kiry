@@ -688,15 +688,30 @@ fn build_cmd(args: &[String]) {
         })
         .collect();
     batch_begin(&root, todo.len(), &rows, &rows);
+    let mut brought = false;
     for (name, targets) in &todo {
         let p = &recipes[name];
-        let r = match fix {
-            true => recover(&root, p, targets, verbose, 1),
-            false => build(&root, p, targets, verbose, false, 1).map(|_| ()),
-        };
-        if let Err(e) = r {
-            die(e);
+        let mut waits = 0;
+        loop {
+            for t in targets {
+                brought |= bring(&root, p, t, verbose);
+            }
+            let r = match fix {
+                true => recover(&root, p, targets, verbose, 1),
+                false => build(&root, p, targets, verbose, false, 1).map(|_| ()),
+            };
+            match r {
+                Ok(()) => break,
+                // discovery found a dep that is not in yet: bring it and build again
+                Err(_) if WAITING.swap(false, Ordering::Relaxed) && waits < 60 => waits += 1,
+                Err(e) => die(e),
+            }
         }
+    }
+    // what came in for the builds goes again unless something asked for needs it
+    if brought {
+        let _w = writer(&root);
+        leave(&root);
     }
 
     say!("cached {}", root.join("var/kiry/cache").display());
@@ -811,7 +826,20 @@ fn build(
             match r {
                 Ok(x) => {
                     set_last_round(root, t, &p.name, None);
-                    break (x, closure);
+                    match discovers(p).then(|| more(root, p, t, &x.0, &closure)).flatten() {
+                        Some(Step::Again) if rounds < 60 => {
+                            rounds += 1;
+                            if live {
+                                live_start(&key(p, t), eta);
+                            }
+                            continue;
+                        }
+                        Some(Step::Wait) => {
+                            WAITING.store(true, Ordering::Relaxed);
+                            return Err(format!("{} {t}: waits on a dependency", p.name));
+                        }
+                        _ => break (x, closure),
+                    }
                 }
                 Err(Fail::Other(e)) => return Err(e),
                 Err(Fail::Build { log, work, secs }) => {
@@ -849,12 +877,16 @@ fn build(
         batch_took(&key(p, t), secs);
         say!("{}{note}", row(&p.name, &p.version.upstream, was.as_deref(), t, "ok", Some(secs)));
         // what the recipe lists that this build did without. each is a flag away: a line
-        // flags <name> in /etc/kiry/pkg puts it in the closure for the next build
+        // flags <name> in /etc/kiry/pkg puts it in the closure for the next build. the
+        // toolchain is in every build, and a dep a .pc chain staged shows up linked: harfbuzz
+        // said libpng was skipped and libharfbuzz-raster links it through freetype2.pc
         if discovers(p) {
+            let tools: Vec<String> = sandbox::toolchain(root).unwrap_or_default().into_iter().map(|d| d.name).collect();
             let off: Vec<&str> = p
                 .depends
                 .iter()
                 .filter(|d| d.make && d.applies(t) && !used.iter().any(|u| u.name == d.name))
+                .filter(|d| !linked.contains(&d.name) && !tools.contains(&d.name))
                 .map(|d| d.name.as_str())
                 .collect();
             if !off.is_empty() {
@@ -931,7 +963,9 @@ fn start(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
             .unwrap_or_default();
         out.extend(p.depends.iter().filter(|d| !no.contains(&d.name)).cloned());
     }
+    // a flag set against a dep takes it out after it was proven too, not only before
     let proven = pkg::depends_from(ls.into_iter().filter(|l| l != "*").collect());
+    let proven: Vec<Dep> = proven.into_iter().filter(|d| !refused(root, p, &d.name)).collect();
     for d in proven.into_iter().chain(flagged(root, p)) {
         if !out.iter().any(|x| x.name == d.name) {
             out.push(d);
@@ -959,6 +993,14 @@ fn flagged(root: &Path, p: &Package) -> Vec<Dep> {
         }
     }
     out
+}
+
+// flags -name in the config, or the gentoo entry putting name under a flag set against it
+fn refused(root: &Path, p: &Package, d: &str) -> bool {
+    flags(root, &p.name, Some(&p.dir)).is_ok_and(|f| {
+        f.use_flags.iter().any(|x| x.strip_prefix('-') == Some(d))
+            || gentoo(&p.dir).is_some_and(|g| g.unwanted(&chosen(&f.use_flags), d))
+    })
 }
 
 fn prove(root: &Path, t: &str, name: &str, line: &str) -> Result<(), String> {
@@ -1289,16 +1331,21 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     }
 
     let stem = lower.trim_end_matches(".h").to_string();
+    // through the aliases first: local/aliases says jpeg is libjpeg-turbo here, and extra/
+    // also carries the ijg jpeg, which libjxl's Could NOT find JPEG would otherwise get
     let named = [stem.clone(), format!("lib{stem}"), format!("py3-{stem}")]
         .into_iter()
+        .map(|c| called(root, &c, t).filter(|a| a != "-").unwrap_or(c))
         .find(|c| fresh(c) && recipe(root, c).is_some())
         .map(|c| (c, "name"));
     if named.is_some() {
         return named;
     }
     // a binding is named for what it binds, Lpeg is lua-lpeg. a whole word of a name on the
-    // recipe's own list, never a guess across the tree
-    let word = pool.iter().find(|c| c.split('-').any(|w| w == stem) && fresh(c)).map(|c| ((*c).to_string(), "name"));
+    // recipe's own list, never a guess across the tree, lib on either end of it allowed:
+    // cmake's GIF is giflib and its JPEG is libjpeg-turbo
+    let named_for = |w: &str| w == stem || w.strip_prefix("lib") == Some(stem.as_str()) || w.strip_suffix("lib") == Some(stem.as_str());
+    let word = pool.iter().find(|c| c.split('-').any(named_for) && fresh(c)).map(|c| ((*c).to_string(), "name"));
     if word.is_some() || k != "cmake" {
         return word;
     }
@@ -1343,16 +1390,10 @@ fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Optio
     }
 
     let have = start(root, p, t);
-    let off = |d: &str| {
-        flags(root, &p.name, Some(&p.dir)).is_ok_and(|f| {
-            f.use_flags.iter().any(|x| x.strip_prefix('-') == Some(d))
-                || gentoo(&p.dir).is_some_and(|g| g.unwanted(&chosen(&f.use_flags), d))
-        })
-    };
     let host = sandbox::host();
     for m in &ms {
         let Some((d, how)) = answers(root, t, m, p, &have) else { continue };
-        if off(&d) {
+        if refused(root, p, &d) {
             say!("{} {t} needs {d} for {m}, and a flag takes it out", p.name);
             return None;
         }
@@ -1386,6 +1427,59 @@ fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Optio
         .filter(|d| d.applies(t))
         .all(|d| db::read(root, if d.host { &host } else { t }, &d.name).is_ok());
     Some(if all_in { Step::Again } else { Step::Wait })
+}
+
+// what an ok build looked for, did not find, and the recipe lists. swayimg built that way
+// without wayland-client and opened no window on dwl, libjxl without giflib, libjpeg and
+// libpng. a probe the build made that alpine's list answers is a feature both expected, so
+// it goes in and the package builds once more, and flags -name keeps it out. only from what
+// is installed or already built in the cache: an optional dep is not worth a build of its
+// own, and one that cannot build would take the package down with it -- gtk4's
+// gobject-introspection, which muon cannot build
+fn more(root: &Path, p: &Package, t: &str, work: &Path, have: &[Dep]) -> Option<Step> {
+    let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
+    let noted = fs::read_to_string(work.join("src/.kiry-missing")).unwrap_or_default();
+    // a toolchain member is staged whole in every build, so a probe that failed on one is
+    // about something else
+    let tools: Vec<String> = sandbox::toolchain(root).unwrap_or_default().into_iter().map(|d| d.name).collect();
+    let host = sandbox::host();
+    let ms = log
+        .lines()
+        .filter_map(|l| miss(&uncoloured(l)))
+        .chain(noted.lines().filter_map(|l| l.split_once(' ')).map(|(k, n)| format!("{k}:{}", n.trim())));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut took: Vec<String> = Vec::new();
+    let mut wait = false;
+    for m in ms {
+        if !seen.insert(m.clone()) {
+            continue;
+        }
+        let Some((d, _)) = answers(root, t, &m, p, have) else { continue };
+        let listed = p.depends.iter().any(|x| x.name == d && x.applies(t));
+        if !listed || took.contains(&d) || tools.contains(&d) || refused(root, p, &d) {
+            continue;
+        }
+        let kind = if m.starts_with("cmd:") { "make" } else { "build" };
+        let dt = if kind == "make" { host.as_str() } else { t };
+        let there = db::read(root, dt, &d).is_ok();
+        let built = there || recipe(root, &d).and_then(|at| load(root, &at).ok()).is_some_and(|q| fresh(root, &q, dt));
+        if !built {
+            continue;
+        }
+        if let Err(e) = prove(root, t, &p.name, &format!("{d} {kind}")) {
+            say!("{} {t} {e}", p.name);
+            return None;
+        }
+        let from = if there { "" } else { ", from the cache" };
+        say!("{} {t} could use {d}  {m}{from}", p.name);
+        wait |= !there;
+        took.push(d);
+    }
+    match (took.is_empty(), wait) {
+        (true, _) => None,
+        (false, true) => Some(Step::Wait),
+        (false, false) => Some(Step::Again),
+    }
 }
 
 // b of a package the cache already holds under the same key -- recipe, sources, flags,
@@ -1614,26 +1708,18 @@ fn unbacked(root: &Path, deps: &[Dep], t: &str, dest: &Path) -> Vec<String> {
 
     let mut doubt: Vec<(String, Vec<String>)> = Vec::new();
     for d in deps.iter().filter(|d| !d.make && d.applies(t)) {
-        let Ok(ps) = db::read_provides(root, t, &d.name) else { continue };
-        if ps.is_empty() || ps.iter().any(|p| needed.contains(&p.soname)) {
+        let Some((sonames, module, exes)) = shape(root, t, &d.name) else { continue };
+        if sonames.is_empty() || module || sonames.iter().any(|s| needed.contains(s)) {
             continue;
         }
-        let Ok(rec) = db::read(root, t, &d.name) else { continue };
-        let more = rec.manifest.iter().any(|e| {
-            let db::Kind::File(_) = e.kind else { return false };
-            let so = e.path.ends_with(".so") || e.path.contains(".so.");
-            if !so {
-                return e.mode & 0o111 != 0;
-            }
-            e.path.ends_with(".so")
-                && elf::read(&root.join(&e.path))
-                    .is_ok_and(|o| !o.soname.is_some_and(|s| s.contains(".so.")))
-        });
-        if !more {
-            // libsensors.so.5 and the bare libsensors.so both count, a dlopen names either
-            let stems = ps.iter().map(|p| p.soname.split(".so").next().unwrap_or(&p.soname).to_string() + ".so");
-            doubt.push((d.name.clone(), stems.collect()));
-        }
+        // libsensors.so.5 and the bare libsensors.so both count, a dlopen names either. a
+        // program counts by its name: htop runs lsof by name. a library that also ships a
+        // cli -- bzip2, xmllint, png-fix-itxt -- is judged like any other library, and kept
+        // only while something names one of them
+        let mut names: Vec<String> =
+            sonames.iter().map(|s| s.split(".so").next().unwrap_or(s).to_string() + ".so").collect();
+        names.extend(exes);
+        doubt.push((d.name.clone(), names));
     }
     if doubt.is_empty() {
         return Vec::new();
@@ -1652,6 +1738,83 @@ fn unbacked(root: &Path, deps: &[Dep], t: &str, dest: &Path) -> Vec<String> {
         }
     }
     doubt.into_iter().map(|(n, _)| n).filter(|n| !seen.contains(n)).collect()
+}
+
+// a closure member the artifact dlopens. sdl2 links none of wayland, libdecor, xkbcommon,
+// EGL, pipewire, pulse or alsa and names every one of them, so DT_NEEDED alone gave it no
+// runtime edge at all and an sdl app on a fresh root had no video or audio. the same
+// evidence unbacked() keeps a declared dep on, read from elf files only, since a cmake
+// export naming /usr/lib/libz.so is a link line and not a load. only the closure: the
+// build had the headers, which is what compiling a dlopen of it took
+fn loaded(root: &Path, deps: &[Dep], t: &str, dest: &Path, linked: &BTreeSet<String>) -> Vec<(String, String)> {
+    let mut want: Vec<(String, Vec<String>)> = Vec::new();
+    for d in deps.iter().filter(|d| d.make && d.applies(t) && !linked.contains(&d.name)) {
+        let ps = db::read_provides(root, t, &d.name).unwrap_or_default();
+        let stems: Vec<String> = ps.iter().map(|p| p.soname.split(".so").next().unwrap_or(&p.soname).to_string() + ".so").collect();
+        if !stems.is_empty() {
+            want.push((d.name.clone(), stems));
+        }
+    }
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    under(dest, &mut files);
+    let mut out: Vec<(String, String)> = Vec::new();
+    for f in files.iter().filter(|f| elf::read(f).is_ok()) {
+        let Ok(bytes) = fs::read(f) else { continue };
+        for (name, stems) in &want {
+            if out.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            if let Some(s) = stems.iter().find(|s| bytes.windows(s.len()).any(|w| w == s.as_bytes())) {
+                out.push((name.clone(), s.clone()));
+            }
+        }
+    }
+    out
+}
+
+// what a dep is, for unbacked(): its sonames, whether it ships a module (a .so with no
+// soname or an unversioned one), and the names of its programs. from its record when it is
+// installed, otherwise from the listing of its built artifact -- under discovery most
+// declared runtime deps are not installed when the build runs, and one that cannot be
+// looked at at all stays what the recipe said
+fn shape(root: &Path, t: &str, name: &str) -> Option<(Vec<String>, bool, Vec<String>)> {
+    let prog = |path: &str, mode: u32| -> Option<String> {
+        let so = path.ends_with(".so") || path.contains(".so.");
+        (!so && mode & 0o111 != 0).then(|| path.rsplit('/').next().unwrap_or(path).to_string())
+    };
+    if let (Ok(ps), Ok(rec)) = (db::read_provides(root, t, name), db::read(root, t, name)) {
+        let files: Vec<&db::Entry> = rec.manifest.iter().filter(|e| matches!(e.kind, db::Kind::File(_))).collect();
+        let module = files.iter().any(|e| {
+            e.path.ends_with(".so")
+                && elf::read(&root.join(&e.path)).is_ok_and(|o| !o.soname.is_some_and(|s| s.contains(".so.")))
+        });
+        let exes = files.iter().filter_map(|e| prog(&e.path, e.mode)).collect();
+        return Some((ps.into_iter().map(|p| p.soname).collect(), module, exes));
+    }
+    let q = load(root, &recipe(root, name)?).ok()?;
+    let art = artifact(root, &q, t);
+    let ms = kiry_core::archive::plan(root, &art).ok()?;
+    let lib = libdir(t).trim_start_matches('/').to_string() + "/";
+    let files: Vec<&kiry_core::archive::Member> =
+        ms.iter().filter(|m| m.what == kiry_core::archive::What::File).collect();
+    // no elf to read in a listing, so the file names say it: a versioned lib*.so.N in the
+    // libdir is a soname, and a regular file ending in .so -- a dev link is a symlink -- is
+    // a module
+    let sonames = files
+        .iter()
+        .filter_map(|m| m.path.strip_prefix(&lib))
+        .filter(|f| !f.contains('/') && f.starts_with("lib") && f.contains(".so."))
+        .map(|f| {
+            let (stem, ver) = f.split_once(".so.").unwrap_or((f, ""));
+            format!("{stem}.so.{}", ver.split('.').next().unwrap_or(ver))
+        })
+        .collect();
+    let module = files.iter().any(|m| m.path.ends_with(".so"));
+    let exes = files.iter().filter_map(|m| prog(&m.path, m.mode)).collect();
+    Some((sonames, module, exes))
 }
 
 // who ships the interpreter of each script the build installed, since the kernel will not
@@ -2937,6 +3100,10 @@ fn compile(
                 if !declared.iter().any(|d| !d.make && d.name == who) && linked.insert(who.clone()) {
                     say!("{} {t} interpreter {who}  {path}", p.name);
                 }
+            }
+            for (who, so) in loaded(root, &deps, t, &dest, &linked) {
+                say!("{} {t} loads {who}  {so}", p.name);
+                linked.insert(who);
             }
             let dropped = unbacked(root, &declared, t, &dest);
             for d in &dropped {
@@ -5750,8 +5917,51 @@ fn install_cmd(args: &[String]) {
     if names.is_empty() {
         die("nothing to install".into());
     }
+    install(&root, names, &How { want, verbose, fix, dry, live, force, dep: false });
+}
+
+struct How {
+    want: Option<String>,
+    verbose: bool,
+    fix: bool,
+    dry: bool,
+    live: bool,
+    force: bool,
+    // for a build: nothing goes in world and nothing leaves until the build is done, or the
+    // deps it came for would go again the moment they were in
+    dep: bool,
+}
+
+// what a build of p stands on that the root does not have. kiry i plans these as it goes;
+// b and rebuild only build, and leave() takes build deps out after every batch, so newsboat
+// lost asciidoctor and kiry b newsboat stopped on it before compiling anything. in through
+// the same planner, which builds what the cache does not hold. true when anything came in
+fn bring(root: &Path, p: &Package, t: &str, verbose: bool) -> bool {
+    let host = sandbox::host();
+    let mut short: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for d in start(root, p, t).iter().filter(|d| d.applies(t)) {
+        let dt = if d.host { host.clone() } else { t.to_string() };
+        if db::read(root, &dt, &d.name).is_err() {
+            short.entry(dt).or_default().push(d.name.clone());
+        }
+    }
+    for (dt, names) in &short {
+        say!("{} {t} wants {} first", p.name, names.join(" "));
+        let how = How { want: Some(dt.clone()), verbose, fix: false, dry: false, live: false, force: false, dep: true };
+        install(root, names.clone(), &how);
+    }
+    !short.is_empty()
+}
+
+fn install(root: &Path, names: Vec<String>, how: &How) {
+    let root = root.to_path_buf();
+    let How { want, verbose, fix, dry, live, force, dep } = how;
+    let (verbose, fix, dry, live, force, dep) = (*verbose, *fix, *dry, *live, *force, *dep);
     // a name typed is a name asked for. @world and @outdated stand for what is already in
-    let typed: Vec<String> = names.iter().filter(|n| !n.starts_with('@')).cloned().collect();
+    let typed: Vec<String> = match dep {
+        true => Vec::new(),
+        false => names.iter().filter(|n| !n.starts_with('@')).cloned().collect(),
+    };
     let names = expand(&root, names);
     if names.is_empty() {
         return;
@@ -5771,7 +5981,9 @@ fn install_cmd(args: &[String]) {
         let _w = writer(&root);
         apply_batch(&root, &paths, force);
         wish(&root, &going.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
-        leave(&root);
+        if !dep {
+            leave(&root);
+        }
         skew(&root);
         return;
     }
@@ -5924,7 +6136,9 @@ fn install_cmd(args: &[String]) {
             let _w = writer(&root);
             apply_batch(&root, &all, force);
             wish(&root, &named);
-            leave(&root);
+            if !dep {
+                leave(&root);
+            }
             skew(&root);
             return;
         }
@@ -6026,7 +6240,9 @@ fn install_cmd(args: &[String]) {
         }
         let _w = writer(&root);
         wish(&root, &named);
-        leave(&root);
+        if !dep {
+            leave(&root);
+        }
         skew(&root);
         batch_end(true);
         return;
@@ -7817,6 +8033,10 @@ fn rebuild_cmd(args: &[String]) {
         .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
         .collect();
     batch_begin(&root, names.len(), &rows, &rows);
+    let mut brought = false;
+    for (name, t) in &want {
+        brought |= bring(&root, &recipes[name], t, false);
+    }
     // one stuck package out of a storm leaves the rest to build. what needs it, directly
     // or through something skipped, is skipped rather than built against the old one
     let host = sandbox::host();
@@ -7876,7 +8096,31 @@ fn rebuild_cmd(args: &[String]) {
             }
             Ok(())
         });
-        let errs = errs.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut errs = errs.into_inner().unwrap_or_else(|e| e.into_inner());
+        // a build that stopped for a dep discovery found is not a failure. the dep comes in
+        // and the package builds again, one at a time, since bringing it installs
+        if WAITING.swap(false, Ordering::Relaxed) {
+            let waiting: Vec<String> =
+                errs.iter().filter(|(_, e)| e.ends_with("waits on a dependency")).map(|(n, _)| n.clone()).collect();
+            errs.retain(|(n, _)| !waiting.contains(n));
+            for name in waiting {
+                let p = &recipes[&name];
+                let mine: Vec<String> = level.iter().filter(|(i, _)| want[*i].0 == name).map(|(i, _)| want[*i].1.clone()).collect();
+                let mut waits = 0;
+                let r = loop {
+                    for t in &mine {
+                        brought |= bring(&root, p, t, false);
+                    }
+                    match recover(&root, p, &mine, false, 1) {
+                        Err(_) if WAITING.swap(false, Ordering::Relaxed) && waits < 60 => waits += 1,
+                        r => break r,
+                    }
+                };
+                if let Err(e) = r {
+                    errs.push((name, e));
+                }
+            }
+        }
         for (_, e) in &errs {
             for l in e.lines() {
                 complain(l);
@@ -7949,6 +8193,9 @@ fn rebuild_cmd(args: &[String]) {
         .collect();
     if let Err(e) = db::write_queue(&root, &left_over) {
         die(e.to_string());
+    }
+    if brought {
+        leave(&root);
     }
 
     let mut left = 0;
@@ -12142,20 +12389,78 @@ mod sidecar {
         so(&root.join("usr/lib/qt6/plugins/libqwayland.so"), None, &[]);
         installed(&root, "plugin", &[("usr/lib/libQt6Wl.so.6", 0o755), ("usr/lib/qt6/plugins/libqwayland.so", 0o755)], &["libQt6Wl.so.6"]);
         installed(&root, "data", &[("usr/share/icons/hicolor/index.theme", 0o644)], &[]);
+        // a library with a cli nobody here runs, the way bzip2 and libxml2 ship one
+        installed(&root, "cli", &[("usr/lib/libxml9.so.2", 0o755), ("usr/bin/xmllint9", 0o755)], &["libxml9.so.2"]);
+
+        // not installed, and judged from the listing of its artifact: a plain library
+        // nothing names goes, one whose program something runs stays
+        let built = |name: &str, files: &[(&str, u32)]| {
+            let d = root.join(REPOS_AT).join("extra").join(name);
+            mkdirs(&d).unwrap();
+            fs::write(d.join("version"), "1.0 1\n").unwrap();
+            fs::write(d.join("targets"), format!("{T}\n")).unwrap();
+            fs::write(d.join("build"), "true\n").unwrap();
+            let tree = at.join("tree").join(name);
+            for (f, mode) in files {
+                let p = tree.join(f);
+                mkdirs(p.parent().unwrap()).unwrap();
+                fs::write(&p, "x\n").unwrap();
+                fs::set_permissions(&p, fs::Permissions::from_mode(*mode)).unwrap();
+            }
+            let art = artifact(&root, &load(&root, &d).unwrap(), T);
+            mkdirs(art.parent().unwrap()).unwrap();
+            let sh = format!("tar -C {} -cf - usr | zstd -q -o {}", tree.display(), art.display());
+            assert!(Command::new("sh").arg("-c").arg(&sh).status().unwrap().success());
+        };
+        built("unbuiltplain", &[("usr/lib/libqq.so.3.1", 0o755)]);
+        built("unbuilttool", &[("usr/lib/libww.so.1", 0o755), ("usr/bin/wwctl", 0o755)]);
 
         so(&dest.join("usr/bin/thing"), None, &[&root.join("usr/lib/libfoo.so.1")]);
         mkdirs(&dest.join("usr/share/thing")).unwrap();
-        fs::write(dest.join("usr/share/thing/probe"), "dlopen(\"libsensors.so.5\")\n").unwrap();
+        fs::write(dest.join("usr/share/thing/probe"), "dlopen(\"libsensors.so.5\")\nexec java\nexec wwctl\n").unwrap();
 
         let deps: Vec<pkg::Dep> =
-            ["linked", "loaded", "plain", "tool", "plugin", "data", "absent"].iter().map(|n| dep(n)).collect();
+            ["linked", "loaded", "plain", "tool", "plugin", "data", "cli", "unbuiltplain", "unbuilttool", "absent"]
+                .iter()
+                .map(|n| dep(n))
+                .collect();
         let mut make = dep("plainmake");
         make.make = true;
         installed(&root, "plainmake", &[("usr/lib/libz.so.1", 0o755)], &["libz.so.1"]);
         let mut all = deps.clone();
         all.push(make);
 
-        assert_eq!(unbacked(&root, &all, T, &dest), vec!["plain".to_string()]);
+        assert_eq!(
+            unbacked(&root, &all, T, &dest),
+            vec!["plain".to_string(), "cli".to_string(), "unbuiltplain".to_string()]
+        );
+    }
+
+    // sdl2 links none of what it dlopens. a closure member whose soname an elf in the
+    // artifact names is a runtime edge, one only a text file names is not
+    #[test]
+    fn a_closure_member_the_artifact_dlopens_is_loaded() {
+        let at = scratch("loaded");
+        let root = at.join("root");
+        let dest = at.join("dest");
+        installed(&root, "wayland", &[("usr/lib/libwayland-client.so.0", 0o755)], &["libwayland-client.so.0"]);
+        installed(&root, "zlib", &[("usr/lib/libz.so.1", 0o755)], &["libz.so.1"]);
+        installed(&root, "pipewire", &[("usr/lib/libpipewire-0.3.so.0", 0o755)], &["libpipewire-0.3.so.0"]);
+        so(&dest.join("usr/lib/libSDL2-2.0.so.0"), Some("libSDL2-2.0.so.0"), &[]);
+        let lib = dest.join("usr/lib/libSDL2-2.0.so.0");
+        let mut bytes = fs::read(&lib).unwrap();
+        bytes.extend_from_slice(b"\0libwayland-client.so.0\0");
+        fs::write(&lib, bytes).unwrap();
+        mkdirs(&dest.join("usr/lib/cmake/SDL2")).unwrap();
+        fs::write(dest.join("usr/lib/cmake/SDL2/targets.cmake"), "/usr/lib/libz.so\n").unwrap();
+
+        let build = |n: &str| pkg::Dep { name: n.into(), make: true, host: false, only: None };
+        let deps = vec![build("wayland"), build("zlib"), build("pipewire")];
+        let got = loaded(&root, &deps, T, &dest, &BTreeSet::new());
+        assert_eq!(got, vec![("wayland".to_string(), "libwayland-client.so".to_string())]);
+        let mut linked = BTreeSet::new();
+        linked.insert("wayland".to_string());
+        assert!(loaded(&root, &deps, T, &dest, &linked).is_empty());
     }
 
     #[test]

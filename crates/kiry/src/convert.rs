@@ -365,11 +365,16 @@ pub fn recipe(
         v.get("subpackages").map(String::as_str).unwrap_or(""),
     );
     let mut wrote: Vec<String> = Vec::new();
+    let unshipped = variants(&text, &subs);
     for f in functions(&text) {
         if subs.contains(&f) || SKIP.contains(&f.as_str()) || wrote.contains(&f) {
             continue;
         }
-        let Some(b) = body(&text, &f) else { continue };
+        let Some(mut b) = body(&text, &f) else { continue };
+        if f == "build" && !unshipped.is_empty() {
+            b = without(&b, &unshipped);
+            notes.push(format!("build() leaves out the variant only a split installs: {}", unshipped.join(" ")));
+        }
         wrote.push(f.clone());
         script.push_str(&format!(
             "\n{f}() {{\n{}}}\n",
@@ -406,13 +411,7 @@ pub fn recipe(
     // a package() that installs nothing leaves the payload to the splits: lua-mpack builds
     // a module per lua and each lua$v-mpack installs its own. folded into one recipe, those
     // run into $DESTDIR. a split that moves files out of $pkgdir would have nothing to move
-    let empty = body(&text, "package").is_none_or(|b| {
-        b.lines().all(|l| {
-            let l = l.trim();
-            l.is_empty() || l.starts_with('#') || (l.starts_with("mkdir -p") && l.contains("pkgdir"))
-        })
-    });
-    if empty {
+    if !installs(&text) {
         for entry in v.get("subpackages").map(String::as_str).unwrap_or("").split_whitespace() {
             let sub = entry.split(':').next().unwrap_or("");
             let Some(f) = subpackage_funcs(&name, entry).pop() else { continue };
@@ -459,6 +458,110 @@ pub fn recipe(
         ));
     }
     Ok(Report { name, notes })
+}
+
+// build dirs build() makes that package() never reads and a split does: swayimg's
+// output-full, vim's "$builddir"-gvim, pinentry's libsecret copy, rofi's output-wayland.
+// one recipe here is what package() installs, so a variant only a split ships is a build
+// whose deps discovery proves for nothing -- libheif, libjxl and librsvg for a swayimg
+// that links none of them, gtk3 for a vim without a gui. fcitx5-gtk and the two-qt
+// libraries install every dir in package() and keep them all
+fn variants(text: &str, subs: &[String]) -> Vec<String> {
+    let flat = |s: &str| s.replace(['"', '\''], "").replace("${builddir}", "$builddir");
+    // lua-mpack's package() installs nothing and its splits are the payload
+    if !installs(text) {
+        return Vec::new();
+    }
+    let Some(pkg) = body(text, "package").map(|b| flat(&b)) else { return Vec::new() };
+    let Some(build) = body(text, "build").map(|b| flat(&b)) else { return Vec::new() };
+    let splits: Vec<String> = subs.iter().filter_map(|f| body(text, f)).map(|b| flat(&b)).collect();
+    let fns = functions(text);
+    let words: Vec<&str> = pkg.split(|c: char| c.is_whitespace() || ";|&()".contains(c)).collect();
+    let mut out: Vec<String> = Vec::new();
+    for w in build.split(|c: char| c.is_whitespace() || ";|&()".contains(c)) {
+        let named = w.contains("build") || w.contains("output") || w.starts_with("$builddir");
+        // a command or a helper is not a dir: abuild-meson, _build
+        if w.starts_with("abuild") || fns.iter().any(|f| f == w) {
+            continue;
+        }
+        if !named || w.starts_with('-') || w.contains('=') || ["build", "output", "$builddir"].contains(&w) {
+            continue;
+        }
+        if pkg.contains(w) || !splits.iter().any(|s| s.contains(w)) || out.iter().any(|o| o == w) {
+            continue;
+        }
+        // a sibling of a dir package() reads, by a plain word: output-full beside output,
+        // $builddir-gvim beside $builddir, build-qt5 beside build-qt6. a path into the tree
+        // or a dir per lua version is something else
+        let sibling = w.match_indices('-').any(|(i, _)| {
+            let (base, rest) = (&w[..i], &w[i + 1..]);
+            let plain = !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            let read = base == "$builddir" || words.iter().any(|p| *p == base || p.starts_with(&format!("{base}-")));
+            plain && !base.contains('/') && read
+        });
+        if sibling {
+            out.push(w.to_string());
+        }
+    }
+    out
+}
+
+// what lua-mpack's package() is: nothing, or only a mkdir of $pkgdir
+fn installs(text: &str) -> bool {
+    body(text, "package").is_some_and(|b| {
+        !b.lines().all(|l| {
+            let l = l.trim();
+            l.is_empty() || l.starts_with('#') || (l.starts_with("mkdir -p") && l.contains("pkgdir"))
+        })
+    })
+}
+
+// build() without the statements that make those dirs. a statement is a line with its
+// backslash continuations, or a whole if/for/while/case block, since vim builds gvim under
+// if $BUILD_GVIM. a cd into one takes what follows with it up to the next cd: pinentry
+// builds its libsecret copy by cd and then a bare _build
+fn without(b: &str, dirs: &[String]) -> String {
+    let flat = |s: &str| s.replace(['"', '\''], "").replace("${builddir}", "$builddir");
+    let mut stmts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for l in b.lines() {
+        cur.push_str(l);
+        cur.push('\n');
+        let first = l.split_whitespace().next().unwrap_or("");
+        depth += match first {
+            "if" | "for" | "while" | "until" | "case" => 1,
+            "fi" | "done" | "esac" => -1,
+            _ => 0,
+        };
+        if depth <= 0 && !l.trim_end().ends_with('\\') {
+            stmts.push(std::mem::take(&mut cur));
+            depth = 0;
+        }
+    }
+    if !cur.is_empty() {
+        stmts.push(cur);
+    }
+    let mut out = String::new();
+    let mut away = false;
+    for s in stmts {
+        let f = flat(&s);
+        let said = |w: &str| f.split(|c: char| c.is_whitespace() || ";|&()".contains(c)).any(|x| x == w);
+        let hit = dirs.iter().any(|d| f.contains(d.as_str()));
+        // nemo's mkdir build-qt5 && cd build-qt5 goes in too, and so does dnsdist's
+        // [ -d "$builddir-jit" ] || return 0, which is the gate in front of the variant
+        if said("cd") {
+            away = hit;
+        }
+        if hit && said("return") {
+            away = true;
+        }
+        if hit || away {
+            continue;
+        }
+        out.push_str(&s);
+    }
+    out
 }
 
 fn joined(v: &[String]) -> String {

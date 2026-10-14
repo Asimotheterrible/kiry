@@ -218,6 +218,33 @@ fn subpackage_functions_do_not_come_across() {
     assert!(!script.contains("amove"), "{script}");
 }
 
+// lua-mpack's shape: package() installs nothing and each lua$v-mpack split installs its
+// own module, so with no splits here those run into $DESTDIR, once per name
+#[test]
+fn splits_that_install_run_when_package_installs_nothing() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("splits");
+    let (d, _) = convert(
+        &at,
+        "pkgname=thing\npkgver=1.0\npkgrel=0\n_luaversions=\"5.1 5.4\"\n\
+         for _v in $_luaversions; do\n\tsubpackages=\"$subpackages lua$_v-$pkgname:_subpackage\"\ndone\n\
+         subpackages=\"$subpackages $pkgname-doc\"\n\
+         build() {\n\tmake\n}\n\
+         package() {\n\tmkdir -p \"$pkgdir\"\n}\n\
+         _subpackage() {\n\tlocal lver=\"${subpkgname:3:3}\"\n\tmake -C \"$builddir-$lver\" DESTDIR=\"$subpkgdir\" install\n}\n\
+         doc() {\n\tamove usr/share/doc\n}\n",
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    assert!(script.contains("_subpackage() {"), "{script}");
+    let a = script.find("subpkgname=\"lua5.1-thing\" subpkgdir=\"$DESTDIR\"\n_subpackage\n");
+    let b = script.find("subpkgname=\"lua5.4-thing\" subpkgdir=\"$DESTDIR\"\n_subpackage\n");
+    assert!(a.is_some() && b.is_some(), "{script}");
+    assert!(script.find("\npackage\n").unwrap() < a.unwrap(), "{script}");
+    assert!(!script.contains("amove"), "{script}");
+}
+
 // a version constraint, a ! for a conflict and a -dev suffix are all alpine spellings
 // with no kiry equivalent. what cannot be carried is reported rather than invented. a
 // so: name is carried as it is: which package it means is decided when the recipe is

@@ -2172,6 +2172,47 @@ fn only_the_consumer_that_used_what_left_is_queued() {
     );
 }
 
+// plex ships its own libp and finds it through $ORIGIN. the system libp losing q is
+// nothing to plex, and plex's copy losing it is nothing to what links the system one
+#[test]
+fn a_private_copy_and_the_system_library_queue_only_what_loads_each() {
+    if !have_cc() {
+        return;
+    }
+    let at = scratch("abi-private");
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let r = root.to_str().unwrap();
+
+    let both = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\nvoid q(void){}\n");
+    let gone = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
+    let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &both)]);
+    let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    place(&root, "useq", &[("usr/bin/useq", &app_calling(&at.join("a"), "useq", "q", &both))]);
+
+    let plexq = app_calling(&at.join("b"), "plexq", "q", &both);
+    let plex = |n: &str, lib: &Path| {
+        let arc = archive(&at, n, &[("usr/lib64/plex/lib64/libp.so.1", lib), ("usr/lib64/plex/bin/plexq", &plexq)]);
+        fs::write(at.join(format!("{n}.tar.zst.meta/name")), "plex\n").unwrap();
+        arc
+    };
+    let o = kiry(&["i", "--root", r, plex("plex-1", &both).to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &gone)]);
+    let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let q = queued(&root);
+    assert!(q.iter().any(|l| queued_pkg(l) == "useq"), "{q:?}");
+    assert!(!q.iter().any(|l| queued_pkg(l) == "plex"), "plex loads its own copy: {q:?}");
+
+    let o = kiry(&["i", "--root", r, "--force", plex("plex-2", &gone).to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let after = queued(&root);
+    assert_eq!(after, q, "plex's copy changed and something else was queued for it");
+}
+
 // a soname bump leaves the old library preserved, so the consumer still loads and no
 // check sees anything wrong. the queue is what gets it rebuilt and the old copy released
 #[test]
@@ -3099,6 +3140,33 @@ fn tries(o: &Output) -> usize {
         .lines()
         .filter(|l| l.contains(" building "))
         .count()
+}
+
+// libtool's c++ link is -nostdlib with the runtime put back as -l flags, and clang's
+// builtins archive is a path it does not carry over. the wrapper adds it to that link
+// and to no other
+#[test]
+fn a_nostdlib_shared_link_gets_the_builtins_archive() {
+    let at = scratch("builtins");
+    let d = recipe(
+        &at,
+        "x86_64-musl",
+        &format!(
+            "{}touch /src/rt.a\n\
+             kirycc -shared -nostdlib -o a.so a.o\n\
+             kirycc -shared -o b.so b.o\n\
+             grep -q ' -o a.so a.o /src/rt.a$' /src/args || {{ cat /src/args; exit 1; }}\n\
+             grep b.so /src/args | grep -q rt.a && exit 1\n{GOOD}",
+            fake_clang("*-print-libgcc-file-name*", "echo /src/rt.a; exit 0")
+        ),
+    );
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
 }
 
 // a crash is answered on the file it happened to, in place. the build system never sees

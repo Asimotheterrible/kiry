@@ -28,7 +28,17 @@ shows up in `DT_NEEDED` afterwards or it did nothing. And when a compiler failur
 a signature kiry recognises, the rule that fixed it is written back beside the package
 with the date, so the same fight does not happen twice.
 
-WIP, nothing reads a build log yet.
+The build log gets read too. A recipe converted from Alpine does not build with Alpine's
+whole list: a header, `.pc`, command or library the log says is missing names the package
+that ships it, and the build goes again with that package in. clang writes down the system
+headers each file included, so after a good build a dep that nothing included, linked or
+loaded leaves again. Recipes written by hand in `core/` and `local/` build with exactly what
+they list.
+
+What none of this sees is a library opened with `dlopen` under a name put together at
+runtime. Nothing in the binary names it, so a listed dep like that looks unused and is
+dropped from what the package needs at runtime. A plugin or a data package ships no
+soname, so those stay as the recipe listed them.
 
 ## Current state
 

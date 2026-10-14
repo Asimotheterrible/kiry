@@ -494,6 +494,21 @@ fn with_art(root: &Path, state: &str, lines: &[String]) {
     }
 }
 
+// a line without its colour. meson and cmake turn clang's on, and llvm21's
+// 'plugin-api.h' file not found had escapes between error: and the quote
+fn uncoloured(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut esc = false;
+    for c in s.chars() {
+        match (esc, c) {
+            (false, '\x1b') => esc = true,
+            (true, c) => esc = !c.is_ascii_alphabetic(),
+            (false, c) => out.push(c),
+        }
+    }
+    out
+}
+
 // what a line takes on screen: escape sequences take nothing, and the full width forms
 // character art is made of take two
 fn cells(s: &str) -> usize {
@@ -996,7 +1011,8 @@ fn set_last_round(root: &Path, t: &str, name: &str, round: Option<(&str, &str)>)
 // down comes last, newest first, for the build systems that send their probes nowhere a
 // log can see -- newsboat's own configure
 fn misses(log: &str, noted: &str) -> Vec<String> {
-    let lines: Vec<&str> = log.lines().collect();
+    let plain: Vec<String> = log.lines().map(uncoloured).collect();
+    let lines: Vec<&str> = plain.iter().map(String::as_str).collect();
     let fatal = |l: &str| {
         l.contains(" error required dependency not found")
             || l.contains(" error program not found")
@@ -13002,6 +13018,8 @@ mod misses_from_logs {
 
         assert_eq!(first("/usr/bin/libtool: eval: line 11083: kiry-cc: not found\n").as_deref(), Some("cmd:kiry-cc"));
         assert_eq!(first("foo.c:1:10: fatal error: 'sensors/sensors.h' file not found\n").as_deref(), Some("h:sensors/sensors.h"));
+        let coloured = "\x1b[1m../tools/gold/gold-plugin.cpp:40:10: \x1b[0m\x1b[0;1;31mfatal error: \x1b[0m\x1b[1m'plugin-api.h' file not found\x1b[0m\n";
+        assert_eq!(first(coloured).as_deref(), Some("h:plugin-api.h"));
         let unibilium = "./configure: line 1744: LT_INIT: not found\nconfig.status: creating Makefile\n\
             make: LIBTOOL@: No such file or directory\nmake: *** [Makefile:78: unibilium.lo] Error 127\n";
         assert_eq!(first(unibilium).as_deref(), Some("cmd:libtool"));

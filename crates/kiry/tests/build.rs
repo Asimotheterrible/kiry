@@ -3155,7 +3155,7 @@ fn a_nostdlib_shared_link_gets_the_builtins_archive() {
             "{}touch /src/rt.a\n\
              kirycc -shared -nostdlib -o a.so a.o\n\
              kirycc -shared -o b.so b.o\n\
-             grep -q ' -o a.so a.o /src/rt.a$' /src/args || {{ cat /src/args; exit 1; }}\n\
+             grep -q ' -o a.so a.o -x none /src/rt.a$' /src/args || {{ cat /src/args; exit 1; }}\n\
              grep b.so /src/args | grep -q rt.a && exit 1\n{GOOD}",
             fake_clang("*-print-libgcc-file-name*", "echo /src/rt.a; exit 0")
         ),

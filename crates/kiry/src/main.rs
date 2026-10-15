@@ -1369,6 +1369,15 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("the '", "' module needs to be installed").or_else(|| between("\"", "\" module is required")) {
         return Some(format!("py:{n}"));
     }
+    // a macro aclocal never found goes into configure as it is, and sh trips on it there:
+    // sassc's LT_INIT without libtool. the line says which macro, read by discover()
+    if let Some((_, r)) = l.split_once("configure: line ") {
+        if let Some((n, rest)) = r.split_once(": ") {
+            if rest.starts_with("syntax error") && n.parse::<usize>().is_ok() {
+                return Some(format!("sh:configure:{n}"));
+            }
+        }
+    }
     // a macro autoconf could not expand, which some package's aclocal .m4 defines:
     // volume_key's AM_PATH_GPGME is gpgme's
     for k in ["undefined or overquoted macro: ", "possibly undefined macro: "] {
@@ -1392,6 +1401,23 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("Can't exec \"", "\"") {
         return Some(format!("cmd:{n}"));
     }
+    // perl's module by its path under @INC, Can't locate XML/Parser.pm in @INC. a missing
+    // loadable object is an xs module that never got built, not a missing package
+    if let Some(n) = between("Can't locate ", " in @INC").filter(|n| n.ends_with(".pm")) {
+        return Some(format!("pl:{n}"));
+    }
+    // a #!/usr/bin/env bash with no bash, busybox's env and then coreutils'
+    if let Some(n) = between("env: can't execute '", "'").or_else(|| between("env: '", "': No such file")) {
+        return Some(format!("cmd:{n}"));
+    }
+    // autoconf's AC_PATH_PROGS_FEATURE_CHECK: could not find m4 that supports -I option
+    if let Some(n) = between("could not find ", " that supports ").filter(|n| !n.contains(' ')) {
+        return Some(format!("cmd:{n}"));
+    }
+    // xsltproc --nonet asked the network for a stylesheet its catalog did not have
+    if let Some(u) = between("failed to load external entity \"", "\"").filter(|u| u.starts_with("http")) {
+        return Some(format!("xml:{u}"));
+    }
     if let Some(n) = between("no such command: `", "`") {
         return Some(format!("cmd:cargo-{n}"));
     }
@@ -1402,6 +1428,18 @@ fn miss(l: &str) -> Option<String> {
     // qt5's configure: You need perl in your PATH to make a build from GIT
     if let Some(n) = between("need ", " in your PATH") {
         return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // libpcap's configure: Neither flex nor lex was found
+    if let Some(n) = between("Neither ", " nor ").filter(|_| l.ends_with("was found.") || l.ends_with("were found.")) {
+        return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // xmlto: Can't continue, xsltproc tool not found or not executable
+    if let Some(n) = between("Can't continue, ", " tool not found") {
+        return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // automake with no libtool.m4: Libtool library used but 'LIBTOOL' is undefined
+    if l.contains("'LIBTOOL' is undefined") {
+        return Some("cmd:libtool".to_string());
     }
     // a shell that went looking on PATH. a path that is not found is a script whose #!
     // names something absent -- lsof's Mksrc wants bash -- and discover() reads which
@@ -1430,6 +1468,21 @@ fn shebang_of(src: &Path, rel: &str) -> Option<String> {
     let words: Vec<String> = String::from_utf8_lossy(line).split_whitespace().map(str::to_string).collect();
     let w = interpreter(&words)?;
     Some(w.rsplit('/').next()?.to_string())
+}
+
+// the macro left in configure at or just above the line sh stopped on. a call spread over
+// lines gets the error a few lines under its name
+fn unexpanded(src: &Path, n: usize) -> Option<String> {
+    let mut files = Vec::new();
+    under(src, &mut files);
+    let f = files.iter().filter(|f| f.file_name().is_some_and(|x| x == "configure")).min_by_key(|f| f.components().count())?;
+    let text = read_log(f);
+    let lines: Vec<&str> = text.lines().take(n).collect();
+    lines.iter().rev().take(5).find_map(|l| {
+        let (name, _) = l.trim_start().split_once('(')?;
+        let caps = name.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_');
+        (caps && name.contains('_')).then(|| name.to_string())
+    })
 }
 
 // origin for every pc:, so: and cmd: name alpine's index lists, the first repo to name one
@@ -1486,6 +1539,11 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
                         [format!("AC_DEFUN([{n}]"), format!("AC_DEFUN({n},"), format!("AU_DEFUN([{n}]")].iter().any(|d| s.contains(d.as_str()))
                     })
             }
+            // under any of perl's dirs: usr/share/perl5/vendor_perl/XML/Parser.pm
+            "pl" => path.split_once("/perl5/").and_then(|(_, r)| r.split_once('/')).is_some_and(|(_, f)| f == n),
+            // the url's file anywhere under the xml tree: the package that ships
+            // manpages/docbook.xsl is the one whose catalog maps its url there
+            "xml" => path.starts_with("usr/share/xml/") && path.rsplit('/').next() == n.rsplit('/').next(),
             "cmake" => {
                 let pl = path.to_lowercase();
                 // a Find module is the finder, not the package: cmake ships FindLua.cmake and
@@ -1551,7 +1609,11 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
         }
     }
 
-    let stem = lower.trim_end_matches(".h").to_string();
+    // a perl module is perl- and its name in lowercase, XML/Parser.pm is perl-xml-parser
+    let stem = match k {
+        "pl" => format!("perl-{}", lower.trim_end_matches(".pm").replace('/', "-")),
+        _ => lower.trim_end_matches(".h").to_string(),
+    };
     // through the aliases first: local/aliases says jpeg is libjpeg-turbo here, and extra/
     // also carries the ijg jpeg, which libjxl's Could NOT find JPEG would otherwise get
     let named = [stem.clone(), format!("lib{stem}"), format!("py3-{stem}")]
@@ -1589,13 +1651,16 @@ enum Step {
 static WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Option<Step> {
-    let text = fs::read_to_string(log).unwrap_or_default();
-    let noted = fs::read_to_string(work.join("src/.kiry-missing")).unwrap_or_default();
+    let text = read_log(log);
+    let noted = read_log(&work.join("src/.kiry-missing"));
     let ms: Vec<String> = misses(&text, &noted)
         .into_iter()
         .filter_map(|m| match m.strip_prefix("cmd:").filter(|c| c.starts_with('.')) {
             Some(path) => shebang_of(&work.join("src"), path).map(|i| format!("cmd:{i}")),
-            None => Some(m),
+            None => match m.strip_prefix("sh:configure:") {
+                Some(n) => unexpanded(&work.join("src"), n.parse().ok()?).map(|x| format!("m4:{x}")),
+                None => Some(m),
+            },
         })
         .collect();
 
@@ -1667,8 +1732,8 @@ fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Optio
 // own, and one that cannot build would take the package down with it -- gtk4's
 // gobject-introspection, which muon cannot build
 fn more(root: &Path, p: &Package, t: &str, work: &Path, have: &[Dep]) -> Option<Step> {
-    let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
-    let noted = fs::read_to_string(work.join("src/.kiry-missing")).unwrap_or_default();
+    let log = read_log(&logpath(root, p, t));
+    let noted = read_log(&work.join("src/.kiry-missing"));
     // a toolchain member is staged whole in every build, so a probe that failed on one is
     // about something else
     let tools: Vec<String> = sandbox::toolchain(root).unwrap_or_default().into_iter().map(|d| d.name).collect();
@@ -2886,7 +2951,7 @@ fn failed(root: &Path, p: &Package, t: &str, log: Option<&Path>, secs: u64) {
     batch_took(&key(p, t), secs);
     loud!("{}", row(&p.name, &p.version.upstream, was.as_deref(), t, "failed", Some(secs)));
     let Some(log) = log else { return };
-    let text = fs::read_to_string(log).unwrap_or_default();
+    let text = read_log(log);
     let rule = rules(root).ok().and_then(|rs| scan(&rs, &text));
     loud!("  phase  {}", phase(&text));
     loud!("  rule   {}", rule.map_or("none matched".to_string(), |f| format!("{} -> {}", f.rule, f.act)));
@@ -2956,7 +3021,7 @@ fn recover(root: &Path, p: &Package, ts: &[String], verbose: bool, at_once: usiz
             .or(ts.first())
             .map_or("", String::as_str);
         let first = firstlog(root, p, t);
-        let log = fs::read_to_string(logpath(root, p, t)).unwrap_or_default();
+        let log = read_log(&logpath(root, p, t));
         // every retry truncates the log, so without this the failure that started it all
         // is gone by the time anyone reads it and the rung that fixed it cannot be judged
         if !first.exists() {
@@ -3246,6 +3311,12 @@ fn logpath(root: &Path, p: &Package, t: &str) -> PathBuf {
     ))
 }
 
+// lossy bc one byte that is not utf-8 made the whole log read as empty. libbsd's had
+// clang dumping the builtins archive as assembler source, and no rule or miss saw a line
+fn read_log(at: &Path) -> String {
+    String::from_utf8_lossy(&fs::read(at).unwrap_or_default()).into_owned()
+}
+
 fn compile(
     root: &Path,
     p: &Package,
@@ -3462,6 +3533,7 @@ fn compile(
     let cc = CC_WRAPPER
         .replace("@TRIPLE@", triple(t))
         .replace("@SYSROOT@", sysroot_arg)
+        .replace("@INC@", incdir(t))
         .replace("@LTO@", LTO_CACHE);
     // no directory means no c++ in this closure, which a c package is entitled to. the
     // flags come out empty and a c++ compile then fails at its first include, which says
@@ -3636,7 +3708,7 @@ fn compile(
             // a file the wrapper stepped down built with less than the record says, and
             // the log is the only other place that knows
             if !verbose {
-                for l in fs::read_to_string(&log).unwrap_or_default().lines() {
+                for l in read_log(&log).lines() {
                     if let Some(r) = l.strip_prefix("kirycc: ") {
                         say!("{} {t} {r}", p.name);
                     }
@@ -3664,8 +3736,7 @@ fn compile(
             let missed = match verbose {
                 true => None,
                 false => Some(
-                    fs::read_to_string(&log)
-                        .unwrap_or_default()
+                    read_log(&log)
                         .matches("(hash mismatch)")
                         .count(),
                 ),
@@ -4052,20 +4123,34 @@ fn cache_rate(root: &Path, p: &Package, t: &str, work: &Path) -> Option<String> 
 // libtool links a c++ library -nostdlib and puts back what `clang++ -v` showed it as -l
 // flags, which drops the builtins archive since that is a path. libopenmpt then needed
 // __muldc3 and nothing loaded it. the archive goes last, and gives only what is missing
+// after -x none, bc libbsd's format.ld links -x assembler /dev/null and clang went on to
+// assemble the archive
 //
 // clang hands a language it has no frontend for (ada, fortran) to `gcc`, and toollinks
 // makes gcc a link to clang, so gdb's configure asking whether the driver knows ada
 // forked about 1700 clangs in 25s. -ccc-gcc-name points the handoff at a name nothing
 // has, so that compile just fails and configure says no
+//
+// clang's header log names a system header only, so libdrm's -I/usr/include/libdrm from
+// pkg-config left radeon_drm.h out of fastfetch's and the next round took libdrm away.
+// a closure dir goes in as -isystem, which still comes after every -I of the project's
+// own. the include dir itself stays, -isystem on a default dir reorders the c++ wrappers
 const CC_WRAPPER: &str = "\
 #!/bin/sh
 run() { @REAL@ --target=@TRIPLE@ -ccc-gcc-name kiry-no-gcc@SYSROOT@@EXTRA@@LTO@ \"$@\"; }
+case \" $* \" in *\" -I/usr/\"*)
+\tfor a do
+\t\tshift
+\t\tcase $a in -I@INC@|-I@INC@/) ;; -I/usr/?*) a=-isystem${a#-I} ;; esac
+\t\tset -- \"$@\" \"$a\"
+\tdone ;;
+esac
 case \" $* \" in *\" - \"*) run \"$@\"; exit ;; esac
 if [ -n \"$KIRY_PRUNE\" ]; then
 \tcase \" $* \" in *\" -shared \"*) { printf '%s\\0' \"$PWD\" \"$PATH\" \"${0##*/}\" \"$@\"; printf '\\n'; } >>/src/.kiry-links ;; esac
 fi
 case \" $* \" in *\" -nostdlib \"*) case \" $* \" in *\" -shared \"*)
-\trt=$(run -print-libgcc-file-name 2>/dev/null) && [ -f \"$rt\" ] && set -- \"$@\" \"$rt\" ;;
+\trt=$(run -print-libgcc-file-name 2>/dev/null) && [ -f \"$rt\" ] && set -- \"$@\" -x none \"$rt\" ;;
 esac ;; esac
 e=/tmp/.kirycc.$$
 trap 'rm -f \"$e\"' EXIT
@@ -13969,6 +14054,63 @@ mod sidecar {
         assert!(!seen.iter().any(|h| h.ends_with("inner.h") || h.ends_with("local.h")), "{text}");
     }
 
+    // a closure dir pkg-config hands over as -I is a system dir by the time clang sees it,
+    // so the header it was there for gets logged. fastfetch's radeon_drm.h was not
+    #[test]
+    fn kirycc_logs_a_header_found_through_a_closure_dash_i() {
+        let at = scratch("dashi");
+        let cc = kirycc(&at);
+        fs::write(at.join("a.c"), "#include <types.h>\nint a;\n").unwrap();
+        let log = at.join("log");
+        let ok = Command::new("sh")
+            .arg(&cc)
+            .envs(HEADER_LOG)
+            .env("CC_PRINT_HEADERS_FILE", &log)
+            .arg("-I/usr/include/linux")
+            .arg("-c")
+            .arg(at.join("a.c"))
+            .arg("-o")
+            .arg(at.join("a.o"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(included(&text).contains("usr/include/linux/types.h"), "{text}");
+    }
+
+    fn kirycc(at: &Path) -> PathBuf {
+        let cc = at.join("kirycc");
+        let w = CC_WRAPPER
+            .replace("@REAL@", "clang")
+            .replace("@TRIPLE@", triple(T))
+            .replace("@SYSROOT@", "")
+            .replace("@INC@", incdir(T))
+            .replace("@EXTRA@", "")
+            .replace("@LTO@", "");
+        // run through sh, an exec races another test's fork holding the write fd: ETXTBSY
+        fs::write(&cc, w).unwrap();
+        cc
+    }
+
+    #[test]
+    fn kirycc_links_the_builtins_archive_after_a_language_flag() {
+        let at = scratch("xnone");
+        let ok = Command::new("sh")
+            .arg(kirycc(&at))
+            .args(["-shared", "-nostdlib", "-nostartfiles", "-x", "assembler", "/dev/null", "-o"])
+            .arg(at.join("format.ld.so"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    }
+
+    #[test]
+    fn a_log_with_a_byte_that_is_not_utf8_still_reads() {
+        let at = scratch("lossy").join("log");
+        fs::write(&at, b"\xff\xfe junk\nconfigure: error: no acceptable m4 could be found\n").unwrap();
+        assert!(read_log(&at).contains("no acceptable m4"));
+    }
+
     // a line goes when its headers went unread and nothing links it. a library reached
     // only through another header, or a .pc chain, is linked and not included
     #[test]
@@ -14520,6 +14662,35 @@ mod names {
         let at = recipe(&r, "extra", "volume_key", "");
         let p = load(&r, &at).unwrap();
         assert_eq!(answers(&r, T, "m4:AM_PATH_GPGME", &p, &[]), Some(("gpgme".to_string(), "")));
+    }
+
+    // a perl module is the package with it under a perl dir, then perl- and its name; a
+    // stylesheet's url is the package with that file under the xml tree
+    #[test]
+    fn the_macro_configure_stopped_on_is_read_off_its_line() {
+        let src = root("unexpanded");
+        mkdirs(&src.join("sassc-3.6.2/sub")).unwrap();
+        fs::write(src.join("sassc-3.6.2/configure"), "#!/bin/sh\nac_cv=1\nLT_INIT(dlopen)\nas_fn_set_status(1)\ncase x in\nesac\n").unwrap();
+        fs::write(src.join("sassc-3.6.2/sub/configure"), "OTHER_MACRO(x)\n").unwrap();
+        assert_eq!(unexpanded(&src, 3).as_deref(), Some("LT_INIT"));
+        assert_eq!(unexpanded(&src, 5).as_deref(), Some("LT_INIT"));
+        assert_eq!(unexpanded(&src, 2), None);
+    }
+
+    #[test]
+    fn a_perl_module_and_a_stylesheet_url_are_answered() {
+        let r = root("plxml");
+        installed(&r, "perl-xml-parser", &["usr/lib/perl5/vendor_perl/XML/Parser.pm"], &[]);
+        installed(&r, "perl-a", &["usr/lib/perl5/vendor_perl/Other/XML/Parser.pm"], &[]);
+        installed(&r, "docbook-xsl", &["usr/share/xml/docbook/xsl-stylesheets-1.79.2/manpages/docbook.xsl"], &[]);
+        installed(&r, "a-doc", &["usr/share/doc/a/docbook.xsl"], &[]);
+        recipe(&r, "extra", "perl-devel-checklib", "");
+        let at = recipe(&r, "extra", "xmltoman", "");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "pl:XML/Parser.pm", &p, &[]), Some(("perl-xml-parser".to_string(), "")));
+        assert_eq!(answers(&r, T, "pl:Devel/CheckLib.pm", &p, &[]), Some(("perl-devel-checklib".to_string(), "name")));
+        let url = "xml:http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl";
+        assert_eq!(answers(&r, T, url, &p, &[]), Some(("docbook-xsl".to_string(), "")));
     }
 
     // - is no equivalent here, and a name that comes back to the recipe itself is its own
@@ -15420,6 +15591,8 @@ mod misses_from_logs {
         assert_eq!(first(xfs).as_deref(), Some("cmd:../install-sh"));
         assert_eq!(first("make[2]: /usr/bin/foo: No such file or directory\n"), None);
         assert_eq!(first("configure.ac:12: error: possibly undefined macro: AM_PATH_GLIB_2_0\n").as_deref(), Some("m4:AM_PATH_GLIB_2_0"));
+        assert_eq!(first("./configure: line 6259: syntax error: unexpected word (expecting \")\")\n").as_deref(), Some("sh:configure:6259"));
+        assert_eq!(first("./configure: line 12: syntax error near unexpected token `dlopen'\n").as_deref(), Some("sh:configure:12"));
         assert_eq!(
             first("hatchling.plugin.exceptions.UnknownPluginError: Unknown version source: vcs\n").as_deref(),
             Some("py:hatch_vcs")
@@ -15431,6 +15604,20 @@ mod misses_from_logs {
         }
         trove.push_str("FileNotFoundError: [Errno 2] No such file or directory: '.dist/trove_classifiers-2026.4.28.13-py3-none-any.whl'\n");
         assert!(misses(&trove, "").contains(&"pykw:use_calver".to_string()), "{:?}", misses(&trove, ""));
+        // 2026-10-15, the packages built before discovery
+        let xmltoman = "Can't locate XML/Parser.pm in @INC (you may need to install the XML::Parser module) (@INC entries checked: /usr/lib/perl5/vendor_perl) at ./xmltoman line 22.\nBEGIN failed--compilation aborted at ./xmltoman line 22.\nmake: *** [Makefile:11: xmltoman.1] Error 2\n";
+        assert_eq!(first(xmltoman).as_deref(), Some("pl:XML/Parser.pm"));
+        assert_eq!(first("Can't locate loadable object for module Foo::Bar in @INC (@INC contains: /usr/lib/perl5)\n"), None);
+        assert_eq!(first("/src/libnvme-1.16.2/meson.build:52:9: error command failed\nenv: can't execute 'bash': No such file or directory\n").as_deref(), Some("cmd:bash"));
+        assert_eq!(first("/usr/bin/env: 'bash': No such file or directory\n").as_deref(), Some("cmd:bash"));
+        let cursor = "checking for m4 that supports -I option... configure: error: could not find m4 that supports -I option\n";
+        assert_eq!(first(cursor).as_deref(), Some("cmd:m4"));
+        let secret = "I/O error : Attempt to load network entity: http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl\nwarning: failed to load external entity \"http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl\"\nninja: subcommand failed\n";
+        assert_eq!(first(secret).as_deref(), Some("xml:http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl"));
+        assert_eq!(first("checking for flex... no\nchecking for lex... no\nconfigure: error: Neither flex nor lex was found.\n").as_deref(), Some("cmd:flex"));
+        assert_eq!(first("xmlto: Can't continue, xsltproc tool not found or not executable.\n").as_deref(), Some("cmd:xsltproc"));
+        let onig = "src/Makefile.am:24: error: Libtool library used but 'LIBTOOL' is undefined\nautoreconf: error: automake failed with exit status: 1\n";
+        assert_eq!(first(onig).as_deref(), Some("cmd:libtool"));
     }
 
     #[test]

@@ -1633,10 +1633,15 @@ fn a_python_import_is_checked_like_a_library() {
     };
     let os = put("os.py", "");
     let yaml = put("yaml.py", "");
-    let app = put("app", "#!/usr/bin/python3\nimport os\nimport yaml\nimport missingmod\ntry:\n    import optional\nexcept ImportError:\n    pass\n");
+    let app = put("app", "#!/usr/bin/python3\nimport os\nimport yaml\nimport missingmod\nimport elftools\ntry:\n    import optional\nexcept ImportError:\n    pass\n");
+    // a recipe named for the module is the one that would ship it
+    let r = root.join("var/db/kiry/extra/py3-elftools");
+    fs::create_dir_all(&r).unwrap();
+    fs::write(r.join("build"), "true\n").unwrap();
     install(&root, "python3", &[("usr/lib/python3.14/os.py", &os)]);
     install(&root, "py3-yaml", &[("usr/lib/python3.14/site-packages/yaml.py", &yaml)]);
-    install(&root, "app", &[("usr/bin/app", &app)]);
+    let example = put("example.py", "#!/usr/bin/env python3\nimport notshipped\n");
+    install(&root, "app", &[("usr/bin/app", &app), ("usr/share/doc/app/example.py", &example)]);
     needs(&root, "app", &["python3"]);
     needs(&root, "py3-yaml", &["python3"]);
 
@@ -1645,6 +1650,7 @@ fn a_python_import_is_checked_like_a_library() {
     rows.sort_unstable();
     assert_eq!(rows, vec![
         format!("app {TARGET} build-only py3-yaml py:yaml app"),
+        format!("app {TARGET} no-module elftools py3-elftools"),
         format!("app {TARGET} no-module missingmod"),
     ], "{out}");
 

@@ -1445,8 +1445,12 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
             "cmd" => ["usr/bin/", "usr/sbin/", "bin/", "sbin/"].iter().any(|d| path.strip_prefix(d) == Some(n)),
             "lib" => path.strip_prefix(lib).and_then(|r| r.strip_prefix('/')).is_some_and(|f| f.starts_with(&format!("lib{n}.so"))),
             "h" => path.strip_prefix(inc).and_then(|r| r.strip_prefix('/')) == Some(n),
+            // setuptools ships distutils as distutils-precedence.pth, the way pykey() reads it
             "py" => path.split_once("/site-packages/").is_some_and(|(_, f)| {
-                f == format!("{n}.py") || f.starts_with(&format!("{n}/")) || (f.starts_with(n) && f.ends_with(".so"))
+                f == format!("{n}.py")
+                    || f.starts_with(&format!("{n}/"))
+                    || (f.starts_with(n) && f.ends_with(".so"))
+                    || f == format!("{n}-precedence.pth")
             }),
             "m4" => {
                 path.starts_with("usr/share/aclocal/")
@@ -7489,6 +7493,15 @@ fn dlopened(exe: &str, mapped: &BTreeSet<String>, needed: &dyn Fn(&str) -> Vec<S
 // probe does not cover, so builds never show up in it
 const TRACE: &str = "/sys/kernel/tracing";
 const TRACED: &str = "run/kiry/traced";
+const LINEAGE: &str = "run/kiry/lineage";
+
+// when a process started, in seconds since boot: the clock the trace instances keep, so a
+// dlopen's time and a pid's start compare. stat's 22nd field counts USER_HZ, 100 on linux
+fn started(proc: &Path) -> Option<f64> {
+    let stat = fs::read_to_string(proc.join("stat")).ok()?;
+    let after = stat.rsplit_once(") ")?.1;
+    after.split_whitespace().nth(19)?.parse::<f64>().ok().map(|t| t / 100.0)
+}
 
 fn probe(t: &str) -> String {
     format!("dl_{}", t.replace(|c: char| !c.is_ascii_alphanumeric(), "_"))
@@ -7582,7 +7595,10 @@ fn arm(root: &Path) {
     let _ = kp("-:kiryexec/args\n");
     let _ = kp("p:kiryexec/args __x64_sys_execve a1=+0(+8(+104(%di))):ustring a2=+0(+16(+104(%di))):ustring a3=+0(+24(+104(%di))):ustring\n");
     let _ = put(&ex.join("buffer_size_kb"), "4096");
+    let _ = put(&ex.join("trace_clock"), "boot");
+    let _ = put(&inst.join("trace_clock"), "boot");
     let _ = put(&ex.join("events/sched/sched_process_exec/enable"), "1");
+    let _ = put(&ex.join("events/sched/sched_process_fork/enable"), "1");
     let _ = put(&ex.join("events/kiryexec/enable"), "1");
     // a thread's dlopen carries its own pid, and the program is the thread group's
     let _ = put(&inst.join("options/record-tgid"), "1");
@@ -7613,18 +7629,24 @@ fn drained(inst: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-// the trace's lines as (pid the program is known by, target, name asked, whether it
-// loaded), and each process's execs in order. a line is "comm-pid (tgid) [cpu] flags ts:
-// event: args", tgid ------- when the kernel had not recorded it
-type Asked = (u32, f64, String, String, bool);
-type Exec = (f64, String, Vec<String>);
-fn trace_lines(text: &str, probes: &HashMap<String, String>) -> (Vec<Asked>, HashMap<u32, Vec<Exec>>) {
-    let mut asked = Vec::new();
-    let mut execs: HashMap<u32, Vec<Exec>> = HashMap::new();
-    // argv as execve was called with it, which the exec that follows on the pid took
+// one trace event. a line is "comm-pid (tgid) [cpu] flags ts: event: args", tgid -------
+// when the kernel had not recorded it
+#[derive(Debug, Clone, PartialEq)]
+enum Ev {
+    // pid, the file execve ran, argv[1..3] as it was called with them
+    Exec(u32, String, Vec<String>),
+    // parent, child: a thread too, and chromium's zygote children never exec
+    Fork(u32, u32),
+    // the pid the program is known by, target, name asked, whether it loaded
+    Asked(u32, String, String, bool),
+}
+
+// both instances' lines as events in time order. a dlopen's own constructors can dlopen,
+// so a return pairs with the latest call on its thread
+fn trace_events(text: &str, probes: &HashMap<String, String>) -> Vec<(f64, Ev)> {
+    let mut out = Vec::new();
     let mut argv: HashMap<u32, Vec<String>> = HashMap::new();
-    // a dlopen's own constructors can dlopen, so the return pairs with the latest call
-    let mut open: HashMap<u32, Vec<(u32, String, String, f64)>> = HashMap::new();
+    let mut open: HashMap<u32, Vec<(u32, String, String)>> = HashMap::new();
     for l in text.lines() {
         let Some((head, rest)) = l.split_once(") [") else { continue };
         let Some((left, tgid)) = head.rsplit_once('(') else { continue };
@@ -7633,9 +7655,14 @@ fn trace_lines(text: &str, probes: &HashMap<String, String>) -> (Vec<Asked>, Has
         let Some((stamp, r)) = rest.split_once(": ") else { continue };
         let Some((ev, args)) = r.split_once(": ") else { continue };
         let ts = stamp.rsplit(' ').next().and_then(|t| t.parse::<f64>().ok()).unwrap_or_default();
+        let field = |k: &str| args.split_whitespace().find_map(|w| w.strip_prefix(k)).and_then(|v| v.parse::<u32>().ok());
         if ev == "sched_process_exec" {
             if let Some(f) = args.strip_prefix("filename=").and_then(|a| a.rsplit_once(" pid=")).map(|(f, _)| f) {
-                execs.entry(pid).or_default().push((ts, f.to_string(), argv.remove(&pid).unwrap_or_default()));
+                out.push((ts, Ev::Exec(pid, f.to_string(), argv.remove(&pid).unwrap_or_default())));
+            }
+        } else if ev == "sched_process_fork" {
+            if let (Some(a), Some(b)) = (field("pid="), field("child_pid=")) {
+                out.push((ts, Ev::Fork(a, b)));
             }
         } else if ev == "args" {
             // a1="x" a2=(fault): each value quoted up to the next key, a fault ends them
@@ -7654,42 +7681,61 @@ fn trace_lines(text: &str, probes: &HashMap<String, String>) -> (Vec<Asked>, Has
                 .split_once("name=\"")
                 .and_then(|(_, n)| n.rsplit_once('"'))
                 .map_or(String::new(), |(n, _)| n.to_string());
-            open.entry(pid).or_default().push((key, t.clone(), name, ts));
+            open.entry(pid).or_default().push((key, t.clone(), name));
         } else if ev.strip_suffix("_ret").is_some_and(|e| probes.contains_key(e)) {
-            let Some((key, t, name, at)) = open.get_mut(&pid).and_then(Vec::pop) else { continue };
+            let Some((key, t, name)) = open.get_mut(&pid).and_then(Vec::pop) else { continue };
             let ok = args.rsplit_once("handle=").is_some_and(|(_, h)| h.trim() != "0x0");
             if !name.is_empty() {
-                asked.push((key, at, t, name, ok));
+                out.push((ts, Ev::Asked(key, t, name, ok)));
             }
         }
     }
-    (asked, execs)
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out
 }
 
-// the program behind a process from its execs: the last one, unless what came before it
-// was a script whose #! names it. a #!/usr/bin/env python3 script is two execs, the
-// script and then python3, and the script is the program. vesktop's #!/bin/sh execs
-// electron, which names nothing the script's #! does, so electron is the program and
-// what chromium dlopens is electron's
+// which program each pid is, walked through the events: an exec makes the pid that
+// program and a fork hands the parent's to the child. an exec after a script whose #!
+// names it keeps the script -- a #!/usr/bin/env python3 script is two execs, the script and
+// then python3 -- and an interpreter run by hand is its script, python3 foo.py. vesktop's
+// #!/bin/sh execs electron, which its #! does not name, so what chromium dlopens is
+// electron's
 //
-// an interpreter run by hand is one exec, python3 with the script among its arguments.
-// only the execs before the dlopen count: a pid used again later is another program
-fn program(execs: &[Exec], at: f64, shebang: &dyn Fn(&str) -> Option<String>, script: &dyn Fn(&[String]) -> Option<String>) -> Option<String> {
-    let chain: Vec<&Exec> = execs.iter().filter(|e| e.0 <= at).collect();
-    let mut i = chain.len().checked_sub(1)?;
-    while i > 0 {
-        let next = chain[i].1.rsplit('/').next().unwrap_or_default();
-        match shebang(&chain[i - 1].1) {
-            Some(l) if l.split_whitespace().any(|w| w.rsplit('/').next() == Some(next)) => i -= 1,
-            _ => break,
+// known carries the live processes over from the last read, since that read took their
+// execs out of the buffer. a dlopen by a pid nothing says anything about comes back with
+// None, for /proc to answer if the process is still the one that asked
+type Said = (u32, f64, Option<String>, String, String, bool);
+fn lineage(
+    events: &[(f64, Ev)],
+    known: &mut HashMap<u32, String>,
+    shebang: &dyn Fn(&str) -> Option<String>,
+    script: &dyn Fn(&[String]) -> Option<String>,
+) -> Vec<Said> {
+    let mut out = Vec::new();
+    for (ts, e) in events {
+        match e {
+            Ev::Exec(pid, file, args) => {
+                let name = file.rsplit('/').next().unwrap_or_default();
+                let keep = known
+                    .get(pid)
+                    .and_then(|prev| shebang(prev))
+                    .is_some_and(|l| l.split_whitespace().any(|w| w.rsplit('/').next() == Some(name)));
+                if !keep {
+                    known.insert(*pid, script(args).unwrap_or_else(|| file.clone()));
+                }
+            }
+            Ev::Fork(parent, child) => match known.get(parent).cloned() {
+                Some(p) => {
+                    known.insert(*child, p);
+                }
+                None => {
+                    known.remove(child);
+                }
+            },
+            Ev::Asked(key, t, name, ok) => out.push((*key, *ts, known.get(key).cloned(), t.clone(), name.clone(), *ok)),
         }
     }
-    if i == chain.len() - 1 {
-        if let Some(s) = script(&chain[i].2) {
-            return Some(s);
-        }
-    }
-    Some(chain[i].1.clone())
+    out
 }
 
 // the #! line of a script, or None for anything else
@@ -7729,21 +7775,32 @@ fn observe(root: &Path) {
     }
     let rel = |p: &str| fold(p.trim_start_matches('/').trim_end_matches(" (deleted)"));
     let real = |p: &Path| fs::canonicalize(p).ok().map(|p| rel(&p.to_string_lossy()));
-    // (program, what it dlopened) from the trace, read before arm() can drop it. a
-    // process the trace saw no exec for was running before the probe went in, and /proc
-    // still says what it is while it lives
+    // (program, what it dlopened) from the trace, read before arm() can drop it
     let probes: HashMap<String, String> =
         db::targets(root).unwrap_or_default().into_iter().map(|t| (probe(&t), t)).collect();
-    let (asked, execs) = trace_lines(&(drained("kiry-exec") + &drained("kiry")), &probes);
+    let events = trace_events(&(drained("kiry-exec") + &drained("kiry")), &probes);
     arm(root);
+    let carried = root.join(LINEAGE);
+    let mut known: HashMap<u32, String> = fs::read_to_string(&carried)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' ').and_then(|(p, f)| Some((p.parse().ok()?, f.to_string()))))
+        .collect();
+    let said = lineage(&events, &mut known, &|p| hashbang(p), &|a| script_of(a));
     let mut traced: Vec<(String, String)> = Vec::new();
-    for (pid, at, t, name, ok) in asked {
-        let prog = match execs.get(&pid).and_then(|c| program(c, at, &|p| hashbang(p), &|a| script_of(a))) {
+    for (pid, at, prog, t, name, ok) in said {
+        let prog = match prog {
             Some(p) => real(Path::new(&p)),
+            // running from before the probe went in, so /proc says what it is -- if the pid
+            // is still that process: one that started after the dlopen took the number over
             None => {
                 let d = Path::new("/proc").join(pid.to_string());
-                script_of(&argv_of(&fs::read(d.join("cmdline")).unwrap_or_default()))
-                    .map(PathBuf::from).or_else(|| fs::read_link(d.join("exe")).ok()).and_then(|p| real(&p))
+                started(&d).filter(|s| *s <= at + 0.01).and_then(|_| {
+                    script_of(&argv_of(&fs::read(d.join("cmdline")).unwrap_or_default()))
+                        .map(PathBuf::from)
+                        .or_else(|| fs::read_link(d.join("exe")).ok())
+                        .and_then(|p| real(&p))
+                })
             }
         };
         let file = if name.starts_with('/') { real(Path::new(&name)) } else { real(&root.join(libdir(&t).trim_start_matches('/')).join(&name)) };
@@ -7751,6 +7808,13 @@ fn observe(root: &Path) {
             traced.push((p, f));
         }
     }
+    // the ones still running, for the next read
+    let live: String = known
+        .iter()
+        .filter(|(p, _)| Path::new("/proc").join(p.to_string()).exists())
+        .map(|(p, f)| format!("{p} {f}\n"))
+        .collect();
+    let _ = put(&carried, &live);
 
     // (exe, the script an interpreter runs, the shared objects it has mapped), paths
     // relative and folded the way manifests have them
@@ -8214,7 +8278,7 @@ fn leave(root: &Path) {
                     let cmd = cmd.rsplit('/').next().unwrap_or_default().to_string();
                     own.get(&(t.clone(), format!("cmd:{cmd}"))).and_then(|o| gone.iter().find(|(gt, n)| gt == t && n == o))
                 }
-                What::NoModule(m) => {
+                What::NoModule(m, _) => {
                     own.get(&(t.clone(), format!("py:{m}"))).and_then(|o| gone.iter().find(|(gt, n)| gt == t && n == o))
                 }
                 _ => None,
@@ -12031,7 +12095,8 @@ enum What {
     CrossTier(String),
     Unresolved(String),
     NoInterpreter(String),
-    NoModule(String),
+    // the module, and the recipe its name says would ship it
+    NoModule(String, Option<String>),
     MissingSymbol(String),
     Duplicate(usize, String),
     MissingUser(String),
@@ -12050,7 +12115,8 @@ impl fmt::Display for What {
             What::CrossTier(p) => write!(f, "cross-tier {p}"),
             What::Unresolved(n) => write!(f, "unresolved {n}"),
             What::NoInterpreter(w) => write!(f, "no-interpreter {w}"),
-            What::NoModule(m) => write!(f, "no-module {m}"),
+            What::NoModule(m, None) => write!(f, "no-module {m}"),
+            What::NoModule(m, Some(r)) => write!(f, "no-module {m} {r}"),
             What::MissingSymbol(s) => write!(f, "missing-symbol {s}"),
             What::Duplicate(n, p) => write!(f, "duplicate-symbols {n} {p}"),
             What::MissingUser(u) => write!(f, "missing-user {u}"),
@@ -12071,7 +12137,7 @@ impl What {
     fn breaks(&self) -> bool {
         matches!(
             self,
-            What::Unresolved(_) | What::MissingSymbol(_) | What::NoInterpreter(_) | What::NoModule(_)
+            What::Unresolved(_) | What::MissingSymbol(_) | What::NoInterpreter(_) | What::NoModule(..)
         )
     }
 }
@@ -12244,7 +12310,13 @@ fn pychecked(
         let Some((direct, reach)) = reached(target, deps, name) else { continue };
         for m in need {
             let what = match pyown.get(&format!("py:{m}")) {
-                None => What::NoModule(m),
+                // a dist is packaged as py3-<name> under its import name more often than
+                // not: elftools is py3-elftools. gi is py3-gobject3, which no name says
+                None => {
+                    let r = called(root, &format!("py3-{m}"), target).unwrap_or(format!("py3-{m}"));
+                    let r = Some(r).filter(|r| r != "-" && recipe(root, r).is_some());
+                    What::NoModule(m, r)
+                }
                 Some((who, _)) if who == name || direct.contains(who) => continue,
                 // the package, not the module: one line in its depends covers them all
                 Some((who, _)) if !said.insert((name.as_str(), who.clone())) => continue,
@@ -12323,7 +12395,13 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
             }
         }
         if rec.manifest.iter().any(|e| e.path.ends_with(".py")) || seen.iter().any(|(_, w)| matches!(w, install::Seen::Script(_))) {
-            let files = rec.manifest.iter().filter(|e| matches!(e.kind, db::Kind::File(_))).map(|e| e.path.clone()).collect();
+            // the line imported() draws: dbus' examples/GetAllMatchRules.py is not dbus running python
+            let files = rec
+                .manifest
+                .iter()
+                .filter(|e| matches!(e.kind, db::Kind::File(_)) && !e.path.starts_with("usr/share/doc/"))
+                .map(|e| e.path.clone())
+                .collect();
             pyfiles.push((name.clone(), files));
         }
 
@@ -14283,6 +14361,16 @@ mod names {
         assert_eq!(answers(&r, T, "pykw:use_nothing", &p, &[]), None);
     }
 
+    // python 3.12 has no distutils, and setuptools puts one back with a .pth
+    #[test]
+    fn distutils_is_answered_by_setuptools() {
+        let r = root("distutils");
+        installed(&r, "py3-setuptools", &["usr/lib/python3.14/site-packages/distutils-precedence.pth"], &[]);
+        let at = recipe(&r, "extra", "volume_key", "");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "py:distutils", &p, &[]), Some(("py3-setuptools".to_string(), "")));
+    }
+
     // a macro is whichever installed .m4 defines it, not one that only calls it
     #[test]
     fn an_autoconf_macro_is_answered_by_the_m4_defining_it() {
@@ -14878,14 +14966,11 @@ mod leaving {
     }
 
     // the trace as tracefs prints it: a thread's dlopen belongs to its thread group, a
-    // constructor's dlopen inside another pairs with its own return, and a handle of 0x0
-    // is a load that failed
+    // constructor's dlopen inside another pairs with its own return, a handle of 0x0 is a
+    // load that failed, and the two instances' lines come out in time order
     #[test]
     fn a_traced_dlopen_is_paired_and_put_on_its_process() {
-        let text = r#"
-              sh-100     (    100) [001] .....    10.000000: sched_process_exec: filename=/usr/bin/vesktop pid=100 old_pid=100
-        electron-100     (    100) [001] ..Zff    10.100000: args: (__x64_sys_execve+0x4/0x60) a1="--ozone-platform=wayland" a2="/usr/lib/vesktop/app.asar" a3=(fault)
-        electron-100     (    100) [001] .....    10.100100: sched_process_exec: filename=/usr/bin/electron pid=100 old_pid=100
+        let dl = r#"
  Chrome_IOThread-101     (    100) [003] DBZff    11.000000: dl_x86_64_musl: (0x7f00000c10f0) name="libnotify.so.4"
  Chrome_IOThread-101     (    100) [003] DBZff    11.000100: dl_x86_64_musl_ret: (0x55d000000000 <- 0x7f00000c10f0) handle=0x7f4fde823940
             game-400     (-------) [005] DBZff    12.000000: dl_x86_64_musl: (0x7f00000c10f0) name="/usr/lib/libdecor/plugins-1/libdecor-cairo.so"
@@ -14894,46 +14979,83 @@ mod leaving {
             game-400     (-------) [005] DBZff    12.000030: dl_x86_64_musl_ret: (0x55d000000000 <- 0x7f00000c10f0) handle=0x0
            steam-500     (    500) [002] DBZff    13.000000: dl_x86_64_gnu_ret: (0x55d000000000 <- 0x7f0000095ba0) handle=0x7f4fde823940
 "#;
+        let ex = r#"
+              sh-100     (    100) [001] .....    10.000000: sched_process_exec: filename=/usr/bin/vesktop pid=100 old_pid=100
+        electron-100     (    100) [001] ..Zff    10.100000: args: (__x64_sys_execve+0x4/0x60) a1="--ozone-platform=wayland" a2="/usr/lib/vesktop/app.asar" a3=(fault)
+        electron-100     (    100) [001] .....    10.100100: sched_process_exec: filename=/usr/bin/electron pid=100 old_pid=100
+        electron-100     (    100) [001] .....    10.200000: sched_process_fork: comm=electron pid=100 child_comm=electron child_pid=101
+"#;
         let probes: HashMap<String, String> =
             [("dl_x86_64_musl", "x86_64-musl"), ("dl_x86_64_gnu", "x86_64-gnu")].map(|(a, b)| (a.to_string(), b.to_string())).into();
-        let (asked, execs) = trace_lines(text, &probes);
-        let row = |k: u32, n: &str, ok: bool| (k, n.to_string(), ok);
+        let asked = |k: u32, n: &str, ok: bool| Ev::Asked(k, "x86_64-musl".into(), n.into(), ok);
+        let got: Vec<Ev> = trace_events(&(dl.to_string() + ex), &probes).into_iter().map(|(_, e)| e).collect();
         assert_eq!(
-            asked.iter().map(|(k, _, _, n, ok)| (*k, n.clone(), *ok)).collect::<Vec<_>>(),
+            got,
             vec![
-                row(100, "libnotify.so.4", true),
-                row(400, "libcairo.so.2", true),
-                row(400, "/usr/lib/libdecor/plugins-1/libdecor-cairo.so", false),
+                Ev::Exec(100, "/usr/bin/vesktop".into(), vec![]),
+                Ev::Exec(100, "/usr/bin/electron".into(), vec!["--ozone-platform=wayland".into(), "/usr/lib/vesktop/app.asar".into()]),
+                Ev::Fork(100, 101),
+                asked(100, "libnotify.so.4", true),
+                asked(400, "libcairo.so.2", true),
+                asked(400, "/usr/lib/libdecor/plugins-1/libdecor-cairo.so", false),
             ]
         );
-        assert_eq!(execs[&100][1].1, "/usr/bin/electron");
-        assert_eq!(execs[&100][1].2, ["--ozone-platform=wayland", "/usr/lib/vesktop/app.asar"]);
-        assert!(execs[&100][0].2.is_empty());
     }
 
-    // which exec of a process is the program: a #! that names the next exec hands over to
-    // the script, one that does not leaves the last exec, an interpreter run by hand is its
-    // script, and an exec after the dlopen is a later process on the same pid
+    // which program a dlopen belongs to: a #! that names the next exec keeps the script,
+    // one that does not hands over, an interpreter run by hand is its script, a fork takes
+    // its parent's, a pid used again is the new program, and one nothing said anything
+    // about is left for /proc
     #[test]
     fn the_program_behind_a_traced_process() {
-        let e = |at: f64, f: &str, a: &[&str]| (at, f.to_string(), a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
         let shebang = |p: &str| match p {
             "/usr/bin/vesktop" => Some("/bin/sh".to_string()),
             "/usr/bin/lddtree" => Some("/usr/bin/env python3".to_string()),
             _ => None,
         };
         let script = |a: &[String]| a.iter().find(|x| x.ends_with(".py")).cloned();
-        let got = |chain: &[Exec], at: f64| program(chain, at, &shebang, &script);
+        let exec = |t: f64, pid: u32, f: &str, a: &[&str]| (t, Ev::Exec(pid, f.into(), a.iter().map(|s| (*s).to_string()).collect()));
+        let ask = |t: f64, pid: u32, n: &str| (t, Ev::Asked(pid, "x86_64-musl".into(), n.into(), true));
+        let events = vec![
+            exec(1.0, 100, "/usr/bin/vesktop", &[]),
+            exec(1.1, 100, "/usr/bin/electron", &["/usr/lib/vesktop/app.asar"]),
+            (1.2, Ev::Fork(100, 150)),
+            ask(1.3, 150, "libnotify.so.4"),
+            exec(2.0, 200, "/usr/bin/lddtree", &["-a"]),
+            exec(2.1, 200, "/usr/bin/python3", &["/usr/bin/lddtree", "-a"]),
+            ask(2.2, 200, "_ctypes.so"),
+            exec(3.0, 300, "/usr/bin/python3", &["/home/u/bot.py"]),
+            ask(3.1, 300, "libharfbuzz.so.0"),
+            exec(4.0, 300, "/usr/bin/wpctl", &[]),
+            ask(4.1, 300, "libspa-support.so"),
+            ask(5.0, 999, "libnuma.so"),
+        ];
+        let mut known = HashMap::new();
+        let said: Vec<(u32, Option<String>)> =
+            lineage(&events, &mut known, &shebang, &script).into_iter().map(|(p, _, w, _, _, _)| (p, w)).collect();
+        let some = |p: u32, w: &str| (p, Some(w.to_string()));
+        assert_eq!(
+            said,
+            vec![
+                some(150, "/usr/bin/electron"),
+                some(200, "/usr/bin/lddtree"),
+                some(300, "/home/u/bot.py"),
+                some(300, "/usr/bin/wpctl"),
+                (999, None),
+            ]
+        );
+        // carried to the next read: a process the last one saw exec still is that program
+        let mut known = HashMap::from([(700, "/usr/bin/librewolf".to_string())]);
+        let said = lineage(&[ask(9.0, 700, "libudev.so.1")], &mut known, &shebang, &script);
+        assert_eq!(said[0].2.as_deref(), Some("/usr/bin/librewolf"));
+    }
 
-        let vesktop = [e(1.0, "/usr/bin/vesktop", &[]), e(2.0, "/usr/bin/electron", &["/usr/lib/vesktop/app.asar"])];
-        assert_eq!(got(&vesktop, 3.0).as_deref(), Some("/usr/bin/electron"));
-        let lddtree = [e(1.0, "/usr/bin/lddtree", &["-a"]), e(1.1, "/usr/bin/python3", &["/usr/bin/lddtree", "-a"])];
-        assert_eq!(got(&lddtree, 2.0).as_deref(), Some("/usr/bin/lddtree"));
-        let by_hand = [e(1.0, "/usr/bin/python3", &["/home/u/bot.py"])];
-        assert_eq!(got(&by_hand, 2.0).as_deref(), Some("/home/u/bot.py"));
-        let reused = [e(1.0, "/usr/bin/foo", &[]), e(5.0, "/usr/bin/bar", &[])];
-        assert_eq!(got(&reused, 2.0).as_deref(), Some("/usr/bin/foo"));
-        assert_eq!(got(&reused, 0.5), None);
+    // this test's own process started moments ago, on the clock /proc/uptime counts
+    #[test]
+    fn a_process_start_is_seconds_since_boot() {
+        let up: f64 = fs::read_to_string("/proc/uptime").unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        let me = started(Path::new("/proc/self")).unwrap();
+        assert!(me <= up && up - me < 120.0, "started {me}, up {up}");
     }
 
     #[test]

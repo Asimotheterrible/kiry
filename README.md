@@ -35,10 +35,30 @@ headers each file included, so after a good build a dep that nothing included, l
 loaded leaves again. Recipes written by hand in `core/` and `local/` build with exactly what
 they list.
 
-What none of this sees is a library opened with `dlopen` under a name put together at
-runtime. Nothing in the binary names it, so a listed dep like that looks unused and is
-dropped from what the package needs at runtime. A plugin or a data package ships no
-soname, so those stay as the recipe listed them.
+A library opened with `dlopen` has no `DT_NEEDED` entry, so kiry reads three other kinds
+of evidence for it:
+
+- **Names in the binary.** sdl2 carries the string `libwayland-client.so.0`, which makes
+  wayland a runtime dep.
+- **`.note.dlopen` notes.** These follow the UAPI.12 spec that systemd's
+  `SD_ELF_NOTE_DLOPEN` writes, where upstream lists what it loads. kbd's `loadkeys`
+  already carries them. Required and recommended entries become runtime deps; suggested
+  ones do not.
+- **What running programs actually map.** A library a process has mapped that its
+  `DT_NEEDED` closure does not explain was dlopened. kiry records it under
+  `/var/kiry/seen`, keeps it installed while the program is, and makes it a runtime dep
+  at the program's next build.
+
+A name put together at runtime from a format string, like pipewire's `%s/%s.so`, cannot be
+read off the binary. An artifact that can `dlopen` and carries such a string keeps every
+library its recipe lists. A plugin or a data package ships no soname, so those stay as the
+recipe listed them.
+
+Python gets the same treatment as ELF. An import at column 0 runs when the module loads,
+so the package shipping that module is a runtime dep. kiry follows the imports from each
+script and top-level package through the package's own modules. An indented import sits
+under a `try`, an `if` or a `def`, so it is optional. `kiry doctor` reports an import that
+nothing installed provides, and one the package's record does not account for.
 
 ## Current state
 

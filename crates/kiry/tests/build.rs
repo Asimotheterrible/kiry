@@ -7884,3 +7884,33 @@ fn a_rebuild_under_another_key_compares_nothing() {
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(quiet(&said), "the sidecar says nothing about a profile: {said}");
 }
+
+// an import at column 0 and a dlopen a running program was seen doing are runtime edges
+// the same way DT_NEEDED is, written into the sidecar for the record to carry
+#[test]
+fn an_import_and_a_seen_dlopen_are_runtime_edges() {
+    let at = scratch("pyedge");
+    let script = "mkdir -p \"$DESTDIR/usr/bin\"\nprintf '#!/usr/bin/python3\\nimport yaml\\ntry:\\n    import maybe\\nexcept ImportError:\\n    pass\\n' > \"$DESTDIR/usr/bin/tool\"\nchmod 755 \"$DESTDIR/usr/bin/tool\"\n";
+    let d = recipe(&at, "x86_64-musl", script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let entry = |p: &str| db::Entry { mode: 0o644, kind: db::Kind::File("0".repeat(64)), path: p.into() };
+    record(&root, "pyyaml", &[], vec![entry("usr/lib/python3.14/site-packages/yaml/__init__.py")]);
+    db::write_provides(&root, "x86_64-musl", "pyyaml", &[]).unwrap();
+    record(&root, "pymaybe", &[], vec![entry("usr/lib/python3.14/site-packages/maybe.py")]);
+    db::write_provides(&root, "x86_64-musl", "pymaybe", &[]).unwrap();
+    bare(&root, "plugin", &[]);
+    fs::create_dir_all(root.join("var/kiry/seen/x86_64-musl")).unwrap();
+    fs::write(root.join("var/kiry/seen/x86_64-musl/hello"), "plugin usr/lib/plugin/p.so\n").unwrap();
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    let said = String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{said}");
+    let deps = fs::read_to_string(root.join("var/kiry/cache").join(&sidecars(&root)[0]).join("depends")).unwrap();
+    let lines: Vec<&str> = deps.lines().collect();
+    assert!(lines.contains(&"pyyaml") && lines.contains(&"plugin"), "{deps}\n{said}");
+    assert!(!deps.contains("pymaybe"), "{deps}");
+}

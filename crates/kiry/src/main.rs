@@ -1812,6 +1812,16 @@ fn unbacked(root: &Path, deps: &[Dep], t: &str, dest: &Path) -> Vec<String> {
     if doubt.is_empty() {
         return Vec::new();
     }
+    // a name put together at runtime -- pipewire's %s/%s.so, alsa's libasound_module_pcm_%s.so
+    // -- can be any of them, and no string in the artifact will say which. so an artifact
+    // that can dlopen and builds a library name drops nothing
+    let builds = |x: &PathBuf| {
+        elf::read(x).is_ok_and(|o| o.undefined.iter().any(|s| DL.contains(&s.name.as_str())))
+            && fs::read(x).is_ok_and(|b| names_at_runtime(&b))
+    };
+    if files.iter().any(builds) {
+        return Vec::new();
+    }
 
     let mut seen: HashSet<String> = HashSet::new();
     for f in &files {
@@ -1861,6 +1871,123 @@ fn loaded(root: &Path, deps: &[Dep], t: &str, dest: &Path, linked: &BTreeSet<Str
         }
     }
     out
+}
+
+// a format string that makes a library name: %s/%s.so, lib%s.so, libfoo_%s.so.1. a
+// printf that ends up in dlopen is how a name gets put together at runtime
+fn names_at_runtime(b: &[u8]) -> bool {
+    b.split(|c| *c == 0).any(|w| {
+        w.len() < 256
+            && w.iter().all(|c| (0x20..0x7f).contains(c))
+            && w.windows(2).position(|p| p[0] == b'%' && matches!(p[1], b's' | b'd' | b'.')).is_some_and(|at| {
+                w[at..].windows(3).any(|x| x == b".so") || w[..at].ends_with(b"lib")
+            })
+    })
+}
+
+// UAPI.12, the dlopen metadata spec systemd 261 writes with SD_ELF_NOTE_DLOPEN: a
+// .note.dlopen note in a PT_NOTE segment, owner FDO, type 0x407c0c0a, holding a JSON array
+// of objects with soname (alternatives, most wanted first) and priority (required,
+// recommended or suggested, recommended when it is left out). upstream saying in the elf
+// what it dlopens, which is the one form of this that needs no guessing
+//
+// (priority, sonames) per object. a hand-cut reader: the spec forbids control characters
+// and \u escapes, and a soname has no quote in it
+fn dlnotes(b: &[u8]) -> Vec<(String, Vec<String>)> {
+    let u16at = |at: usize| b.get(at..at + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize);
+    let u32at = |at: usize| b.get(at..at + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]) as usize);
+    let u64at = |at: usize| b.get(at..at + 8).and_then(|x| usize::try_from(u64::from_le_bytes(x.try_into().ok()?)).ok());
+    let mut out = Vec::new();
+    if b.get(..5) != Some(b"\x7fELF\x02".as_slice()) {
+        return out;
+    }
+    let (Some(phoff), Some(size), Some(count)) = (u64at(0x20), u16at(0x36), u16at(0x38)) else { return out };
+    for i in 0..count {
+        let ph = phoff + i * size;
+        if u32at(ph) != Some(4) {
+            continue;
+        }
+        let (Some(off), Some(len)) = (u64at(ph + 8), u64at(ph + 32)) else { continue };
+        let mut at = off;
+        while at + 12 <= off + len {
+            let (Some(namesz), Some(descsz), Some(kind)) = (u32at(at), u32at(at + 4), u32at(at + 8)) else { break };
+            let name = at + 12;
+            let desc = name + namesz.div_ceil(4) * 4;
+            if b.get(name..name + namesz) == Some(b"FDO\0".as_slice()) && kind == 0x407c_0c0a {
+                if let Some(d) = b.get(desc..desc + descsz) {
+                    out.extend(notejson(&String::from_utf8_lossy(d)));
+                }
+            }
+            at = desc + descsz.div_ceil(4) * 4;
+        }
+    }
+    out
+}
+
+fn notejson(s: &str) -> Vec<(String, Vec<String>)> {
+    let value = |obj: &str, key: &str| -> Vec<String> {
+        let Some(at) = obj.find(&format!("\"{key}\"")) else { return Vec::new() };
+        let rest = obj[at + key.len() + 2..].trim_start().trim_start_matches(':').trim_start();
+        // an array up to its ], or one string up to its closing quote
+        let v = match rest.strip_prefix('[') {
+            Some(r) => r.split(']').next().unwrap_or_default(),
+            None => rest.get(..rest.get(1..).and_then(|r| r.find('"')).map_or(0, |e| e + 2)).unwrap_or_default(),
+        };
+        v.split('"').skip(1).step_by(2).map(str::to_string).collect()
+    };
+    // the objects, cut at braces outside strings: a description may hold either brace
+    let mut objs: Vec<&str> = Vec::new();
+    let (mut quoted, mut escaped, mut from) = (false, false, None);
+    for (i, c) in s.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '{' if !quoted => from = Some(i + 1),
+            '}' if !quoted => objs.extend(from.take().map(|f| &s[f..i])),
+            _ => {}
+        }
+    }
+    objs.into_iter()
+        .filter_map(|o| {
+            let names = value(o, "soname");
+            let prio = value(o, "priority").into_iter().next().unwrap_or_else(|| "recommended".into());
+            (!names.is_empty()).then_some((prio, names))
+        })
+        .collect()
+}
+
+// what the artifact's notes say it dlopens, as runtime edges: the first soname of each
+// required or recommended entry something installed ships. suggested is a feature for
+// a full install and is left to the user, the way the spec's packaging tools make it a
+// Suggests. a required one nobody ships is handed back to be printed
+fn noted(root: &Path, t: &str, dest: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    let mut files = Vec::new();
+    under(dest, &mut files);
+    let mut want: Vec<(String, Vec<String>)> = Vec::new();
+    for f in &files {
+        let mut head = [0u8; 4];
+        if fs::File::open(f).and_then(|mut h| h.read_exact(&mut head)).is_err() || &head != b"\x7fELF" {
+            continue;
+        }
+        let Ok(b) = fs::read(f) else { continue };
+        want.extend(dlnotes(&b).into_iter().filter(|(p, _)| p != "suggested"));
+    }
+    if want.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let own = owners(root);
+    let (mut found, mut none) = (Vec::new(), Vec::new());
+    for (prio, names) in want {
+        match names.iter().find_map(|n| own.get(&(t.to_string(), format!("so:{n}"))).map(|w| (w.clone(), n.clone()))) {
+            Some(x) => found.push(x),
+            None if prio == "required" => none.push(names.join("|")),
+            None => {}
+        }
+    }
+    found.sort();
+    found.dedup();
+    (found, none)
 }
 
 // the name standing as a word of its own. binutils ships ar and every file with "start" or
@@ -1963,6 +2090,242 @@ fn interpreters(root: &Path, t: &str, dest: &Path) -> Vec<(String, String)> {
             (!BASE.contains(&who.as_str())).then(|| (w.clone(), who.clone()))
         })
         .collect()
+}
+
+// who ships each module the build's python needs, and the modules nobody here ships. the
+// second half is printed, not refused: it is either a dep that is not built yet or an
+// import that only looks unconditional, and the build is the wrong place to find out
+fn imported(root: &Path, t: &str, dest: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    let mut all = Vec::new();
+    under(dest, &mut all);
+    let rel = |f: &PathBuf| f.strip_prefix(dest).unwrap_or(f).to_string_lossy().into_owned();
+    let files: BTreeSet<String> = all.iter().map(rel).filter(|f| !f.starts_with("usr/share/doc/")).collect();
+    let read = |f: &str| fs::read_to_string(dest.join(f)).ok();
+    let script = |f: &str| {
+        let at = dest.join(f);
+        let mut head = [0u8; 256];
+        if !fs::metadata(&at).is_ok_and(|m| m.permissions().mode() & 0o111 != 0) {
+            return false;
+        }
+        let n = fs::File::open(&at).and_then(|mut h| h.read(&mut head)).unwrap_or(0);
+        pyscript(&head[..n])
+    };
+    let need = pyneeds(&files, &read, &script);
+    if need.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let own = owners(root);
+    let (mut found, mut none) = (Vec::new(), Vec::new());
+    for m in need {
+        match own.get(&(t.to_string(), format!("py:{m}"))) {
+            Some(who) => found.push((who.clone(), m)),
+            None => none.push(m),
+        }
+    }
+    (found, none)
+}
+
+// python's DT_NEEDED. an import at column 0 runs the moment the module loads, so whatever
+// ships it has to be there. an indented one sits under a try, an if or a def -- the
+// except ImportError fallback, the TYPE_CHECKING block, the lazy import inside a function
+// -- and is optional the way meson's found: NO is. python's own grammar draws that line
+// without needing python: a module-level statement starts at column 0, nothing else does,
+// and a triple-quoted string is the one place a column-0 import is not a statement
+//
+// (dots, module, names). from x import y hands back y too, it may be a submodule
+fn pyimports(text: &str) -> Vec<(usize, String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut quote: Option<&str> = None;
+    let mut lines = text.lines();
+    while let Some(l) = lines.next() {
+        if let Some(q) = quote {
+            if l.matches(q).count() % 2 == 1 {
+                quote = None;
+            }
+            continue;
+        }
+        let stmt = l.split('#').next().unwrap_or_default();
+        if let Some(rest) = stmt.strip_prefix("import ") {
+            for m in rest.split(',') {
+                let m = m.split(" as ").next().unwrap_or_default().trim();
+                if !m.is_empty() {
+                    out.push((0, m.to_string(), Vec::new()));
+                }
+            }
+        } else if let Some((from, names)) = stmt.strip_prefix("from ").and_then(|r| r.split_once(" import")) {
+            let from = from.trim();
+            let dots = from.len() - from.trim_start_matches('.').len();
+            let mut names = names.to_string();
+            // a parenthesised list goes on until its paren closes
+            if names.contains('(') {
+                while !names.contains(')') {
+                    let Some(more) = lines.next() else { break };
+                    names.push_str(more.split('#').next().unwrap_or_default());
+                }
+            }
+            let names = names
+                .split(',')
+                .map(|n| n.split(" as ").next().unwrap_or_default().trim_matches(|c: char| c.is_whitespace() || "()\\".contains(c)))
+                .filter(|n| !n.is_empty() && *n != "*")
+                .map(str::to_string)
+                .collect();
+            out.push((dots, from[dots..].to_string(), names));
+        }
+        for q in ["\"\"\"", "'''"] {
+            if stmt.matches(q).count() % 2 == 1 {
+                quote = Some(q);
+                break;
+            }
+        }
+    }
+    out
+}
+
+// always compiled into the interpreter, so no file anywhere ships them. sys.builtin_module_names
+// of a static 3.14, and the edge to the interpreter comes from site-packages or the #!
+const PY_BUILTIN: &[&str] = &[
+    "_abc", "_ast", "_codecs", "_collections", "_contextvars", "_datetime", "_functools", "_imp", "_io",
+    "_locale", "_opcode", "_operator", "_signal", "_sre", "_stat", "_string", "_suggestions", "_symtable",
+    "_sysconfig", "_thread", "_tokenize", "_tracemalloc", "_types", "_typing", "_warnings", "_weakref",
+    "atexit", "builtins", "errno", "faulthandler", "gc", "itertools", "marshal", "posix", "pwd", "sys", "time",
+];
+
+// the top-level modules a package's python cannot start without and does not ship itself.
+// walked from what gets run or imported from outside -- a #! python script, a module or
+// package at the top of site-packages -- through its own modules, so a column-0 import in
+// a submodule nothing reaches (urllib3's pyopenssl, sphinx's extension) stays optional.
+// files are relative paths, read() gets one's text, script() says it is run by python
+//
+// a module under site-packages runs on the interpreter whose stdlib sits beside it, and os
+// is the stdlib file every python has, so that is the edge to the interpreter
+fn pyneeds(files: &BTreeSet<String>, read: &dyn Fn(&str) -> Option<String>, script: &dyn Fn(&str) -> bool) -> BTreeSet<String> {
+    let mut need = BTreeSet::new();
+    let mut queue: Vec<String> = Vec::new();
+    for f in files {
+        if let Some((_, rest)) = f.split_once("/site-packages/") {
+            need.insert("os".to_string());
+            let top = rest.matches('/').count() == 0 && rest.ends_with(".py")
+                || rest.matches('/').count() == 1 && rest.ends_with("/__init__.py");
+            if top {
+                queue.push(f.clone());
+            }
+        } else if script(f) {
+            queue.push(f.clone());
+        }
+    }
+    // a name the package ships somewhere is its own. glib's gdbus-codegen puts its codegen
+    // package on sys.path by hand, setuptools vendors jaraco under _vendor
+    let mut own: HashMap<&str, &str> = files
+        .iter()
+        .filter_map(|f| {
+            let (dir, base) = f.rsplit_once('/')?;
+            let name = match base {
+                "__init__.py" => dir.rsplit('/').next()?,
+                b => b.strip_suffix(".py")?,
+            };
+            Some((name, f.as_str()))
+        })
+        .collect();
+    let dirs: HashSet<&str> = files.iter().flat_map(|f| f.match_indices('/').map(|(i, _)| &f[..i])).collect();
+    // a namespace package has no __init__ to name it, only the dir
+    for d in &dirs {
+        own.entry(d.rsplit('/').next().unwrap_or(d)).or_insert("");
+    }
+    let mut seen: HashSet<String> = queue.iter().cloned().collect();
+    while let Some(f) = queue.pop() {
+        let Some(text) = read(&f) else { continue };
+        let dir = f.rsplit_once('/').map_or("", |(d, _)| d);
+        // what an absolute import resolves against: the site-packages it sits in, or the
+        // script's own directory, which python puts first on sys.path
+        let base = f.split_once("/site-packages/").map_or(dir.to_string(), |(sp, _)| format!("{sp}/site-packages"));
+        for (dots, m, names) in pyimports(&text) {
+            let from = if dots == 0 {
+                base.clone()
+            } else {
+                let mut d = dir;
+                for _ in 1..dots {
+                    d = d.rsplit_once('/').map_or("", |(up, _)| up);
+                }
+                d.to_string()
+            };
+            let parts: Vec<&str> = m.split('.').filter(|p| !p.is_empty()).collect();
+            let top = parts.first().copied().unwrap_or_default();
+            // the files an import runs, resolved against one directory. a.b.c runs
+            // a/__init__.py and a/b/__init__.py on the way
+            let resolve = |from: &str| -> Vec<String> {
+                let path = |m: &str| if m.is_empty() { from.to_string() } else { format!("{from}/{}", m.replace('.', "/")) };
+                let mut hit = Vec::new();
+                for i in 1..=parts.len() {
+                    let p = path(&parts[..i].join("."));
+                    hit.extend([format!("{p}/__init__.py"), format!("{p}.py")].into_iter().filter(|c| files.contains(c)));
+                }
+                for n in &names {
+                    let p = path(&if m.is_empty() { n.clone() } else { format!("{m}.{n}") });
+                    hit.extend([format!("{p}/__init__.py"), format!("{p}.py")].into_iter().filter(|c| files.contains(c)));
+                }
+                hit
+            };
+            let mut hit = resolve(&from);
+            let mine = dots > 0 || !hit.is_empty() || dirs.contains(format!("{from}/{top}").as_str());
+            if !mine {
+                match own.get(top) {
+                    // resolved again from where the package ships it
+                    Some(f) => {
+                        let at = f.strip_suffix("/__init__.py").or(f.strip_suffix(".py")).unwrap_or(f);
+                        hit = resolve(at.rsplit_once('/').map_or("", |(d, _)| d));
+                    }
+                    None if !top.is_empty() && !PY_BUILTIN.contains(&top) && top != "__main__" => {
+                        need.insert(top.to_string());
+                    }
+                    None => {}
+                }
+            }
+            for h in hit {
+                if seen.insert(h.clone()) {
+                    queue.push(h);
+                }
+            }
+        }
+    }
+    need
+}
+
+// whether a file is a python script, by its #! the way the kernel reads it
+fn pyscript(head: &[u8]) -> bool {
+    let Some(line) = head.strip_prefix(b"#!") else { return false };
+    let line = line.split(|c| *c == b'\n').next().unwrap_or_default();
+    let words: Vec<String> = String::from_utf8_lossy(line).split_whitespace().map(str::to_string).collect();
+    interpreter(&words).is_some_and(|w| w.rsplit('/').next().unwrap_or_default().starts_with("python"))
+}
+
+// the package shipping a top-level python module, keyed py:<module> beside so: and cmd:.
+// a module file or package __init__ is the module, a file deeper in a dir without one is a
+// namespace package and only counts when nothing ships the real thing: pygobject has
+// gi/__init__.py and at-spi2-core only drops an override into gi/overrides
+fn pykey(path: &str) -> Option<(String, bool)> {
+    let rest = path.strip_prefix("usr/lib/python3")?.split_once('/')?.1;
+    let rest = rest.strip_prefix("site-packages/").or(rest.strip_prefix("lib-dynload/")).unwrap_or(rest);
+    let (top, deeper) = match rest.split_once('/') {
+        Some((d, r)) => (d, r),
+        None => (rest, ""),
+    };
+    let name = top.split('.').next()?;
+    if name.is_empty() || name == "__pycache__" || top.ends_with("-info") || top == "site-packages" {
+        return None;
+    }
+    // setuptools' distutils-precedence.pth puts its own distutils in place of the one 3.12
+    // took out of the stdlib, so that file is how distutils gets shipped now
+    if let Some(n) = top.strip_suffix("-precedence.pth").filter(|_| deeper.is_empty()) {
+        return Some((format!("py:{n}"), false));
+    }
+    // a namespace package is a dir of packages with no __init__ of its own (jaraco,
+    // sphinxcontrib, google). an override file two levels down is not one of those
+    let (real, space) = match deeper {
+        "" => (top.ends_with(".py") || top.ends_with(".so"), false),
+        "__init__.py" => (true, false),
+        d => (false, d.ends_with(".py") && (!d.contains('/') || d.matches('/').count() == 1 && d.ends_with("/__init__.py"))),
+    };
+    (real || space).then(|| (format!("py:{name}"), real))
 }
 
 fn under(at: &Path, out: &mut Vec<PathBuf>) {
@@ -3208,6 +3571,29 @@ fn compile(
                 if !declared.iter().any(|d| !d.make && d.name == who) && linked.insert(who.clone()) {
                     say!("{} {t} interpreter {who}  {path}", p.name);
                 }
+            }
+            let (found, none) = imported(root, t, &dest);
+            for (who, m) in found {
+                if who != p.name && !declared.iter().any(|d| !d.make && d.name == who) && linked.insert(who.clone()) {
+                    say!("{} {t} imports {who}  {m}", p.name);
+                }
+            }
+            if !none.is_empty() {
+                say!("{} {t} imports what nothing installed ships  {}", p.name, none.join(" "));
+            }
+            for (who, at) in seen(root, t, &p.name) {
+                if who != p.name && !declared.iter().any(|d| !d.make && d.name == who) && linked.insert(who.clone()) {
+                    say!("{} {t} seen loading {who}  /{at}", p.name);
+                }
+            }
+            let (found, none) = noted(root, t, &dest);
+            for (who, so) in found {
+                if who != p.name && linked.insert(who.clone()) {
+                    say!("{} {t} notes {who}  {so}", p.name);
+                }
+            }
+            if !none.is_empty() {
+                say!("{} {t} notes a required dlopen nothing installed ships  {}", p.name, none.join(" "));
             }
             for (who, so) in loaded(root, &deps, t, &dest, &linked) {
                 say!("{} {t} loads {who}  {so}", p.name);
@@ -6952,6 +7338,162 @@ fn mapped() -> (HashMap<String, usize>, usize) {
     (out, blind)
 }
 
+// what running programs were seen to dlopen, one file per consumer under
+// var/kiry/seen/<target>/<pkg>, a line per provider: "<pkg> <path>". a library a process
+// has mapped that nothing its DT_NEEDED reaches explains was dlopened, whatever string
+// built the name -- the one evidence that does not care how. it is per program, put on the
+// executable (or the script an interpreter runs) rather than on whichever library in the
+// process called dlopen, since that is what world and leave() reason about
+//
+// regrows by running things, so deleting it loses nothing for good. a new install of the
+// consumer clears its file: the new build has to be seen again
+const SEEN: &str = "var/kiry/seen";
+
+fn seen(root: &Path, t: &str, name: &str) -> Vec<(String, String)> {
+    fs::read_to_string(root.join(SEEN).join(t).join(name))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string())))
+        .collect()
+}
+
+// the files a process mapped that its DT_NEEDED closure does not explain, less what one
+// of those pulled in after it: what was dlopened, by the name each file is asked for
+fn dlopened(exe: &str, mapped: &BTreeSet<String>, needed: &dyn Fn(&str) -> Vec<String>, soname: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut by_name: HashMap<String, &str> = HashMap::new();
+    for m in mapped {
+        by_name.insert(m.rsplit('/').next().unwrap_or(m).to_string(), m);
+        if let Some(so) = soname(m) {
+            by_name.insert(so, m);
+        }
+    }
+    let mut explained: HashSet<&str> = HashSet::new();
+    let mut walk = vec![exe];
+    while let Some(f) = walk.pop() {
+        if explained.insert(f) {
+            walk.extend(needed(f).iter().filter_map(|n| by_name.get(n).copied()));
+        }
+    }
+    let opened: Vec<&String> = mapped.iter().filter(|m| !explained.contains(m.as_str())).collect();
+    let pulled: HashSet<&str> = opened.iter().flat_map(|m| needed(m)).filter_map(|n| by_name.get(&n).copied()).collect();
+    opened.into_iter().filter(|m| !pulled.contains(m.as_str())).cloned().collect()
+}
+
+// only on the live root, the one the processes run from, and only processes in this
+// mount namespace: a flatpak's /usr/lib is the runtime's and not ours
+fn observe(root: &Path) {
+    if root != Path::new("/") {
+        return;
+    }
+    // (exe, the script an interpreter runs, the shared objects it has mapped), paths
+    // relative and folded the way manifests have them
+    let ns = fs::read_link("/proc/self/ns/mnt").ok();
+    let Ok(rd) = fs::read_dir("/proc") else { return };
+    let mut procs: Vec<(String, Option<String>, BTreeSet<String>)> = Vec::new();
+    for e in rd.flatten() {
+        let d = e.path();
+        if !e.file_name().to_str().is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit())) {
+            continue;
+        }
+        if ns.is_none() || fs::read_link(d.join("ns/mnt")).ok() != ns {
+            continue;
+        }
+        let (Ok(exe), Ok(maps)) = (fs::read_link(d.join("exe")), fs::read_to_string(d.join("maps"))) else { continue };
+        let rel = |p: &str| fold(p.trim_start_matches('/').trim_end_matches(" (deleted)"));
+        let argv = fs::read(d.join("cmdline")).unwrap_or_default();
+        let script = argv
+            .split(|c| *c == 0)
+            .skip(1)
+            .take(3)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .find(|a| a.starts_with('/') && Path::new(a).is_file())
+            .map(|a| rel(&a));
+        let mut mapped = BTreeSet::new();
+        for l in maps.lines() {
+            let Some(at) = l.find('/') else { continue };
+            let path = l[at + 1..].trim_end().trim_end_matches("(deleted)").trim_end();
+            if path.contains(".so") {
+                mapped.insert(rel(path));
+            }
+        }
+        procs.push((rel(&exe.to_string_lossy()), script, mapped));
+    }
+    if procs.is_empty() {
+        return;
+    }
+
+    // who owns each of those paths, and nothing else: indexing every manifest was half
+    // of what this cost
+    let wanted: HashSet<&str> = procs
+        .iter()
+        .flat_map(|(e, s, m)| std::iter::once(e).chain(s).chain(m))
+        .map(String::as_str)
+        .collect();
+    let all: Vec<(String, String)> = db::targets(root)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|t| db::installed(root, &t).unwrap_or_default().into_iter().map(move |n| (t.clone(), n)))
+        .collect();
+    let own: HashMap<String, (String, String)> = each(all.len(), |i| {
+        let (t, n) = &all[i];
+        let Ok(r) = db::read(root, t, n) else { return Vec::new() };
+        r.manifest
+            .iter()
+            .filter(|e| matches!(e.kind, db::Kind::File(_)))
+            .map(|e| match e.path.split('/').next() {
+                Some("lib" | "lib64" | "bin" | "sbin") => fold(&e.path),
+                _ => e.path.clone(),
+            })
+            .filter(|p| wanted.contains(p.as_str()))
+            .map(|p| (p, (t.clone(), n.clone())))
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let files: Vec<&str> = wanted.iter().copied().filter(|p| own.contains_key(*p)).collect();
+    let elves: HashMap<&str, elf::Elf> = files
+        .iter()
+        .copied()
+        .zip(each(files.len(), |i| elf::read(&root.join(files[i])).ok()))
+        .filter_map(|(p, o)| Some((p, o?)))
+        .collect();
+    let needed = |p: &str| elves.get(p).map(|o| o.needed.clone()).unwrap_or_default();
+
+    let mut found: BTreeMap<(String, String), BTreeSet<(String, String)>> = BTreeMap::new();
+    for (exe, script, mapped) in &procs {
+        let Some(mut who) = own.get(exe).cloned() else { continue };
+        // an interpreter runs a script, and the script is the program. one nothing owns
+        // is not a program of ours: galleond's pip pillow is not python's harfbuzz edge
+        if let Some(s) = script {
+            match own.get(s) {
+                Some(o) => who = o.clone(),
+                None => continue,
+            }
+        }
+        let soname = |p: &str| elves.get(p).and_then(|o| o.soname.clone());
+        for m in dlopened(exe, mapped, &needed, &soname) {
+            let Some((t, n)) = own.get(&m) else { continue };
+            if *t == who.0 && *n != who.1 && !BASE.contains(&n.as_str()) {
+                found.entry(who.clone()).or_default().insert((n.clone(), m.clone()));
+            }
+        }
+    }
+    for ((t, name), add) in found {
+        let mut all: BTreeSet<(String, String)> = seen(root, &t, &name).into_iter().collect();
+        let before = all.len();
+        all.extend(add);
+        if all.len() == before {
+            continue;
+        }
+        let text: String = all.iter().map(|(n, m)| format!("{n} {m}\n")).collect();
+        let at = root.join(SEEN).join(&t);
+        // a doctor run as a user reads what it can and writes nothing
+        let _ = mkdirs(&at).and_then(|()| put(&at.join(&name), &text));
+    }
+}
+
 fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
     let jobs = match install::plan(root, archives, force) {
         Ok(j) => j,
@@ -6965,6 +7507,7 @@ fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
 
     for j in &jobs {
         say!("{} {} {} ok", j.name, j.version.upstream, j.target);
+        let _ = fs::remove_file(root.join(SEEN).join(&j.target).join(&j.name));
     }
     for k in &done.edits {
         say!(
@@ -7239,6 +7782,7 @@ fn unwish(root: &Path, names: &[String]) {
 // says so, rather than guess which one it was
 fn leave(root: &Path) {
     let Some(asked) = asked_for(root) else { return };
+    observe(root);
     let host = sandbox::host();
     let mut roots: Vec<String> = asked;
     roots.extend(BASE.iter().chain(SUBSTRATE).map(|s| (*s).to_string()));
@@ -7260,6 +7804,12 @@ fn leave(root: &Path) {
         while let Some((t, n)) = queue.pop() {
             if !keep.insert((t.clone(), n.clone())) {
                 continue;
+            }
+            // what the program was seen to dlopen holds as well as what its record says
+            for (d, _) in seen(root, &t, &n) {
+                if installed.contains(&(t.clone(), d.clone())) {
+                    queue.push((t.clone(), d));
+                }
             }
             let Ok(r) = db::read(root, &t, &n) else { continue };
             for d in r.depends.iter().filter(|d| !d.make && d.applies(&t)) {
@@ -7295,6 +7845,9 @@ fn leave(root: &Path) {
                     let cmd = interpreter(&words).unwrap_or_default();
                     let cmd = cmd.rsplit('/').next().unwrap_or_default().to_string();
                     own.get(&(t.clone(), format!("cmd:{cmd}"))).and_then(|o| gone.iter().find(|(gt, n)| gt == t && n == o))
+                }
+                What::NoModule(m) => {
+                    own.get(&(t.clone(), format!("py:{m}"))).and_then(|o| gone.iter().find(|(gt, n)| gt == t && n == o))
                 }
                 _ => None,
             };
@@ -7732,6 +8285,7 @@ fn owners(root: &Path) -> HashMap<(String, String), String> {
     // a copy under a package's own directory is that package's: electron ships a
     // libvulkan.so.1, and electron sorts before vulkan-loader
     let mut private: HashSet<(String, String)> = HashSet::new();
+    let mut realpy: HashSet<(String, String)> = HashSet::new();
     for t in db::targets(root).unwrap_or_default() {
         let dirs = defaults(&t).unwrap_or_default();
         for name in db::installed(root, &t).unwrap_or_default() {
@@ -7748,6 +8302,16 @@ fn owners(root: &Path) -> HashMap<(String, String), String> {
             let Ok(rec) = db::read(root, &t, &name) else { continue };
             for e in &rec.manifest {
                 let path = e.path.as_str();
+                if let Some((key, real)) = pykey(path) {
+                    let key = (t.clone(), key);
+                    if real && !realpy.contains(&key) {
+                        realpy.insert(key.clone());
+                        out.insert(key, name.clone());
+                    } else {
+                        out.entry(key).or_insert_with(|| name.clone());
+                    }
+                    continue;
+                }
                 let key = if let Some(c) = ["usr/bin/", "usr/sbin/", "bin/", "sbin/"]
                     .iter()
                     .find_map(|d| path.strip_prefix(d))
@@ -10880,6 +11444,7 @@ fn doctor_cmd(args: &[String]) {
         Err(e) => die(e.to_string()),
     };
 
+    observe(&root);
     let mut found = 0;
     let (all, waiting) = checks_without(&root, &[]);
     for (t, f) in all {
@@ -11098,6 +11663,7 @@ enum What {
     CrossTier(String),
     Unresolved(String),
     NoInterpreter(String),
+    NoModule(String),
     MissingSymbol(String),
     Duplicate(usize, String),
     MissingUser(String),
@@ -11116,6 +11682,7 @@ impl fmt::Display for What {
             What::CrossTier(p) => write!(f, "cross-tier {p}"),
             What::Unresolved(n) => write!(f, "unresolved {n}"),
             What::NoInterpreter(w) => write!(f, "no-interpreter {w}"),
+            What::NoModule(m) => write!(f, "no-module {m}"),
             What::MissingSymbol(s) => write!(f, "missing-symbol {s}"),
             What::Duplicate(n, p) => write!(f, "duplicate-symbols {n} {p}"),
             What::MissingUser(u) => write!(f, "missing-user {u}"),
@@ -11132,11 +11699,11 @@ impl What {
         matches!(self, What::Unresolved(_) | What::MissingSymbol(_))
     }
 
-    // the three that mean a file on disk will not run, as against the ones worth reading
+    // the ones that mean a file on disk will not run, as against the ones worth reading
     fn breaks(&self) -> bool {
         matches!(
             self,
-            What::Unresolved(_) | What::MissingSymbol(_) | What::NoInterpreter(_)
+            What::Unresolved(_) | What::MissingSymbol(_) | What::NoInterpreter(_) | What::NoModule(_)
         )
     }
 }
@@ -11201,35 +11768,9 @@ fn accounted(
     uniq.sort_unstable();
     uniq.dedup();
     for name in uniq {
-        let Some(own) = deps.get(name) else {
-            continue;
-        };
-        let mut direct: HashSet<String> = own
-            .iter()
-            .filter(|d| !d.make && d.applies(target))
-            .map(|d| d.name.clone())
-            .collect();
-        direct.extend(
-            sandbox::substrate(target)
-                .iter()
-                .filter(|(_, make)| !make)
-                .map(|(n, _)| (*n).to_string()),
-        );
-        let mut reach: HashSet<String> = HashSet::new();
-        let mut queue: Vec<String> = direct.iter().cloned().collect();
-        while let Some(n) = queue.pop() {
-            if !reach.insert(n.clone()) {
-                continue;
-            }
-            if let Some(r) = deps.get(&n) {
-                queue.extend(
-                    r.iter()
-                        .filter(|d| !d.make && d.applies(target))
-                        .map(|d| d.name.clone()),
-                );
-            }
+        if let Some(e) = reached(target, deps, name) {
+            edges.insert(name, e);
         }
-        edges.insert(name, (direct, reach));
     }
 
     let mut said: HashSet<(&str, &str, &str)> = HashSet::new();
@@ -11265,6 +11806,86 @@ fn accounted(
                     elves[i].0.clone(),
                 ),
             });
+        }
+    }
+    out
+}
+
+// a package's own runtime lines, with the substrate every one of them gets, and everything
+// those reach in turn
+fn reached(target: &str, deps: &HashMap<String, Vec<Dep>>, name: &str) -> Option<(HashSet<String>, HashSet<String>)> {
+    let own = deps.get(name)?;
+    let mut direct: HashSet<String> = own
+        .iter()
+        .filter(|d| !d.make && d.applies(target))
+        .map(|d| d.name.clone())
+        .collect();
+    direct.extend(
+        sandbox::substrate(target)
+            .iter()
+            .filter(|(_, make)| !make)
+            .map(|(n, _)| (*n).to_string()),
+    );
+    let mut reach: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = direct.iter().cloned().collect();
+    while let Some(n) = queue.pop() {
+        if !reach.insert(n.clone()) {
+            continue;
+        }
+        if let Some(r) = deps.get(&n) {
+            queue.extend(
+                r.iter()
+                    .filter(|d| !d.make && d.applies(target))
+                    .map(|d| d.name.clone()),
+            );
+        }
+    }
+    Some((direct, reach))
+}
+
+// the import check, what accounted() is for DT_NEEDED: a module a package's python can't
+// start without that nothing installed ships, and one that is there only because
+// something else dragged its owner in
+fn pychecked(
+    root: &Path,
+    target: &str,
+    deps: &HashMap<String, Vec<Dep>>,
+    pyown: &HashMap<String, (String, bool)>,
+    pyfiles: &[(String, BTreeSet<String>)],
+    pyrun: &HashSet<String>,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    // no interpreter on this target, so its python files are data a build left there: the
+    // gnu tier gets vulkan-headers' registry scripts and nothing that runs them
+    if !pyown.contains_key("py:os") {
+        return out;
+    }
+    let mut said: HashSet<(&str, String)> = HashSet::new();
+    for (name, files) in pyfiles {
+        // a package with its own libpython runs its python on that, the way bundles() reads
+        // a package with its own loader: plex's python 2 is all of plex's
+        if files.iter().any(|f| f.rsplit('/').next().is_some_and(|b| b.starts_with("libpython"))) {
+            continue;
+        }
+        let read = |f: &str| fs::read_to_string(root.join(f)).ok();
+        let script = |f: &str| pyrun.contains(f);
+        let need = pyneeds(files, &read, &script);
+        if need.is_empty() {
+            continue;
+        }
+        let Some((direct, reach)) = reached(target, deps, name) else { continue };
+        for m in need {
+            let what = match pyown.get(&format!("py:{m}")) {
+                None => What::NoModule(m),
+                Some((who, _)) if who == name || direct.contains(who) => continue,
+                // the package, not the module: one line in its depends covers them all
+                Some((who, _)) if !said.insert((name.as_str(), who.clone())) => continue,
+                Some((who, _)) => {
+                    let kind = if reach.contains(who) { "undeclared" } else { "build-only" };
+                    What::Undeclared(kind, who.clone(), format!("py:{m}"), name.clone())
+                }
+            };
+            out.push(Finding { pkg: name.clone(), path: name.clone(), what });
         }
     }
     out
@@ -11308,6 +11929,11 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
     let mut deps: HashMap<String, Vec<Dep>> = HashMap::new();
     let mut users: Vec<(String, Vec<String>)> = Vec::new();
     let mut own: Vec<(String, String)> = Vec::new();
+    // py:<module> -> the package shipping it, and whether that is the module itself or a
+    // file in a namespace package. then each package with python in it, and its scripts
+    let mut pyown: HashMap<String, (String, bool)> = HashMap::new();
+    let mut pyfiles: Vec<(String, BTreeSet<String>)> = Vec::new();
+    let mut pyrun: HashSet<String> = HashSet::new();
 
     for (name, one) in names.iter().zip(scans(root, target, &names)) {
         let (mut rec, seen) = match one {
@@ -11321,12 +11947,26 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
         // points at the loader itself
         index(&rec.manifest, &mut present, &mut links);
         own.extend(bundles(rec.manifest.iter().map(|e| e.path.as_str()), target));
+        for e in &rec.manifest {
+            if let Some((key, real)) = pykey(&e.path) {
+                if real || !pyown.contains_key(&key) {
+                    pyown.insert(key, (name.clone(), real));
+                }
+            }
+        }
+        if rec.manifest.iter().any(|e| e.path.ends_with(".py")) || seen.iter().any(|(_, w)| matches!(w, install::Seen::Script(_))) {
+            let files = rec.manifest.iter().filter(|e| matches!(e.kind, db::Kind::File(_))).map(|e| e.path.clone()).collect();
+            pyfiles.push((name.clone(), files));
+        }
 
         let mut mine = Vec::new();
         for (path, what) in seen {
             let o = match what {
                 install::Seen::Elf(o) => o,
                 install::Seen::Script(words) => {
+                    if interpreter(&words).is_some_and(|w| w.rsplit('/').next().unwrap_or_default().starts_with("python")) {
+                        pyrun.insert(path.clone());
+                    }
                     shebangs.push((name.clone(), path, words));
                     continue;
                 }
@@ -11466,6 +12106,23 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
     }
 
     out.extend(accounted(target, &deps, &elves, &owners, &needs));
+    out.extend(pychecked(root, target, &deps, &pyown, &pyfiles, &pyrun));
+    // a dlopen a running program was seen doing that its record cannot account for
+    for name in &names {
+        let Some((direct, reach)) = reached(target, &deps, name) else { continue };
+        let mut said: HashSet<String> = HashSet::new();
+        for (who, at) in seen(root, target, name) {
+            if direct.contains(&who) || !deps.contains_key(&who) || !said.insert(who.clone()) {
+                continue;
+            }
+            let kind = if reach.contains(&who) { "undeclared" } else { "build-only" };
+            out.push(Finding {
+                pkg: name.clone(),
+                path: name.clone(),
+                what: What::Undeclared(kind, who, format!("seen:{at}"), name.clone()),
+            });
+        }
+    }
     let waiting = (first_kept..elves.len()).filter(|j| linked.contains(j)).count();
 
     // a perl xs module is dlopened, so nothing links it and it is not asked. the library
@@ -12628,10 +13285,54 @@ mod sidecar {
         let mut all = deps.clone();
         all.push(make);
 
-        assert_eq!(
-            unbacked(&root, &all, T, &dest),
-            vec!["plain".to_string(), "cli".to_string(), "short".to_string(), "unbuiltplain".to_string()]
+        let dropped = vec!["plain".to_string(), "cli".to_string(), "short".to_string(), "unbuiltplain".to_string()];
+        assert_eq!(unbacked(&root, &all, T, &dest), dropped);
+
+        // a format string that makes a library name decides nothing in a file that cannot
+        // dlopen, and keeps every listed library in one that can
+        let c = |name: &str, src: &str| {
+            let out = dest.join("usr/lib").join(name);
+            mkdirs(out.parent().unwrap()).unwrap();
+            let at = out.with_extension("c");
+            fs::write(&at, src).unwrap();
+            let ok = Command::new("clang").args(["-shared", "-fPIC", "-nostdlib", "-o"]).arg(&out).arg(&at).status().unwrap();
+            assert!(ok.success());
+            fs::remove_file(&at).unwrap();
+        };
+        c("libfmt.so", "const char *fmt = \"%s/%s.so\";\n");
+        assert_eq!(unbacked(&root, &all, T, &dest), dropped);
+        c("libdl.so", "extern void *dlopen(const char *, int);\nvoid *f(const char *n) { return dlopen(n, 0); }\nconst char *fmt = \"lib%s.so\";\n");
+        assert!(unbacked(&root, &all, T, &dest).is_empty());
+    }
+
+    // UAPI.12 notes, the way SD_ELF_NOTE_DLOPEN writes them: required and recommended are
+    // runtime edges to what ships the first soname here, suggested is nothing, and a
+    // required one nobody ships comes back to be printed
+    #[test]
+    fn a_dlopen_note_is_a_runtime_edge() {
+        let at = scratch("notes");
+        let root = at.join("root");
+        let dest = at.join("dest");
+        installed(&root, "libxkbcommon", &[("usr/lib/libxkbcommon.so.0", 0o755)], &["libxkbcommon.so.0"]);
+        installed(&root, "foo", &[("usr/lib/libfoo.so.9", 0o755)], &["libfoo.so.9"]);
+        installed(&root, "alt", &[("usr/lib/libalt.so.2", 0o755)], &["libalt.so.2"]);
+        let json = r#"[{"feature":"xkb","description":"keyboard {layouts}","soname":["libxkbcommon.so.0"],"priority":"required"},{"soname":["libfoo.so.9"],"priority":"suggested"},{"soname":["libmissing.so.1","libalt.so.2"]},{"soname":["libnone.so.1"],"priority":"required"},{"soname":["libgone.so.3"],"priority":"recommended"}]"#;
+        let src = format!(
+            "#define J \"{}\"\n__attribute__((used, section(\".note.dlopen\"), aligned(4))) static const struct {{ unsigned a, b, c; char n[4]; char d[(sizeof(J) + 3) & ~3]; }} note = {{ 4, sizeof(J), 0x407c0c0a, \"FDO\", J }};\n",
+            json.replace('"', "\\\"")
         );
+        let out = dest.join("usr/bin/app");
+        mkdirs(out.parent().unwrap()).unwrap();
+        let c = at.join("app.c");
+        fs::write(&c, src).unwrap();
+        assert!(Command::new("clang").args(["-shared", "-fPIC", "-nostdlib", "-o"]).arg(&out).arg(&c).status().unwrap().success());
+
+        let (found, none) = noted(&root, T, &dest);
+        assert_eq!(
+            found,
+            vec![("alt".to_string(), "libalt.so.2".to_string()), ("libxkbcommon".to_string(), "libxkbcommon.so.0".to_string())]
+        );
+        assert_eq!(none, vec!["libnone.so.1"]);
     }
 
     // sdl2 links none of what it dlopens. a closure member whose soname an elf in the
@@ -13169,6 +13870,105 @@ mod names {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
+mod python {
+    use super::*;
+
+    const T: &str = "x86_64-musl";
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("kiry-python-{}", std::process::id())).join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn put(at: &Path, text: &str, mode: u32) {
+        mkdirs(at.parent().unwrap()).unwrap();
+        fs::write(at, text).unwrap();
+        fs::set_permissions(at, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    // column 0 is a statement that runs on import, anything indented is under a try, an
+    // if or a def. a docstring mentioning an import is neither
+    #[test]
+    fn only_a_column_0_import_outside_a_string_counts() {
+        let text = "\"\"\"usage:\nimport notreal\n\"\"\"\nimport os, re as regex\nfrom . import (a,\n    b as c)\nfrom ..up.x import y  # why\ntry:\n    import simplejson\nexcept ImportError:\n    pass\ndef f():\n    import lazy\n";
+        let got: Vec<(usize, String, Vec<String>)> = pyimports(text);
+        let want = vec![
+            (0, "os".to_string(), vec![]),
+            (0, "re".to_string(), vec![]),
+            (1, String::new(), vec!["a".to_string(), "b".to_string()]),
+            (2, "up.x".to_string(), vec!["y".to_string()]),
+        ];
+        assert_eq!(got, want);
+    }
+
+    // walked from what gets run or imported from outside, through the package's own
+    // modules. a submodule nothing reaches keeps its imports optional
+    #[test]
+    fn needs_are_what_the_entry_points_reach() {
+        let sp = "usr/lib/python3.14/site-packages";
+        let text: HashMap<String, &str> = [
+            (format!("{sp}/foo/__init__.py"), "import os\nimport sys\nimport requests\nfrom . import sub\ntry:\n    import simplejson\nexcept ImportError:\n    pass\n"),
+            (format!("{sp}/foo/sub.py"), "import yaml\n"),
+            (format!("{sp}/foo/sphinxext.py"), "import sphinx\n"),
+            (format!("{sp}/foo/cli.py"), "from .sub import thing\nimport click\n"),
+            ("usr/bin/foo".to_string(), "#!/usr/bin/python3\nfrom foo.cli import main\n"),
+        ]
+        .into_iter()
+        .collect();
+        let files: BTreeSet<String> = text.keys().cloned().collect();
+        let read = |f: &str| text.get(f).map(|t| (*t).to_string());
+        let script = |f: &str| f == "usr/bin/foo";
+        let got: Vec<String> = pyneeds(&files, &read, &script).into_iter().collect();
+        assert_eq!(got, vec!["click", "os", "requests", "yaml"]);
+    }
+
+    // the module is whoever ships its __init__ or its file. a file two levels into
+    // someone else's package is an override, not a namespace package
+    #[test]
+    fn an_import_is_answered_by_the_package_shipping_the_module() {
+        let at = scratch("imported");
+        let root = at.join("root");
+        let dest = at.join("dest");
+        let sp = "usr/lib/python3.14/site-packages";
+        names_installed(&root, "python3", &["usr/lib/python3.14/os.py", "usr/lib/python3.14/lib-dynload/_bz2.cpython-314-x86_64-linux-musl.so"]);
+        names_installed(&root, "py3-requests", &[&format!("{sp}/requests/__init__.py")]);
+        names_installed(&root, "at-spi2-core", &[&format!("{sp}/gi/overrides/Atspi.py")]);
+        names_installed(&root, "py3-jaraco", &[&format!("{sp}/jaraco/functools/__init__.py")]);
+        put(&dest.join(format!("{sp}/app/__init__.py")), "import requests\nimport gi\nimport jaraco.functools\nimport _bz2\n", 0o644);
+
+        let (found, none) = imported(&root, T, &dest);
+        let mut found: Vec<String> = found.into_iter().map(|(w, m)| format!("{w} {m}")).collect();
+        found.sort();
+        assert_eq!(found, vec!["py3-jaraco jaraco", "py3-requests requests", "python3 _bz2", "python3 os"]);
+        assert_eq!(none, vec!["gi"]);
+    }
+
+    fn names_installed(root: &Path, name: &str, files: &[&str]) {
+        db::write(
+            root,
+            &db::Installed {
+                name: name.into(),
+                target: T.into(),
+                version: pkg::Version::parse("1.0 1").unwrap(),
+                depends: Vec::new(),
+                manifest: files
+                    .iter()
+                    .map(|f| db::Entry { mode: 0o644, kind: db::Kind::File("0".repeat(64)), path: (*f).to_string() })
+                    .collect(),
+                hash: String::new(),
+                users: Vec::new(),
+                flags: Vec::new(),
+            },
+        )
+        .unwrap();
+        db::write_provides(root, T, name, &[]).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod gentoo_flags {
     use super::*;
 
@@ -13582,6 +14382,55 @@ mod leaving {
 
         leave(&root);
         assert_eq!(have(&root), vec!["app", "hidden"]);
+    }
+
+    // a plugin the program was seen to dlopen holds like a runtime line, and a seen file
+    // naming something not installed holds nothing
+    #[test]
+    fn what_a_program_was_seen_loading_stays() {
+        let root = scratch("seen");
+        installed(&root, "app", &[("usr/bin/app", 0o755)], &[]);
+        installed(&root, "plugin", &[("usr/lib/plug/plug.so", 0o755)], &[]);
+        installed(&root, "builddep", &[("usr/bin/builddep", 0o755)], &[]);
+        mkdirs(&root.join("etc/kiry")).unwrap();
+        fs::write(root.join(WORLD), "app\n").unwrap();
+        mkdirs(&root.join(SEEN).join(T)).unwrap();
+        fs::write(root.join(SEEN).join(T).join("app"), "plugin usr/lib/plug/plug.so\ngone usr/lib/gone.so\n").unwrap();
+
+        leave(&root);
+        assert_eq!(have(&root), vec!["app", "plugin"]);
+    }
+
+    // what DT_NEEDED explains is linked, what a dlopened file pulls in came with it, and
+    // the rest of what the process maps was dlopened
+    #[test]
+    fn what_no_needed_entry_explains_was_dlopened() {
+        let mapped: BTreeSet<String> = [
+            "usr/lib/libSDL2.so.0.3", "usr/lib/libwayland-client.so.0.2", "usr/lib/libffi.so.8.1",
+            "usr/lib/libdecor-0.so.0", "usr/lib/libdecor/plugins-1/libdecor-cairo.so", "usr/lib/libcairo.so.2",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let needed = |f: &str| -> Vec<String> {
+            let n: &[&str] = match f {
+                "usr/bin/game" => &["libSDL2-2.0.so.0"],
+                "usr/lib/libwayland-client.so.0.2" => &["libffi.so.8"],
+                "usr/lib/libdecor/plugins-1/libdecor-cairo.so" => &["libcairo.so.2", "libdecor-0.so.0"],
+                _ => &[],
+            };
+            n.iter().map(|s| (*s).to_string()).collect()
+        };
+        let soname = |f: &str| match f {
+            "usr/lib/libSDL2.so.0.3" => Some("libSDL2-2.0.so.0".to_string()),
+            "usr/lib/libwayland-client.so.0.2" => Some("libwayland-client.so.0".to_string()),
+            "usr/lib/libffi.so.8.1" => Some("libffi.so.8".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            dlopened("usr/bin/game", &mapped, &needed, &soname),
+            vec!["usr/lib/libdecor/plugins-1/libdecor-cairo.so", "usr/lib/libwayland-client.so.0.2"]
+        );
     }
 
     #[test]

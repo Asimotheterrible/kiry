@@ -2203,10 +2203,13 @@ fn noted(root: &Path, t: &str, dest: &Path) -> (Vec<(String, String)>, Vec<Strin
 // .xz is a suffix and not the program
 fn mentions(bytes: &[u8], name: &str) -> bool {
     let word = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+');
-    let n = name.len();
+    let (n, nb) = (name.len(), name.as_bytes());
+    // the first byte before a memcmp, which windows() called at every offset
     !name.is_empty()
-        && bytes.windows(n).enumerate().any(|(i, w)| {
-            w == name.as_bytes()
+        && bytes.len() >= n
+        && (0..=bytes.len() - n).any(|i| {
+            bytes[i] == nb[0]
+                && &bytes[i..i + n] == nb
                 && (i == 0 || !(word(bytes[i - 1]) || bytes[i - 1] == b'.'))
                 && bytes.get(i + n).is_none_or(|b| !word(*b))
         })
@@ -7883,20 +7886,24 @@ fn lineage(
 // the execs that count: the program names what it ran as a word of its own. dwl runs what
 // a key is bound to and that is in the binary. a shell runs whatever is typed at it and
 // names half the world anyway, bash's ip and ps and busybox's every applet, so what
-// /etc/shells lists never counts. each program is read once, they can be large
+// /etc/shells lists never counts. each program is read once and searched once a name,
+// they can be large: cargo test's thousands of clang runs had kiry i spinning 20 minutes
+// on the test binary
 fn named_runs(
     ran: &[(String, String, String)],
     shells: &HashSet<String>,
     read: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Vec<(String, String)> {
-    let mut by: BTreeMap<&str, Vec<&(String, String, String)>> = BTreeMap::new();
+    let mut by: BTreeMap<&str, BTreeMap<&str, BTreeSet<&str>>> = BTreeMap::new();
     for r in ran.iter().filter(|r| r.0 != r.1 && !shells.contains(&r.0)) {
-        by.entry(r.0.as_str()).or_default().push(r);
+        by.entry(r.0.as_str()).or_default().entry(r.2.as_str()).or_default().insert(r.1.as_str());
     }
     let mut out = Vec::new();
-    for (p, rs) in by {
+    for (p, names) in by {
         let Some(b) = read(p) else { continue };
-        out.extend(rs.into_iter().filter(|r| mentions(&b, &r.2)).map(|r| (r.0.clone(), r.1.clone())));
+        for (_, fs) in names.into_iter().filter(|(n, _)| mentions(&b, n)) {
+            out.extend(fs.into_iter().map(|f| (p.to_string(), f.to_string())));
+        }
     }
     out
 }
@@ -7904,6 +7911,9 @@ fn named_runs(
 // the #! line of a script, or None for anything else
 fn hashbang(p: &str) -> Option<String> {
     let mut head = [0u8; 256];
+    if !regular(p) {
+        return None;
+    }
     let n = fs::File::open(p).and_then(|mut f| f.read(&mut head)).ok()?;
     let l = head[..n].split(|c| *c == b'\n').next()?;
     l.strip_prefix(b"#!").map(|s| String::from_utf8_lossy(s).into_owned())
@@ -7920,10 +7930,17 @@ fn script_of(args: &[String]) -> Option<String> {
         .find(|a| {
             let mut head = [0u8; 2];
             a.starts_with('/')
+                && regular(a)
                 && fs::File::open(a.as_str()).and_then(|mut f| f.read_exact(&mut head)).is_ok()
                 && (&head == b"#!" || SCRIPTS.iter().any(|x| a.ends_with(x)))
         })
         .cloned()
+}
+
+// an argument can be a device: something ran with /dev/dri/renderD128 and kiry i sat in a
+// read of it with the lineage lock held, and a fifo blocks the open itself
+fn regular(p: &str) -> bool {
+    fs::metadata(p).is_ok_and(|m| m.is_file())
 }
 
 fn argv_of(cmdline: &[u8]) -> Vec<String> {
@@ -15418,7 +15435,9 @@ mod leaving {
             r("usr/bin/yash", "usr/bin/git", "git"),
             r("usr/bin/dwl", "usr/bin/foot", "foot"),
             r("usr/bin/dwl", "usr/bin/footclient", "footclient"),
+            r("usr/bin/dwl", "usr/bin/foot", "foot"),
             r("usr/bin/foot", "usr/bin/foot", "foot"),
+            r("usr/bin/tiny", "usr/bin/footclient", "footclient"),
         ];
         let read = |p: &str| match p {
             "usr/bin/yash" => Some(b"\0exec\0digit\0".to_vec()),
@@ -15462,6 +15481,19 @@ mod leaving {
         let up = "../".repeat(here.components().count() - 1);
         assert!(fs::File::open(format!("{up}{}", &module[1..])).is_ok());
         assert_eq!(script_of(&args(&[&format!("{up}{}", &module[1..])])), None);
+    }
+
+    #[test]
+    fn a_device_or_a_fifo_argument_is_not_opened() {
+        let d = scratch("fifoarg");
+        let fifo = d.join("x.sh").to_string_lossy().into_owned();
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((script_of(&[f.clone()]), hashbang(&f)));
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).expect("blocked on the fifo"), (None, None));
     }
 
     // the offset a uprobe goes on, checked against readelf's symbol value and load

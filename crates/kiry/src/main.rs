@@ -7636,8 +7636,6 @@ fn arm(root: &Path) {
     let _ = put(&ex.join("events/sched/sched_process_exec/enable"), "1");
     let _ = put(&ex.join("events/sched/sched_process_fork/enable"), "1");
     let _ = put(&ex.join("events/kiryexec/enable"), "1");
-    // a thread's dlopen carries its own pid, and the program is the thread group's
-    let _ = put(&inst.join("options/record-tgid"), "1");
     if put(&inst.join("events/kiry/enable"), "1").is_ok() {
         let _ = mkdirs(&root.join(TRACED).with_file_name("")).and_then(|()| put(&root.join(TRACED), &stamp));
     }
@@ -7665,15 +7663,18 @@ fn drained(inst: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-// one trace event. a line is "comm-pid (tgid) [cpu] flags ts: event: args", tgid -------
-// when the kernel had not recorded it
+// one trace event. a line is "comm-pid [cpu] flags ts: event: args", with a (tgid) before
+// the cpu where record-tgid is on. that tgid is read out of a cache the kernel fills
+// lazily by pid: a short-lived wpctl on a pid a librewolf thread once had printed
+// librewolf's, and put pipewire on it. the pid is the thread itself, and a fork hands a
+// thread its parent's program like it does a process
 #[derive(Debug, Clone, PartialEq)]
 enum Ev {
     // pid, the file execve ran, argv[1..3] as it was called with them
     Exec(u32, String, Vec<String>),
     // parent, child: a thread too, and chromium's zygote children never exec
     Fork(u32, u32),
-    // the pid the program is known by, target, name asked, whether it loaded
+    // the thread that asked, target, name asked, whether it loaded
     Asked(u32, String, String, bool),
 }
 
@@ -7682,12 +7683,12 @@ enum Ev {
 fn trace_events(text: &str, probes: &HashMap<String, String>) -> Vec<(f64, Ev)> {
     let mut out = Vec::new();
     let mut argv: HashMap<u32, Vec<String>> = HashMap::new();
-    let mut open: HashMap<u32, Vec<(u32, String, String)>> = HashMap::new();
+    let mut open: HashMap<u32, Vec<(String, String)>> = HashMap::new();
     for l in text.lines() {
-        let Some((head, rest)) = l.split_once(") [") else { continue };
-        let Some((left, tgid)) = head.rsplit_once('(') else { continue };
-        let Some(pid) = left.trim_end().rsplit('-').next().and_then(|p| p.parse::<u32>().ok()) else { continue };
-        let key = tgid.trim().parse::<u32>().unwrap_or(pid);
+        let Some((head, rest)) = l.split_once("] ") else { continue };
+        let Some((pre, _cpu)) = head.rsplit_once('[') else { continue };
+        let left = pre.trim_end().strip_suffix(')').and_then(|p| p.rsplit_once('(')).map_or(pre, |(l, _)| l);
+        let Some(pid) = left.trim().rsplit('-').next().and_then(|p| p.parse::<u32>().ok()) else { continue };
         let Some((stamp, r)) = rest.split_once(": ") else { continue };
         let Some((ev, args)) = r.split_once(": ") else { continue };
         let ts = stamp.rsplit(' ').next().and_then(|t| t.parse::<f64>().ok()).unwrap_or_default();
@@ -7717,12 +7718,12 @@ fn trace_events(text: &str, probes: &HashMap<String, String>) -> Vec<(f64, Ev)> 
                 .split_once("name=\"")
                 .and_then(|(_, n)| n.rsplit_once('"'))
                 .map_or(String::new(), |(n, _)| n.to_string());
-            open.entry(pid).or_default().push((key, t.clone(), name));
+            open.entry(pid).or_default().push((t.clone(), name));
         } else if ev.strip_suffix("_ret").is_some_and(|e| probes.contains_key(e)) {
-            let Some((key, t, name)) = open.get_mut(&pid).and_then(Vec::pop) else { continue };
+            let Some((t, name)) = open.get_mut(&pid).and_then(Vec::pop) else { continue };
             let ok = args.rsplit_once("handle=").is_some_and(|(_, h)| h.trim() != "0x0");
             if !name.is_empty() {
-                out.push((ts, Ev::Asked(key, t, name, ok)));
+                out.push((ts, Ev::Asked(pid, t, name, ok)));
             }
         }
     }
@@ -15031,9 +15032,10 @@ mod leaving {
         );
     }
 
-    // the trace as tracefs prints it: a thread's dlopen belongs to its thread group, a
-    // constructor's dlopen inside another pairs with its own return, a handle of 0x0 is a
-    // load that failed, and the two instances' lines come out in time order
+    // the trace as tracefs prints it, with a (tgid) column or without: a dlopen is put on
+    // the thread that asked and never on the printed tgid, a constructor's dlopen inside
+    // another pairs with its own return, a handle of 0x0 is a load that failed, and the two
+    // instances' lines come out in time order
     #[test]
     fn a_traced_dlopen_is_paired_and_put_on_its_process() {
         let dl = r#"
@@ -15045,11 +15047,12 @@ mod leaving {
             game-400     (-------) [005] DBZff    12.000030: dl_x86_64_musl_ret: (0x55d000000000 <- 0x7f00000c10f0) handle=0x0
            steam-500     (    500) [002] DBZff    13.000000: dl_x86_64_gnu_ret: (0x55d000000000 <- 0x7f0000095ba0) handle=0x7f4fde823940
 "#;
+        // kiry-exec records no tgid, so its lines have no (tgid) column
         let ex = r#"
-              sh-100     (    100) [001] .....    10.000000: sched_process_exec: filename=/usr/bin/vesktop pid=100 old_pid=100
-        electron-100     (    100) [001] ..Zff    10.100000: args: (__x64_sys_execve+0x4/0x60) a1="--ozone-platform=wayland" a2="/usr/lib/vesktop/app.asar" a3=(fault)
-        electron-100     (    100) [001] .....    10.100100: sched_process_exec: filename=/usr/bin/electron pid=100 old_pid=100
-        electron-100     (    100) [001] .....    10.200000: sched_process_fork: comm=electron pid=100 child_comm=electron child_pid=101
+              sh-100     [001] .....    10.000000: sched_process_exec: filename=/usr/bin/vesktop pid=100 old_pid=100
+        electron-100     [001] ..Zff    10.100000: args: (__x64_sys_execve+0x4/0x60) a1="--ozone-platform=wayland" a2="/usr/lib/vesktop/app.asar" a3=(fault)
+        electron-100     [001] .....    10.100100: sched_process_exec: filename=/usr/bin/electron pid=100 old_pid=100
+        electron-100     [001] .....    10.200000: sched_process_fork: comm=electron pid=100 child_comm=electron child_pid=101
 "#;
         let probes: HashMap<String, String> =
             [("dl_x86_64_musl", "x86_64-musl"), ("dl_x86_64_gnu", "x86_64-gnu")].map(|(a, b)| (a.to_string(), b.to_string())).into();
@@ -15061,7 +15064,7 @@ mod leaving {
                 Ev::Exec(100, "/usr/bin/vesktop".into(), vec![]),
                 Ev::Exec(100, "/usr/bin/electron".into(), vec!["--ozone-platform=wayland".into(), "/usr/lib/vesktop/app.asar".into()]),
                 Ev::Fork(100, 101),
-                asked(100, "libnotify.so.4", true),
+                asked(101, "libnotify.so.4", true),
                 asked(400, "libcairo.so.2", true),
                 asked(400, "/usr/lib/libdecor/plugins-1/libdecor-cairo.so", false),
             ]

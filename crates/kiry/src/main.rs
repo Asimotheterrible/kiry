@@ -1181,9 +1181,18 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
     let to = (f + 3).min(lines.len());
     out.extend(lines[f.saturating_sub(40)..to].iter().rev().filter_map(|l| miss(l)));
     out.extend(noted.lines().rev().filter_map(|l| l.split_once(' ')).map(|(k, n)| format!("{k}:{}", n.trim())));
+    // setuptools warns about a setup() keyword nobody registered and builds on, so the
+    // fatal line is wherever the missing plugin's absence surfaced later: trove-classifiers
+    // packed version 0.0.0 without calver and died installing the wheel by its real name
+    out.extend(lines.iter().filter_map(|l| between_in(l, "Unknown distribution option: '", "'")).map(|o| format!("pykw:{o}")));
     let mut seen = HashSet::new();
     out.retain(|m| seen.insert(m.clone()));
     out
+}
+
+fn between_in(l: &str, a: &str, b: &str) -> Option<String> {
+    let (_, r) = l.split_once(a)?;
+    Some(r.split_once(b)?.0.to_string())
 }
 
 // whether a failure is about something missing at all, read where it failed. neovim's
@@ -1272,6 +1281,16 @@ fn miss(l: &str) -> Option<String> {
     }
     if let Some(n) = between("No module named '", "'") {
         return n.split('.').next().map(|m| format!("py:{m}"));
+    }
+    // a hatchling plugin is the hatch-<name> package, module hatch_<name>
+    for k in ["Unknown version source: ", "Unknown build hook: ", "Unknown metadata hook: "] {
+        if let Some((_, r)) = l.split_once(k) {
+            return word(r).map(|n| format!("py:hatch_{}", n.replace('-', "_")));
+        }
+    }
+    // python -m says it without the quotes: /usr/bin/python3: No module named installer
+    if let Some((_, r)) = l.split_once(": No module named ") {
+        return word(r).and_then(|n| n.split('.').next().map(|m| format!("py:{m}")));
     }
     // make, perl and cargo each say a program is missing their own way
     if let Some(n) = l.strip_prefix("make: ").and_then(|r| r.strip_suffix(": No such file or directory")) {
@@ -1378,10 +1397,21 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     let fresh = |d: &str| d != p.name && !have.iter().any(|h| h.name == d);
     let pool: Vec<&str> = p.depends.iter().map(|d| d.name.as_str()).collect();
 
+    // a setup() keyword is whatever a dist registers under [distutils.setup_keywords]
+    let registers = |path: &str| -> bool {
+        k == "pykw"
+            && path.ends_with(".dist-info/entry_points.txt")
+            && fs::read_to_string(root.join(path)).is_ok_and(|t| {
+                t.split("\n[").any(|sec| {
+                    sec.trim_start_matches('[').starts_with("distutils.setup_keywords]")
+                        && sec.lines().any(|l| l.split('=').next().is_some_and(|w| w.trim() == n))
+                })
+            })
+    };
     let mut found: Vec<String> = Vec::new();
     for name in db::installed(root, at).unwrap_or_default() {
         let Ok(rec) = db::read(root, at, &name) else { continue };
-        if rec.manifest.iter().any(|e| ships(&e.path)) {
+        if rec.manifest.iter().any(|e| ships(&e.path) || registers(&e.path)) {
             found.push(name);
         }
     }
@@ -13853,6 +13883,21 @@ mod names {
         assert_eq!(deps(&p), vec!["emacs", "so:libSDL3.so.0"]);
     }
 
+    // a setup() keyword belongs to whichever installed dist registers it as one
+    #[test]
+    fn a_setup_keyword_is_answered_by_the_dist_registering_it() {
+        let r = root("setupkw");
+        let ep = "usr/lib/python3.14/site-packages/calver-2025.10.20.dist-info/entry_points.txt";
+        installed(&r, "py3-calver", &[ep], &[]);
+        mkdirs(&r.join(ep).parent().unwrap().to_path_buf()).unwrap();
+        fs::write(r.join(ep), "[distutils.setup_keywords]\nuse_calver = calver.integration:version\n").unwrap();
+        installed(&r, "py3-other", &["usr/lib/python3.14/site-packages/other-1.dist-info/entry_points.txt"], &[]);
+        let at = recipe(&r, "extra", "py3-trove-classifiers", "py3-calver make\n");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "pykw:use_calver", &p, &[]), Some(("py3-calver".to_string(), "")));
+        assert_eq!(answers(&r, T, "pykw:use_nothing", &p, &[]), None);
+    }
+
     // - is no equivalent here, and a name that comes back to the recipe itself is its own
     // subpackage. neither is an edge, and two spellings of one package are one
     #[test]
@@ -14507,6 +14552,18 @@ mod misses_from_logs {
         assert_eq!(first(itstool).as_deref(), Some("py:libxml2"));
         assert!(lacking(itstool));
         assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
+        assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
+        assert_eq!(
+            first("hatchling.plugin.exceptions.UnknownPluginError: Unknown version source: vcs\n").as_deref(),
+            Some("py:hatch_vcs")
+        );
+        // the warning is the only sign and sits wherever setup.py ran, far above the fatal
+        let mut trove = String::from("dist.py:318: UserWarning: Unknown distribution option: 'use_calver'\n");
+        for i in 0..80 {
+            trove.push_str(&format!("wheel INFO adding 'f{i}.py'\n"));
+        }
+        trove.push_str("FileNotFoundError: [Errno 2] No such file or directory: '.dist/trove_classifiers-2026.4.28.13-py3-none-any.whl'\n");
+        assert!(misses(&trove, "").contains(&"pykw:use_calver".to_string()), "{:?}", misses(&trove, ""));
     }
 
     #[test]

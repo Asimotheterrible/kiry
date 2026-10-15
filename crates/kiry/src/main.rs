@@ -979,10 +979,12 @@ fn start(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
     out
 }
 
-// a declared dep the installed build links. a rebuild that starts without it can come out
-// fine with the feature quietly off: libxml2's gnu build linked zlib, its closure said only
-// xz, and configure dropped compression without a word. nothing misses a feature, but the
-// last build's link is proof it was used
+// a dep the installed build links, from the recipe's list or the record's own runtime
+// lines. a rebuild that starts without it can come out fine with the feature quietly off:
+// libxml2's gnu build linked zlib, its closure said only xz, and configure dropped
+// compression without a word. qt6-qtbase links at-spi2-core and the xcb-util libraries its
+// recipe never names, and without them cmake died on PkgConfig::ATSPI2. nothing misses a
+// feature, but the last build's link is proof it was used
 fn linked_before(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
     let Ok(rec) = db::read(root, t, &p.name) else { return Vec::new() };
     let mut needed: HashSet<String> = HashSet::new();
@@ -993,12 +995,17 @@ fn linked_before(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
             needed.extend(elf::read(&at).map(|o| o.needed).unwrap_or_default());
         }
     }
-    p.depends
-        .iter()
-        .filter(|d| d.applies(t) && !refused(root, p, &d.name))
-        .filter(|d| db::read_provides(root, t, &d.name).is_ok_and(|ps| ps.iter().any(|x| needed.contains(&x.soname))))
-        .cloned()
-        .collect()
+    let mut out: Vec<Dep> = Vec::new();
+    for d in p.depends.iter().chain(&rec.depends) {
+        if d.applies(t)
+            && !refused(root, p, &d.name)
+            && !out.iter().any(|x| x.name == d.name)
+            && db::read_provides(root, t, &d.name).is_ok_and(|ps| ps.iter().any(|x| needed.contains(&x.soname)))
+        {
+            out.push(d.clone());
+        }
+    }
+    out
 }
 
 // a declared tool busybox also answers to never misses: configure finds busybox's awk, and
@@ -1234,6 +1241,10 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
     // fatal line is wherever the missing plugin's absence surfaced later: trove-classifiers
     // packed version 0.0.0 without calver and died installing the wheel by its real name
     out.extend(lines.iter().filter_map(|l| between_in(l, "Unknown distribution option: '", "'")).map(|o| format!("pykw:{o}")));
+    // the same for a python traceback configure swallowed: volume_key's AM_PATH_PYTHON asked
+    // distutils for the extension dir, got nothing, and libtool died on an empty -rpath
+    // hundreds of lines on
+    out.extend(lines.iter().filter(|l| l.starts_with("ModuleNotFoundError: ")).filter_map(|l| miss(l)));
     let mut seen = HashSet::new();
     out.retain(|m| seen.insert(m.clone()));
     out
@@ -13913,8 +13924,8 @@ mod sidecar {
         assert_eq!(names, ["gawk", "coreutils"]);
     }
 
-    // a rebuild starts with what the installed build links and the recipe lists: the link
-    // proves the feature was on. a listed library nothing linked waits to be found
+    // a rebuild starts with what the installed build links, listed by the recipe or by the
+    // record: the link proves the feature was on. a listed library nothing linked waits
     #[test]
     fn what_the_last_build_linked_starts_the_next() {
         let at = scratch("linkedbefore");
@@ -13923,8 +13934,14 @@ mod sidecar {
         installed(&root, "zlib", &[("usr/lib/libz.so.1", 0o755)], &["libz.so.1"]);
         so(&root.join("usr/lib/liblzma.so.5"), Some("liblzma.so.5"), &[]);
         installed(&root, "xz", &[("usr/lib/liblzma.so.5", 0o755)], &["liblzma.so.5"]);
-        so(&root.join("usr/lib/libxml2.so.2"), Some("libxml2.so.2"), &[&root.join("usr/lib/libz.so.1")]);
+        so(&root.join("usr/lib/libatspi.so.0"), Some("libatspi.so.0"), &[]);
+        installed(&root, "at-spi2-core", &[("usr/lib/libatspi.so.0", 0o755)], &["libatspi.so.0"]);
+        so(&root.join("usr/lib/libxml2.so.2"), Some("libxml2.so.2"), &[&root.join("usr/lib/libz.so.1"), &root.join("usr/lib/libatspi.so.0")]);
         installed(&root, "libxml2", &[("usr/lib/libxml2.so.2", 0o755), ("usr/share/doc/libxml2/README", 0o644)], &["libxml2.so.2"]);
+        // a runtime line the record carries and the recipe never named
+        let mut rec = db::read(&root, T, "libxml2").unwrap();
+        rec.depends = vec![dep("at-spi2-core")];
+        db::write(&root, &rec).unwrap();
         let d = root.join(REPOS_AT).join("extra/libxml2");
         mkdirs(&d).unwrap();
         fs::write(d.join("version"), "1.0 1\n").unwrap();
@@ -13933,7 +13950,7 @@ mod sidecar {
         fs::write(d.join("depends"), "xz\nzlib\n").unwrap();
         let p = load(&root, &d).unwrap();
         let names: Vec<String> = start(&root, &p, T).into_iter().map(|d| d.name).collect();
-        assert_eq!(names, ["zlib"]);
+        assert_eq!(names, ["zlib", "at-spi2-core"]);
     }
 
     #[test]
@@ -15186,6 +15203,13 @@ mod misses_from_logs {
         assert!(lacking(itstool));
         assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
         assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
+        // configure carried on past the traceback and libtool died far below it
+        let mut vk = String::from("checking for /usr/bin/python3 extension module directory... Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'distutils'\n");
+        for i in 0..120 {
+            vk.push_str(&format!("kirycc -c file{i}.c -o file{i}.o\n"));
+        }
+        vk.push_str("libtool:   error: argument to -rpath is not absolute: _volume_key_la-volume_key_wrap.lo\nmake[3]: *** [Makefile:501: _volume_key.la] Error 1\n");
+        assert_eq!(first(&vk).as_deref(), Some("py:distutils"));
         // 2026-10-15, the first rebuilds through discovery
         let lttng = "configure: error: Python >= 3.12 removed 'distutils', the 'setuptools' module needs to be installed for the selected interpreter.\n";
         assert_eq!(first(lttng).as_deref(), Some("py:setuptools"));

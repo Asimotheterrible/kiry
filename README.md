@@ -44,15 +44,17 @@ of evidence for it:
   `SD_ELF_NOTE_DLOPEN` writes, where upstream lists what it loads. kbd's `loadkeys`
   already carries them. Required and recommended entries become runtime deps; suggested
   ones do not.
-- **What running programs actually map.** A library a process has mapped that its
-  `DT_NEEDED` closure does not explain was dlopened. kiry records it under
-  `/var/kiry/seen`, keeps it installed while the program is, and makes it a runtime dep
-  at the program's next build.
+- **What programs actually load.** A uprobe on each libc's `dlopen` logs every name a
+  program asks for, however the string was built, and an exec probe says which program
+  asked, so a short-lived one counts after it exits. A library a running process has
+  mapped that its `DT_NEEDED` closure does not explain was dlopened too. kiry records both
+  under `/var/kiry/seen`, keeps them installed while the program is, and makes them
+  runtime deps at the program's next build. procps' `ps` loads `libnuma.so` this way.
 
 A name put together at runtime from a format string, like pipewire's `%s/%s.so`, cannot be
-read off the binary. An artifact that can `dlopen` and carries such a string keeps every
-library its recipe lists. A plugin or a data package ships no soname, so those stay as the
-recipe listed them.
+read off the binary before the program runs and asks for it. Until then, an artifact that
+can `dlopen` and carries such a string keeps every library its recipe lists. A plugin or a
+data package ships no soname, so those stay as the recipe listed them.
 
 Python gets the same treatment as ELF. An import at column 0 runs when the module loads,
 so the package shipping that module is a runtime dep. kiry follows the imports from each

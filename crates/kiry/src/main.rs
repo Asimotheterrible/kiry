@@ -7741,10 +7741,15 @@ fn trace_events(text: &str, probes: &HashMap<String, String>) -> Vec<(f64, Ev)> 
 // known carries the live processes over from the last read, since that read took their
 // execs out of the buffer. a dlopen by a pid nothing says anything about comes back with
 // None, for /proc to answer if the process is still the one that asked
-type Said = (u32, f64, Option<String>, String, String, bool);
+//
+// an exec comes back too, target None, on the program that ran it. built is every pid
+// under a kiry exec: a build runs make, cc and the recipe's tools by the thousand, and
+// what a build runs is the recipe's business, not a dep of make's
+type Said = (u32, f64, Option<String>, Option<String>, String, bool);
 fn lineage(
     events: &[(f64, Ev)],
     known: &mut HashMap<u32, String>,
+    built: &mut HashSet<u32>,
     shebang: &dyn Fn(&str) -> Option<String>,
     script: &dyn Fn(&[String]) -> Option<String>,
 ) -> Vec<Said> {
@@ -7757,20 +7762,56 @@ fn lineage(
                     .get(pid)
                     .and_then(|prev| shebang(prev))
                     .is_some_and(|l| l.split_whitespace().any(|w| w.rsplit('/').next() == Some(name)));
+                if name == "kiry" {
+                    built.insert(*pid);
+                }
+                // a build execs by the million between two reads, and each of these would
+                // open a file to find out what nothing uses
+                if built.contains(pid) {
+                    known.insert(*pid, file.clone());
+                    continue;
+                }
                 if !keep {
+                    if file.starts_with('/') {
+                        out.push((*pid, *ts, known.get(pid).cloned(), None, file.clone(), true));
+                    }
                     known.insert(*pid, script(args).unwrap_or_else(|| file.clone()));
                 }
             }
-            Ev::Fork(parent, child) => match known.get(parent).cloned() {
-                Some(p) => {
-                    known.insert(*child, p);
+            Ev::Fork(parent, child) => {
+                match known.get(parent).cloned() {
+                    Some(p) => known.insert(*child, p),
+                    None => known.remove(child),
+                };
+                if built.contains(parent) {
+                    built.insert(*child);
+                } else {
+                    built.remove(child);
                 }
-                None => {
-                    known.remove(child);
-                }
-            },
-            Ev::Asked(key, t, name, ok) => out.push((*key, *ts, known.get(key).cloned(), t.clone(), name.clone(), *ok)),
+            }
+            Ev::Asked(key, t, name, ok) => out.push((*key, *ts, known.get(key).cloned(), Some(t.clone()), name.clone(), *ok)),
         }
+    }
+    out
+}
+
+// the execs that count: the program names what it ran as a word of its own. dwl runs what
+// a key is bound to and that is in the binary. a shell runs whatever is typed at it and
+// names half the world anyway, bash's ip and ps and busybox's every applet, so what
+// /etc/shells lists never counts. each program is read once, they can be large
+fn named_runs(
+    ran: &[(String, String, String)],
+    shells: &HashSet<String>,
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Vec<(String, String)> {
+    let mut by: BTreeMap<&str, Vec<&(String, String, String)>> = BTreeMap::new();
+    for r in ran.iter().filter(|r| r.0 != r.1 && !shells.contains(&r.0)) {
+        by.entry(r.0.as_str()).or_default().push(r);
+    }
+    let mut out = Vec::new();
+    for (p, rs) in by {
+        let Some(b) = read(p) else { continue };
+        out.extend(rs.into_iter().filter(|r| mentions(&b, &r.2)).map(|r| (r.0.clone(), r.1.clone())));
     }
     out
 }
@@ -7815,17 +7856,42 @@ fn observe(root: &Path) {
     // (program, what it dlopened) from the trace, read before arm() can drop it
     let probes: HashMap<String, String> =
         db::targets(root).unwrap_or_default().into_iter().map(|t| (probe(&t), t)).collect();
-    let events = trace_events(&(drained("kiry-exec") + &drained("kiry")), &probes);
-    arm(root);
     let carried = root.join(LINEAGE);
-    let mut known: HashMap<u32, String> = fs::read_to_string(&carried)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_once(' ').and_then(|(p, f)| Some((p.parse().ok()?, f.to_string()))))
-        .collect();
-    let said = lineage(&events, &mut known, &|p| hashbang(p), &|a| script_of(a));
+    // two readers would each take half of every buffer and carry their own idea of the
+    // pids, so the second waits. leave() and doctor both get here
+    let _ = mkdirs(&root.join(TRACED).with_file_name(""));
+    let lock = fs::OpenOptions::new().create(true).append(true).open(&carried);
+    if let Ok(f) = &lock {
+        let _ = rustix::fs::flock(f, rustix::fs::FlockOperation::LockExclusive);
+    }
+    // the dlopens first: the fork and exec behind each are older and so still in the exec
+    // buffer. the other way round a wpctl run between the two reads had its dlopens read
+    // without its exec, and its pid was whatever last had the number, a kiry thread
+    let asked = drained("kiry");
+    let events = trace_events(&(drained("kiry-exec") + &asked), &probes);
+    arm(root);
+    // a pid under a build is written with a b in front
+    let (mut known, mut built) = (HashMap::new(), HashSet::new());
+    for l in fs::read_to_string(&carried).unwrap_or_default().lines() {
+        let Some((p, f)) = l.split_once(' ') else { continue };
+        let Ok(pid) = p.trim_start_matches('b').parse::<u32>() else { continue };
+        if p.starts_with('b') {
+            built.insert(pid);
+        }
+        known.insert(pid, f.to_string());
+    }
+    let said = lineage(&events, &mut known, &mut built, &|p| hashbang(p), &|a| script_of(a));
     let mut traced: Vec<(String, String)> = Vec::new();
+    // (program, what it ran, the name it ran it by)
+    let mut ran: Vec<(String, String, String)> = Vec::new();
     for (pid, at, prog, t, name, ok) in said {
+        let Some(t) = t else {
+            let by = name.rsplit('/').next().unwrap_or_default().to_string();
+            if let (Some(p), Some(f)) = (prog.and_then(|p| real(Path::new(&p))), real(Path::new(&name))) {
+                ran.push((p, f, by));
+            }
+            continue;
+        };
         let prog = match prog {
             Some(p) => real(Path::new(&p)),
             // running from before the probe went in, so /proc says what it is -- if the pid
@@ -7849,9 +7915,12 @@ fn observe(root: &Path) {
     let live: String = known
         .iter()
         .filter(|(p, _)| Path::new("/proc").join(p.to_string()).exists())
-        .map(|(p, f)| format!("{p} {f}\n"))
+        .map(|(p, f)| format!("{}{p} {f}\n", if built.contains(p) { "b" } else { "" }))
         .collect();
     let _ = put(&carried, &live);
+    let shells: HashSet<String> =
+        fs::read_to_string("/etc/shells").unwrap_or_default().lines().filter_map(|l| real(Path::new(l.trim()))).collect();
+    traced.extend(named_runs(&ran, &shells, &|p| fs::read(root.join(p)).ok()));
 
     // (exe, the script an interpreter runs, the shared objects it has mapped), paths
     // relative and folded the way manifests have them
@@ -7942,7 +8011,8 @@ fn observe(root: &Path) {
         }
     }
     // an explicit dlopen counts even of something the program's DT_NEEDED reaches anyway:
-    // asking for it by name is using it, which is what a line in its depends says
+    // asking for it by name is using it, which is what a line in its depends says. an
+    // exec the same
     for (p, f) in &traced {
         let (Some(who), Some((t, n))) = (own.get(p), own.get(f)) else { continue };
         if *t == who.0 && *n != who.1 && !BASE.contains(&n.as_str()) {
@@ -7986,7 +8056,7 @@ fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
         );
     }
     for so in &done.preserved {
-        say!("preserved {so}, still named by what has not rebuilt yet");
+        say!("preserved {so}, its soname left the package. kiry gc takes it once nothing links or maps it");
     }
     enqueue(root, &done.broke, &named(&jobs));
     queue_layouts(root, &moved, &named(&jobs));
@@ -9331,7 +9401,7 @@ fn rebuild_cmd(args: &[String]) {
             rebuilt_log(&root, &j.name, &j.target, &reason, same);
         }
         for so in &done.preserved {
-            say!("preserved {so}, still named by what has not rebuilt yet");
+            say!("preserved {so}, its soname left the package. kiry gc takes it once nothing links or maps it");
         }
         enqueue(&root, &broke, &named(&jobs));
         hooks(&root, jobs.iter().map(|j| j.target.clone()).collect());
@@ -15100,8 +15170,11 @@ mod leaving {
             ask(5.0, 999, "libnuma.so"),
         ];
         let mut known = HashMap::new();
-        let said: Vec<(u32, Option<String>)> =
-            lineage(&events, &mut known, &shebang, &script).into_iter().map(|(p, _, w, _, _, _)| (p, w)).collect();
+        let said: Vec<(u32, Option<String>)> = lineage(&events, &mut known, &mut HashSet::new(), &shebang, &script)
+            .into_iter()
+            .filter(|s| s.3.is_some())
+            .map(|(p, _, w, _, _, _)| (p, w))
+            .collect();
         let some = |p: u32, w: &str| (p, Some(w.to_string()));
         assert_eq!(
             said,
@@ -15115,8 +15188,77 @@ mod leaving {
         );
         // carried to the next read: a process the last one saw exec still is that program
         let mut known = HashMap::from([(700, "/usr/bin/librewolf".to_string())]);
-        let said = lineage(&[ask(9.0, 700, "libudev.so.1")], &mut known, &shebang, &script);
+        let said = lineage(&[ask(9.0, 700, "libudev.so.1")], &mut known, &mut HashSet::new(), &shebang, &script);
         assert_eq!(said[0].2.as_deref(), Some("/usr/bin/librewolf"));
+    }
+
+    // an exec goes on the program that ran it, except under a kiry exec: everything a
+    // build runs descends from one, carried between reads like the programs are. a #! that
+    // names the next exec is the interpreter starting, not a second program
+    #[test]
+    fn an_exec_goes_on_its_parent_unless_a_build_ran_it() {
+        let shebang = |p: &str| (p == "/usr/bin/lddtree").then(|| "/usr/bin/env python3".to_string());
+        let script = |_: &[String]| None;
+        let exec = |t: f64, pid: u32, f: &str| (t, Ev::Exec(pid, f.into(), vec![]));
+        let events = vec![
+            (1.0, Ev::Fork(10, 11)),
+            exec(1.1, 11, "/usr/bin/git"),
+            (1.2, Ev::Fork(11, 12)),
+            exec(1.3, 12, "/usr/bin/ssh"),
+            exec(2.0, 20, "/usr/bin/kiry"),
+            (2.1, Ev::Fork(20, 21)),
+            exec(2.2, 21, "/usr/bin/make"),
+            (2.3, Ev::Fork(21, 22)),
+            exec(2.4, 22, "/usr/bin/clang"),
+            exec(3.0, 30, "/usr/bin/cc"),
+            exec(4.0, 40, "/usr/bin/lddtree"),
+            exec(4.1, 40, "/usr/bin/python3"),
+            (5.0, Ev::Fork(30, 31)),
+            exec(5.1, 31, "/usr/bin/ld"),
+            (6.0, Ev::Fork(10, 31)),
+            exec(6.1, 31, "/usr/bin/less"),
+        ];
+        let mut known = HashMap::from([(10, "/usr/bin/yash".to_string()), (30, "/usr/bin/make".to_string())]);
+        let mut built = HashSet::from([30]);
+        let ran: Vec<(Option<String>, String)> = lineage(&events, &mut known, &mut built, &shebang, &script)
+            .into_iter()
+            .filter(|s| s.3.is_none())
+            .map(|(_, _, w, _, f, _)| (w, f))
+            .collect();
+        let by = |w: Option<&str>, f: &str| (w.map(str::to_string), f.to_string());
+        assert_eq!(
+            ran,
+            vec![
+                by(Some("/usr/bin/yash"), "/usr/bin/git"),
+                by(Some("/usr/bin/git"), "/usr/bin/ssh"),
+                by(None, "/usr/bin/lddtree"),
+                by(Some("/usr/bin/yash"), "/usr/bin/less"),
+            ]
+        );
+        assert!(built.contains(&22) && !built.contains(&31));
+    }
+
+    // a shell runs what it is told and is not the program's dep, dwl runs what its config
+    // names and is
+    #[test]
+    fn an_exec_counts_when_the_program_names_it() {
+        let r = |p: &str, f: &str, b: &str| (p.to_string(), f.to_string(), b.to_string());
+        let ran = vec![
+            r("usr/bin/yash", "usr/bin/git", "git"),
+            r("usr/bin/dwl", "usr/bin/foot", "foot"),
+            r("usr/bin/dwl", "usr/bin/footclient", "footclient"),
+            r("usr/bin/foot", "usr/bin/foot", "foot"),
+        ];
+        let read = |p: &str| match p {
+            "usr/bin/yash" => Some(b"\0exec\0digit\0".to_vec()),
+            "usr/bin/dwl" => Some(b"\0foot\0-e\0".to_vec()),
+            "usr/bin/busybox" => Some(b"\0bash\0".to_vec()),
+            _ => Some(b"foot".to_vec()),
+        };
+        let shells = HashSet::from(["usr/bin/busybox".to_string()]);
+        let mut ran = ran;
+        ran.push(r("usr/bin/busybox", "usr/bin/bash", "bash"));
+        assert_eq!(named_runs(&ran, &shells, &read), vec![("usr/bin/dwl".to_string(), "usr/bin/foot".to_string())]);
     }
 
     // this test's own process started moments ago, on the clock /proc/uptime counts

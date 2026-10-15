@@ -50,6 +50,10 @@ of evidence for it:
   mapped that its `DT_NEEDED` closure does not explain was dlopened too. kiry records both
   under `/var/kiry/seen`, keeps them installed while the program is, and makes them
   runtime deps at the program's next build. procps' `ps` loads `libnuma.so` this way.
+  The same trace records which programs a program runs. One counts when the parent
+  names it as a word of its own, the way dwl's key bindings name `grim` and `slurp`.
+  A shell listed in `/etc/shells` names half the system and never counts, and neither
+  does anything a build runs.
 
 A name put together at runtime from a format string, like pipewire's `%s/%s.so`, cannot be
 read off the binary before the program runs and asks for it. Until then, an artifact that

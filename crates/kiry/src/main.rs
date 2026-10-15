@@ -1344,6 +1344,13 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("provided by \"", "\"") {
         return Some(format!("cmake:{n}"));
     }
+    // a target nothing defined: qt's WrapVulkanHeaders::WrapVulkanHeaders is the
+    // VulkanHeaders package config. a PkgConfig:: one is a .pc, which misses() reads
+    if let Some(t) = between_in(l, "", " is not a valid target") {
+        let (ns, name) = t.trim().split_once("::")?;
+        let name = name.strip_prefix("Wrap").filter(|r| r.starts_with(char::is_uppercase)).unwrap_or(name);
+        return (ns != "PkgConfig" && !name.is_empty()).then(|| format!("cmake:{name}"));
+    }
     // python, asked by a configure or found missing at run time
     if let Some(r) = l.strip_prefix("checking for python module ").filter(|_| no) {
         return word(r).map(|n| format!("py:{}", n.trim_end_matches('.')));
@@ -1603,10 +1610,19 @@ fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Optio
         }
     }
 
+    // a probe kirycc noted is a feature configure looked for, not what it died of. one
+    // something installed answers is cheap to try; building a package for one is how
+    // qt6-qtbase went building directfb twice, the way more() never would
+    let said: HashSet<String> = misses(&text, "").into_iter().collect();
+    let probed: HashSet<String> = misses(&text, &noted).into_iter().filter(|m| !said.contains(m)).collect();
+
     let have = start(root, p, t);
     let host = sandbox::host();
     for m in &ms {
         let Some((d, how)) = answers(root, t, m, p, &have) else { continue };
+        if !how.is_empty() && probed.contains(m) {
+            continue;
+        }
         if refused(root, p, &d) {
             say!("{} {t} needs {d} for {m}, and a flag takes it out", p.name);
             return None;
@@ -14387,6 +14403,30 @@ mod names {
         assert_eq!(answers(&r, T, "pykw:use_nothing", &p, &[]), None);
     }
 
+    // a failure no line of the log names falls back on what kirycc saw probed: something
+    // installed answers one of those, a package that would have to be built does not
+    #[test]
+    fn a_noted_probe_is_answered_only_from_what_is_installed() {
+        let r = root("noted");
+        installed(&r, "at-spi2-core", &["usr/lib/pkgconfig/atspi-2.pc"], &[]);
+        recipe(&r, "extra", "directfb", "");
+        let at = recipe(&r, "extra", "qt", "");
+        let p = load(&r, &at).unwrap();
+        let work = r.join("work");
+        mkdirs(&work.join("src")).unwrap();
+        let log = r.join("qt.log");
+        fs::write(&log, "CMake Error at src/gui/CMakeLists.txt:12 (message):\n  something odd\n").unwrap();
+        let closure = || fs::read_to_string(closure_at(&r, T, "qt")).unwrap_or_default();
+
+        fs::write(work.join("src/.kiry-missing"), "pc directfb\n").unwrap();
+        assert!(discover(&r, &p, T, &log, &work).is_none());
+        assert_eq!(closure(), "");
+
+        fs::write(work.join("src/.kiry-missing"), "pc atspi-2\npc directfb\n").unwrap();
+        assert!(matches!(discover(&r, &p, T, &log, &work), Some(Step::Again)));
+        assert_eq!(closure(), "at-spi2-core build\n");
+    }
+
     // python 3.12 has no distutils, and setuptools puts one back with a .pth
     #[test]
     fn distutils_is_answered_by_setuptools() {
@@ -15212,6 +15252,9 @@ mod misses_from_logs {
         assert!(lacking(itstool));
         assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
         assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
+        let vk = "CMake Error at cmake/QtTargetHelpers.cmake:1599 (message):\n  WrapVulkanHeaders::WrapVulkanHeaders is not a valid target.\n";
+        assert_eq!(first(vk).as_deref(), Some("cmake:VulkanHeaders"));
+        assert_eq!(first("  Foo::Bar is not a valid target.\n").as_deref(), Some("cmake:Bar"));
         // the target names the noted probe, newer probes noted after it or not
         let qt = "CMake Error at cmake/QtTargetHelpers.cmake:1599 (message):\n  PkgConfig::ATSPI2 is not a valid target.\n-- Configuring incomplete, errors occurred!\n";
         assert_eq!(misses(qt, "pc jemalloc\npc atspi-2\npc directfb\n").first().map(String::as_str), Some("pc:atspi-2"));

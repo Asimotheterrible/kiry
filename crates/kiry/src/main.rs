@@ -971,12 +971,61 @@ fn start(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
     // a flag set against a dep takes it out after it was proven too, not only before
     let proven = pkg::depends_from(ls.into_iter().filter(|l| l != "*").collect());
     let proven: Vec<Dep> = proven.into_iter().filter(|d| !refused(root, p, &d.name)).collect();
-    for d in proven.into_iter().chain(flagged(root, p)) {
+    for d in proven.into_iter().chain(flagged(root, p)).chain(shadowed(root, p)).chain(linked_before(root, p, t)) {
         if !out.iter().any(|x| x.name == d.name) {
             out.push(d);
         }
     }
     out
+}
+
+// a declared dep the installed build links. a rebuild that starts without it can come out
+// fine with the feature quietly off: libxml2's gnu build linked zlib, its closure said only
+// xz, and configure dropped compression without a word. nothing misses a feature, but the
+// last build's link is proof it was used
+fn linked_before(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
+    let Ok(rec) = db::read(root, t, &p.name) else { return Vec::new() };
+    let mut needed: HashSet<String> = HashSet::new();
+    for e in rec.manifest.iter().filter(|e| matches!(e.kind, db::Kind::File(_))) {
+        let at = root.join(&e.path);
+        let mut head = [0u8; 4];
+        if fs::File::open(&at).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head == b"\x7fELF" {
+            needed.extend(elf::read(&at).map(|o| o.needed).unwrap_or_default());
+        }
+    }
+    p.depends
+        .iter()
+        .filter(|d| d.applies(t) && !refused(root, p, &d.name))
+        .filter(|d| db::read_provides(root, t, &d.name).is_ok_and(|ps| ps.iter().any(|x| needed.contains(&x.soname))))
+        .cloned()
+        .collect()
+}
+
+// a declared tool busybox also answers to never misses: configure finds busybox's awk, and
+// what it lacks comes out later as broken output instead of a name. rsync's help-from-md
+// wrote help-rsync.h with its quotes unescaped under busybox awk while gawk sat on the
+// recipe's list. so a make dep with a program named as an applet, or as g and the applet
+// the way gnu names its own, starts in the build
+fn shadowed(root: &Path, p: &Package) -> Vec<Dep> {
+    let host = sandbox::host();
+    let bin = |path: &str| {
+        let (dir, name) = path.rsplit_once('/')?;
+        dir.rsplit('/').next().is_some_and(|d| d == "bin" || d == "sbin").then(|| name.to_string())
+    };
+    let Ok(bb) = db::read(root, &host, "busybox") else { return Vec::new() };
+    let applets: HashSet<String> = bb.manifest.iter().filter_map(|e| bin(&e.path)).collect();
+    p.depends
+        .iter()
+        .filter(|d| d.make && d.name != "busybox" && !refused(root, p, &d.name))
+        .filter(|d| {
+            let progs: Vec<String> = match db::read(root, &host, &d.name) {
+                Ok(r) => r.manifest.iter().filter(|e| !matches!(e.kind, db::Kind::Dir)).filter_map(|e| bin(&e.path)).collect(),
+                Err(_) => shape(root, &host, &d.name).map(|s| s.2).unwrap_or_default(),
+            };
+            progs.iter().any(|x| applets.contains(x) || x.strip_prefix('g').is_some_and(|a| applets.contains(a)))
+        })
+        .cloned()
+        .collect()
 }
 
 // deps a flag set on in the config brings in: one named after a package the recipe lists,
@@ -1288,14 +1337,30 @@ fn miss(l: &str) -> Option<String> {
             return word(r).map(|n| format!("py:hatch_{}", n.replace('-', "_")));
         }
     }
+    // lttng-ust's configure: the 'setuptools' module needs to be installed for the selected
+    // interpreter. flatpak's meson.build: python3 "pyparsing" module is required
+    if let Some(n) = between("the '", "' module needs to be installed").or_else(|| between("\"", "\" module is required")) {
+        return Some(format!("py:{n}"));
+    }
+    // a macro autoconf could not expand, which some package's aclocal .m4 defines:
+    // volume_key's AM_PATH_GPGME is gpgme's
+    for k in ["undefined or overquoted macro: ", "possibly undefined macro: "] {
+        if let Some((_, r)) = l.split_once(k) {
+            return word(r).map(|n| format!("m4:{n}"));
+        }
+    }
     // python -m says it without the quotes: /usr/bin/python3: No module named installer
     if let Some((_, r)) = l.split_once(": No module named ") {
         return word(r).and_then(|n| n.split('.').next().map(|m| format!("py:{m}")));
     }
     // make, perl and cargo each say a program is missing their own way
-    if let Some(n) = l.strip_prefix("make: ").and_then(|r| r.strip_suffix(": No such file or directory")) {
-        // @LIBTOOL@ is configure's substitution that never happened, not a program
-        return (!n.contains(['/', ' ', '@'])).then(|| format!("cmd:{n}"));
+    let make = l.strip_prefix("make: ").or_else(|| l.strip_prefix("make[").and_then(|r| r.split_once("]: ")).map(|(_, r)| r));
+    if let Some(n) = make.and_then(|r| r.strip_suffix(": No such file or directory")) {
+        // @LIBTOOL@ is configure's substitution that never happened, not a program. a
+        // relative path is a script of the tree's own whose #! names what is missing:
+        // xfsprogs' ../install-sh is #! /bin/bash
+        let rel = n.starts_with("./") || n.starts_with("../");
+        return (!n.contains([' ', '@']) && (rel || !n.contains('/'))).then(|| format!("cmd:{n}"));
     }
     if let Some(n) = between("Can't exec \"", "\"") {
         return Some(format!("cmd:{n}"));
@@ -1383,6 +1448,13 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
             "py" => path.split_once("/site-packages/").is_some_and(|(_, f)| {
                 f == format!("{n}.py") || f.starts_with(&format!("{n}/")) || (f.starts_with(n) && f.ends_with(".so"))
             }),
+            "m4" => {
+                path.starts_with("usr/share/aclocal/")
+                    && path.ends_with(".m4")
+                    && fs::read_to_string(root.join(path)).is_ok_and(|s| {
+                        [format!("AC_DEFUN([{n}]"), format!("AC_DEFUN({n},"), format!("AU_DEFUN([{n}]")].iter().any(|d| s.contains(d.as_str()))
+                    })
+            }
             "cmake" => {
                 let pl = path.to_lowercase();
                 // a Find module is the finder, not the package: cmake ships FindLua.cmake and
@@ -7409,12 +7481,277 @@ fn dlopened(exe: &str, mapped: &BTreeSet<String>, needed: &dyn Fn(&str) -> Vec<S
     opened.into_iter().filter(|m| !pulled.contains(m.as_str())).cloned().collect()
 }
 
+// every dlopen on the live root as the kernel saw it: a uprobe on each target's libc
+// dlopen, in a tracefs instance of kiry's own beside exec events that say which program
+// asked. maps show only what loaded and only while the process lives. this has the name
+// as it was asked, whatever string built it -- pipewire's %s/%s.so, a plugin a config
+// chose -- and a load that failed. a build's sandbox reflinks its libc, a new inode the
+// probe does not cover, so builds never show up in it
+const TRACE: &str = "/sys/kernel/tracing";
+const TRACED: &str = "run/kiry/traced";
+
+fn probe(t: &str) -> String {
+    format!("dl_{}", t.replace(|c: char| !c.is_ascii_alphanumeric(), "_"))
+}
+
+fn libc(t: &str) -> String {
+    format!("{}/{}", libdir(t).trim_start_matches('/'), if t.ends_with("gnu") { "libc.so.6" } else { "libc.so" })
+}
+
+// the file offset of dlopen in a libc, which is what a uprobe is placed by: its .dynsym
+// value, moved from the address its PT_LOAD maps to the place in the file
+fn dlopen_at(b: &[u8]) -> Option<u64> {
+    let u16at = |at: usize| b.get(at..at + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize);
+    let u32at = |at: usize| b.get(at..at + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
+    let u64at = |at: usize| b.get(at..at + 8).map(|x| u64::from_le_bytes(x.try_into().unwrap_or_default()));
+    let at = |v: u64| usize::try_from(v).ok();
+    if b.get(..5) != Some(b"\x7fELF\x02".as_slice()) {
+        return None;
+    }
+    let (shoff, shsize, shnum) = (at(u64at(0x28)?)?, u16at(0x3a)?, u16at(0x3c)?);
+    let value = (0..shnum).find_map(|i| {
+        let sh = shoff + i * shsize;
+        if u32at(sh + 4)? != 11 {
+            return None;
+        }
+        let (off, size) = (at(u64at(sh + 24)?)?, at(u64at(sh + 32)?)?);
+        let link = shoff + u32at(sh + 40)? as usize * shsize;
+        let strs = at(u64at(link + 24)?)?;
+        (off..off + size).step_by(24).find_map(|s| {
+            let name = strs + u32at(s)? as usize;
+            let func = b.get(s + 4)? & 0xf == 2;
+            let v = u64at(s + 8)?;
+            (func && v != 0 && b.get(name..name + 7)? == b"dlopen\0").then_some(v)
+        })
+    })?;
+    let (phoff, phsize, phnum) = (at(u64at(0x20)?)?, u16at(0x36)?, u16at(0x38)?);
+    (0..phnum).find_map(|i| {
+        let ph = phoff + i * phsize;
+        let (off, vaddr, filesz) = (u64at(ph + 8)?, u64at(ph + 16)?, u64at(ph + 32)?);
+        (u32at(ph)? == 1 && (vaddr..vaddr + filesz).contains(&value)).then(|| value - vaddr + off)
+    })
+}
+
+// put the probes in, once per libc: the stamp says which inode each went on, and a libc
+// that was replaced since is a new inode the old probe never fires for
+fn arm(root: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let tr = Path::new(TRACE);
+    if !tr.join("uprobe_events").exists() {
+        let _ = rustix::mount::mount("nodev", tr, "tracefs", rustix::mount::MountFlags::empty(), None);
+    }
+    let mut stamp = String::new();
+    let mut add = Vec::new();
+    for t in db::targets(root).unwrap_or_default() {
+        let at = root.join(libc(&t));
+        let (Ok(b), Ok(m)) = (fs::read(&at), fs::metadata(&at)) else { continue };
+        let Some(off) = dlopen_at(&b) else { continue };
+        let ev = probe(&t);
+        stamp += &format!("{ev} {} {} {off:#x}\n", m.dev(), m.ino());
+        add.push(format!("p:kiry/{ev} {}:{off:#x} name=+0(%di):ustring", at.display()));
+        add.push(format!("r:kiry/{ev}_ret {}:{off:#x} handle=%ax:x64", at.display()));
+    }
+    // two instances: a build execs a hundred times a second and the exec tracepoint is
+    // the kernel's, not libc's, so it fires inside the sandbox too. in a buffer of their
+    // own, execs that overrun cost the name of a short-lived process and never a dlopen
+    let (inst, ex) = (tr.join("instances/kiry"), tr.join("instances/kiry-exec"));
+    let was = fs::read_to_string(root.join(TRACED)).unwrap_or_default();
+    if stamp.is_empty() || (was == stamp && inst.join("events/kiry").is_dir()) {
+        return;
+    }
+    let events = |s: &str| fs::OpenOptions::new().append(true).open(tr.join("uprobe_events")).and_then(|mut f| f.write_all(s.as_bytes()));
+    let _ = fs::create_dir(&inst);
+    let _ = fs::create_dir(&ex);
+    let _ = put(&inst.join("events/kiry/enable"), "0");
+    let _ = put(&ex.join("events/kiryexec/enable"), "0");
+    // a probe has to go before one by the same name can go in, and only while no instance
+    // has it enabled
+    for l in fs::read_to_string(tr.join("uprobe_events")).unwrap_or_default().lines() {
+        if let Some(name) = l.split_whitespace().next().and_then(|w| w.split_once(':')).map(|(_, n)| n) {
+            if name.starts_with("kiry/") {
+                let _ = events(&format!("-:{name}\n"));
+            }
+        }
+    }
+    if add.iter().any(|a| events(&format!("{a}\n")).is_err()) {
+        return;
+    }
+    // argv[1..3] at execve, so python3 foo.py says foo.py after the process is gone.
+    // __x64_sys_execve takes the caller's pt_regs, argv is its si at 104
+    let kp = |s: &str| fs::OpenOptions::new().append(true).open(tr.join("kprobe_events")).and_then(|mut f| f.write_all(s.as_bytes()));
+    let _ = kp("-:kiryexec/args\n");
+    let _ = kp("p:kiryexec/args __x64_sys_execve a1=+0(+8(+104(%di))):ustring a2=+0(+16(+104(%di))):ustring a3=+0(+24(+104(%di))):ustring\n");
+    let _ = put(&ex.join("buffer_size_kb"), "4096");
+    let _ = put(&ex.join("events/sched/sched_process_exec/enable"), "1");
+    let _ = put(&ex.join("events/kiryexec/enable"), "1");
+    // a thread's dlopen carries its own pid, and the program is the thread group's
+    let _ = put(&inst.join("options/record-tgid"), "1");
+    if put(&inst.join("events/kiry/enable"), "1").is_ok() {
+        let _ = mkdirs(&root.join(TRACED).with_file_name("")).and_then(|()| put(&root.join(TRACED), &stamp));
+    }
+}
+
+// what an instance's buffer holds, taken out of it: trace_pipe consumes, so each line is
+// read once
+fn drained(inst: &str) -> String {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(mut f) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(Path::new(TRACE).join("instances").join(inst).join("trace_pipe"))
+    else {
+        return String::new();
+    };
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    while let Ok(n) = f.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// the trace's lines as (pid the program is known by, target, name asked, whether it
+// loaded), and each process's execs in order. a line is "comm-pid (tgid) [cpu] flags ts:
+// event: args", tgid ------- when the kernel had not recorded it
+type Asked = (u32, f64, String, String, bool);
+type Exec = (f64, String, Vec<String>);
+fn trace_lines(text: &str, probes: &HashMap<String, String>) -> (Vec<Asked>, HashMap<u32, Vec<Exec>>) {
+    let mut asked = Vec::new();
+    let mut execs: HashMap<u32, Vec<Exec>> = HashMap::new();
+    // argv as execve was called with it, which the exec that follows on the pid took
+    let mut argv: HashMap<u32, Vec<String>> = HashMap::new();
+    // a dlopen's own constructors can dlopen, so the return pairs with the latest call
+    let mut open: HashMap<u32, Vec<(u32, String, String, f64)>> = HashMap::new();
+    for l in text.lines() {
+        let Some((head, rest)) = l.split_once(") [") else { continue };
+        let Some((left, tgid)) = head.rsplit_once('(') else { continue };
+        let Some(pid) = left.trim_end().rsplit('-').next().and_then(|p| p.parse::<u32>().ok()) else { continue };
+        let key = tgid.trim().parse::<u32>().unwrap_or(pid);
+        let Some((stamp, r)) = rest.split_once(": ") else { continue };
+        let Some((ev, args)) = r.split_once(": ") else { continue };
+        let ts = stamp.rsplit(' ').next().and_then(|t| t.parse::<f64>().ok()).unwrap_or_default();
+        if ev == "sched_process_exec" {
+            if let Some(f) = args.strip_prefix("filename=").and_then(|a| a.rsplit_once(" pid=")).map(|(f, _)| f) {
+                execs.entry(pid).or_default().push((ts, f.to_string(), argv.remove(&pid).unwrap_or_default()));
+            }
+        } else if ev == "args" {
+            // a1="x" a2=(fault): each value quoted up to the next key, a fault ends them
+            let mut v = Vec::new();
+            for k in 1..=3 {
+                let Some(from) = args.find(&format!(" a{k}=")).map(|at| at + 4) else { break };
+                let to = args.rfind(&format!(" a{}=", k + 1)).filter(|e| *e > from).unwrap_or(args.len());
+                match args[from..to].strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+                    Some(x) => v.push(x.to_string()),
+                    None => break,
+                }
+            }
+            argv.insert(pid, v);
+        } else if let Some(t) = probes.get(ev) {
+            let name = args
+                .split_once("name=\"")
+                .and_then(|(_, n)| n.rsplit_once('"'))
+                .map_or(String::new(), |(n, _)| n.to_string());
+            open.entry(pid).or_default().push((key, t.clone(), name, ts));
+        } else if ev.strip_suffix("_ret").is_some_and(|e| probes.contains_key(e)) {
+            let Some((key, t, name, at)) = open.get_mut(&pid).and_then(Vec::pop) else { continue };
+            let ok = args.rsplit_once("handle=").is_some_and(|(_, h)| h.trim() != "0x0");
+            if !name.is_empty() {
+                asked.push((key, at, t, name, ok));
+            }
+        }
+    }
+    (asked, execs)
+}
+
+// the program behind a process from its execs: the last one, unless what came before it
+// was a script whose #! names it. a #!/usr/bin/env python3 script is two execs, the
+// script and then python3, and the script is the program. vesktop's #!/bin/sh execs
+// electron, which names nothing the script's #! does, so electron is the program and
+// what chromium dlopens is electron's
+//
+// an interpreter run by hand is one exec, python3 with the script among its arguments.
+// only the execs before the dlopen count: a pid used again later is another program
+fn program(execs: &[Exec], at: f64, shebang: &dyn Fn(&str) -> Option<String>, script: &dyn Fn(&[String]) -> Option<String>) -> Option<String> {
+    let chain: Vec<&Exec> = execs.iter().filter(|e| e.0 <= at).collect();
+    let mut i = chain.len().checked_sub(1)?;
+    while i > 0 {
+        let next = chain[i].1.rsplit('/').next().unwrap_or_default();
+        match shebang(&chain[i - 1].1) {
+            Some(l) if l.split_whitespace().any(|w| w.rsplit('/').next() == Some(next)) => i -= 1,
+            _ => break,
+        }
+    }
+    if i == chain.len() - 1 {
+        if let Some(s) = script(&chain[i].2) {
+            return Some(s);
+        }
+    }
+    Some(chain[i].1.clone())
+}
+
+// the #! line of a script, or None for anything else
+fn hashbang(p: &str) -> Option<String> {
+    let mut head = [0u8; 256];
+    let n = fs::File::open(p).and_then(|mut f| f.read(&mut head)).ok()?;
+    let l = head[..n].split(|c| *c == b'\n').next()?;
+    l.strip_prefix(b"#!").map(|s| String::from_utf8_lossy(s).into_owned())
+}
+
+// the script an interpreter runs, from the first few arguments after argv[0]: an absolute
+// path to a file that has a #! or a script's suffix. app.asar is electron's argument and
+// an archive, so electron stays the program; python3 /usr/bin/foo hands over to foo, and
+// vim /etc/foo.conf stays vim
+const SCRIPTS: &[&str] = &[".py", ".pl", ".pm", ".rb", ".lua", ".js", ".mjs", ".sh", ".tcl"];
+fn script_of(args: &[String]) -> Option<String> {
+    args.iter()
+        .take(3)
+        .find(|a| {
+            let mut head = [0u8; 2];
+            a.starts_with('/')
+                && fs::File::open(a.as_str()).and_then(|mut f| f.read_exact(&mut head)).is_ok()
+                && (&head == b"#!" || SCRIPTS.iter().any(|x| a.ends_with(x)))
+        })
+        .cloned()
+}
+
+fn argv_of(cmdline: &[u8]) -> Vec<String> {
+    cmdline.split(|c| *c == 0).skip(1).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect()
+}
+
 // only on the live root, the one the processes run from, and only processes in this
 // mount namespace: a flatpak's /usr/lib is the runtime's and not ours
 fn observe(root: &Path) {
     if root != Path::new("/") {
         return;
     }
+    let rel = |p: &str| fold(p.trim_start_matches('/').trim_end_matches(" (deleted)"));
+    let real = |p: &Path| fs::canonicalize(p).ok().map(|p| rel(&p.to_string_lossy()));
+    // (program, what it dlopened) from the trace, read before arm() can drop it. a
+    // process the trace saw no exec for was running before the probe went in, and /proc
+    // still says what it is while it lives
+    let probes: HashMap<String, String> =
+        db::targets(root).unwrap_or_default().into_iter().map(|t| (probe(&t), t)).collect();
+    let (asked, execs) = trace_lines(&(drained("kiry-exec") + &drained("kiry")), &probes);
+    arm(root);
+    let mut traced: Vec<(String, String)> = Vec::new();
+    for (pid, at, t, name, ok) in asked {
+        let prog = match execs.get(&pid).and_then(|c| program(c, at, &|p| hashbang(p), &|a| script_of(a))) {
+            Some(p) => real(Path::new(&p)),
+            None => {
+                let d = Path::new("/proc").join(pid.to_string());
+                script_of(&argv_of(&fs::read(d.join("cmdline")).unwrap_or_default()))
+                    .map(PathBuf::from).or_else(|| fs::read_link(d.join("exe")).ok()).and_then(|p| real(&p))
+            }
+        };
+        let file = if name.starts_with('/') { real(Path::new(&name)) } else { real(&root.join(libdir(&t).trim_start_matches('/')).join(&name)) };
+        if let (Some(p), Some(f), true) = (prog, file, ok) {
+            traced.push((p, f));
+        }
+    }
+
     // (exe, the script an interpreter runs, the shared objects it has mapped), paths
     // relative and folded the way manifests have them
     let ns = fs::read_link("/proc/self/ns/mnt").ok();
@@ -7429,15 +7766,7 @@ fn observe(root: &Path) {
             continue;
         }
         let (Ok(exe), Ok(maps)) = (fs::read_link(d.join("exe")), fs::read_to_string(d.join("maps"))) else { continue };
-        let rel = |p: &str| fold(p.trim_start_matches('/').trim_end_matches(" (deleted)"));
-        let argv = fs::read(d.join("cmdline")).unwrap_or_default();
-        let script = argv
-            .split(|c| *c == 0)
-            .skip(1)
-            .take(3)
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .find(|a| a.starts_with('/') && Path::new(a).is_file())
-            .map(|a| rel(&a));
+        let script = script_of(&argv_of(&fs::read(d.join("cmdline")).unwrap_or_default())).map(|a| rel(&a));
         let mut mapped = BTreeSet::new();
         for l in maps.lines() {
             let Some(at) = l.find('/') else { continue };
@@ -7448,7 +7777,7 @@ fn observe(root: &Path) {
         }
         procs.push((rel(&exe.to_string_lossy()), script, mapped));
     }
-    if procs.is_empty() {
+    if procs.is_empty() && traced.is_empty() {
         return;
     }
 
@@ -7457,6 +7786,7 @@ fn observe(root: &Path) {
     let wanted: HashSet<&str> = procs
         .iter()
         .flat_map(|(e, s, m)| std::iter::once(e).chain(s).chain(m))
+        .chain(traced.iter().flat_map(|(p, f)| [p, f]))
         .map(String::as_str)
         .collect();
     let all: Vec<(String, String)> = db::targets(root)
@@ -7508,6 +7838,14 @@ fn observe(root: &Path) {
             if *t == who.0 && *n != who.1 && !BASE.contains(&n.as_str()) {
                 found.entry(who.clone()).or_default().insert((n.clone(), m.clone()));
             }
+        }
+    }
+    // an explicit dlopen counts even of something the program's DT_NEEDED reaches anyway:
+    // asking for it by name is using it, which is what a line in its depends says
+    for (p, f) in &traced {
+        let (Some(who), Some((t, n))) = (own.get(p), own.get(f)) else { continue };
+        if *t == who.0 && *n != who.1 && !BASE.contains(&n.as_str()) {
+            found.entry(who.clone()).or_default().insert((n.clone(), f.clone()));
         }
     }
     for ((t, name), add) in found {
@@ -13473,6 +13811,53 @@ mod sidecar {
         assert_eq!(fs::read_to_string(&at_).unwrap(), "hdr build\nlib build\n");
     }
 
+    // nothing misses a tool busybox stands in for, so a declared one starts in the build:
+    // named as the applet, or as gnu names it. a library, a program that only begins like
+    // an applet and a runtime line wait to be found
+    #[test]
+    fn a_tool_busybox_stands_in_for_starts_in_the_build() {
+        let at = scratch("shadowed");
+        let root = at.join("root");
+        installed(&root, "busybox", &[("usr/bin/awk", 0o777), ("usr/bin/cat", 0o777), ("usr/bin/sed", 0o777)], &[]);
+        installed(&root, "gawk", &[("usr/bin/gawk", 0o755)], &[]);
+        installed(&root, "coreutils", &[("usr/bin/cat", 0o755)], &[]);
+        installed(&root, "sed", &[("usr/bin/sed", 0o755)], &[]);
+        installed(&root, "zlib", &[("usr/lib/libz.so.1", 0o755)], &["libz.so.1"]);
+        installed(&root, "awkward", &[("usr/bin/awkward", 0o755)], &[]);
+        let d = root.join(REPOS_AT).join("extra/app");
+        mkdirs(&d).unwrap();
+        fs::write(d.join("version"), "1.0 1\n").unwrap();
+        fs::write(d.join("targets"), format!("{T}\n")).unwrap();
+        fs::write(d.join("build"), "true\n").unwrap();
+        fs::write(d.join("depends"), "gawk make\ncoreutils make\nsed\nzlib make\nawkward make\n").unwrap();
+        let p = load(&root, &d).unwrap();
+        let names: Vec<String> = start(&root, &p, T).into_iter().map(|d| d.name).collect();
+        assert_eq!(names, ["gawk", "coreutils"]);
+    }
+
+    // a rebuild starts with what the installed build links and the recipe lists: the link
+    // proves the feature was on. a listed library nothing linked waits to be found
+    #[test]
+    fn what_the_last_build_linked_starts_the_next() {
+        let at = scratch("linkedbefore");
+        let root = at.join("root");
+        so(&root.join("usr/lib/libz.so.1"), Some("libz.so.1"), &[]);
+        installed(&root, "zlib", &[("usr/lib/libz.so.1", 0o755)], &["libz.so.1"]);
+        so(&root.join("usr/lib/liblzma.so.5"), Some("liblzma.so.5"), &[]);
+        installed(&root, "xz", &[("usr/lib/liblzma.so.5", 0o755)], &["liblzma.so.5"]);
+        so(&root.join("usr/lib/libxml2.so.2"), Some("libxml2.so.2"), &[&root.join("usr/lib/libz.so.1")]);
+        installed(&root, "libxml2", &[("usr/lib/libxml2.so.2", 0o755), ("usr/share/doc/libxml2/README", 0o644)], &["libxml2.so.2"]);
+        let d = root.join(REPOS_AT).join("extra/libxml2");
+        mkdirs(&d).unwrap();
+        fs::write(d.join("version"), "1.0 1\n").unwrap();
+        fs::write(d.join("targets"), format!("{T}\n")).unwrap();
+        fs::write(d.join("build"), "true\n").unwrap();
+        fs::write(d.join("depends"), "xz\nzlib\n").unwrap();
+        let p = load(&root, &d).unwrap();
+        let names: Vec<String> = start(&root, &p, T).into_iter().map(|d| d.name).collect();
+        assert_eq!(names, ["zlib"]);
+    }
+
     #[test]
     fn a_dropped_dep_stays_out_of_the_sidecar() {
         let at = scratch("dropped");
@@ -13896,6 +14281,20 @@ mod names {
         let p = load(&r, &at).unwrap();
         assert_eq!(answers(&r, T, "pykw:use_calver", &p, &[]), Some(("py3-calver".to_string(), "")));
         assert_eq!(answers(&r, T, "pykw:use_nothing", &p, &[]), None);
+    }
+
+    // a macro is whichever installed .m4 defines it, not one that only calls it
+    #[test]
+    fn an_autoconf_macro_is_answered_by_the_m4_defining_it() {
+        let r = root("m4");
+        installed(&r, "gpgme", &["usr/share/aclocal/gpgme.m4"], &[]);
+        mkdirs(&r.join("usr/share/aclocal")).unwrap();
+        fs::write(r.join("usr/share/aclocal/gpgme.m4"), "AC_DEFUN([AM_PATH_GPGME],\n[ _AM_PATH_GPGME_CONFIG ])\n").unwrap();
+        installed(&r, "caller", &["usr/share/aclocal/caller.m4"], &[]);
+        fs::write(r.join("usr/share/aclocal/caller.m4"), "AC_DEFUN([CALLER], [AM_PATH_GPGME])\n").unwrap();
+        let at = recipe(&r, "extra", "volume_key", "");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "m4:AM_PATH_GPGME", &p, &[]), Some(("gpgme".to_string(), "")));
     }
 
     // - is no equivalent here, and a name that comes back to the recipe itself is its own
@@ -14478,6 +14877,118 @@ mod leaving {
         );
     }
 
+    // the trace as tracefs prints it: a thread's dlopen belongs to its thread group, a
+    // constructor's dlopen inside another pairs with its own return, and a handle of 0x0
+    // is a load that failed
+    #[test]
+    fn a_traced_dlopen_is_paired_and_put_on_its_process() {
+        let text = r#"
+              sh-100     (    100) [001] .....    10.000000: sched_process_exec: filename=/usr/bin/vesktop pid=100 old_pid=100
+        electron-100     (    100) [001] ..Zff    10.100000: args: (__x64_sys_execve+0x4/0x60) a1="--ozone-platform=wayland" a2="/usr/lib/vesktop/app.asar" a3=(fault)
+        electron-100     (    100) [001] .....    10.100100: sched_process_exec: filename=/usr/bin/electron pid=100 old_pid=100
+ Chrome_IOThread-101     (    100) [003] DBZff    11.000000: dl_x86_64_musl: (0x7f00000c10f0) name="libnotify.so.4"
+ Chrome_IOThread-101     (    100) [003] DBZff    11.000100: dl_x86_64_musl_ret: (0x55d000000000 <- 0x7f00000c10f0) handle=0x7f4fde823940
+            game-400     (-------) [005] DBZff    12.000000: dl_x86_64_musl: (0x7f00000c10f0) name="/usr/lib/libdecor/plugins-1/libdecor-cairo.so"
+            game-400     (-------) [005] DBZff    12.000010: dl_x86_64_musl: (0x7f00000c10f0) name="libcairo.so.2"
+            game-400     (-------) [005] DBZff    12.000020: dl_x86_64_musl_ret: (0x55d000000000 <- 0x7f00000c10f0) handle=0x7f4fde823940
+            game-400     (-------) [005] DBZff    12.000030: dl_x86_64_musl_ret: (0x55d000000000 <- 0x7f00000c10f0) handle=0x0
+           steam-500     (    500) [002] DBZff    13.000000: dl_x86_64_gnu_ret: (0x55d000000000 <- 0x7f0000095ba0) handle=0x7f4fde823940
+"#;
+        let probes: HashMap<String, String> =
+            [("dl_x86_64_musl", "x86_64-musl"), ("dl_x86_64_gnu", "x86_64-gnu")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let (asked, execs) = trace_lines(text, &probes);
+        let row = |k: u32, n: &str, ok: bool| (k, n.to_string(), ok);
+        assert_eq!(
+            asked.iter().map(|(k, _, _, n, ok)| (*k, n.clone(), *ok)).collect::<Vec<_>>(),
+            vec![
+                row(100, "libnotify.so.4", true),
+                row(400, "libcairo.so.2", true),
+                row(400, "/usr/lib/libdecor/plugins-1/libdecor-cairo.so", false),
+            ]
+        );
+        assert_eq!(execs[&100][1].1, "/usr/bin/electron");
+        assert_eq!(execs[&100][1].2, ["--ozone-platform=wayland", "/usr/lib/vesktop/app.asar"]);
+        assert!(execs[&100][0].2.is_empty());
+    }
+
+    // which exec of a process is the program: a #! that names the next exec hands over to
+    // the script, one that does not leaves the last exec, an interpreter run by hand is its
+    // script, and an exec after the dlopen is a later process on the same pid
+    #[test]
+    fn the_program_behind_a_traced_process() {
+        let e = |at: f64, f: &str, a: &[&str]| (at, f.to_string(), a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        let shebang = |p: &str| match p {
+            "/usr/bin/vesktop" => Some("/bin/sh".to_string()),
+            "/usr/bin/lddtree" => Some("/usr/bin/env python3".to_string()),
+            _ => None,
+        };
+        let script = |a: &[String]| a.iter().find(|x| x.ends_with(".py")).cloned();
+        let got = |chain: &[Exec], at: f64| program(chain, at, &shebang, &script);
+
+        let vesktop = [e(1.0, "/usr/bin/vesktop", &[]), e(2.0, "/usr/bin/electron", &["/usr/lib/vesktop/app.asar"])];
+        assert_eq!(got(&vesktop, 3.0).as_deref(), Some("/usr/bin/electron"));
+        let lddtree = [e(1.0, "/usr/bin/lddtree", &["-a"]), e(1.1, "/usr/bin/python3", &["/usr/bin/lddtree", "-a"])];
+        assert_eq!(got(&lddtree, 2.0).as_deref(), Some("/usr/bin/lddtree"));
+        let by_hand = [e(1.0, "/usr/bin/python3", &["/home/u/bot.py"])];
+        assert_eq!(got(&by_hand, 2.0).as_deref(), Some("/home/u/bot.py"));
+        let reused = [e(1.0, "/usr/bin/foo", &[]), e(5.0, "/usr/bin/bar", &[])];
+        assert_eq!(got(&reused, 2.0).as_deref(), Some("/usr/bin/foo"));
+        assert_eq!(got(&reused, 0.5), None);
+    }
+
+    #[test]
+    fn an_archive_or_a_config_is_not_a_script() {
+        let d = scratch("scriptof");
+        let at = |n: &str, b: &[u8]| {
+            fs::write(d.join(n), b).unwrap();
+            d.join(n).to_string_lossy().into_owned()
+        };
+        let asar = at("app.asar", b"\x04\x00\x00\x00{\"files\":{}}");
+        let conf = at("foo.conf", b"key = value\n");
+        let tool = at("tool", b"#!/usr/bin/python3\nimport sys\n");
+        let module = at("bot.py", b"import sys\n");
+        let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(script_of(&args(&["--ozone-platform=wayland", &asar])), None);
+        assert_eq!(script_of(&args(&[&conf])), None);
+        assert_eq!(script_of(&args(&["-u", &tool])), Some(tool.clone()));
+        assert_eq!(script_of(&args(&[&module])), Some(module.clone()));
+        assert_eq!(script_of(&args(&["tool"])), None);
+        // relative is the process's cwd, not ours, even when it happens to open from here
+        let here = std::env::current_dir().unwrap();
+        let up = "../".repeat(here.components().count() - 1);
+        assert!(fs::File::open(format!("{up}{}", &module[1..])).is_ok());
+        assert_eq!(script_of(&args(&[&format!("{up}{}", &module[1..])])), None);
+    }
+
+    // the offset a uprobe goes on, checked against readelf's symbol value and load
+    // segments for each libc this machine has
+    #[test]
+    fn dlopen_is_where_readelf_puts_it() {
+        let mut checked = 0;
+        for lib in ["/usr/lib/libc.so", "/usr/lib64/libc.so.6"] {
+            let Ok(b) = fs::read(lib) else { continue };
+            let run = |a: &[&str]| String::from_utf8(Command::new("readelf").args(a).arg(lib).output().expect("readelf").stdout).unwrap();
+            let value = run(&["-W", "--dyn-syms"])
+                .lines()
+                .find_map(|l| {
+                    let w: Vec<&str> = l.split_whitespace().collect();
+                    (w.len() >= 8 && w[3] == "FUNC" && w[7].split('@').next() == Some("dlopen")).then(|| u64::from_str_radix(w[1], 16).unwrap())
+                })
+                .unwrap();
+            let off = run(&["-lW"])
+                .lines()
+                .filter(|l| l.trim_start().starts_with("LOAD"))
+                .find_map(|l| {
+                    let w: Vec<u64> = l.split_whitespace().skip(1).take(5).map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).unwrap()).collect();
+                    (w[1] <= value && value < w[1] + w[3]).then(|| value - w[1] + w[0])
+                })
+                .unwrap();
+            assert_eq!(dlopen_at(&b), Some(off), "{lib}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no libc to check dlopen_at against");
+    }
+
     #[test]
     fn no_world_means_nothing_leaves() {
         let root = scratch("noworld");
@@ -14553,6 +15064,16 @@ mod misses_from_logs {
         assert!(lacking(itstool));
         assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
         assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
+        // 2026-10-15, the first rebuilds through discovery
+        let lttng = "configure: error: Python >= 3.12 removed 'distutils', the 'setuptools' module needs to be installed for the selected interpreter.\n";
+        assert_eq!(first(lttng).as_deref(), Some("py:setuptools"));
+        let flatpak = "error /src/flatpak-1.18.4/meson.build:257:3: python3 \"pyparsing\" module is required\n";
+        assert_eq!(first(flatpak).as_deref(), Some("py:pyparsing"));
+        assert_eq!(first("configure.ac:198: error: undefined or overquoted macro: AM_PATH_GPGME\n").as_deref(), Some("m4:AM_PATH_GPGME"));
+        let xfs = "../install-sh -o root -g root -m 755 -d /usr/include/xfs\nmake[1]: ../install-sh: No such file or directory\n";
+        assert_eq!(first(xfs).as_deref(), Some("cmd:../install-sh"));
+        assert_eq!(first("make[2]: /usr/bin/foo: No such file or directory\n"), None);
+        assert_eq!(first("configure.ac:12: error: possibly undefined macro: AM_PATH_GLIB_2_0\n").as_deref(), Some("m4:AM_PATH_GLIB_2_0"));
         assert_eq!(
             first("hatchling.plugin.exceptions.UnknownPluginError: Unknown version source: vcs\n").as_deref(),
             Some("py:hatch_vcs")

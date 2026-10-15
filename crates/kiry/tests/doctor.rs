@@ -1618,3 +1618,38 @@ fn every_package_still_needing_one_is_named() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("a still needs libp") && err.contains("b still needs libp"), "{err}");
 }
+
+// python's DT_NEEDED is an import at column 0. a module nothing installed ships is a script
+// that dies at its first line, one whose owner the record does not reach is the same
+// missing line accounted() reports for a library. the indented import is optional
+#[test]
+fn a_python_import_is_checked_like_a_library() {
+    let at = scratch("python");
+    let root = at.join("root");
+    let put = |name: &str, text: &str| {
+        let f = at.join(name);
+        fs::write(&f, text).unwrap();
+        f
+    };
+    let os = put("os.py", "");
+    let yaml = put("yaml.py", "");
+    let app = put("app", "#!/usr/bin/python3\nimport os\nimport yaml\nimport missingmod\ntry:\n    import optional\nexcept ImportError:\n    pass\n");
+    install(&root, "python3", &[("usr/lib/python3.14/os.py", &os)]);
+    install(&root, "py3-yaml", &[("usr/lib/python3.14/site-packages/yaml.py", &yaml)]);
+    install(&root, "app", &[("usr/bin/app", &app)]);
+    needs(&root, "app", &["python3"]);
+    needs(&root, "py3-yaml", &["python3"]);
+
+    let (_, out) = doctor(&root);
+    let mut rows: Vec<&str> = out.lines().filter(|l| !l.contains("no-interpreter")).collect();
+    rows.sort_unstable();
+    assert_eq!(rows, vec![
+        format!("app {TARGET} build-only py3-yaml py:yaml app"),
+        format!("app {TARGET} no-module missingmod"),
+    ], "{out}");
+
+    // the edge written down, the row goes
+    needs(&root, "app", &["python3", "py3-yaml"]);
+    let (_, out) = doctor(&root);
+    assert!(!out.contains("py3-yaml"), "{out}");
+}

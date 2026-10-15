@@ -1236,6 +1236,15 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
     }
     let to = (f + 3).min(lines.len());
     out.extend(lines[f.saturating_sub(40)..to].iter().rev().filter_map(|l| miss(l)));
+    // cmake names a pkg_check_modules target the way its Find file spelled the module,
+    // PkgConfig::ATSPI2 for atspi-2.pc, so the probe kirycc noted under that name with the
+    // punctuation gone is the one that failed. qt6-qtbase's list had directfb after it, and
+    // newest first went building directfb
+    let squash = |s: &str| s.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_lowercase();
+    for t in lines.iter().filter_map(|l| between_in(l, "PkgConfig::", " is not a valid target")) {
+        let want = squash(&t);
+        out.extend(noted.lines().filter_map(|l| l.strip_prefix("pc ")).filter(|n| squash(n) == want).map(|n| format!("pc:{}", n.trim())));
+    }
     out.extend(noted.lines().rev().filter_map(|l| l.split_once(' ')).map(|(k, n)| format!("{k}:{}", n.trim())));
     // setuptools warns about a setup() keyword nobody registered and builds on, so the
     // fatal line is wherever the missing plugin's absence surfaced later: trove-classifiers
@@ -15203,6 +15212,9 @@ mod misses_from_logs {
         assert!(lacking(itstool));
         assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
         assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
+        // the target names the noted probe, newer probes noted after it or not
+        let qt = "CMake Error at cmake/QtTargetHelpers.cmake:1599 (message):\n  PkgConfig::ATSPI2 is not a valid target.\n-- Configuring incomplete, errors occurred!\n";
+        assert_eq!(misses(qt, "pc jemalloc\npc atspi-2\npc directfb\n").first().map(String::as_str), Some("pc:atspi-2"));
         // configure carried on past the traceback and libtool died far below it
         let mut vk = String::from("checking for /usr/bin/python3 extension module directory... Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'distutils'\n");
         for i in 0..120 {

@@ -1429,12 +1429,27 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("need ", " in your PATH") {
         return (!n.contains(' ')).then(|| format!("cmd:{n}"));
     }
-    // libpcap's configure: Neither flex nor lex was found
-    if let Some(n) = between("Neither ", " nor ").filter(|_| l.ends_with("was found.") || l.ends_with("were found.")) {
+    // libpcap's configure: Neither flex nor lex was found. libvpx's: Neither yasm nor nasm
+    // have been found. See the prerequisites section
+    if let Some(n) = between("Neither ", " nor ").filter(|_| l.contains(" found.")) {
         return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // qt's vulkan header takes <vulkan/vulkan.h> under __has_include and goes on without
+    // it, so qtwayland never said the header was missing, only the types
+    if l.contains("unknown type name 'PFN_vk") || l.contains("unknown type name 'Vk") {
+        return Some("h:vulkan/vulkan.h".to_string());
     }
     // xmlto: Can't continue, xsltproc tool not found or not executable
     if let Some(n) = between("Can't continue, ", " tool not found") {
+        return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // nss: Building NSS requires an installation of gyp: https://gyp.gsrc.io/
+    if let Some(n) = between("requires an installation of ", ":") {
+        return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // x264's configure says Found no assembler and only the next line names one:
+    // Minimum version is nasm-2.13
+    if let Some(n) = between("Minimum version is ", "-") {
         return (!n.contains(' ')).then(|| format!("cmd:{n}"));
     }
     // automake with no libtool.m4: Libtool library used but 'LIBTOOL' is undefined
@@ -15648,6 +15663,12 @@ mod misses_from_logs {
         assert_eq!(first(secret).as_deref(), Some("xml:http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl"));
         assert_eq!(first("checking for flex... no\nchecking for lex... no\nconfigure: error: Neither flex nor lex was found.\n").as_deref(), Some("cmd:flex"));
         assert_eq!(first("xmlto: Can't continue, xsltproc tool not found or not executable.\n").as_deref(), Some("cmd:xsltproc"));
+        assert_eq!(first("Neither yasm nor nasm have been found. See the prerequisites section in the README for more info.\n").as_deref(), Some("cmd:yasm"));
+        assert_eq!(first("Building NSS requires an installation of gyp: https://gyp.gsrc.io/\n").as_deref(), Some("cmd:gyp"));
+        assert_eq!(first("Found no assembler\nMinimum version is nasm-2.13\nIf you really want to compile without asm, configure with --disable-asm.\n").as_deref(), Some("cmd:nasm"));
+        let qtw = "/src/q/vulkanwrapper.cpp:55:5: error: unknown type name 'PFN_vkAllocateCommandBuffers'\n";
+        assert_eq!(first(qtw).as_deref(), Some("h:vulkan/vulkan.h"));
+        assert_eq!(first("a.c:3:1: error: unknown type name 'VkInstance'\n").as_deref(), Some("h:vulkan/vulkan.h"));
         let onig = "src/Makefile.am:24: error: Libtool library used but 'LIBTOOL' is undefined\nautoreconf: error: automake failed with exit status: 1\n";
         assert_eq!(first(onig).as_deref(), Some("cmd:libtool"));
     }

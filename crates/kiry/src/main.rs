@@ -78,7 +78,8 @@ fn usage() {
     say!("i is enough on its own. it builds the package and everything under it, in");
     say!("order, then installs. use b when you want the build without the install, or");
     say!("when you want to force one: b always compiles, i takes what is in the cache.");
-    say!("so `i foo` installs foo, and `b foo` then `i foo` rebuilds it.");
+    say!("`i foo` with foo's version already in does nothing: the rebuild is `b foo`,");
+    say!("then `i` given the archive it left in /var/kiry/cache.");
     say!("");
     say!("b and i also take a set: @outdated is everything installed at a version the");
     say!("tree has since moved past, which is the upgrade, and @world is everything");
@@ -9619,6 +9620,9 @@ fn affected(
                 _ => None,
             })
             .collect();
+        // a dlsym looks up a name someone wrote down, a plugin's extern "C" entry or a gl
+        // proc. a mangled one is an instantiation the compiler chose to export
+        let typed = moved.iter().any(|s| !s.starts_with("_Z"));
         let Ok(names) = db::installed(root, &b.target) else {
             continue;
         };
@@ -9642,7 +9646,7 @@ fn affected(
                 o.needed.contains(&b.soname)
                     && reaches(root, o, at, &b.target, &b.soname, &b.path, &own)
                     && (b.changed.is_empty()
-                        || o.undefined.iter().any(|u| DL.contains(&u.name.as_str()))
+                        || (typed && o.undefined.iter().any(|u| DL.contains(&u.name.as_str())))
                         || o.undefined
                             .iter()
                             .any(|u| moved.contains(symbol(u, versions).as_str())))

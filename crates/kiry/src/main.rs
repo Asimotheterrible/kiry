@@ -1204,6 +1204,10 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
             || l.contains(" error program not found")
             || l.contains(" error required library not found")
             || l.starts_with("configure: error")
+            // prepare's autoreconf failing goes on to configure, and make dies much later
+            // wanting the automake that wrote the old Makefile.in: libbsd's automake-1.16,
+            // 170 lines below the libtoolize that was missing
+            || l.starts_with("autoreconf: error")
             || l.contains("CMake Error")
             || l.contains("fatal error:")
             || l.ends_with(": not found")
@@ -15662,6 +15666,12 @@ mod misses_from_logs {
         }
         trove.push_str("FileNotFoundError: [Errno 2] No such file or directory: '.dist/trove_classifiers-2026.4.28.13-py3-none-any.whl'\n");
         assert!(misses(&trove, "").contains(&"pykw:use_calver".to_string()), "{:?}", misses(&trove, ""));
+        let mut libbsd = String::from("Can't exec \"libtoolize\": No such file or directory at /usr/share/autoconf/Autom4te/FileUtils.pm line 316.\nautoreconf: error: failed to run libtoolize: No such file or directory\n");
+        for i in 0..80 {
+            libbsd.push_str(&format!("checking for f{i}... yes\n"));
+        }
+        libbsd.push_str("/src/libbsd-0.12.2/build-aux/missing: line 81: automake-1.16: not found\nmake: *** [Makefile:363: Makefile.in] Error 1\n");
+        assert_eq!(misses(&libbsd, "").first().map(String::as_str), Some("cmd:libtoolize"), "{:?}", misses(&libbsd, ""));
         // 2026-10-15, the packages built before discovery
         let xmltoman = "Can't locate XML/Parser.pm in @INC (you may need to install the XML::Parser module) (@INC entries checked: /usr/lib/perl5/vendor_perl) at ./xmltoman line 22.\nBEGIN failed--compilation aborted at ./xmltoman line 22.\nmake: *** [Makefile:11: xmltoman.1] Error 2\n";
         assert_eq!(first(xmltoman).as_deref(), Some("pl:XML/Parser.pm"));

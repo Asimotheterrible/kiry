@@ -1429,10 +1429,21 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("need ", " in your PATH") {
         return (!n.contains(' ')).then(|| format!("cmd:{n}"));
     }
-    // libpcap's configure: Neither flex nor lex was found. libvpx's: Neither yasm nor nasm
-    // have been found. See the prerequisites section
+    // libpcap's configure: Neither flex nor lex was found, and Neither bison, byacc, nor
+    // yacc. libvpx's: Neither yasm nor nasm have been found. See the prerequisites section
     if let Some(n) = between("Neither ", " nor ").filter(|_| l.contains(" found.")) {
-        return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+        let n = n.split(',').next().unwrap_or_default();
+        return (!n.is_empty() && !n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // autoreconf: error: failed to run libtoolize: No such file or directory
+    if let Some(n) = between("failed to run ", ": No such file") {
+        return (!n.contains([' ', '/'])).then(|| format!("cmd:{n}"));
+    }
+    // a python build script's subprocess, nss' gyp actions: FileNotFoundError: [Errno 2]
+    // No such file or directory: 'perl'. a bare name with no dot is a program, a file
+    // the script opened would carry a path or an extension
+    if let Some(n) = between("FileNotFoundError: [Errno 2] No such file or directory: '", "'") {
+        return (!n.contains([' ', '/', '.'])).then(|| format!("cmd:{n}"));
     }
     // qt's vulkan header takes <vulkan/vulkan.h> under __has_include and goes on without
     // it, so qtwayland never said the header was missing, only the types
@@ -15665,6 +15676,10 @@ mod misses_from_logs {
         assert_eq!(first("xmlto: Can't continue, xsltproc tool not found or not executable.\n").as_deref(), Some("cmd:xsltproc"));
         assert_eq!(first("Neither yasm nor nasm have been found. See the prerequisites section in the README for more info.\n").as_deref(), Some("cmd:yasm"));
         assert_eq!(first("Building NSS requires an installation of gyp: https://gyp.gsrc.io/\n").as_deref(), Some("cmd:gyp"));
+        assert_eq!(first("configure: error: Neither bison, byacc, nor yacc was found.\n").as_deref(), Some("cmd:bison"));
+        assert_eq!(first("autoreconf: error: failed to run libtoolize: No such file or directory\n").as_deref(), Some("cmd:libtoolize"));
+        assert_eq!(first("    raise child_exception_type(errno_num, err_msg, err_filename)\nFileNotFoundError: [Errno 2] No such file or directory: 'perl'\nninja: subcommands failed\n").as_deref(), Some("cmd:perl"));
+        assert_eq!(first("FileNotFoundError: [Errno 2] No such file or directory: 'config.json'\n"), None);
         assert_eq!(first("Found no assembler\nMinimum version is nasm-2.13\nIf you really want to compile without asm, configure with --disable-asm.\n").as_deref(), Some("cmd:nasm"));
         let qtw = "/src/q/vulkanwrapper.cpp:55:5: error: unknown type name 'PFN_vkAllocateCommandBuffers'\n";
         assert_eq!(first(qtw).as_deref(), Some("h:vulkan/vulkan.h"));

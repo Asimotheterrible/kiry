@@ -1519,6 +1519,19 @@ fn pydist(n: &str) -> String {
     n.to_lowercase().replace(['-', '.'], "_")
 }
 
+// configure takes a program it did not find as `:` when the makefile can do without it,
+// and every rule that runs it then makes nothing. mate-menus' .directory files came from
+// $(GMSGFMT) that way and install died on them 400 lines on. GMSGFMT is msgfmt under the
+// gnu name, so a name with a g in front is also tried without
+fn stubbed(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|l| l.strip_prefix("checking for ")?.strip_suffix("... :"))
+        .filter(|p| !p.is_empty() && !p.contains(' '))
+        .flat_map(|p| [Some(p), p.strip_prefix('g')].into_iter().flatten())
+        .map(|p| format!("cmd:{p}"))
+        .collect()
+}
+
 // what a python tree says it builds with, [build-system] requires in its pyproject.toml.
 // setuptools without setuptools_scm builds anyway and packs version 0.0.0, and installer
 // dies on the wheel by its real name with nothing missing said: twine. only the top of the
@@ -1769,6 +1782,7 @@ fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Optio
             },
         })
         .chain(build_requires(&work.join("src")))
+        .chain(stubbed(&text))
         .collect();
 
     // the dep added last round was for a miss that is still at the head: it did not help,
@@ -3831,8 +3845,10 @@ fn compile(
                 }
             }
             // ahead of trim, which drops on policy rather than on the build having
-            // failed, and would otherwise make the two indistinguishable
-            if staged(&dest) == 0 {
+            // failed, and would otherwise make the two indistinguishable. a recipe with no
+            // sources is a list of what to install, gnome or build-base, and staging nothing
+            // is its whole build
+            if staged(&dest) == 0 && !p.sources.is_empty() {
                 return Err(format!("{} {t}: built and staged nothing", p.name).into());
             }
             // DESTDIR said twice: `make PREFIX="$DESTDIR"/usr` into a Makefile that also
@@ -3928,7 +3944,7 @@ fn compile(
                 say!("{} {t} loads {who}  {so}", p.name);
                 linked.insert(who);
             }
-            let dropped = unbacked(root, &declared, t, &dest);
+            let dropped = if p.sources.is_empty() { Vec::new() } else { unbacked(root, &declared, t, &dest) };
             for d in &dropped {
                 say!("{} {t} dropped {d}  nothing links or loads it", p.name);
             }
@@ -4242,6 +4258,9 @@ fn cache_rate(root: &Path, p: &Package, t: &str, work: &Path) -> Option<String> 
 // after -x none, bc libbsd's format.ld links -x assembler /dev/null and clang went on to
 // assemble the archive
 //
+// gcc warns about a -std for the other language and goes on, clang stops. laszip puts
+// -std=c++17 on its c file too. the flag goes and the compile runs again
+//
 // clang hands a language it has no frontend for (ada, fortran) to `gcc`, and toollinks
 // makes gcc a link to clang, so gdb's configure asking whether the driver knows ada
 // forked about 1700 clangs in 25s. -ccc-gcc-name points the handoff at a name nothing
@@ -4284,6 +4303,17 @@ if [ $s -eq 137 ] || grep -q -e 'command: Killed' -e 'out of memory' \"$e\"; the
 \t\tset -- \"$@\" \"$a\"
 \tdone
 \techo \"kirycc: $o was killed, again with half the lto jobs\" >&2
+\tcc \"$@\"
+\texit
+fi
+x=$(sed -n \"s/.*invalid argument '\\\\(-std=[^']*\\\\)' not allowed with.*/\\\\1/p\" \"$e\" | head -n 1)
+if [ -n \"$x\" ]; then
+\tfor a do
+\t\tshift
+\t\t[ \"$a\" = \"$x\" ] && continue
+\t\tset -- \"$@\" \"$a\"
+\tdone
+\techo \"kirycc: $o has $x for the other language, again without it\" >&2
 \tcc \"$@\"
 \texit
 fi
@@ -14273,6 +14303,22 @@ mod sidecar {
     }
 
     #[test]
+    fn kirycc_drops_a_std_meant_for_the_other_language() {
+        let at = scratch("stdcxx");
+        fs::write(at.join("a.c"), "int a;\n").unwrap();
+        let o = Command::new("sh")
+            .arg(kirycc(&at))
+            .args(["-std=c++17", "-c"])
+            .arg(at.join("a.c"))
+            .arg("-o")
+            .arg(at.join("a.o"))
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(String::from_utf8_lossy(&o.stderr).contains("has -std=c++17 for the other language"));
+    }
+
+    #[test]
     fn kirycc_links_the_builtins_archive_after_a_language_flag() {
         let at = scratch("xnone");
         let ok = Command::new("sh")
@@ -14874,6 +14920,13 @@ mod names {
     }
 
     #[test]
+    fn a_program_configure_stubbed_out_is_a_miss() {
+        let log = "checking for msgfmt... no\nchecking for gmsgfmt... :\nchecking for xgettext... no\n\
+                   checking for perl... /usr/bin/perl\nchecking for a BSD-compatible install... :\n";
+        assert_eq!(stubbed(log), ["cmd:gmsgfmt", "cmd:msgfmt"]);
+    }
+
+    #[test]
     fn a_python_tree_says_what_it_builds_with() {
         let src = root("pyreq");
         mkdirs(&src.join("twine-6.1.0/sub")).unwrap();
@@ -14889,6 +14942,10 @@ mod names {
         mkdirs(&deep.join("a/b")).unwrap();
         fs::write(deep.join("a/b/pyproject.toml"), "[build-system]\nrequires = [\"deep\"]\n").unwrap();
         assert!(build_requires(&deep).is_empty());
+        // hatch's [tool.hatch...] requires is its own, not what the backend builds with
+        let none = root("pyreq-none");
+        fs::write(none.join("pyproject.toml"), "[build-system]\nbuild-backend = \"x\"\n\n[tool.y]\nrequires = [\"no\"]\n").unwrap();
+        assert!(build_requires(&none).is_empty());
     }
 
     // a path is whoever ships it, and before that a name on the list the path runs through

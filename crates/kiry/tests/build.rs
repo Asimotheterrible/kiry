@@ -6827,6 +6827,53 @@ fn a_build_that_stages_nothing_is_not_ok() {
     assert!(artifacts(&root).is_empty());
 }
 
+// gnome and build-base are lists: no sources, an empty stage, and the whole point is the
+// depends the sidecar carries, which nothing staged could ever link
+#[test]
+fn a_recipe_with_no_sources_builds_its_list() {
+    let at = scratch("meta");
+    let d = at.join("desk");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("version"), "1.0 1\n").unwrap();
+    fs::write(d.join("targets"), "x86_64-musl\n").unwrap();
+    fs::write(d.join("sources"), "").unwrap();
+    fs::write(d.join("checksums"), "").unwrap();
+    fs::write(d.join("depends"), "part\n").unwrap();
+    fs::write(d.join("build"), "mkdir -p \"$DESTDIR\"\n").unwrap();
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    db::write(
+        &root,
+        &db::Installed {
+            name: "part".into(),
+            target: "x86_64-musl".into(),
+            version: Version::parse("1.0 1").unwrap(),
+            depends: Vec::new(),
+            manifest: Vec::new(),
+            hash: String::new(),
+            users: Vec::new(),
+            flags: Vec::new(),
+        },
+    )
+    .unwrap();
+    // a plain library nothing in an empty stage links, which unbacked() would drop
+    db::write_provides(
+        &root,
+        "x86_64-musl",
+        "part",
+        &[db::Provide { soname: "libpart.so.1".into(), versioned: false, path: "usr/lib/libpart.so.1".into() }],
+    )
+    .unwrap();
+
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let meta = root.join("var/kiry/cache/desk-1.0-1.x86_64-musl.tar.zst.meta");
+    assert_eq!(fs::read_to_string(meta.join("depends")).unwrap(), "part\n");
+}
+
 // PREFIX="$DESTDIR"/usr on a Makefile that honours DESTDIR too lands the package under
 // /dest/usr, which installs cleanly onto the live root and resolves nothing
 #[test]

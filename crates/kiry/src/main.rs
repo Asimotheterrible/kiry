@@ -1314,6 +1314,14 @@ fn miss(l: &str) -> Option<String> {
     if let Some(r) = l.strip_prefix("program ").or_else(|| l.strip_prefix("Program ")).filter(|_| no) {
         return word(r).map(|n| format!("cmd:{n}"));
     }
+    // dune
+    if let Some(n) = between("Program ", " not found in the tree or in PATH") {
+        return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // emacs' autogen.sh: Checking for autoconf (need at least version 2.65) ... missing
+    if let Some(r) = l.strip_prefix("Checking for ").filter(|_| l.ends_with("... missing")) {
+        return word(r).map(|n| format!("cmd:{n}"));
+    }
     if let Some(r) = l.strip_prefix("library ").filter(|_| no) {
         return word(r).map(|n| format!("lib:{n}"));
     }
@@ -1367,6 +1375,10 @@ fn miss(l: &str) -> Option<String> {
     }
     if let Some(n) = between("No module named '", "'") {
         return n.split('.').next().map(|m| format!("py:{m}"));
+    }
+    // a version plugin asked for by its distribution, which pip spells either way
+    if let Some((_, r)) = l.split_once("No package metadata was found for ") {
+        return word(r).map(|n| format!("py:{}", pydist(&n)));
     }
     // a hatchling plugin is the hatch-<name> package, module hatch_<name>
     for k in ["Unknown version source: ", "Unknown build hook: ", "Unknown metadata hook: "] {
@@ -1499,6 +1511,49 @@ fn miss(l: &str) -> Option<String> {
     }
     let n = if n.starts_with("./") || n.starts_with("../") { n } else { n.rsplit('/').next()? };
     (!n.is_empty() && !n.contains(' ')).then(|| format!("cmd:{n}"))
+}
+
+// a requirement's distribution name as the module it most often installs, the way alpine's
+// index lists it: setuptools-scm is setuptools_scm
+fn pydist(n: &str) -> String {
+    n.to_lowercase().replace(['-', '.'], "_")
+}
+
+// what a python tree says it builds with, [build-system] requires in its pyproject.toml.
+// setuptools without setuptools_scm builds anyway and packs version 0.0.0, and installer
+// dies on the wheel by its real name with nothing missing said: twine. only the top of the
+// tree: a binding's pyproject further down is not what a C build failed on. a requirement
+// under a marker is for some other python
+fn build_requires(src: &Path) -> Vec<String> {
+    let tops = fs::read_dir(src).into_iter().flatten().flatten().map(|e| e.path());
+    let Some(text) = std::iter::once(src.to_path_buf())
+        .chain(tops)
+        .find_map(|d| fs::read_to_string(d.join("pyproject.toml")).ok())
+    else {
+        return Vec::new();
+    };
+    let Some((_, sec)) = text.split_once("[build-system]") else { return Vec::new() };
+    let sec = sec.split("\n[").next().unwrap_or_default();
+    let Some((_, r)) = sec.split_once("requires") else { return Vec::new() };
+    let Some((_, r)) = r.split_once('[') else { return Vec::new() };
+    let (mut out, mut cur, mut quote) = (Vec::new(), String::new(), None);
+    for c in r.chars() {
+        match (quote, c) {
+            (None, ']') => break,
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if c == q => {
+                quote = None;
+                let name: String = cur.chars().take_while(|x| x.is_ascii_alphanumeric() || "-_.".contains(*x)).collect();
+                if !name.is_empty() && !cur.contains(';') {
+                    out.push(format!("py:{}", pydist(&name)));
+                }
+                cur.clear();
+            }
+            (Some(_), _) => cur.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 // a script the build tree has and the shell could not start: what its #! names instead
@@ -1667,7 +1722,7 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     };
     // through the aliases first: local/aliases says jpeg is libjpeg-turbo here, and extra/
     // also carries the ijg jpeg, which libjxl's Could NOT find JPEG would otherwise get
-    let named = [stem.clone(), format!("lib{stem}"), format!("py3-{stem}")]
+    let named = [stem.clone(), format!("lib{stem}"), format!("py3-{stem}"), format!("py3-{}", stem.replace('_', "-"))]
         .into_iter()
         .map(|c| called(root, &c, t).filter(|a| a != "-").unwrap_or(c))
         .find(|c| fresh(c) && recipe(root, c).is_some())
@@ -1713,6 +1768,7 @@ fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Optio
                 None => Some(m),
             },
         })
+        .chain(build_requires(&work.join("src")))
         .collect();
 
     // the dep added last round was for a miss that is still at the head: it did not help,
@@ -14817,6 +14873,24 @@ mod names {
         assert_eq!(answers(&r, T, url, &p, &[]), Some(("docbook-xsl".to_string(), "")));
     }
 
+    #[test]
+    fn a_python_tree_says_what_it_builds_with() {
+        let src = root("pyreq");
+        mkdirs(&src.join("twine-6.1.0/sub")).unwrap();
+        fs::write(
+            src.join("twine-6.1.0/pyproject.toml"),
+            "[project]\nrequires = [\"nope\"]\n\n[build-system]\nrequires = [\n  \"setuptools>=61.2\",\n  'setuptools-scm[toml]>=6.0',\n  \"tomli; python_version < '3.11'\",\n  \"PyYAML\",\n]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.x]\nrequires = [\"no\"]\n",
+        )
+        .unwrap();
+        fs::write(src.join("twine-6.1.0/sub/pyproject.toml"), "[build-system]\nrequires = [\"deep\"]\n").unwrap();
+        assert_eq!(build_requires(&src), ["py:setuptools", "py:setuptools_scm", "py:pyyaml"]);
+        assert!(build_requires(&src.join("twine-6.1.0/sub/none")).is_empty());
+        let deep = root("pyreq-deep");
+        mkdirs(&deep.join("a/b")).unwrap();
+        fs::write(deep.join("a/b/pyproject.toml"), "[build-system]\nrequires = [\"deep\"]\n").unwrap();
+        assert!(build_requires(&deep).is_empty());
+    }
+
     // a path is whoever ships it, and before that a name on the list the path runs through
     #[test]
     fn a_path_is_answered_by_its_owner_or_the_directory_it_is_named_for() {
@@ -15777,6 +15851,11 @@ mod misses_from_logs {
         assert_eq!(first(rdedup).as_deref(), Some("lib:sodium"));
         assert_eq!(first("/build: line 11: /usr/share/rakudo/tools/install-dist.raku: not found\n").as_deref(), Some("path:/usr/share/rakudo/tools/install-dist.raku"));
         assert_eq!(first("/build: line 3: /usr/bin/gem: not found\n").as_deref(), Some("cmd:gem"));
+        assert_eq!(first("File \"bin/dune\", line 3:\nError: Program ocamlc not found in the tree or in PATH\n").as_deref(), Some("cmd:ocamlc"));
+        let emacs = "Checking for autoconf (need at least version 2.65) ... missing\nYour system seems to be missing the following tool(s):\nautoconf (missing)\n";
+        assert_eq!(first(emacs).as_deref(), Some("cmd:autoconf"));
+        let makefun = "importlib.metadata.PackageNotFoundError: No package metadata was found for setuptools-scm\n";
+        assert_eq!(first(makefun).as_deref(), Some("py:setuptools_scm"));
         assert_eq!(first("/usr/bin/env: 'bash': No such file or directory\n").as_deref(), Some("cmd:bash"));
         let cursor = "checking for m4 that supports -I option... configure: error: could not find m4 that supports -I option\n";
         assert_eq!(first(cursor).as_deref(), Some("cmd:m4"));

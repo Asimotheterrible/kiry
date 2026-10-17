@@ -1284,7 +1284,7 @@ fn lacking(log: &str) -> bool {
     }
     lines[f..(f + 4).min(lines.len())].iter().any(|l| {
         let l = l.to_lowercase();
-        ["not found", "find", "missing", "no package", "no such file", "needed", "required", "no module"].iter().any(|w| l.contains(w))
+        ["found", "find", "missing", "no package", "no such file", "needed", "required", "no module"].iter().any(|w| l.contains(w))
     })
 }
 
@@ -1314,6 +1314,20 @@ fn miss(l: &str) -> Option<String> {
     if let Some(r) = l.strip_prefix("program ").or_else(|| l.strip_prefix("Program ")).filter(|_| no) {
         return word(r).map(|n| format!("cmd:{n}"));
     }
+    // meson asked for a language it has no compiler for: Unknown compiler(s): [['cython'],
+    // ['cython3']]
+    if let Some(n) = between("Unknown compiler(s): [['", "'") {
+        return (!n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
+    // muon names the language rather than the program: unable to detect vala compiler
+    if let Some(n) = between("unable to detect ", " compiler").filter(|n| !n.contains(' ')) {
+        let n = match n.as_str() {
+            "vala" => "valac",
+            "rust" => "rustc",
+            n => n,
+        };
+        return Some(format!("cmd:{n}"));
+    }
     // dune
     if let Some(n) = between("Program ", " not found in the tree or in PATH") {
         return (!n.contains(' ')).then(|| format!("cmd:{n}"));
@@ -1327,6 +1341,10 @@ fn miss(l: &str) -> Option<String> {
     }
     // pkg-config, called straight or through autoconf and cmake
     if let Some(n) = between("No package '", "'") {
+        return Some(format!("pc:{n}"));
+    }
+    // xfce's XDT_CHECK_PACKAGE, which exits configure without an error line
+    if let Some(n) = between("*** The required package ", " was not found") {
         return Some(format!("pc:{n}"));
     }
     if l.starts_with("Package '") && l.ends_with("not found") {
@@ -1427,6 +1445,16 @@ fn miss(l: &str) -> Option<String> {
     // loadable object is an xs module that never got built, not a missing package
     if let Some(n) = between("Can't locate ", " in @INC").filter(|n| n.ends_with(".pm")) {
         return Some(format!("pl:{n}"));
+    }
+    // cpan's way for a Build.PL to bow out, so testers file it as not applicable rather than
+    // a failure: OS unsupported - missing ExtUtils::CChecker at Build.PL line 6
+    if let Some((_, r)) = l.split_once("OS unsupported - missing ") {
+        return word(r).map(|n| format!("pl:{}.pm", n.replace("::", "/")));
+    }
+    // sip-build: pyproject.toml: 'tool.sip.project.qmake': '/usr/lib/qt6/bin/qmake' is not a
+    // working qmake
+    if let Some(n) = between_in(l, "", "' is not a working ").and_then(|r| r.rsplit_once('\'').map(|(_, n)| n.to_string())) {
+        return (n.starts_with('/') && !n.contains(' ')).then(|| format!("path:{n}"));
     }
     // a #!/usr/bin/env bash with no bash, busybox's env and then coreutils'
     if let Some(n) = between("env: can't execute '", "'").or_else(|| between("env: '", "': No such file")) {
@@ -1735,8 +1763,11 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     };
     // through the aliases first: local/aliases says jpeg is libjpeg-turbo here, and extra/
     // also carries the ijg jpeg, which libjxl's Could NOT find JPEG would otherwise get
-    let named = [stem.clone(), format!("lib{stem}"), format!("py3-{stem}"), format!("py3-{}", stem.replace('_', "-"))]
+    // py3- only for a module: cmake's OpenGL is not py3-opengl
+    let py = [format!("py3-{stem}"), format!("py3-{}", stem.replace('_', "-"))];
+    let named = [stem.clone(), format!("lib{stem}")]
         .into_iter()
+        .chain(py.into_iter().filter(|_| k == "py"))
         .map(|c| called(root, &c, t).filter(|a| a != "-").unwrap_or(c))
         .find(|c| fresh(c) && recipe(root, c).is_some())
         .map(|c| (c, "name"));
@@ -3542,13 +3573,19 @@ fn compile(
         .collect();
     // tokay and meowdict build from cargo vendor, which reads the same lock
     let fetches = text.contains("cargo fetch") || text.contains("cargo vendor") || net && names(&text, "cargo");
-    let mut locks = shallowest(&src, "Cargo.lock", 3);
+    let mut locks: Vec<PathBuf> =
+        shallowest(&src, "Cargo.lock", 3).into_iter().filter(|l| l.parent() != Some(src.as_path())).collect();
     // cargo-c ships its lock as a source of its own, cargo-c-<ver>-Cargo.lock, and its
-    // prepare copies it in. copied in here first, the fetch has something to read
+    // prepare copies it in. copied in here first, the fetch has something to read.
+    // libimagequant's is plain Cargo.lock, which lands at the top of /src beside the
+    // tarballs rather than in a tree
     let top = unpacked(&src);
-    let apart = srcs.iter().find(|(n, ..)| n.ends_with("-Cargo.lock"));
+    let apart = srcs.iter().find(|(n, ..)| n == "Cargo.lock" || n.ends_with("-Cargo.lock"));
     if let Some((n, ..)) = apart.filter(|_| fetches && locks.is_empty() && top.join("Cargo.toml").is_file()) {
-        fs::copy(src.join(n), top.join("Cargo.lock")).map_err(|e| format!("{n}: {e}"))?;
+        // a tree that carries its own keeps it: shallowest() stopped at the one in /src
+        if !top.join("Cargo.lock").is_file() {
+            fs::copy(src.join(n), top.join("Cargo.lock")).map_err(|e| format!("{n}: {e}"))?;
+        }
         locks.push(top.join("Cargo.lock"));
     }
     for lock in locks.into_iter().filter(|_| fetches) {
@@ -9040,10 +9077,12 @@ fn load(root: &Path, at: &Path) -> Result<Package, String> {
 
 // read once per root and kept: a plan loads hundreds of recipes, and the generated table
 // is seventeen thousand lines. the owner index waits for the first so:, cmd: or pc:
-// name, because it walks every manifest installed
+// name, because it walks every manifest installed, and alpine's index for the first one
+// nothing installed answers
 struct Names {
     alias: HashMap<String, String>,
     owners: Option<HashMap<(String, String), String>>,
+    index: Option<HashMap<String, String>>,
 }
 
 // t is the target the name is wanted on. a provider installed only on the other target
@@ -9054,6 +9093,7 @@ fn called(root: &Path, name: &str, t: &str) -> Option<String> {
     let n = all.get_or_insert_with(HashMap::new).entry(root.to_path_buf()).or_insert_with(|| Names {
         alias: convert::aliases(&repos(root)),
         owners: None,
+        index: None,
     });
     let Some((kind, what)) = name.split_once(':') else {
         return n.alias.get(name).cloned();
@@ -9062,6 +9102,15 @@ fn called(root: &Path, name: &str, t: &str) -> Option<String> {
     let owners = n.owners.get_or_insert_with(|| owners(root));
     if let Some(p) = owners.get(&(t.to_string(), name.to_string())).or_else(|| n.alias.get(name)) {
         return Some(p.clone());
+    }
+    // nothing installed answers, which is every name on a fresh root. alpine's index says
+    // who ships it there: cmd:glslangValidator is glslang, so:libGL.so.1 is mesa
+    let index = n.index.get_or_insert_with(|| apkindex(root));
+    if let Some(o) = index.get(name) {
+        let o = n.alias.get(o).unwrap_or(o);
+        if o == "-" || recipe(root, o).is_some() {
+            return Some(o.clone());
+        }
     }
     // nothing installed answers. a recipe named after the command or the .pc is the
     // likely provider, and a wrong guess still fails loudly at its own build
@@ -14783,6 +14832,27 @@ mod names {
         assert_eq!(deps(&p), vec!["openjdk21", "openjdk8 make"]);
     }
 
+    // with nothing installed, alpine's index names the origin, and the aliases still have
+    // the last word on what that origin is called here
+    #[test]
+    fn a_name_nothing_installed_answers_goes_to_alpines_index() {
+        let r = root("index");
+        let at = recipe(&r, "extra", "app", "cmd:glslangValidator make\nso:libGL.so.1\nso:libnone.so.1\n");
+        recipe(&r, "extra", "glslang", "");
+        recipe(&r, "extra", "mesa", "");
+        fs::create_dir_all(r.join("var/kiry/apkindex")).unwrap();
+        fs::write(
+            r.join("var/kiry/apkindex/main"),
+            "P:glslang\no:glslang\np:cmd:glslangValidator=1.4-r0\n\nP:mesa-gl\no:mesa-src\np:so:libGL.so.1=1.0.0\n\n",
+        )
+        .unwrap();
+        fs::create_dir_all(r.join(REPOS_AT).join("local")).unwrap();
+        fs::write(r.join(REPOS_AT).join("local/aliases"), "mesa-src\tmesa\n").unwrap();
+
+        let p = load(&r, &at).unwrap();
+        assert_eq!(deps(&p), vec!["glslang make", "mesa", "so:libnone.so.1"]);
+    }
+
     // what is installed says who ships a library, a command or a .pc before anything
     // alpine wrote down does
     #[test]
@@ -14917,6 +14987,18 @@ mod names {
         assert_eq!(answers(&r, T, "pl:Devel/CheckLib.pm", &p, &[]), Some(("perl-devel-checklib".to_string(), "name")));
         let url = "xml:http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl";
         assert_eq!(answers(&r, T, url, &p, &[]), Some(("docbook-xsl".to_string(), "")));
+    }
+
+    // a py3- recipe is a python module, and only a py: miss is asked for one: libcprime's
+    // Could NOT find OpenGL got py3-opengl and failed the same way after it
+    #[test]
+    fn only_a_python_miss_is_answered_by_a_py3_name() {
+        let r = root("py3name");
+        recipe(&r, "extra", "py3-opengl", "");
+        let at = recipe(&r, "extra", "libcprime", "");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "cmake:OpenGL", &p, &[]), None);
+        assert_eq!(answers(&r, T, "py:opengl", &p, &[]), Some(("py3-opengl".to_string(), "name")));
     }
 
     #[test]
@@ -15852,6 +15934,13 @@ mod misses_from_logs {
         let itstool = "checking for python module libxml2... not found\nconfigure: error: Python module libxml2 is needed to run this package\n";
         assert_eq!(first(itstool).as_deref(), Some("py:libxml2"));
         assert!(lacking(itstool));
+        assert!(lacking("Looking for a system-wide yasm...\nconfigure: error: no system-wide yasm found\n"));
+        assert_eq!(first("../meson.build:1:0: ERROR: Unknown compiler(s): [['cython'], ['cython3']]\n").as_deref(), Some("cmd:cython"));
+        assert_eq!(first("OS unsupported - missing ExtUtils::CChecker at Build.PL line 6.\n").as_deref(), Some("pl:ExtUtils/CChecker.pm"));
+        let sip = "sip-build: pyproject.toml: 'tool.sip.project.qmake': '/usr/lib/qt6/bin/qmake' is not a working qmake\n";
+        assert_eq!(first(sip).as_deref(), Some("path:/usr/lib/qt6/bin/qmake"));
+        let vala = "warn unable to detect compiler type\n/src/x/meson.build:2:31: error unable to detect vala compiler\n";
+        assert_eq!(first(vala).as_deref(), Some("cmd:valac"));
         assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
         assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
         let vk = "CMake Error at cmake/QtTargetHelpers.cmake:1599 (message):\n  WrapVulkanHeaders::WrapVulkanHeaders is not a valid target.\n";
@@ -15913,6 +16002,10 @@ mod misses_from_logs {
         assert_eq!(first(emacs).as_deref(), Some("cmd:autoconf"));
         let makefun = "importlib.metadata.PackageNotFoundError: No package metadata was found for setuptools-scm\n";
         assert_eq!(first(makefun).as_deref(), Some("py:setuptools_scm"));
+        let xfce = "checking for libxfce4util-1.0 >= 4.18.0... not found\n\
+                    *** The required package libxfce4util-1.0 was not found on your system.\n\
+                    *** Please install libxfce4util-1.0 (atleast version 4.18.0) or adjust\n";
+        assert_eq!(first(xfce).as_deref(), Some("pc:libxfce4util-1.0"));
         assert_eq!(first("/usr/bin/env: 'bash': No such file or directory\n").as_deref(), Some("cmd:bash"));
         let cursor = "checking for m4 that supports -I option... configure: error: could not find m4 that supports -I option\n";
         assert_eq!(first(cursor).as_deref(), Some("cmd:m4"));

@@ -1759,6 +1759,14 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     if let Some(d) = found.iter().find(|f| pool.contains(&f.as_str())).or(found.first()) {
         return Some((d.clone(), ""));
     }
+    // a header one directory down: moarvm's include/moar/moar.h, which rakudo's makefile puts
+    // on the path itself. only off the recipe's own list, config.h is in a hundred packages
+    if k == "h" {
+        let under = |e: &str| e.strip_prefix(inc).is_some_and(|r| r.ends_with(&format!("/{n}")));
+        if let Some(d) = pool.iter().find(|d| fresh(d) && db::read(root, t, d).is_ok_and(|r| r.manifest.iter().any(|e| under(&e.path)))) {
+            return Some(((*d).to_string(), "name"));
+        }
+    }
 
     let index = apkindex(root);
     let origin = match k {
@@ -15120,6 +15128,20 @@ mod names {
         assert_eq!(answers(&r, T, raku, &p, &[]), Some(("rakudo".to_string(), "name")));
         // tools is a recipe but not on the list
         assert_eq!(answers(&r, T, "path:/usr/share/x/tools/y", &p, &[]), None);
+    }
+
+    #[test]
+    fn a_header_one_directory_down_is_a_dep_the_list_names() {
+        let r = root("hsub");
+        installed(&r, "moarvm", &["usr/include/moar/moar.h"], &[]);
+        installed(&r, "decoy", &["usr/include/decoy/config.h"], &[]);
+        recipe(&r, "extra", "moarvm", "");
+        recipe(&r, "extra", "decoy", "");
+        let at = recipe(&r, "extra", "rakudo", "nqp\nmoarvm\n");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "h:moar.h", &p, &[]), Some(("moarvm".to_string(), "name")));
+        // decoy ships one too but nothing put it on the list
+        assert_eq!(answers(&r, T, "h:config.h", &p, &[]), None);
     }
 
     // - is no equivalent here, and a name that comes back to the recipe itself is its own

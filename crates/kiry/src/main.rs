@@ -1521,6 +1521,23 @@ fn miss(l: &str) -> Option<String> {
     if l.contains("'LIBTOOL' is undefined") {
         return Some("cmd:libtool".to_string());
     }
+    // a makefile with an installed file as a prerequisite: rakudo's names /usr/bin/nqp-m.
+    // a relative target is the build's own
+    if let Some(n) = between("No rule to make target '", "'").filter(|n| n.starts_with('/') && !n.contains(' ')) {
+        return match n.rsplit_once('/') {
+            Some((d, c)) if d.ends_with("bin") => Some(format!("cmd:{c}")),
+            _ => Some(format!("path:{n}")),
+        };
+    }
+    // emacs byte-compiling a require: Cannot open load file: No such file or directory, llama
+    if let Some((_, n)) = l.split_once("Cannot open load file: No such file or directory, ") {
+        return (!n.is_empty() && !n.contains(' ')).then(|| format!("el:{n}"));
+    }
+    // PKG_CHECK_VAR with its own message: Unable to retrieve girdir from
+    // gobject-introspection-1.0.pc
+    if let Some(n) = between("Unable to retrieve ", ".pc").and_then(|r| r.split_once(" from ").map(|(_, n)| n.to_string())) {
+        return (!n.contains(' ')).then(|| format!("pc:{n}"));
+    }
     // a shell that went looking on PATH. a path that is not found is a script whose #!
     // names something absent -- lsof's Mksrc wants bash -- and discover() reads which
     let r = l.strip_suffix(": command not found").or_else(|| l.strip_suffix(": not found"))?;
@@ -1686,6 +1703,10 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
             // manpages/docbook.xsl is the one whose catalog maps its url there
             "xml" => path.starts_with("usr/share/xml/") && path.rsplit('/').next() == n.rsplit('/').next(),
             "path" => path == n.trim_start_matches('/'),
+            "el" => {
+                path.starts_with("usr/share/emacs/")
+                    && path.rsplit('/').next().is_some_and(|f| [".el", ".elc", ".el.gz"].iter().any(|x| f == format!("{n}{x}")))
+            }
             "cmake" => {
                 let pl = path.to_lowercase();
                 // a Find module is the finder, not the package: cmake ships FindLua.cmake and
@@ -1756,9 +1777,11 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     if k == "path" {
         return pool.iter().find(|c| n.split('/').any(|w| w == **c) && fresh(c)).map(|c| ((*c).to_string(), "name"));
     }
-    // a perl module is perl- and its name in lowercase, XML/Parser.pm is perl-xml-parser
+    // a perl module is perl- and its name in lowercase, XML/Parser.pm is perl-xml-parser,
+    // and an emacs library emacs-, llama is emacs-llama
     let stem = match k {
         "pl" => format!("perl-{}", lower.trim_end_matches(".pm").replace('/', "-")),
+        "el" => format!("emacs-{lower}"),
         _ => lower.trim_end_matches(".h").to_string(),
     };
     // through the aliases first: local/aliases says jpeg is libjpeg-turbo here, and extra/
@@ -1771,14 +1794,19 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
         .map(|c| called(root, &c, t).filter(|a| a != "-").unwrap_or(c))
         .find(|c| fresh(c) && recipe(root, c).is_some())
         .map(|c| (c, "name"));
-    if named.is_some() {
-        return named;
-    }
     // a binding is named for what it binds, Lpeg is lua-lpeg. a whole word of a name on the
     // recipe's own list, never a guess across the tree, lib on either end of it allowed:
     // cmake's GIF is giflib and its JPEG is libjpeg-turbo
     let named_for = |w: &str| w == stem || w.strip_prefix("lib") == Some(stem.as_str()) || w.strip_suffix("lib") == Some(stem.as_str());
     let word = pool.iter().find(|c| c.split('-').any(named_for) && fresh(c)).map(|c| ((*c).to_string(), "name"));
+    // a module several dists share goes to the one the recipe lists: py3-crashtest's
+    // poetry is py3-poetry-core and not poetry, which ships poetry too and needs crashtest
+    if k == "py" && word.is_some() && named.as_ref().is_some_and(|(c, _)| !pool.contains(&c.as_str())) {
+        return word;
+    }
+    if named.is_some() {
+        return named;
+    }
     if word.is_some() || k != "cmake" {
         return word;
     }
@@ -3602,7 +3630,12 @@ fn compile(
     let gomod = root.join("var/kiry/gomod");
     mkdirs(&gomod)?;
     mkdirs(&sysroot.join(sandbox::GOMOD_AT))?;
-    let downloads = text.contains("go mod download") || net && names(&text, "go");
+    // go build fetches what go.sum lists the moment it runs, so saying it counts. a word
+    // pair, since cargo build has go build in it
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let downloads = text.contains("go mod download")
+        || words.windows(2).any(|w| w == ["go", "build"])
+        || net && names(&text, "go");
     for sum in shallowest(&src, "go.sum", 3).into_iter().filter(|_| downloads) {
         if sum.with_file_name("vendor/modules.txt").is_file() {
             continue;
@@ -14989,6 +15022,19 @@ mod names {
         assert_eq!(answers(&r, T, url, &p, &[]), Some(("docbook-xsl".to_string(), "")));
     }
 
+    // emacs-epkg's require of llama
+    #[test]
+    fn an_emacs_library_is_answered_by_its_file_or_its_name() {
+        let r = root("elisp");
+        installed(&r, "emacs-compat", &["usr/share/emacs/site-lisp/compat/compat.elc"], &[]);
+        installed(&r, "a-doc", &["usr/share/doc/a/compat.el"], &[]);
+        recipe(&r, "extra", "emacs-llama", "");
+        let at = recipe(&r, "extra", "emacs-epkg", "");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "el:compat", &p, &[]), Some(("emacs-compat".to_string(), "")));
+        assert_eq!(answers(&r, T, "el:llama", &p, &[]), Some(("emacs-llama".to_string(), "name")));
+    }
+
     // a py3- recipe is a python module, and only a py: miss is asked for one: libcprime's
     // Could NOT find OpenGL got py3-opengl and failed the same way after it
     #[test]
@@ -14999,6 +15045,20 @@ mod names {
         let p = load(&r, &at).unwrap();
         assert_eq!(answers(&r, T, "cmake:OpenGL", &p, &[]), None);
         assert_eq!(answers(&r, T, "py:opengl", &p, &[]), Some(("py3-opengl".to_string(), "name")));
+    }
+
+    #[test]
+    fn a_shared_module_goes_to_the_dist_the_recipe_lists() {
+        let r = root("pyshared");
+        recipe(&r, "extra", "poetry", "");
+        recipe(&r, "extra", "py3-poetry-core", "");
+        recipe(&r, "extra", "py3-setuptools", "");
+        recipe(&r, "extra", "py3-setuptools-scm", "");
+        let at = recipe(&r, "extra", "py3-crashtest", "py3-poetry-core make\npy3-setuptools-scm make\npy3-setuptools make\n");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "py:poetry", &p, &[]), Some(("py3-poetry-core".to_string(), "name")));
+        // a name the list carries still beats a longer one with the word in it
+        assert_eq!(answers(&r, T, "py:setuptools", &p, &[]), Some(("py3-setuptools".to_string(), "name")));
     }
 
     #[test]
@@ -15942,6 +16002,13 @@ mod misses_from_logs {
         let vala = "warn unable to detect compiler type\n/src/x/meson.build:2:31: error unable to detect vala compiler\n";
         assert_eq!(first(vala).as_deref(), Some("cmd:valac"));
         assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
+        let rakudo = "make: *** No rule to make target '/usr/bin/nqp-m', needed by 'gen/moar/nqp-version'.  Stop.\n";
+        assert_eq!(first(rakudo).as_deref(), Some("cmd:nqp-m"));
+        assert_eq!(first("make: *** No rule to make target 'gen/x.c', needed by 'all'.  Stop.\n"), None);
+        let epkg = "epkg.el:44:11: Error: Cannot open load file: No such file or directory, llama\n";
+        assert_eq!(first(epkg).as_deref(), Some("el:llama"));
+        let gir = "checking for GI_GIRDIR... configure: error: Unable to retrieve girdir from gobject-introspection-1.0.pc\n";
+        assert_eq!(first(gir).as_deref(), Some("pc:gobject-introspection-1.0"));
         assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
         let vk = "CMake Error at cmake/QtTargetHelpers.cmake:1599 (message):\n  WrapVulkanHeaders::WrapVulkanHeaders is not a valid target.\n";
         assert_eq!(first(vk).as_deref(), Some("cmake:VulkanHeaders"));

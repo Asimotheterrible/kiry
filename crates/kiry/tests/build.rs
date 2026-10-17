@@ -3463,16 +3463,30 @@ fn a_patch_that_edits_the_lock_is_fetched_for_and_taken_back_off() {
 // writes where GOMODCACHE says, from the directory the go.sum is in
 #[test]
 fn a_go_sum_is_fetched_outside_and_the_build_finds_it_offline() {
-    let at = scratch("gomod");
-    let d = recipe(
-        &at,
-        "x86_64-musl",
-        &format!(
-            "true || go mod download\n\
-             [ \"$GOPROXY\" = off ] && [ \"$GOTOOLCHAIN\" = local ] || exit 1\n\
-             [ -e \"$GOMODCACHE/cache/fetched\" ] || exit 1\n{GOOD}"
-        ),
-    );
+    go_fetched("gomod", "true || go mod download\n", true);
+}
+
+// go-bindata only says go build, which fetches what go.sum lists the moment it runs
+#[test]
+fn a_go_build_is_fetched_for_too() {
+    go_fetched("gobuild", "true || go build -o go-bindata .\n", true);
+}
+
+// cargo build has go build in it
+#[test]
+fn a_cargo_build_beside_a_go_sum_fetches_no_modules() {
+    go_fetched("gocargo", "true || cargo build --release\n", false);
+}
+
+fn go_fetched(name: &str, head: &str, fetched: bool) {
+    let at = scratch(name);
+    let check = if fetched {
+        "[ \"$GOPROXY\" = off ] && [ \"$GOTOOLCHAIN\" = local ] || exit 1\n\
+         [ -e \"$GOMODCACHE/cache/fetched\" ] || exit 1\n"
+    } else {
+        ""
+    };
+    let d = recipe(&at, "x86_64-musl", &format!("{head}{check}{GOOD}"));
     fs::write(at.join("src/hello-1.0/go.sum"), "").unwrap();
     let arc = tarball(&at);
     let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
@@ -3504,8 +3518,8 @@ fn a_go_sum_is_fetched_outside_and_the_build_finds_it_offline() {
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let args = fs::read_to_string(at.join("args")).unwrap();
-    assert_eq!(args, "mod download hello-1.0 local\n");
+    let args = fs::read_to_string(at.join("args")).unwrap_or_default();
+    assert_eq!(args, if fetched { "mod download hello-1.0 local\n" } else { "" });
 }
 
 // the site file moves a gnu libdir under --prefix=/usr and nothing else. a configure

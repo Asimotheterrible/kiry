@@ -6802,6 +6802,7 @@ fn install(root: &Path, names: Vec<String>, how: &How) {
             die("planned 500 times without finishing, something keeps asking for itself".into());
         }
         let mut set = wanted(&root, &seeds, &mut recipes, &HashSet::new());
+        let mut have: HashSet<(String, String)> = HashSet::new();
         // a build runs on the toolchain, and no recipe names it. a root without it takes the
         // cached one first, stale or not: it compiles the same, and nothing here can build a
         // compiler without one
@@ -6815,7 +6816,7 @@ fn install(root: &Path, names: Vec<String>, how: &How) {
                     let _w = writer(&root);
                     apply_batch(&root, &tools.iter().map(|x| x.2.clone()).collect::<Vec<_>>(), force);
                 }
-                let have: HashSet<(String, String)> = tools.into_iter().map(|(n, t, _)| (n, t)).collect();
+                have = tools.into_iter().map(|(n, t, _)| (n, t)).collect();
                 set = wanted(&root, &seeds, &mut recipes, &have);
             }
         }
@@ -6847,16 +6848,16 @@ fn install(root: &Path, names: Vec<String>, how: &How) {
             // video source took obs from 13 builds to 311, and the number was here to read
             // before the first one started. what a name costs is what goes away with it,
             // which is the closure walked again without that edge
-            let mut alone: Vec<(usize, &str)> = Vec::new();
-            for (n, _) in &seeds {
-                for d in &recipes[n].depends {
+            let mut alone: Vec<(usize, String)> = Vec::new();
+            for (n, t) in &seeds {
+                for d in asks(&root, &recipes[n], t) {
                     if alone.iter().any(|(_, o)| *o == d.name) {
                         continue;
                     }
                     // one is a package and it is already a line above. what is worth
                     // reading here is a name that takes others with it
-                    match set.len() - without(&root, &seeds, &recipes, &d.name) {
-                        gone if gone > 1 => alone.push((gone, &d.name)),
+                    match set.len().saturating_sub(without(&root, &seeds, &recipes, &have, &d.name)) {
+                        gone if gone > 1 => alone.push((gone, d.name)),
                         _ => {}
                     }
                 }
@@ -7093,12 +7094,14 @@ fn requeue_pruned(root: &Path, hurt: &[(String, Finding)]) {
 // the installed database, so a tool that is not installed is one the sandbox has nothing
 // to hand the build
 // what the closure would be with one dependency edge cut. the whole of it is loaded by
-// the time this runs, so it walks what wanted() already walked and touches no disk beyond
-// asking what is installed
+// the time this runs, so it walks what asks() gave wanted(). walking the recipe's list
+// instead counted alpine's every-option closure against a set built from what was
+// proven, and apache2's lua5.4 came out at 18446744073709551614 builds
 fn without(
     root: &Path,
     seeds: &[(String, String)],
     recipes: &HashMap<String, Package>,
+    have: &HashSet<(String, String)>,
     cut: &str,
 ) -> usize {
     let host = sandbox::host();
@@ -7109,9 +7112,9 @@ fn without(
         let (name, t) = out[i].clone();
         i += 1;
         let Some(p) = recipes.get(&name) else { continue };
-        for d in p.depends.iter().filter(|d| d.applies(&t) && d.name != cut) {
+        for d in asks(root, p, &t).into_iter().filter(|d| d.name != cut) {
             let at = (d.name.clone(), if d.host { host.clone() } else { t.clone() });
-            if db::read(root, &at.1, &at.0).is_ok() || !seen.insert(at.clone()) {
+            if db::read(root, &at.1, &at.0).is_ok() || have.contains(&at) || !seen.insert(at.clone()) {
                 continue;
             }
             out.push(at);
@@ -7166,14 +7169,8 @@ fn wanted(
                 None => die(format!("{name} is wanted for {t} and does not build for it")),
             }
         }
-        // a built artifact is installed, which asks for its runtime deps alone. walking
-        // its build deps too closed llvm, cmake and python3 into a cycle on an empty
-        // root with every one of them sitting in the cache
-        let built = fresh(root, p, &t);
-        let deps = if built { planned(root, p, &t) } else { start(root, p, &t) };
-        let next: Vec<(String, String)> = deps
+        let next: Vec<(String, String)> = asks(root, p, &t)
             .iter()
-            .filter(|d| d.applies(&t) && !(built && d.make))
             .map(|d| {
                 let dt = if d.host { host.clone() } else { t.clone() };
                 (d.name.clone(), dt)
@@ -7188,6 +7185,15 @@ fn wanted(
         }
     }
     out
+}
+
+// a built artifact is installed, which asks for its runtime deps alone. walking its build
+// deps too closed llvm, cmake and python3 into a cycle on an empty root with every one of
+// them sitting in the cache
+fn asks(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
+    let built = fresh(root, p, t);
+    let deps = if built { planned(root, p, t) } else { start(root, p, t) };
+    deps.into_iter().filter(|d| d.applies(t) && !(built && d.make)).collect()
 }
 
 // what installing a built artifact asks for: its sidecar's depends, which is what the
@@ -9151,11 +9157,52 @@ mod order {
         let none = Path::new("/nonexistent-kiry-root");
 
         // app vlc dvdread dvdcss zlib
-        assert_eq!(without(none, &seeds, &recipes, ""), 5);
+        let have = HashSet::new();
+        assert_eq!(without(none, &seeds, &recipes, &have, ""), 5);
         // zlib is reached around vlc as well, so only the dvd chain leaves with it
-        assert_eq!(without(none, &seeds, &recipes, "vlc"), 2);
+        assert_eq!(without(none, &seeds, &recipes, &have, "vlc"), 2);
         // and a leaf costs itself alone
-        assert_eq!(without(none, &seeds, &recipes, "zlib"), 4);
+        assert_eq!(without(none, &seeds, &recipes, &have, "zlib"), 4);
+        // the toolchain a dry run counts as in is not a build either
+        let tools = HashSet::from([("zlib".to_string(), "x86_64-musl".to_string())]);
+        assert_eq!(without(none, &seeds, &recipes, &tools, ""), 4);
+    }
+
+    // apache2 lists lua5.4 and its proven closure does not. the cost of a name is counted
+    // over the same edges the set was, or the difference goes below zero
+    #[test]
+    fn what_a_dependency_costs_is_counted_over_what_was_proven() {
+        let t = "x86_64-musl".to_string();
+        let root = std::env::temp_dir().join(format!("kiry-without-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(closure_at(&root, &t, "app").parent().unwrap()).unwrap();
+        fs::write(closure_at(&root, &t, "app"), "zlib\n").unwrap();
+        let pkg = |name: &str, deps: &[&str]| Package {
+            name: name.to_string(),
+            dir: root.join("extra").join(name),
+            version: pkg::Version::parse("1 1").unwrap(),
+            sources: Vec::new(),
+            checksums: Vec::new(),
+            depends: deps
+                .iter()
+                .map(|d| pkg::Dep { name: (*d).to_string(), make: false, host: false, only: None })
+                .collect(),
+            targets: vec![t.clone()],
+            users: Vec::new(),
+        };
+        let mut recipes = HashMap::from([
+            ("app".to_string(), pkg("app", &["lua", "zlib"])),
+            ("lua".to_string(), pkg("lua", &["readline"])),
+            ("readline".to_string(), pkg("readline", &[])),
+            ("zlib".to_string(), pkg("zlib", &[])),
+        ]);
+        let seeds = vec![("app".to_string(), t)];
+        let have = HashSet::new();
+        let set = wanted(&root, &seeds, &mut recipes, &have);
+        assert_eq!(set.len(), 2);
+        assert_eq!(without(&root, &seeds, &recipes, &have, ""), set.len());
+        assert_eq!(without(&root, &seeds, &recipes, &have, "zlib"), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn three() -> Vec<(String, String)> {

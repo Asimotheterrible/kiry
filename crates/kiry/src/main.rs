@@ -1324,6 +1324,11 @@ fn miss(l: &str) -> Option<String> {
     if l.starts_with("Package '") && l.ends_with("not found") {
         return between("Package '", "'").map(|n| format!("pc:{n}"));
     }
+    // acsccid's configure: WARNING: libpcsclite not found by pkg-config, and the error
+    // under it names the project instead, pcsc-lite 1.8.3 or later
+    if let Some(n) = between("WARNING: ", " not found by pkg-config").filter(|n| !n.contains(' ')) {
+        return Some(format!("pc:{n}"));
+    }
     // a configure somebody wrote by hand, newsboat's
     if let Some(r) = l.strip_prefix("Checking for package ").filter(|_| no) {
         return word(r).map(|n| format!("pc:{}", n.trim_end_matches('.')));
@@ -1426,6 +1431,10 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("no such command: `", "`") {
         return Some(format!("cmd:cargo-{n}"));
     }
+    // a -sys crate's build.rs that found nothing: rdedup's libsodium-sys
+    if let Some(n) = between("could not find native static library `", "`") {
+        return Some(format!("lib:{n}"));
+    }
     // libtoolize: Please install GNU M4, or 'export M4=/path/to/gnu/m4'
     if let Some(n) = between("install GNU ", ",").or_else(|| between("install GNU ", " ")) {
         return Some(format!("cmd:{}", n.to_lowercase()));
@@ -1482,6 +1491,11 @@ fn miss(l: &str) -> Option<String> {
     }
     if n.starts_with("PKG_") {
         return Some("cmd:pkg-config".to_string());
+    }
+    // a file some package keeps outside bin: the raku recipes run
+    // /usr/share/rakudo/tools/install-dist.raku
+    if n.starts_with('/') && !n.contains(' ') && !n.rsplit_once('/').is_some_and(|(d, _)| d.ends_with("bin")) {
+        return Some(format!("path:{n}"));
     }
     let n = if n.starts_with("./") || n.starts_with("../") { n } else { n.rsplit('/').next()? };
     (!n.is_empty() && !n.contains(' ')).then(|| format!("cmd:{n}"))
@@ -1575,6 +1589,7 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
             // the url's file anywhere under the xml tree: the package that ships
             // manpages/docbook.xsl is the one whose catalog maps its url there
             "xml" => path.starts_with("usr/share/xml/") && path.rsplit('/').next() == n.rsplit('/').next(),
+            "path" => path == n.trim_start_matches('/'),
             "cmake" => {
                 let pl = path.to_lowercase();
                 // a Find module is the finder, not the package: cmake ships FindLua.cmake and
@@ -1640,6 +1655,11 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
         }
     }
 
+    // nothing uninstalled says what files it has, but a directory is usually named for
+    // its package: share/rakudo is rakudo's. only off the recipe's own list
+    if k == "path" {
+        return pool.iter().find(|c| n.split('/').any(|w| w == **c) && fresh(c)).map(|c| ((*c).to_string(), "name"));
+    }
     // a perl module is perl- and its name in lowercase, XML/Parser.pm is perl-xml-parser
     let stem = match k {
         "pl" => format!("perl-{}", lower.trim_end_matches(".pm").replace('/', "-")),
@@ -1736,6 +1756,12 @@ fn discover(root: &Path, p: &Package, t: &str, log: &Path, work: &Path) -> Optio
         }
         say!("{} {t} needs {d}  {m}{via}, not installed yet", p.name);
         return Some(Step::Wait);
+    }
+
+    // without alpine's index a miss for anything not yet installed has only the names to
+    // go on, and plain sync never fetches it
+    if !ms.is_empty() && !root.join("var/kiry/apkindex/main").is_file() {
+        say!("{} {t} has no alpine index to answer {}, sync --net fetches one", p.name, ms[0]);
     }
 
     // nothing it said names a package. a configure that failed this way gets everything the
@@ -14791,6 +14817,22 @@ mod names {
         assert_eq!(answers(&r, T, url, &p, &[]), Some(("docbook-xsl".to_string(), "")));
     }
 
+    // a path is whoever ships it, and before that a name on the list the path runs through
+    #[test]
+    fn a_path_is_answered_by_its_owner_or_the_directory_it_is_named_for() {
+        let r = root("path");
+        installed(&r, "nqp", &["usr/share/nqp/tools/x.raku"], &[]);
+        recipe(&r, "extra", "rakudo", "");
+        recipe(&r, "extra", "tools", "");
+        let at = recipe(&r, "extra", "raku-cbor-simple", "raku-tinyfloats\nrakudo\n");
+        let p = load(&r, &at).unwrap();
+        assert_eq!(answers(&r, T, "path:/usr/share/nqp/tools/x.raku", &p, &[]), Some(("nqp".to_string(), "")));
+        let raku = "path:/usr/share/rakudo/tools/install-dist.raku";
+        assert_eq!(answers(&r, T, raku, &p, &[]), Some(("rakudo".to_string(), "name")));
+        // tools is a recipe but not on the list
+        assert_eq!(answers(&r, T, "path:/usr/share/x/tools/y", &p, &[]), None);
+    }
+
     // - is no equivalent here, and a name that comes back to the recipe itself is its own
     // subpackage. neither is an edge, and two spellings of one package are one
     #[test]
@@ -15728,6 +15770,13 @@ mod misses_from_logs {
         assert_eq!(first(xmltoman).as_deref(), Some("pl:XML/Parser.pm"));
         assert_eq!(first("Can't locate loadable object for module Foo::Bar in @INC (@INC contains: /usr/lib/perl5)\n"), None);
         assert_eq!(first("/src/libnvme-1.16.2/meson.build:52:9: error command failed\nenv: can't execute 'bash': No such file or directory\n").as_deref(), Some("cmd:bash"));
+        // 2026-10-17, recipes never built before
+        let acsccid = "configure: WARNING: libpcsclite not found by pkg-config\nchecking for SCardEstablishContext... no\nconfigure: error: install pcsc-lite 1.8.3 or later, or use ./configure PCSC_CFLAGS=...\n";
+        assert_eq!(first(acsccid).as_deref(), Some("pc:libpcsclite"));
+        let rdedup = "error: could not find native static library `sodium`, perhaps an -L flag is missing?\n\nerror: could not compile `libsodium-sys` (lib) due to 1 previous error\n";
+        assert_eq!(first(rdedup).as_deref(), Some("lib:sodium"));
+        assert_eq!(first("/build: line 11: /usr/share/rakudo/tools/install-dist.raku: not found\n").as_deref(), Some("path:/usr/share/rakudo/tools/install-dist.raku"));
+        assert_eq!(first("/build: line 3: /usr/bin/gem: not found\n").as_deref(), Some("cmd:gem"));
         assert_eq!(first("/usr/bin/env: 'bash': No such file or directory\n").as_deref(), Some("cmd:bash"));
         let cursor = "checking for m4 that supports -I option... configure: error: could not find m4 that supports -I option\n";
         assert_eq!(first(cursor).as_deref(), Some("cmd:m4"));

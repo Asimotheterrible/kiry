@@ -1259,6 +1259,9 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
     // distutils for the extension dir, got nothing, and libtool died on an empty -rpath
     // hundreds of lines on
     out.extend(lines.iter().filter(|l| l.starts_with("ModuleNotFoundError: ")).filter_map(|l| miss(l)));
+    // and make stopping for an installed file: rakudo's Configure.pl runs a make clean that
+    // fails on a directory and carries on, so the anchor is that, lines above the real stop
+    out.extend(lines.iter().filter(|l| l.contains("No rule to make target '/")).filter_map(|l| miss(l)));
     let mut seen = HashSet::new();
     out.retain(|m| seen.insert(m.clone()));
     out
@@ -1537,6 +1540,11 @@ fn miss(l: &str) -> Option<String> {
     // gobject-introspection-1.0.pc
     if let Some(n) = between("Unable to retrieve ", ".pc").and_then(|r| r.split_once(" from ").map(|(_, n)| n.to_string())) {
         return (!n.contains(' ')).then(|| format!("pc:{n}"));
+    }
+    // apr's find_apr.m4 when its config script is absent: the --with-apr-util parameter is
+    // incorrect. it names a package and no file, so with: is answered by name alone
+    if let Some(n) = between("the --with-", " parameter is incorrect") {
+        return (!n.contains(' ')).then(|| format!("with:{n}"));
     }
     // a shell that went looking on PATH. a path that is not found is a script whose #!
     // names something absent -- lsof's Mksrc wants bash -- and discover() reads which
@@ -16009,6 +16017,8 @@ mod misses_from_logs {
         assert_eq!(first(epkg).as_deref(), Some("el:llama"));
         let gir = "checking for GI_GIRDIR... configure: error: Unable to retrieve girdir from gobject-introspection-1.0.pc\n";
         assert_eq!(first(gir).as_deref(), Some("pc:gobject-introspection-1.0"));
+        let apr = "checking for APR-util... configure: error: the --with-apr-util parameter is incorrect. It must specify an install prefix, a build directory, or an apu-config file.\n";
+        assert_eq!(first(apr).as_deref(), Some("with:apr-util"));
         assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
         let vk = "CMake Error at cmake/QtTargetHelpers.cmake:1599 (message):\n  WrapVulkanHeaders::WrapVulkanHeaders is not a valid target.\n";
         assert_eq!(first(vk).as_deref(), Some("cmake:VulkanHeaders"));
@@ -16052,6 +16062,8 @@ mod misses_from_logs {
         }
         libbsd.push_str("/src/libbsd-0.12.2/build-aux/missing: line 81: automake-1.16: not found\nmake: *** [Makefile:363: Makefile.in] Error 1\n");
         assert_eq!(misses(&libbsd, "").first().map(String::as_str), Some("cmd:libtoolize"), "{:?}", misses(&libbsd, ""));
+        let rakudo = "rm: 'dynext' is a directory\nmake: *** [Makefile:1724: m-clean] Error 1\nYou can now use 'make' to build Rakudo.\nAfter that, 'make test' will run some tests and\n'make install' will install Rakudo.\nmake: *** No rule to make target '/usr/bin/nqp-m', needed by 'gen/moar/nqp-version'.  Stop.\n";
+        assert_eq!(misses(rakudo, "").first().map(String::as_str), Some("cmd:nqp-m"), "{:?}", misses(rakudo, ""));
         // 2026-10-15, the packages built before discovery
         let xmltoman = "Can't locate XML/Parser.pm in @INC (you may need to install the XML::Parser module) (@INC entries checked: /usr/lib/perl5/vendor_perl) at ./xmltoman line 22.\nBEGIN failed--compilation aborted at ./xmltoman line 22.\nmake: *** [Makefile:11: xmltoman.1] Error 2\n";
         assert_eq!(first(xmltoman).as_deref(), Some("pl:XML/Parser.pm"));

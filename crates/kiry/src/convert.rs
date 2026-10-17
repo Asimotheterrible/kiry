@@ -356,6 +356,7 @@ pub fn recipe(
             script.push_str(&format!("{k}=\"{a}\"\n"));
         }
     }
+    script.push_str(&untested(&exports(&text)));
 
     // definitions rather than inlined bodies, which is what abuild runs too. 852 scripts
     // declare a local in a phase and ash refuses one outside a function. it also puts a
@@ -713,21 +714,54 @@ fn body(text: &str, name: &str) -> Option<String> {
 // kiry never runs check(), and a test suite it builds anyway is one more thing to fail:
 // mbedtls2, glm and cxxopts all stopped on clang's -Werror inside their tests. a word at a
 // time, so the whitespace and the line continuations stay as they were. the same walk
-// takes alpine's lto words out
+// takes alpine's lto words and pinned clangs out
 pub fn untested(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut word = String::new();
     for c in body.chars() {
         if c.is_whitespace() {
-            out.push_str(&off(&unlto(&word)));
+            out.push_str(&off(&unlto(&unpinned(&word))));
             word.clear();
             out.push(c);
         } else {
             word.push(c);
         }
     }
-    out.push_str(&off(&unlto(&word)));
+    out.push_str(&off(&unlto(&unpinned(&word))));
     out
+}
+
+// an apkbuild's own environment, written above its functions: rdedup's
+// SODIUM_USE_PKG_CONFIG=1, without which libsodium-sys wants a static libsodium. as
+// written, since most say $GOFLAGS or $CFLAGS and mean the build's. one inside a case is
+// indented and left, being for some other arch
+fn exports(text: &str) -> String {
+    let mut out = String::new();
+    // a value can go on over lines inside quotes or after a backslash
+    let (mut quoted, mut more) = (false, false);
+    for line in text.lines() {
+        if !quoted && !more && !line.starts_with("export ") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        quoted ^= line.matches('"').count() % 2 == 1;
+        more = line.ends_with('\\');
+    }
+    out
+}
+
+// php sets CC=clang-$_clang_ver, a clang alpine keeps beside its default one. navi has
+// only its own, and the wrapper the sandbox names in CC is what carries the flags
+fn unpinned(word: &str) -> String {
+    let bare = |p: &str| word.strip_prefix(p).map(|v| v.trim_matches(['"', '\'']));
+    if bare("CC=").is_some_and(|v| v.starts_with("clang-")) {
+        return "CC=$CC".to_string();
+    }
+    if bare("CXX=").is_some_and(|v| v.starts_with("clang++-")) {
+        return "CXX=$CXX".to_string();
+    }
+    word.to_string()
 }
 
 // alpine's -flto=auto is gcc's full lto spelled for clang, and it rides on top of the LTO
@@ -961,5 +995,27 @@ mod tests {
 
         let got = aliases(std::slice::from_ref(&at));
         assert_eq!(got.get("pulseaudio").map(String::as_str), Some("libpulse"));
+    }
+
+    #[test]
+    fn an_apkbuilds_own_exports_come_along() {
+        let text = "pkgname=x\nexport SODIUM_USE_PKG_CONFIG=1\nexport CFLAGS=\"$CFLAGS\n\t-O2\"\n\
+            export GOFLAGS=\"$GOFLAGS -trimpath\" \\\n\tGOAMD64=v3\n\
+            case \"$CARCH\" in\nx86) export FOO=1 ;;\nesac\n\tbuild() {\n\texport BAR=1\n}\n";
+        assert_eq!(
+            exports(text),
+            "export SODIUM_USE_PKG_CONFIG=1\nexport CFLAGS=\"$CFLAGS\n\t-O2\"\n\
+             export GOFLAGS=\"$GOFLAGS -trimpath\" \\\n\tGOAMD64=v3\n"
+        );
+    }
+
+    // php83 asked for clang-21 and its configure found no compiler at all
+    #[test]
+    fn a_pinned_clang_gives_way_to_the_sandboxs_cc() {
+        let got = untested("\texport CC=clang-$_clang_ver\n\texport CXX=\"clang++-$_llvmver\"\n");
+        assert_eq!(got, "\texport CC=$CC\n\texport CXX=$CXX\n");
+        // llvm building itself names its own, and a plain clang is not pinned
+        let kept = "\tCC=clang -DCMAKE_C_COMPILER=clang-$_llvmver CLANG=clang-$_llvmver\n";
+        assert_eq!(untested(kept), kept);
     }
 }

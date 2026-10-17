@@ -68,6 +68,27 @@ fn a_case_on_carch_decides_a_private_variable() {
     assert!(!script.contains("narrow"), "{script}");
 }
 
+// rdedup exports SODIUM_USE_PKG_CONFIG=1 above its functions, and without it libsodium-sys
+// went looking for a static libsodium
+#[test]
+fn an_apkbuilds_top_level_exports_reach_the_build() {
+    if !have_busybox() {
+        return;
+    }
+    let at = scratch("exports");
+    let (d, _) = convert(
+        &at,
+        "pkgname=thing\npkgver=1.0\npkgrel=0\n\
+         export SODIUM_USE_PKG_CONFIG=1\nexport CFLAGS=\"$CFLAGS -flto=auto\"\n\
+         build() {\n\tcargo build\n}\n\
+         package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
+    );
+    let script = fs::read_to_string(d.join("build")).unwrap();
+    let at = script.find("export SODIUM_USE_PKG_CONFIG=1\n").expect(&script);
+    assert!(at < script.find("build() {").unwrap(), "{script}");
+    assert!(!script.contains("lto"), "{script}");
+}
+
 // $source holds what the apkbuild wrote, not the names the files land under. 64 recipes
 // reach for ${p##*/} to get a name back out of it, and bash finds its vendor patches by
 // matching */bash[0-9][0-9]-[0-9]*, which a bare name never matches

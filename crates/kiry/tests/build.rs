@@ -3324,14 +3324,27 @@ fn a_recipe_that_runs_cargo_vendor_gets_its_crates_too() {
 // cargo-c's lock is a source of its own, cargo-c-<ver>-Cargo.lock, which prepare copies in
 #[test]
 fn a_lock_shipped_as_its_own_source_is_fetched_for() {
-    cargo_fetched_apart("cargoapart", "true || cargo fetch --locked\n", true);
+    cargo_fetched_apart("cargoapart", "true || cargo fetch --locked\n", Some("hello-1.0-Cargo.lock"), false);
+}
+
+// libimagequant's is called just Cargo.lock, and lands at the top of /src with no
+// Cargo.toml beside it to fetch for
+#[test]
+fn a_plain_cargo_lock_shipped_as_a_source_is_fetched_for() {
+    cargo_fetched_apart("cargoplain", "true || cargo fetch --locked\n", Some("Cargo.lock"), false);
+}
+
+// a tree that ships its own lock is fetched for by that one, not the source beside it
+#[test]
+fn a_trees_own_cargo_lock_wins_over_one_shipped_as_a_source() {
+    cargo_fetched_apart("cargoown", "true || cargo fetch --locked\n", Some("Cargo.lock"), true);
 }
 
 fn cargo_fetched(name: &str, head: &str) {
-    cargo_fetched_apart(name, head, false);
+    cargo_fetched_apart(name, head, None, false);
 }
 
-fn cargo_fetched_apart(name: &str, head: &str, apart: bool) {
+fn cargo_fetched_apart(name: &str, head: &str, apart: Option<&str>, own: bool) {
     let at = scratch(name);
     let d = recipe(
         &at,
@@ -3342,18 +3355,21 @@ fn cargo_fetched_apart(name: &str, head: &str, apart: bool) {
         ),
     );
     let lock = match apart {
-        true => d.join("hello-1.0-Cargo.lock"),
-        false => at.join("src/hello-1.0/Cargo.lock"),
+        Some(n) => d.join(n),
+        None => at.join("src/hello-1.0/Cargo.lock"),
     };
     fs::write(&lock, "version = 4\n").unwrap();
+    if own {
+        fs::write(at.join("src/hello-1.0/Cargo.lock"), "own\n").unwrap();
+    }
     fs::write(at.join("src/hello-1.0/Cargo.toml"), "[package]\n").unwrap();
     let arc = tarball(&at);
     let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
     fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
-    if apart {
+    if let Some(n) = apart {
         let s = kiry_core::sha256(fs::File::open(&lock).unwrap()).unwrap();
         let src = fs::read_to_string(d.join("sources")).unwrap();
-        fs::write(d.join("sources"), format!("{src}hello-1.0-Cargo.lock\n")).unwrap();
+        fs::write(d.join("sources"), format!("{src}{n}\n")).unwrap();
         fs::write(d.join("checksums"), format!("{sum}\n{s}\n")).unwrap();
     }
 
@@ -3362,9 +3378,10 @@ fn cargo_fetched_apart(name: &str, head: &str, apart: bool) {
     fs::write(
         bin.join("cargo"),
         format!(
-            "#!/bin/sh\necho \"$*\" >> {}\nmkdir -p \"$CARGO_HOME/registry\"\n\
-             touch \"$CARGO_HOME/registry/fetched\"\n",
-            at.join("args").display()
+            "#!/bin/sh\necho \"$*\" >> {}\nm=$4\ncat \"${{m%/*}}/Cargo.lock\" > {}\n\
+             mkdir -p \"$CARGO_HOME/registry\"\ntouch \"$CARGO_HOME/registry/fetched\"\n",
+            at.join("args").display(),
+            at.join("lock").display()
         ),
     )
     .unwrap();
@@ -3386,6 +3403,8 @@ fn cargo_fetched_apart(name: &str, head: &str, apart: bool) {
     let args = fs::read_to_string(at.join("args")).unwrap();
     assert!(args.starts_with("fetch --locked --manifest-path "), "{args}");
     assert!(args.trim_end().ends_with("hello-1.0/Cargo.toml"), "{args}");
+    let fetched = fs::read_to_string(at.join("lock")).unwrap();
+    assert_eq!(fetched, if own { "own\n" } else { "version = 4\n" });
 }
 
 // tree-sitter's patch bumps crates in Cargo.lock, and default_prepare applies it only

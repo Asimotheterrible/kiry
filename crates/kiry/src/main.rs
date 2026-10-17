@@ -1536,6 +1536,10 @@ fn miss(l: &str) -> Option<String> {
     if let Some((_, n)) = l.split_once("Cannot open load file: No such file or directory, ") {
         return (!n.is_empty() && !n.contains(' ')).then(|| format!("el:{n}"));
     }
+    // rakudo's use of a module nothing installed: Could not find TinyFloats in:
+    if let Some(n) = l.trim_end().strip_prefix("Could not find ").and_then(|r| r.strip_suffix(" in:")) {
+        return (!n.is_empty() && !n.contains(' ')).then(|| format!("rk:{n}"));
+    }
     // PKG_CHECK_VAR with its own message: Unable to retrieve girdir from
     // gobject-introspection-1.0.pc
     if let Some(n) = between("Unable to retrieve ", ".pc").and_then(|r| r.split_once(" from ").map(|(_, n)| n.to_string())) {
@@ -1798,10 +1802,12 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
         return pool.iter().find(|c| n.split('/').any(|w| w == **c) && fresh(c)).map(|c| ((*c).to_string(), "name"));
     }
     // a perl module is perl- and its name in lowercase, XML/Parser.pm is perl-xml-parser,
-    // and an emacs library emacs-, llama is emacs-llama
+    // an emacs library emacs-, llama is emacs-llama, and a raku module raku-, TinyFloats is
+    // raku-tinyfloats
     let stem = match k {
         "pl" => format!("perl-{}", lower.trim_end_matches(".pm").replace('/', "-")),
         "el" => format!("emacs-{lower}"),
+        "rk" => format!("raku-{}", lower.replace("::", "-")),
         _ => lower.trim_end_matches(".h").to_string(),
     };
     // through the aliases first: local/aliases says jpeg is libjpeg-turbo here, and extra/
@@ -15128,6 +15134,10 @@ mod names {
         assert_eq!(answers(&r, T, raku, &p, &[]), Some(("rakudo".to_string(), "name")));
         // tools is a recipe but not on the list
         assert_eq!(answers(&r, T, "path:/usr/share/x/tools/y", &p, &[]), None);
+        recipe(&r, "extra", "raku-tinyfloats", "");
+        assert_eq!(answers(&r, T, "rk:TinyFloats", &p, &[]), Some(("raku-tinyfloats".to_string(), "name")));
+        recipe(&r, "extra", "raku-json-fast", "");
+        assert_eq!(answers(&r, T, "rk:JSON::Fast", &p, &[]), Some(("raku-json-fast".to_string(), "name")));
     }
 
     #[test]
@@ -16045,6 +16055,8 @@ mod misses_from_logs {
         assert_eq!(first("make: *** No rule to make target 'gen/x.c', needed by 'all'.  Stop.\n"), None);
         let epkg = "epkg.el:44:11: Error: Cannot open load file: No such file or directory, llama\n";
         assert_eq!(first(epkg).as_deref(), Some("el:llama"));
+        let cbor = "===SORRY!=== Error while compiling /src/C/vendor#sources/6F54 (CBOR::Simple)\nCould not find TinyFloats in:\n    /usr/share/rakudo/vendor\nat /src/C/vendor#sources/6F54 (CBOR::Simple):4\n\n  in sub MAIN at /usr/share/rakudo/tools/install-dist.raku line 19\n";
+        assert_eq!(first(cbor).as_deref(), Some("rk:TinyFloats"));
         let gir = "checking for GI_GIRDIR... configure: error: Unable to retrieve girdir from gobject-introspection-1.0.pc\n";
         assert_eq!(first(gir).as_deref(), Some("pc:gobject-introspection-1.0"));
         let apr = "checking for APR-util... configure: error: the --with-apr-util parameter is incorrect. It must specify an install prefix, a build directory, or an apu-config file.\n";

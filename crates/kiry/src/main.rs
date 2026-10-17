@@ -1546,6 +1546,10 @@ fn miss(l: &str) -> Option<String> {
     if let Some(n) = between("the --with-", " parameter is incorrect") {
         return (!n.contains(' ')).then(|| format!("with:{n}"));
     }
+    // nqp's Configure.pl: No moar executable found in /usr
+    if let Some(n) = between("No ", " executable found") {
+        return (!n.is_empty() && !n.contains(' ')).then(|| format!("cmd:{n}"));
+    }
     // a shell that went looking on PATH. a path that is not found is a script whose #!
     // names something absent -- lsof's Mksrc wants bash -- and discover() reads which
     let r = l.strip_suffix(": command not found").or_else(|| l.strip_suffix(": not found"))?;
@@ -3879,6 +3883,10 @@ fn compile(
     c.env("KIRY_CARGO", abs(&cargo)?);
     c.env("CARGO_HOME", format!("/{}", sandbox::CARGO_AT));
     c.env("CARGO_NET_OFFLINE", "true");
+    // a project's .cargo/config names a linker for its own release box: mprocs'
+    // x86_64-linux-musl-gcc. alpine's vendor triple never matches one, ours does. cc is
+    // rustc's own default, and a recipe's export or -C linker still wins over this
+    c.env(format!("CARGO_TARGET_{}_LINKER", triple(t).replace('-', "_").to_uppercase()), "cc");
     c.env("KIRY_GOMOD", abs(&gomod)?);
     c.env("GOMODCACHE", format!("/{}", sandbox::GOMOD_AT));
     c.env("GOPROXY", "off");
@@ -16019,6 +16027,7 @@ mod misses_from_logs {
         assert_eq!(first(gir).as_deref(), Some("pc:gobject-introspection-1.0"));
         let apr = "checking for APR-util... configure: error: the --with-apr-util parameter is incorrect. It must specify an install prefix, a build directory, or an apu-config file.\n";
         assert_eq!(first(apr).as_deref(), Some("with:apr-util"));
+        assert_eq!(first("  No moar executable found in /usr at /src/nqp-2026.08/3rdparty/nqp-configure/lib/NQP/Config.pm line 192.\n").as_deref(), Some("cmd:moar"));
         assert_eq!(first("/usr/bin/python3: No module named installer\n").as_deref(), Some("py:installer"));
         let vk = "CMake Error at cmake/QtTargetHelpers.cmake:1599 (message):\n  WrapVulkanHeaders::WrapVulkanHeaders is not a valid target.\n";
         assert_eq!(first(vk).as_deref(), Some("cmake:VulkanHeaders"));

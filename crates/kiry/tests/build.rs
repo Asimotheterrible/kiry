@@ -878,14 +878,15 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
 
 // abuild exports the triple and 1700 recipes read it. most only pass it to configure,
 // which guesses right anyway, but LLVM_HOST_TRIPLE and clang/$CHOST.cfg take it as a
-// name -- an unset one is a wrong answer that builds and installs
+// name -- an unset one is a wrong answer that builds and installs. cargo is told its linker
+// for the same triple, or a .cargo/config written for the upstream release box wins
 #[test]
 fn a_build_is_told_which_triple_it_is() {
     let at = scratch("triple");
     let d = recipe(
         &at,
         "x86_64-musl",
-        "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$CBUILD $CHOST $CTARGET $CARCH\" > \"$DESTDIR/usr/bin/hello\"\n",
+        "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$CBUILD $CHOST $CTARGET $CARCH $CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER\" > \"$DESTDIR/usr/bin/hello\"\n",
     );
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -908,7 +909,7 @@ fn a_build_is_told_which_triple_it_is() {
     let said = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         said.trim(),
-        "x86_64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-unknown-linux-musl x86_64",
+        "x86_64-unknown-linux-musl x86_64-unknown-linux-musl x86_64-unknown-linux-musl x86_64 cc",
         "{said}"
     );
 }

@@ -3760,7 +3760,8 @@ fn compile(
         .replace("@TRIPLE@", triple(t))
         .replace("@SYSROOT@", sysroot_arg)
         .replace("@INC@", incdir(t))
-        .replace("@LTO@", LTO_CACHE);
+        .replace("@LTO@", LTO_CACHE)
+        .replace("@LTODIR@", &format!("/{}", sandbox::LTO_AT));
     // no directory means no c++ in this closure, which a c package is entitled to. the
     // flags come out empty and a c++ compile then fails at its first include, which says
     // more than a wrapper that refused to be written
@@ -4370,6 +4371,13 @@ fn cache_rate(root: &Path, p: &Package, t: &str, work: &Path) -> Option<String> 
 // pkg-config left radeon_drm.h out of fastfetch's and the next round took libdrm away.
 // a closure dir goes in as -isystem, which still comes after every -I of the project's
 // own. the include dir itself stays, -isystem on a default dir reorders the c++ wrappers
+//
+// lld caches what a module's codegen wrote even when the codegen failed, so the same link
+// run again is a hit and exits 0. a configure probe is exactly that link, and the cache is
+// shared: python's mc68881 fpcr check failed once, said yes in every build after, and
+// floatobject.c then had fmove.l to assemble. whatever a failed link wrote there goes.
+// busybox find -newer is whole seconds, so the mark is a second back: an entry another
+// link wrote in that second goes too, which is a miss and nothing worse
 const CC_WRAPPER: &str = "\
 #!/bin/sh
 run() { @REAL@ --target=@TRIPLE@ -ccc-gcc-name kiry-no-gcc@SYSROOT@@EXTRA@@LTO@ \"$@\"; }
@@ -4388,8 +4396,13 @@ case \" $* \" in *\" -nostdlib \"*) case \" $* \" in *\" -shared \"*)
 \trt=$(run -print-libgcc-file-name 2>/dev/null) && [ -f \"$rt\" ] && set -- \"$@\" -x none \"$rt\" ;;
 esac ;; esac
 e=/tmp/.kirycc.$$
-trap 'rm -f \"$e\"' EXIT
-cc() { run \"$@\" 2>\"$e\"; s=$?; [ -s \"$e\" ] && cat \"$e\" >&2; return $s; }
+trap 'rm -f \"$e\" \"$e.t\"' EXIT
+case \" $* \" in *\" -c \"*|*\" -S \"*|*\" -E \"*) ;; *) touch -d \"@$(($(date +%s) - 1))\" \"$e.t\" ;; esac
+cc() {
+\trun \"$@\" 2>\"$e\"; s=$?; [ -s \"$e\" ] && cat \"$e\" >&2
+\t[ $s -eq 0 ] || [ ! -e \"$e.t\" ] || find @LTODIR@ -name 'llvmcache-*' -newer \"$e.t\" -delete 2>/dev/null
+\treturn $s
+}
 cc \"$@\" && exit
 s=$?
 sed -n -e \"s/.*error: '\\\\([^']*\\\\)' file not found.*/h \\\\1/p\" -e \"s/.*unable to find library -l\\\\([^ ]*\\\\).*/lib \\\\1/p\" \"$e\" >>/src/.kiry-missing 2>/dev/null
@@ -14408,10 +14421,33 @@ mod sidecar {
             .replace("@SYSROOT@", "")
             .replace("@INC@", incdir(T))
             .replace("@EXTRA@", "")
-            .replace("@LTO@", "");
+            .replace("@LTO@", "")
+            .replace("@LTODIR@", &at.join("lto").to_string_lossy());
         // run through sh, an exec races another test's fork holding the write fd: ETXTBSY
         fs::write(&cc, w).unwrap();
         cc
+    }
+
+    #[test]
+    fn kirycc_leaves_no_cache_hit_for_a_link_that_failed() {
+        let at = scratch("ltopoison");
+        fs::write(
+            at.join("p.c"),
+            "int main(void) { unsigned f; __asm__ volatile (\"fmove.l %%fpcr,%0\" : \"=dm\" (f)); return 0; }\n",
+        )
+        .unwrap();
+        let cache = format!("-Wl,--thinlto-cache-dir={}", at.join("lto").display());
+        for _ in 0..2 {
+            let o = Command::new("sh")
+                .arg(kirycc(&at))
+                .args(["-O2", "-flto=thin", &cache])
+                .arg(at.join("p.c"))
+                .arg("-o")
+                .arg(at.join("p"))
+                .output()
+                .unwrap();
+            assert!(!o.status.success(), "the second link was a cache hit");
+        }
     }
 
     #[test]

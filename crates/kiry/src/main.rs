@@ -1200,6 +1200,10 @@ fn set_last_round(root: &Path, t: &str, name: &str, round: Option<(&str, &str)>)
 fn misses(log: &str, noted: &str) -> Vec<String> {
     let plain: Vec<String> = log.lines().map(uncoloured).collect();
     let lines: Vec<&str> = plain.iter().map(String::as_str).collect();
+    // autoconf-archive's macros come through a release tarball's configure unexpanded and
+    // configure goes on: fontconfig's AX_FUNC_SNPRINTF was the anchor and the gperf make
+    // died wanting, 300 lines on, was never looked at
+    let archive = |l: &str| l.strip_suffix(": not found").and_then(|r| r.rsplit(": ").next()).is_some_and(|n| n.starts_with("AX_"));
     let fatal = |l: &str| {
         l.contains(" error required dependency not found")
             || l.contains(" error program not found")
@@ -1211,7 +1215,7 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
             || l.starts_with("autoreconf: error")
             || l.contains("CMake Error")
             || l.contains("fatal error:")
-            || l.ends_with(": not found")
+            || (l.ends_with(": not found") && !archive(l))
             || l.ends_with(": command not found")
             || l.starts_with("ERROR:")
             // make under -j and ninja keep printing after the step that failed, so the
@@ -1279,7 +1283,11 @@ fn between_in(l: &str, a: &str, b: &str) -> Option<String> {
 fn lacking(log: &str) -> bool {
     let lines: Vec<&str> = log.lines().collect();
     let f = lines.iter().position(|l| {
-        l.starts_with("configure: error") || l.contains("CMake Error") || l.contains(" error ") || l.starts_with("ERROR:")
+        l.starts_with("configure: error")
+            || l.contains("CMake Error")
+            || l.contains(" error ")
+            || l.starts_with("ERROR:")
+            || (l.starts_with("ninja: ") && l.contains("not created by any action"))
     });
     let Some(f) = f else { return false };
     if lines[f].contains("module not found") {
@@ -1531,6 +1539,11 @@ fn miss(l: &str) -> Option<String> {
             Some((d, c)) if d.ends_with("bin") => Some(format!("cmd:{c}")),
             _ => Some(format!("path:{n}")),
         };
+    }
+    // ninja with an installed file as an input: spirv-tools' build.ninja names
+    // /usr/include/spirv/spir-v.xml, which only spirv-headers ships
+    if let Some(n) = between("not created by any action: '", "'").filter(|n| n.starts_with('/') && !n.contains(' ')) {
+        return Some(format!("path:{n}"));
     }
     // emacs byte-compiling a require: Cannot open load file: No such file or directory, llama
     if let Some((_, n)) = l.split_once("Cannot open load file: No such file or directory, ") {
@@ -16052,6 +16065,15 @@ mod misses_from_logs {
         let unibilium = "./configure: line 1744: LT_INIT: not found\nconfig.status: creating Makefile\n\
             make: LIBTOOL@: No such file or directory\nmake: *** [Makefile:78: unibilium.lo] Error 127\n";
         assert_eq!(first(unibilium).as_deref(), Some("cmd:libtool"));
+
+        let fontconfig = "./configure: line 19600: AX_FUNC_SNPRINTF: not found\n".to_string()
+            + &"checking for something else... yes\n".repeat(8)
+            + "./configure: line 20148: gperf: not found\nmake[2]: *** [Makefile:1034: fcobjshash.h] Error 1\n";
+        assert_eq!(first(&fontconfig).as_deref(), Some("cmd:gperf"));
+        let spirv = "-- Build files have been written to: /src/build\n\
+            ninja: file is missing and not created by any action: '/usr/include/spirv/spir-v.xml'\n";
+        assert_eq!(first(spirv).as_deref(), Some("path:/usr/include/spirv/spir-v.xml"));
+        assert!(lacking(spirv));
     }
 
     // the 2026-10-11 a/b run: each of these stopped a build discovery should have got past

@@ -495,6 +495,22 @@ fn with_art(root: &Path, state: &str, lines: &[String]) {
     }
 }
 
+// a line without mach's clock and level letter in front, ` 0:07.22 E ERROR: ...`, so
+// mozbuild's configure reads like any other
+fn unstamped(l: &str) -> &str {
+    let Some((clock, rest)) = l.trim_start().split_once(' ') else { return l };
+    let Some((m, s)) = clock.split_once(':') else { return l };
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    let Some((s, cs)) = s.split_once('.') else { return l };
+    if !(digits(m) && s.len() == 2 && digits(s) && cs.len() == 2 && digits(cs)) {
+        return l;
+    }
+    match rest.as_bytes() {
+        [c, b' ', ..] if c.is_ascii_uppercase() => &rest[2..],
+        _ => rest,
+    }
+}
+
 // a line without its colour. meson and cmake turn clang's on, and llvm21's
 // 'plugin-api.h' file not found had escapes between error: and the quote
 fn uncoloured(s: &str) -> String {
@@ -1198,7 +1214,7 @@ fn set_last_round(root: &Path, t: &str, name: &str, round: Option<(&str, &str)>)
 // down comes last, newest first, for the build systems that send their probes nowhere a
 // log can see -- newsboat's own configure
 fn misses(log: &str, noted: &str) -> Vec<String> {
-    let plain: Vec<String> = log.lines().map(uncoloured).collect();
+    let plain: Vec<String> = log.lines().map(|l| unstamped(&uncoloured(l)).to_string()).collect();
     let lines: Vec<&str> = plain.iter().map(String::as_str).collect();
     // autoconf-archive's macros come through a release tarball's configure unexpanded and
     // configure goes on: fontconfig's AX_FUNC_SNPRINTF was the anchor and the gperf make
@@ -1281,7 +1297,7 @@ fn between_in(l: &str, a: &str, b: &str) -> Option<String> {
 // ships. muon's "module not found" is muon lacking unstable-wayland, which no dependency
 // fixes, and gtk4 would have built its whole declared list to find that out
 fn lacking(log: &str) -> bool {
-    let lines: Vec<&str> = log.lines().collect();
+    let lines: Vec<&str> = log.lines().map(unstamped).collect();
     let f = lines.iter().position(|l| {
         l.starts_with("configure: error")
             || l.contains("CMake Error")
@@ -1401,6 +1417,11 @@ fn miss(l: &str) -> Option<String> {
     // python, asked by a configure or found missing at run time
     if let Some(r) = l.strip_prefix("checking for python module ").filter(|_| no) {
         return word(r).map(|n| format!("py:{}", n.trim_end_matches('.')));
+    }
+    // mozbuild's check_prog, by the name configure gave it, which can be the recipe's rather
+    // than the program's: checking for nodejs... not found
+    if let Some(n) = l.strip_prefix("checking for ").and_then(|r| r.strip_suffix("... not found")).filter(|n| !n.contains(' ')) {
+        return Some(format!("cmd:{n}"));
     }
     if let Some(n) = between("No module named '", "'") {
         return n.split('.').next().map(|m| format!("py:{m}"));
@@ -16057,6 +16078,15 @@ mod misses_from_logs {
         assert_eq!(first(girara).as_deref(), Some("pc:girara"));
         let two = "dependency libtiff-4, tiff found: NO\n/src/gtk/meson.build:484:45: error required dependency not found\n";
         assert_eq!(first(two).as_deref(), Some("pc:libtiff-4"));
+
+        // mach stamps every line, and librewolf's closure without rust read as nothing
+        let mach = " 0:05.31 checking for ccache... not found\n 0:07.22 checking for rustc... not found\n\
+                    \x200:07.22 E ERROR: Rust compiler not found.\n\
+                    \x200:07.22 E To compile Rust language sources, you must have 'rustc' in your path.\n";
+        assert_eq!(first(mach).as_deref(), Some("cmd:rustc"));
+        assert!(lacking(mach));
+        assert_eq!(unstamped("21:08.97 W warning: x"), "warning: x");
+        assert_eq!(unstamped("foo.c:12:5: error: y"), "foo.c:12:5: error: y");
 
         assert_eq!(first("/usr/bin/libtool: eval: line 11083: kiry-cc: not found\n").as_deref(), Some("cmd:kiry-cc"));
         assert_eq!(first("foo.c:1:10: fatal error: 'sensors/sensors.h' file not found\n").as_deref(), Some("h:sensors/sensors.h"));

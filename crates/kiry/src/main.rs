@@ -3505,11 +3505,25 @@ fn profile(root: &Path, p: &Package, t: &str) -> PathBuf {
         .join("merged.profdata")
 }
 
+// the bolt profile is a second word only when there is one, so an artifact recorded
+// before any package had one still reads as built on what is there
 fn profile_sum(at: &Path) -> String {
-    fs::File::open(at)
-        .ok()
-        .and_then(|f| kiry_core::sha256(f).ok())
-        .unwrap_or_else(|| "none".into())
+    let sum = |at: &Path| fs::File::open(at).ok().and_then(|f| kiry_core::sha256(f).ok());
+    let pgo = sum(at).unwrap_or_else(|| "none".into());
+    match sum(&at.with_file_name("bolt.yaml")) {
+        Some(b) => format!("{pgo} {b}"),
+        None => pgo,
+    }
+}
+
+// bolt's yaml rather than its fdata, because only yaml can be laid onto a libxul a version
+// on with -infer-stale-profile, and training it takes more memory than a build is given
+fn keep_bolt(out: &Path, stored: &Path) -> Result<(), String> {
+    let at = stored.with_file_name("bolt.yaml");
+    let part = stored.with_file_name("bolt.yaml.part");
+    mkdirs(at.parent().unwrap_or(&at))?;
+    fs::copy(out, &part).map_err(|e| format!("{}: {e}", part.display()))?;
+    fs::rename(&part, &at).map_err(|e| format!("{}: {e}", at.display()))
 }
 
 // whole or not at all, because the next build is fed whatever sits at the name.
@@ -3722,6 +3736,11 @@ fn compile(
         fs::copy(&stored, share.join("profile.profdata"))
             .map_err(|e| format!("{}: {e}", stored.display()))?;
     }
+    let bolt = stored.with_file_name("bolt.yaml");
+    let bolted = bolt.is_file();
+    if bolted {
+        fs::copy(&bolt, share.join("profile.bolt.yaml")).map_err(|e| format!("{}: {e}", bolt.display()))?;
+    }
     // the automake in the root carries the config.sub that knows musl, and staging it
     // here is what gets it to the callers with no automake dep of their own
     let automake = fs::read_dir(root.join("usr/share"))
@@ -3908,6 +3927,8 @@ fn compile(
         )
         // /src because /tmp dies with the namespace and /dest gets packaged
         .env("KIRY_PROFILE_OUT", "/src/.kiry-profile.profdata")
+        .env("KIRY_BOLT_PROFILE", if bolted { "/usr/share/kiry/profile.bolt.yaml" } else { "" })
+        .env("KIRY_BOLT_PROFILE_OUT", "/src/.kiry-profile.bolt.yaml")
         .env("CFLAGS", &f.cflags)
         .env("CXXFLAGS", &f.cxxflags)
         .env("LDFLAGS", &f.ldflags)
@@ -4008,6 +4029,10 @@ fn compile(
                         .count(),
                 ),
             };
+            let bolt_out = src.join(".kiry-profile.bolt.yaml");
+            if bolt_out.is_file() {
+                keep_bolt(&bolt_out, &stored)?;
+            }
             let out = src.join(".kiry-profile.profdata");
             if out.is_file() {
                 keep_profile(p, &out, &stored, missed)?;

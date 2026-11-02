@@ -5987,6 +5987,48 @@ fn a_profile_outlives_its_build_and_removing_it_retrains() {
     assert_eq!(fs::read_to_string(root.join("usr/bin/fed")).unwrap(), "trained\n");
 }
 
+// bolt trains on more memory than a build is given, so its yaml is kept beside the pgo
+// profile and handed to the next build the same way, and the artifact answers for it too
+#[test]
+fn a_bolt_profile_is_kept_and_fed_back() {
+    let at = scratch("bolt-profile");
+    let script = format!(
+        "{GOOD}if [ -n \"$KIRY_BOLT_PROFILE\" ]; then cp \"$KIRY_BOLT_PROFILE\" \"$DESTDIR/usr/bin/fed\"\n\
+         else echo laid-out > \"$KIRY_BOLT_PROFILE_OUT\"\n\
+         fi\n"
+    );
+    let d = recipe(&at, "x86_64-musl", &script);
+    let root = at.join("root");
+    fs::create_dir_all(&root).unwrap();
+    if !bootstrap(&root) {
+        return;
+    }
+    let r = root.to_str().unwrap();
+    let dir = d.to_str().unwrap();
+    let kept = root.join("var/kiry/profiles/hello/x86_64-musl/bolt.yaml");
+
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "laid-out\n");
+    let meta = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst.meta");
+    let sum = kiry_core::sha256(fs::File::open(&kept).unwrap()).unwrap();
+    assert_eq!(fs::read_to_string(meta.join("profile")).unwrap(), format!("none {sum}\n"));
+
+    let o = kiry(&["b", "--root", r, dir]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    fs::rename(&kept, kept.with_extension("gone")).unwrap();
+    let o = kiry(&["i", "--root", r, "-n", dir]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("rebuilding  profile changed"), "{said}");
+    fs::rename(kept.with_extension("gone"), &kept).unwrap();
+
+    let arc = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst");
+    let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(fs::read_to_string(root.join("usr/bin/fed")).unwrap(), "laid-out\n");
+}
+
 // a root holding one recipe and one installed record of it, with no artifact anywhere:
 // what the sets are read off is the db and the tree, and neither needs a build
 fn set_root(at: &Path, installed: &str, in_tree: &str) -> PathBuf {

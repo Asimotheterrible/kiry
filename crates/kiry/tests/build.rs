@@ -283,6 +283,18 @@ fn round_trip_through_install() {
     );
     assert_eq!(fs::read_to_string(meta.join("hash")).unwrap().len(), 65);
 
+    // -n means nothing happens, an archive named by its path as much as a package named.
+    // on / the real run takes the fallback snapshot first
+    let o = kiry(&[
+        "i",
+        "-n",
+        "--root",
+        root.to_str().unwrap(),
+        arc.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!root.join("usr/bin/hello").exists(), "-n installed it");
+
     let o = kiry(&["i", "--root", root.to_str().unwrap(), arc.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(

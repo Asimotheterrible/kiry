@@ -7023,6 +7023,10 @@ fn install(root: &Path, names: Vec<String>, how: &How) {
     if asked.is_empty() {
         let paths: Vec<PathBuf> = archives.iter().map(PathBuf::from).collect();
         let going: Vec<(String, String)> = paths.iter().filter_map(|a| sidecar(a)).collect();
+        if dry {
+            say_route(&root, &going, live);
+            return;
+        }
         settle(&root, &going, live);
         let _w = writer(&root);
         apply_batch(&root, &paths, force);
@@ -7152,13 +7156,7 @@ fn install(root: &Path, names: Vec<String>, how: &How) {
                 say!("only via {name:w$}  {gone} builds");
             }
 
-            // the same answer the real run would get, override included
-            let (risky, why) = route(&root, &set);
-            match (risky, live) {
-                (true, true) => say!("route live  --live, no fallback: {why}"),
-                (true, false) => say!("route live  fallback first: {why}"),
-                (false, _) => say!("route live  {why}"),
-            }
+            say_route(&root, &set, live);
             return;
         }
         // a level has to be in place before the one above it can build against it, which is
@@ -7572,8 +7570,13 @@ fn pair(text: &str) -> Result<(String, String, String), String> {
 // the running root as it was before a risky transaction, in the other half of the pair.
 // once a boot: a tree that booted is the proven one, and a second risky install in the
 // same boot would otherwise swap it for a tree only the first install has touched
-fn fallback(text: &str, taken: &Path) -> Result<(), String> {
+fn fallback(
+    text: &str,
+    taken: &Path,
+    list: impl Fn() -> Result<String, String>,
+) -> Result<(), String> {
     let (dev, now, other) = pair(text)?;
+    fled(text, taken, list)?;
     if taken.exists() {
         say!("            {other} is the fallback, {now} as this boot found it");
         return Ok(());
@@ -7596,6 +7599,54 @@ fn fallback(text: &str, taken: &Path) -> Result<(), String> {
     put(taken, &format!("{other}\n"))?;
     say!("            {other} is the fallback, a snapshot of {now}. boot {} from the firmware menu if this goes wrong", label(&other));
     Ok(())
+}
+
+fn subvolumes() -> Result<String, String> {
+    let out = Command::new("btrfs")
+        .args(["subvolume", "list", "-q", "-u", "/"])
+        .output()
+        .map_err(|e| format!("btrfs subvolume list: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("btrfs subvolume list: {}", out.status));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("btrfs subvolume list: {e}"))
+}
+
+// whether one subvolume is still a snapshot of the other. a deleted parent keeps its uuid in
+// the child's parent_uuid, so the root a fallback was once taken over does not read as one
+fn snapshot_of(list: &str, sub: &str, of: &str) -> bool {
+    let field = |sub: &str, key: &str| {
+        list.lines().find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let at = |k: &str| {
+                f.iter()
+                    .position(|w| *w == k)
+                    .and_then(|i| f.get(i + 1))
+                    .copied()
+            };
+            if at("path") == Some(sub) {
+                at(key)
+            } else {
+                None
+            }
+        })
+    };
+    field(sub, "parent_uuid").is_some_and(|p| field(of, "uuid") == Some(p))
+}
+
+// a fallback taken while running on a fallback replaces the root that was fled from, and
+// whatever only it had goes too. not BootOrder to tell which is which: boot-time kiry commit
+// moves that to whatever just booted, so it would call the fled-to root home. a snapshot's
+// parent stays what it was until the snapshot is replaced
+fn fled(text: &str, taken: &Path, list: impl Fn() -> Result<String, String>) -> Result<(), String> {
+    let (_, now, other) = pair(text)?;
+    if taken.exists() || !snapshot_of(&list()?, &now, &other) {
+        return Ok(());
+    }
+    Err(format!(
+        "{now} is a snapshot of {other}, so this boot is on the fallback, and taking one here would replace {other} and whatever only it has. \
+         --live installs with no fallback. to stay on {now} for good, boot it and delete {other} from a subvolid=5 mount first"
+    ))
 }
 
 // btrfs says what it did on stdout, and the line kiry prints after says it once
@@ -7661,10 +7712,38 @@ fn entry_for(text: &str, sub: &str) -> Option<String> {
         .find_map(|l| entry(l).filter(|(_, n)| *n == want).map(|(n, _)| n.to_string()))
 }
 
-fn current(text: &str) -> Option<String> {
-    text.lines()
-        .find_map(|l| l.strip_prefix("BootCurrent:"))
-        .map(|n| n.trim().to_string())
+// the subvolume this kernel was told to mount. the kernel takes the last rootflags it is given
+fn booted(cmdline: &str) -> Option<&str> {
+    cmdline
+        .split_whitespace()
+        .rev()
+        .find_map(|w| w.strip_prefix("rootflags="))?
+        .split(',')
+        .find_map(|o| o.strip_prefix("subvol="))
+        .map(|s| s.trim_start_matches('/'))
+}
+
+// the entry kiry commit has to move to the front, none if it is there already. not BootCurrent,
+// a boot manager chaining the image leaves that on its own entry: it read 0000 on every boot of
+// @root-a here, kiry-a.efi having booted. the cmdline is what the image itself carries, and it
+// differs from /proc/mounts in a chroot into the other root, where there is no boot to keep.
+// a third entry reaching the same root now passes too, and its image is what went unproved
+fn keeps(now: &str, cmdline: &str, seen: &str) -> Result<Option<String>, String> {
+    let num = entry_for(seen, now).ok_or_else(|| format!("no uefi entry named {}", label(now)))?;
+    match booted(cmdline) {
+        Some(b) if b == now => {}
+        Some(b) => {
+            return Err(format!(
+                "this boot is {b} and / is {now}, so there is nothing here to keep"
+            ))
+        }
+        None => {
+            return Err(
+                "/proc/cmdline names no subvol, so nothing says which root this boot is".into(),
+            )
+        }
+    }
+    Ok((order(seen).first() != Some(&num)).then_some(num))
 }
 
 fn order(text: &str) -> Vec<String> {
@@ -7707,6 +7786,24 @@ fn broken(root: &Path) -> Vec<(String, Finding)> {
     out
 }
 
+// the same answer the real run would get, override included
+fn say_route(root: &Path, going: &[(String, String)], live: bool) {
+    let (risky, why) = route(root, going);
+    match (risky, live) {
+        (true, true) => say!("route live  --live, no fallback: {why}"),
+        (true, false) => {
+            say!("route live  fallback first: {why}");
+            let refused = fs::read_to_string("/proc/mounts")
+                .map_err(|e| format!("/proc/mounts: {e}"))
+                .and_then(|text| fled(&text, Path::new(TAKEN), subvolumes));
+            if let Err(e) = refused {
+                say!("            {e}");
+            }
+        }
+        (false, _) => say!("route live  {why}"),
+    }
+}
+
 // the transaction lands on the running root either way. what a risky one gets first is
 // a fallback, and which of the two happened is said rather than left to be guessed at
 fn settle(root: &Path, going: &[(String, String)], live: bool) {
@@ -7721,7 +7818,7 @@ fn settle(root: &Path, going: &[(String, String)], live: bool) {
         say!("route live  fallback first: {why}");
         let made = fs::read_to_string("/proc/mounts")
             .map_err(|e| format!("/proc/mounts: {e}"))
-            .and_then(|text| fallback(&text, Path::new(TAKEN)));
+            .and_then(|text| fallback(&text, Path::new(TAKEN), subvolumes));
         if let Err(e) = made {
             die(e);
         }
@@ -11749,31 +11846,27 @@ fn commit_cmd(args: &[String]) {
         Ok(t) => t,
         Err(e) => die(e),
     };
-    let Some(num) = entry_for(&seen, &now) else {
-        die(format!("no uefi entry named {}", label(&now)));
+    let cmdline = match fs::read_to_string("/proc/cmdline") {
+        Ok(t) => t,
+        Err(e) => die(format!("/proc/cmdline: {e}")),
     };
-    // the entry that was booted, not the one that matches the subvolume. they differ when
-    // some third entry reaches the same root, and an entry that has not been through a
-    // boot is one nothing has proved
-    match current(&seen) {
-        Some(c) if c == num => {}
-        Some(c) => die(format!(
-            "this boot came from Boot{c} and {now} is Boot{num}, so there is nothing here to keep"
-        )),
-        None => die("efibootmgr says nothing about BootCurrent".into()),
-    }
-    let was = order(&seen);
-    if was.first() == Some(&num) {
-        say!("{now} is already what boots");
-        return;
-    }
+    let num = match keeps(&now, &cmdline, &seen) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            say!("{now} is already first in BootOrder");
+            return;
+        }
+        Err(e) => die(e),
+    };
 
     // nothing boots a root but the firmware menu, so getting here off the other entry is
-    // someone choosing the fallback. no doctor gate: the root being left is the suspect
-    if let Err(e) = commits(&num, &was) {
+    // someone choosing the fallback. no doctor gate: the root being left is the suspect.
+    // this runs on every boot, so it decides nothing about the other root: that stays until a
+    // person gives it up, and fled() holds the next risky install back from it
+    if let Err(e) = commits(&num, &order(&seen)) {
         die(e);
     }
-    say!("{now} boots from now on  Boot{num}  {other} is the fallback and the next risky install replaces it");
+    say!("{now} is first in BootOrder  Boot{num}  {other} is left as it is");
 }
 
 fn rollback_cmd(args: &[String]) {
@@ -11793,7 +11886,7 @@ fn rollback_cmd(args: &[String]) {
     if let Err(e) = commits(&num, &order(&seen)) {
         die(e);
     }
-    say!("{other} boots from now on  reboot to leave {now}, which becomes the fallback");
+    say!("{other} is first in BootOrder  Boot{num}  reboot to leave {now}");
 }
 
 // the recipes on offer, which nothing else answers: l lists what is installed and a
@@ -13644,13 +13737,67 @@ Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.e
         let fake = REAL.replace("/dev/mapper/cryptroot", "/dev/kiry-test-none");
         let at = std::env::temp_dir().join(format!("kiry-taken-{}", std::process::id()));
         let _ = fs::remove_file(&at);
-        assert!(fallback(&fake, &at).is_err(), "it did not try to snapshot");
+        let list = || Ok(SUBS.to_string());
+        assert!(
+            fallback(&fake, &at, list).is_err(),
+            "it did not try to snapshot"
+        );
         fs::write(&at, "@root-b\n").unwrap();
-        assert_eq!(fallback(&fake, &at), Ok(()));
+        assert_eq!(fallback(&fake, &at, list), Ok(()));
         // a root outside the pair has no other half to hold a fallback, marker or not
         let third = fake.replace("subvol=/@root-a", "subvol=/@root-c");
-        assert!(fallback(&third, &at).is_err());
+        assert!(fallback(&third, &at, list).is_err());
         let _ = fs::remove_file(&at);
+    }
+
+    // btrfs subvolume list -q -u / off this machine, after the 15:01 install on @root-a
+    // replaced @root-b: a's parent is the @root-b it was snapshotted from, which is gone
+    const SUBS: &str = "\
+ID 259 gen 40867 top level 5 parent_uuid -                                    uuid 5ad63705-4157-624b-b96b-b03ea29188f9 path @var
+ID 285 gen 12683 top level 262 parent_uuid 8cbe17e6-0370-b842-8fdd-a975107b9cd1 uuid 0ea9297e-045d-5d45-834b-1c66295c40bc path @tmp/kirytest/root
+ID 337 gen 40839 top level 5 parent_uuid 8cbe17e6-0370-b842-8fdd-a975107b9cd1 uuid 958276a8-6210-0543-99cc-399d12a456b0 path @root-a
+ID 339 gen 40830 top level 5 parent_uuid 958276a8-6210-0543-99cc-399d12a456b0 uuid 794d77e5-26df-b243-927e-7bdb57391a77 path @root-b
+";
+
+    fn refused(r: &Result<(), String>) -> bool {
+        r.as_ref().is_err_and(|e| e.contains("is on the fallback"))
+    }
+
+    // the install that lost work: booted @root-b's snapshot, and the snapshot would have
+    // gone over @root-b. the device does not exist, so anything that got past the refusal
+    // fails at the mount with a different error
+    #[test]
+    fn a_fallback_is_not_taken_over_the_root_it_was_a_snapshot_of() {
+        let fake = REAL.replace("/dev/mapper/cryptroot", "/dev/kiry-test-none");
+        let at = std::env::temp_dir().join(format!("kiry-fled-{}", std::process::id()));
+        let _ = fs::remove_file(&at);
+        // before: @root-a a snapshot of a @root-b that still exists, and @root-a is running
+        let before = SUBS.replace(
+            "uuid 794d77e5-26df-b243-927e-7bdb57391a77",
+            "uuid 8cbe17e6-0370-b842-8fdd-a975107b9cd1",
+        );
+        let got = fallback(&fake, &at, || Ok(before.clone()));
+        assert!(refused(&got), "{got:?}");
+        // the root that was snapshotted is free to replace its own snapshot, and a parent
+        // that no longer exists says nothing about the root standing in its place
+        let got = fallback(&fake, &at, || Ok(SUBS.to_string()));
+        assert!(got.is_err() && !refused(&got), "{got:?}");
+        // running on @root-b as the listing has it now, whose parent is @root-a
+        let on_b = fake.replace("subvol=/@root-a", "subvol=/@root-b");
+        let got = fallback(&on_b, &at, || Ok(SUBS.to_string()));
+        assert!(refused(&got), "{got:?}");
+        // the other half not existing yet has nothing to lose
+        let got = fallback(&fake, &at, || {
+            Ok(SUBS
+                .lines()
+                .filter(|l| !l.ends_with("@root-b"))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        });
+        assert!(got.is_err() && !refused(&got), "{got:?}");
+        // not being able to tell is no licence to delete a root
+        let got = fallback(&fake, &at, || Err("btrfs subvolume list: no".to_string()));
+        assert_eq!(got, Err("btrfs subvolume list: no".to_string()));
     }
 
     // a live install onto a root the firmware does not boot first is undone by the next
@@ -13693,19 +13840,44 @@ Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.e
         assert_eq!(reorder("0001", &was), ["0001", "0000", "0002"]);
     }
 
-    #[test]
-    fn the_entry_that_was_booted_is_read_and_is_not_the_one_the_subvolume_names() {
-        assert_eq!(current(EFI).as_deref(), Some("0002"));
-        // / is on @root-a in REAL, whose entry is 0001, and this boot came from 0002
-        let (_, now, _) = pair(REAL).unwrap();
-        assert_eq!(entry_for(EFI, &now).as_deref(), Some("0001"));
-        assert_ne!(current(EFI), entry_for(EFI, &now));
-    }
+    const CMDLINE: &str = "root=PARTLABEL=kiry-root rw rd.luks.uuid=a9bc260e root=/dev/mapper/cryptroot rootflags=subvol=@root-a rootfstype=btrfs rw\n";
 
     #[test]
-    fn a_root_already_at_the_front_is_already_committed() {
-        assert_eq!(order(EFI).first().map(String::as_str), Some("0001"));
-        assert_eq!(entry_for(EFI, "@root-a").as_deref(), Some("0001"));
+    fn the_root_a_boot_was_given_is_the_last_rootflags_on_the_cmdline() {
+        assert_eq!(booted(CMDLINE), Some("@root-a"));
+        assert_eq!(
+            booted("rootflags=subvol=@root-a rootflags=compress=zstd,subvol=/@root-b"),
+            Some("@root-b")
+        );
+        assert_eq!(
+            booted("root=/dev/sda1 rootflags=subvol=@root-a rootflags=ro"),
+            None
+        );
+        assert_eq!(booted("root=/dev/sda1 rw"), None);
+    }
+
+    // BootCurrent 0000 and @root-a running off kiry-a.efi, the way this machine reports every
+    // boot of it. the entry BootCurrent names says nothing either way
+    #[test]
+    fn a_boot_is_kept_by_the_root_it_was_given_and_not_by_boot_current() {
+        let seen = "\
+BootCurrent: 0000
+BootOrder: 0000,0001,0004
+Boot0000  kiry @root-b\tHD(1,GPT,x)/\\EFI\\LINUX\\KIRY-B.EFI
+Boot0001  UEFI OS\tHD(1,GPT,x)/\\EFI\\BOOT\\BOOTX64.EFI
+Boot0004  kiry @root-a\tHD(1,GPT,x)/\\EFI\\LINUX\\KIRY-A.EFI
+";
+        assert_eq!(
+            keeps("@root-a", CMDLINE, seen),
+            Ok(Some("0004".to_string()))
+        );
+        // already at the front is nothing to do
+        let first = seen.replace("BootOrder: 0000,0001,0004", "BootOrder: 0004,0000,0001");
+        assert_eq!(keeps("@root-a", CMDLINE, &first), Ok(None));
+        // chrooted into the other root: / says b, and b is not what this boot was
+        assert!(keeps("@root-b", CMDLINE, seen).is_err_and(|e| e.contains("nothing here to keep")));
+        assert!(keeps("@root-a", "root=/dev/sda1 rw", seen).is_err());
+        assert!(keeps("@root-c", CMDLINE, seen).is_err_and(|e| e.contains("no uefi entry")));
     }
 
     #[test]

@@ -1107,7 +1107,6 @@ fn unprove(root: &Path, p: &Package, t: &str, work: &Path, linked: &[String]) {
     if log.trim().is_empty() {
         return;
     }
-    let seen = included(&log);
     let at = closure_at(root, t, &p.name);
     let ls = pkg::lines(&at).unwrap_or_default();
     let star = ls.iter().any(|l| l == "*");
@@ -1125,6 +1124,7 @@ fn unprove(root: &Path, p: &Package, t: &str, work: &Path, linked: &[String]) {
     let host = sandbox::host();
     let inc = incdir(t).trim_start_matches('/').to_string() + "/";
     let shared = datadir(t).trim_start_matches('/').to_string() + "/pkgconfig/";
+    let seen = followed(root, &inc, included(&log));
     let mut kept = String::new();
     let mut gone: Vec<String> = Vec::new();
     for d in &deps {
@@ -1150,7 +1150,7 @@ fn unprove(root: &Path, p: &Package, t: &str, work: &Path, linked: &[String]) {
             || data
             || linked.contains(&d.name)
             || heads.is_empty()
-            || heads.iter().any(|h| seen.contains(h))
+            || heads.iter().any(|h| seen.contains(*h))
             || tried.lines().any(|l| l == format!("{} {ver}", d.name));
         if keep {
             kept.push_str(&format!("{d}\n"));
@@ -1181,6 +1181,45 @@ fn included(log: &str) -> HashSet<&str> {
         let Some((_, inc)) = l.split_once("\"includes\":[") else { continue };
         let inc = inc.split(']').next().unwrap_or("");
         seen.extend(inc.split(',').map(|h| h.trim().trim_matches('"').trim_start_matches('/')));
+    }
+    seen
+}
+
+// clang's json log keeps only a system header the project named itself, and cmake hands
+// imported include dirs over as -isystem, so a header another package's header pulls in
+// never shows. qt6-qtdeclarative reaches vulkan/vulkan.h through qvulkaninstance.h only,
+// and lost vulkan-headers after every ok build. the walk follows the #include lines in
+// the installed headers and skips #if: keeping a line costs nothing, losing one is a
+// build that fails or quietly compiles a feature out under __has_include
+fn followed(root: &Path, inc: &str, direct: HashSet<&str>) -> HashSet<String> {
+    let mut seen: HashSet<String> = direct.into_iter().map(str::to_string).collect();
+    let mut todo: Vec<String> = seen.iter().filter(|h| h.starts_with(inc)).cloned().collect();
+    while let Some(h) = todo.pop() {
+        let Ok(text) = fs::read(root.join(&h)) else { continue };
+        let text = String::from_utf8_lossy(&text);
+        for l in text.lines() {
+            let Some(rest) = l.trim_start().strip_prefix('#') else { continue };
+            let Some(rest) = rest.trim_start().strip_prefix("include") else { continue };
+            let rest = rest.trim_start();
+            let close = match rest.chars().next() {
+                Some('<') => '>',
+                Some('"') => '"',
+                _ => continue,
+            };
+            let Some(name) = rest[1..].split(close).next().filter(|n| !n.is_empty()) else { continue };
+            // a <name> is found under the include dir or a dir between it and this header,
+            // the way -isystem /usr/include/qt6 and qt6/QtGui both reach QtGui headers
+            let mut dirs: Vec<&Path> = Path::new(&h).ancestors().skip(1).take_while(|d| d.starts_with(inc)).collect();
+            dirs.push(Path::new(inc));
+            for d in dirs {
+                let c = d.join(name).to_string_lossy().into_owned();
+                if !seen.contains(&c) && root.join(&c).is_file() {
+                    seen.insert(c.clone());
+                    todo.push(c);
+                    break;
+                }
+            }
+        }
     }
     seen
 }
@@ -14264,6 +14303,46 @@ mod sidecar {
 
         unprove(&root, &p, T, &work, &["lib".to_string()]);
         assert_eq!(fs::read_to_string(&at_).unwrap(), "hdr build\nlib build\n");
+    }
+
+    // the log names the qt header and never the vulkan one it includes under -isystem
+    #[test]
+    fn a_header_reached_through_another_packages_header_keeps_its_line() {
+        let at = scratch("reached");
+        let root = at.join("root");
+        let gui = root.join("usr/include/qt6/QtGui");
+        mkdirs(&gui).unwrap();
+        fs::write(gui.join("qvulkaninstance.h"), "#if __has_include(<vulkan/vulkan.h>)\n#  include <vulkan/vulkan.h>\n#endif\n#include <QtGui/qtguiglobal.h>\n").unwrap();
+        fs::write(gui.join("qtguiglobal.h"), "#include \"qtgui-config.h\"\n").unwrap();
+        installed(
+            &root,
+            "qtbase",
+            &[
+                ("usr/include/qt6/QtGui/qvulkaninstance.h", 0o644),
+                ("usr/include/qt6/QtGui/qtguiglobal.h", 0o644),
+                ("usr/include/qt6/QtGui/qtgui-config.h", 0o644),
+            ],
+            &[],
+        );
+        installed(&root, "vulkan-headers", &[("usr/include/vulkan/vulkan.h", 0o644)], &[]);
+        installed(&root, "unused", &[("usr/include/unused.h", 0o644)], &[]);
+        let d = root.join(REPOS_AT).join("extra/app");
+        mkdirs(&d).unwrap();
+        fs::write(d.join("version"), "1.0 1\n").unwrap();
+        fs::write(d.join("targets"), format!("{T}\n")).unwrap();
+        fs::write(d.join("build"), "true\n").unwrap();
+        fs::write(d.join("depends"), "qtbase make\nvulkan-headers make\nunused make\n").unwrap();
+        let p = load(&root, &d).unwrap();
+        let at_ = closure_at(&root, T, "app");
+        mkdirs(at_.parent().unwrap()).unwrap();
+        fs::write(&at_, "qtbase build\nvulkan-headers build\nunused build\n").unwrap();
+        let work = at.join("work");
+        mkdirs(&work.join("src")).unwrap();
+        let log = "{\"source\":\"/src/a.cpp\",\"includes\":[\"/usr/include/qt6/QtGui/qvulkaninstance.h\"]}\n";
+        fs::write(work.join("src/.kiry-headers"), log).unwrap();
+
+        unprove(&root, &p, T, &work, &[]);
+        assert_eq!(fs::read_to_string(&at_).unwrap(), "qtbase build\nvulkan-headers build\n");
     }
 
     // nothing misses a tool busybox stands in for, so a declared one starts in the build:

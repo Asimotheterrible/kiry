@@ -76,10 +76,7 @@ pub struct Elf {
 pub fn read(p: &Path) -> Result<Elf, Error> {
     let io = |e| Error::Io(p.to_path_buf(), e);
     let b = bytes(&fs::File::open(p).map_err(io)?).map_err(io)?;
-    parse(&b).map_err(|why| Error::Elf {
-        path: p.display().to_string(),
-        why,
-    })
+    parse(&b).map_err(|why| Error::Elf { path: p.display().to_string(), why })
 }
 
 // an open file rather than a path, so a caller that opened it beneath a root reads that
@@ -135,7 +132,7 @@ fn sparse(f: &fs::File, len: usize) -> Option<Vec<u8>> {
     fill(&mut b, dynoff, dynsz)?;
 
     let (mut strtab, mut strsz, mut tables) = (None, None, Vec::new());
-    for e in b.get(dynoff..dynoff + dynsz)?.chunks_exact(16) {
+    for e in b.get(dynoff..dynoff + dynsz)?.as_chunks::<16>().0 {
         let (tag, val) = (u64at(e, 0)? as i64, u64at(e, 8)?);
         match tag {
             DT_NULL => break,
@@ -193,13 +190,9 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
     // a loader is named only by something meant to be run
     let mut interp = false;
     for i in 0..phnum {
-        let start = phoff
-            .checked_add(i * phentsize)
-            .ok_or("program headers start past the end of memory")?;
-        let ph = b
-            .get(start..)
-            .and_then(|s| s.get(..phentsize))
-            .ok_or("program headers run past the end of the file")?;
+        let start = phoff.checked_add(i * phentsize).ok_or("program headers start past the end of memory")?;
+        let ph =
+            b.get(start..).and_then(|s| s.get(..phentsize)).ok_or("program headers run past the end of the file")?;
 
         let offset = u64at(ph, 8).ok_or("short program header")?;
         let vaddr = u64at(ph, 16).ok_or("short program header")?;
@@ -218,10 +211,8 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
     };
     let dynoff = at(dynoff)?;
     let dynsz = at(dynsz)?;
-    let entries = b
-        .get(dynoff..)
-        .and_then(|s| s.get(..dynsz))
-        .ok_or("dynamic section runs past the end of the file")?;
+    let entries =
+        b.get(dynoff..).and_then(|s| s.get(..dynsz)).ok_or("dynamic section runs past the end of the file")?;
 
     let mut needed = Vec::new();
     let (mut soname, mut rpath, mut runpath) = (None, None, None);
@@ -231,7 +222,7 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
     let (mut verdef, mut verdefnum) = (None, 0);
     let (mut verneed, mut verneednum) = (None, 0);
 
-    for e in entries.chunks_exact(16) {
+    for e in entries.as_chunks::<16>().0 {
         let (tag, val) = match (e.get(..8), e.get(8..16)) {
             (Some(t), Some(v)) => (
                 i64::from_le_bytes(t.try_into().map_err(|_| "short dynamic entry")?),
@@ -260,12 +251,7 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
         }
     }
 
-    if needed.is_empty()
-        && soname.is_none()
-        && rpath.is_none()
-        && runpath.is_none()
-        && symtab.is_none()
-    {
+    if needed.is_empty() && soname.is_none() && rpath.is_none() && runpath.is_none() && symtab.is_none() {
         return Ok(Elf::default());
     }
 
@@ -287,22 +273,14 @@ pub fn parse(b: &[u8]) -> Result<Elf, &'static str> {
         .map(at)
         .transpose()?;
     let strsz = at(strsz.ok_or("a string table of no stated size")?)?;
-    let strs = b
-        .get(strtab..)
-        .and_then(|s| s.get(..strsz))
-        .ok_or("string table runs past the end of the file")?;
+    let strs = b.get(strtab..).and_then(|s| s.get(..strsz)).ok_or("string table runs past the end of the file")?;
 
     let names = versions(b, &loads, strs, verdef, verdefnum, verneed, verneednum)?;
-    let (exports, undefined) = symbols(
-        b, &loads, strs, &names, symtab, syment, hash, gnu_hash, versym, end,
-    )?;
+    let (exports, undefined) = symbols(b, &loads, strs, &names, symtab, syment, hash, gnu_hash, versym, end)?;
 
     Ok(Elf {
         soname: soname.map(|v| string(strs, v)).transpose()?,
-        needed: needed
-            .into_iter()
-            .map(|v| string(strs, v))
-            .collect::<Result<_, _>>()?,
+        needed: needed.into_iter().map(|v| string(strs, v)).collect::<Result<_, _>>()?,
         rpath: rpath.map(|v| string(strs, v)).transpose()?,
         runpath: runpath.map(|v| string(strs, v)).transpose()?,
         exports,
@@ -335,11 +313,7 @@ pub enum Change {
 impl Change {
     pub fn symbol(&self) -> &str {
         match self {
-            Change::Gone(s)
-            | Change::Weakened(s)
-            | Change::Grew(s)
-            | Change::Retyped(s)
-            | Change::Undefaulted(s) => s,
+            Change::Gone(s) | Change::Weakened(s) | Change::Grew(s) | Change::Retyped(s) | Change::Undefaulted(s) => s,
         }
     }
 }
@@ -395,16 +369,9 @@ fn class(kind: u8) -> Option<u8> {
 
 // there is no DT_SYMSZ. the count comes out of whichever hash table the linker
 // emitted, and modern ones emit only the gnu flavour
-fn count(
-    b: &[u8],
-    loads: &[(u64, u64, u64)],
-    hash: Option<u64>,
-    gnu: Option<u64>,
-) -> Result<usize, &'static str> {
+fn count(b: &[u8], loads: &[(u64, u64, u64)], hash: Option<u64>, gnu: Option<u64>) -> Result<usize, &'static str> {
     if let Some(addr) = gnu {
-        let t = b
-            .get(at(offset_of(loads, addr)?)?..)
-            .ok_or("gnu hash past the file")?;
+        let t = b.get(at(offset_of(loads, addr)?)?..).ok_or("gnu hash past the file")?;
         let nbuckets = at(u32at(t, 0).ok_or("short gnu hash")?.into())?;
         let symoffset = at(u32at(t, 4).ok_or("short gnu hash")?.into())?;
         let bloom = at(u32at(t, 8).ok_or("short gnu hash")?.into())?;
@@ -412,9 +379,7 @@ fn count(
         let buckets_at = 16 + bloom * 8;
         let mut last = 0usize;
         for i in 0..nbuckets {
-            let v = at(u32at(t, buckets_at + i * 4)
-                .ok_or("short gnu hash buckets")?
-                .into())?;
+            let v = at(u32at(t, buckets_at + i * 4).ok_or("short gnu hash buckets")?.into())?;
             last = last.max(v);
         }
         // every bucket empty means nothing is in the table past symoffset
@@ -435,9 +400,7 @@ fn count(
     }
 
     if let Some(addr) = hash {
-        let t = b
-            .get(at(offset_of(loads, addr)?)?..)
-            .ok_or("hash past the file")?;
+        let t = b.get(at(offset_of(loads, addr)?)?..).ok_or("hash past the file")?;
         // nchain is the symbol count, by definition
         return at(u32at(t, 4).ok_or("short hash table")?.into());
     }
@@ -448,9 +411,7 @@ fn count(
 fn offset_of(loads: &[(u64, u64, u64)], addr: u64) -> Result<u64, &'static str> {
     for &(vaddr, filesz, offset) in loads {
         if addr >= vaddr && addr - vaddr < filesz {
-            return offset
-                .checked_add(addr - vaddr)
-                .ok_or("segment offset past the end of memory");
+            return offset.checked_add(addr - vaddr).ok_or("segment offset past the end of memory");
         }
     }
     Err("string table is in no loadable segment")
@@ -458,16 +419,9 @@ fn offset_of(loads: &[(u64, u64, u64)], addr: u64) -> Result<u64, &'static str> 
 
 fn string(strs: &[u8], from: u64) -> Result<String, &'static str> {
     let from = at(from)?;
-    let rest = strs
-        .get(from..)
-        .ok_or("name starts past the string table")?;
-    let end = rest
-        .iter()
-        .position(|&c| c == 0)
-        .ok_or("name runs off the end of the string table")?;
-    std::str::from_utf8(&rest[..end])
-        .map(String::from)
-        .map_err(|_| "name is not utf-8")
+    let rest = strs.get(from..).ok_or("name starts past the string table")?;
+    let end = rest.iter().position(|&c| c == 0).ok_or("name runs off the end of the string table")?;
+    std::str::from_utf8(&rest[..end]).map(String::from).map_err(|_| "name is not utf-8")
 }
 
 fn at(v: u64) -> Result<usize, &'static str> {
@@ -475,21 +429,15 @@ fn at(v: u64) -> Result<usize, &'static str> {
 }
 
 fn u16at(b: &[u8], from: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        b.get(from..)?.get(..2)?.try_into().ok()?,
-    ))
+    Some(u16::from_le_bytes(b.get(from..)?.get(..2)?.try_into().ok()?))
 }
 
 fn u32at(b: &[u8], from: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        b.get(from..)?.get(..4)?.try_into().ok()?,
-    ))
+    Some(u32::from_le_bytes(b.get(from..)?.get(..4)?.try_into().ok()?))
 }
 
 fn u64at(b: &[u8], from: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        b.get(from..)?.get(..8)?.try_into().ok()?,
-    ))
+    Some(u64::from_le_bytes(b.get(from..)?.get(..8)?.try_into().ok()?))
 }
 
 // verdef is what this file exports, verneed what it asks of others. vn_file is
@@ -507,9 +455,7 @@ fn versions(
     let mut out = Vec::new();
 
     if let Some(addr) = verdef {
-        let t = b
-            .get(at(offset_of(loads, addr)?)?..)
-            .ok_or("verdef past the end of the file")?;
+        let t = b.get(at(offset_of(loads, addr)?)?..).ok_or("verdef past the end of the file")?;
         let mut at_ = 0usize;
         for _ in 0..verdefnum {
             let flags = u16at(t, at_ + 2).ok_or("short verdef")?;
@@ -529,9 +475,7 @@ fn versions(
     }
 
     if let Some(addr) = verneed {
-        let t = b
-            .get(at(offset_of(loads, addr)?)?..)
-            .ok_or("verneed past the end of the file")?;
+        let t = b.get(at(offset_of(loads, addr)?)?..).ok_or("verneed past the end of the file")?;
         let mut at_ = 0usize;
         for _ in 0..verneednum {
             let cnt = u16at(t, at_ + 2).ok_or("short verneed")?;
@@ -592,10 +536,7 @@ fn symbols(
         .ok_or("symbol table runs past the end of the file")?;
 
     let vers = match versym {
-        Some(a) => Some(
-            b.get(at(offset_of(loads, a)?)?..)
-                .ok_or("versym past the end of the file")?,
-        ),
+        Some(a) => Some(b.get(at(offset_of(loads, a)?)?..).ok_or("versym past the end of the file")?),
         None => None,
     };
 
@@ -625,9 +566,7 @@ fn symbols(
                     // and a copy relocation, whose definition sits here and keeps the
                     // version of the libc object it was copied out of
                     match names.iter().find(|(k, _, _)| *k == ndx) {
-                        Some((_, v, mine)) => {
-                            (Some(v.clone()), *mine && raw & VERSYM_HIDDEN == 0)
-                        }
+                        Some((_, v, mine)) => (Some(v.clone()), *mine && raw & VERSYM_HIDDEN == 0),
                         None => (None, raw & VERSYM_HIDDEN == 0),
                     }
                 }
@@ -677,10 +616,7 @@ mod tests {
             let Ok(rd) = fs::read_dir(d) else { continue };
             for e in rd.flatten() {
                 let p = e.path();
-                let named_so = p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains(".so"));
+                let named_so = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(".so"));
                 if named_so && p.is_file() {
                     out.push(p);
                 }
@@ -693,11 +629,7 @@ mod tests {
     fn reads_every_shared_library_here() {
         let libs = libraries();
         if libs.len() < 20 {
-            assert!(
-                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-                "only found {} libraries in {DIRS:?}",
-                libs.len()
-            );
+            assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "only found {} libraries in {DIRS:?}", libs.len());
             return;
         }
 
@@ -734,22 +666,13 @@ mod tests {
                     continue;
                 }
                 let lib = read(&p).unwrap();
-                assert_eq!(
-                    lib.soname.as_deref(),
-                    Some(want.as_str()),
-                    "{}",
-                    p.display()
-                );
+                assert_eq!(lib.soname.as_deref(), Some(want.as_str()), "{}", p.display());
                 checked += 1;
                 break;
             }
         }
         if checked == 0 {
-            assert!(
-                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-                "resolved none of {:?} in {DIRS:?}",
-                me.needed
-            );
+            assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "resolved none of {:?} in {DIRS:?}", me.needed);
         }
     }
 
@@ -765,23 +688,7 @@ mod tests {
     #[test]
     fn a_truncated_elf_never_panics() {
         let b = sample();
-        for n in [
-            0,
-            1,
-            3,
-            4,
-            5,
-            6,
-            16,
-            32,
-            52,
-            56,
-            64,
-            100,
-            512,
-            4096,
-            b.len() / 2,
-        ] {
+        for n in [0, 1, 3, 4, 5, 6, 16, 32, 52, 56, 64, 100, 512, 4096, b.len() / 2] {
             let _ = parse(&b[..n.min(b.len())]);
         }
     }

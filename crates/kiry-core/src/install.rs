@@ -29,17 +29,7 @@ pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, 
     for a in archives {
         let (name, target, version, depends, hash, users, flags) = meta(a)?;
         let members = archive::plan(root, a)?;
-        jobs.push(Job {
-            name,
-            target,
-            version,
-            depends,
-            archive: a.clone(),
-            members,
-            hash,
-            users,
-            flags,
-        });
+        jobs.push(Job { name, target, version, depends, archive: a.clone(), members, hash, users, flags });
     }
 
     // both checks before refusing, or a batch with each kind takes a run per kind
@@ -56,10 +46,7 @@ pub fn plan(root: &Path, archives: &[PathBuf], force: bool) -> Result<Vec<Job>, 
 // package's path is the same collision as two musl packages doing it. checked per
 // target, glibc quietly wrote its own stdio.h over musl's and nothing said a word
 fn paths(root: &Path, jobs: &[Job]) -> Result<Vec<(String, String)>, Error> {
-    let replacing: Vec<(&str, &str)> = jobs
-        .iter()
-        .map(|j| (j.name.as_str(), j.target.as_str()))
-        .collect();
+    let replacing: Vec<(&str, &str)> = jobs.iter().map(|j| (j.name.as_str(), j.target.as_str())).collect();
 
     let mut owner: HashMap<String, String> = HashMap::new();
     for t in db::targets(root)? {
@@ -172,14 +159,10 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
     let mut carried: Vec<Vec<db::Provide>> = Vec::new();
     for (i, j) in jobs.iter().enumerate() {
         let ships: HashSet<&str> = j.members.iter().map(|m| m.path.as_str()).collect();
-        let mine: Vec<db::Entry> =
-            etc.iter().filter(|e| ships.contains(e.path.as_str())).cloned().collect();
+        let mine: Vec<db::Entry> = etc.iter().filter(|e| ships.contains(e.path.as_str())).cloned().collect();
         let skip = modified(root, &mine)?;
         let manifest = archive::extract(root, &j.archive, &skip)?;
-        edits.extend(skip.into_iter().map(|path| Kept {
-            path,
-            from: j.archive.clone(),
-        }));
+        edits.extend(skip.into_iter().map(|path| Kept { path, from: j.archive.clone() }));
         kept.extend(manifest.iter().map(|e| e.path.clone()));
 
         let mut provides = Vec::new();
@@ -191,19 +174,10 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
                 // even where one carries them, so keying on them there invents breaks
                 let changed = elf::compare(&old.exports, &o.exports, j.target.ends_with("gnu"));
                 if !changed.is_empty() {
-                    broke.push(Broke {
-                        target: j.target.clone(),
-                        soname: soname.clone(),
-                        path: path.clone(),
-                        changed,
-                    });
+                    broke.push(Broke { target: j.target.clone(), soname: soname.clone(), path: path.clone(), changed });
                 }
             }
-            provides.push(db::Provide {
-                soname,
-                versioned: o.versioned,
-                path,
-            });
+            provides.push(db::Provide { soname, versioned: o.versioned, path });
         }
 
         db::write(
@@ -228,10 +202,8 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
         let m = preserve(was[i].as_ref(), &before[i], &carried[i], &kept);
         // a version that takes a path back owns it again, so the record stops claiming
         // it rather than going on pointing at somebody else's file
-        let mut all: Vec<db::Entry> = db::read_preserved(root, &j.target, &j.name)?
-            .into_iter()
-            .filter(|e| !kept.contains(&e.path))
-            .collect();
+        let mut all: Vec<db::Entry> =
+            db::read_preserved(root, &j.target, &j.name)?.into_iter().filter(|e| !kept.contains(&e.path)).collect();
         let had = all.len();
         all.extend(m.iter().cloned());
         all.sort_by(|a, b| a.path.cmp(&b.path));
@@ -260,11 +232,7 @@ pub fn apply(root: &Path, jobs: &[Job]) -> Result<Applied, Error> {
     }
     dispossess(root, jobs)?;
     prune(root, &was, &kept)?;
-    Ok(Applied {
-        broke,
-        edits,
-        preserved: stayed,
-    })
+    Ok(Applied { broke, edits, preserved: stayed })
 }
 
 // the file the old record pointed at is about to be pruned and there is nowhere else a
@@ -283,10 +251,7 @@ fn preserve(
     let carried: HashSet<&str> = now.iter().map(|p| p.soname.as_str()).collect();
     let stay: HashSet<&str> = before
         .iter()
-        .filter(|(path, o)| {
-            !kept.contains(path.as_str())
-                && o.soname.as_deref().is_some_and(|s| !carried.contains(s))
-        })
+        .filter(|(path, o)| !kept.contains(path.as_str()) && o.soname.as_deref().is_some_and(|s| !carried.contains(s)))
         .map(|(path, _)| path.as_str())
         .collect();
     if stay.is_empty() {
@@ -318,11 +283,7 @@ pub fn beside(path: &str, target: &str) -> Option<String> {
 // the real file carries the full version and the soname is a symlink onto it, so a bump
 // renames the thing being compared. the soname is the part that did not move, and keying
 // on the path alone skipped every library shaped that way
-fn baseline<'a>(
-    before: &'a HashMap<String, elf::Elf>,
-    path: &str,
-    soname: &str,
-) -> Option<&'a elf::Elf> {
+fn baseline<'a>(before: &'a HashMap<String, elf::Elf>, path: &str, soname: &str) -> Option<&'a elf::Elf> {
     if let Some(o) = before.get(path) {
         return Some(o);
     }
@@ -346,8 +307,7 @@ pub fn modified(root: &Path, manifest: &[db::Entry]) -> Result<Vec<String>, Erro
             Some(i) => (&e.path[..i], &e.path[i + 1..]),
             None => ("", e.path.as_str()),
         };
-        let Ok(pfd) = archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent })
-        else {
+        let Ok(pfd) = archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent }) else {
             continue;
         };
         if matches!(hash(&pfd, leaf), Ok(got) if got != *want) {
@@ -399,23 +359,14 @@ fn prune(root: &Path, was: &[Option<db::Installed>], kept: &HashSet<String>) -> 
 // whoever reads the older one rebuilds a shape that is no longer on disk
 fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
     for j in jobs {
-        let taken: HashSet<&str> = j
-            .members
-            .iter()
-            .filter(|m| m.what != archive::What::Dir)
-            .map(|m| m.path.as_str())
-            .collect();
+        let taken: HashSet<&str> =
+            j.members.iter().filter(|m| m.what != archive::What::Dir).map(|m| m.path.as_str()).collect();
 
         // the same reach the check has: a path taken from the other target leaves a
         // record there claiming a file that is no longer its own
         for (t, name) in db::targets(root)?
             .into_iter()
-            .flat_map(|t| {
-                db::installed(root, &t)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(move |n| (t.clone(), n))
-            })
+            .flat_map(|t| db::installed(root, &t).unwrap_or_default().into_iter().map(move |n| (t.clone(), n)))
             .collect::<Vec<_>>()
         {
             if name == j.name && t == j.target {
@@ -423,8 +374,7 @@ fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
             }
             let mut rec = db::read(root, &t, &name)?;
             let before = rec.manifest.len();
-            rec.manifest
-                .retain(|e| matches!(e.kind, db::Kind::Dir) || !taken.contains(e.path.as_str()));
+            rec.manifest.retain(|e| matches!(e.kind, db::Kind::Dir) || !taken.contains(e.path.as_str()));
             if rec.manifest.len() != before {
                 db::write(root, &rec)?;
                 // provides names paths as well, and a record pointing at a file the
@@ -432,10 +382,8 @@ fn dispossess(root: &Path, jobs: &[Job]) -> Result<(), Error> {
                 // keeping what the manifest still holds rather than dropping what was
                 // taken also heals an entry an older kiry left behind
                 let own: HashSet<&str> = rec.manifest.iter().map(|e| e.path.as_str()).collect();
-                let kept: Vec<db::Provide> = db::read_provides(root, &t, &name)?
-                    .into_iter()
-                    .filter(|p| own.contains(p.path.as_str()))
-                    .collect();
+                let kept: Vec<db::Provide> =
+                    db::read_provides(root, &t, &name)?.into_iter().filter(|p| own.contains(p.path.as_str())).collect();
                 db::write_provides(root, &t, &name, &kept)?;
             }
         }
@@ -469,14 +417,11 @@ pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Seen)>, 
             Some(i) => (&e.path[..i], &e.path[i + 1..]),
             None => ("", e.path.as_str()),
         };
-        let Ok(pfd) = archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent })
-        else {
+        let Ok(pfd) = archive::beneath(&rootfd, if parent.is_empty() { "." } else { parent }) else {
             out.push((e.path.clone(), Seen::Bad));
             continue;
         };
-        let Ok(fd) =
-            rustix::fs::openat(&pfd, leaf, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())
-        else {
+        let Ok(fd) = rustix::fs::openat(&pfd, leaf, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()) else {
             out.push((e.path.clone(), Seen::Bad));
             continue;
         };
@@ -510,10 +455,7 @@ pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Seen)>, 
 
         if e.mode & 0o111 != 0 && head.starts_with(b"#!") {
             let line = head[2..].split(|c| *c == b'\n').next().unwrap_or_default();
-            let words: Vec<String> = String::from_utf8_lossy(line)
-                .split_whitespace()
-                .map(str::to_string)
-                .collect();
+            let words: Vec<String> = String::from_utf8_lossy(line).split_whitespace().map(str::to_string).collect();
             if !words.is_empty() {
                 out.push((e.path.clone(), Seen::Script(words)));
                 continue;
@@ -526,15 +468,7 @@ pub fn scan(root: &Path, manifest: &[db::Entry]) -> Result<Vec<(String, Seen)>, 
 
 // sidecar is <archive>.meta, appended rather than derived, since the archive name
 // itself is a display name and is never parsed
-type Meta = (
-    String,
-    String,
-    Version,
-    Vec<Dep>,
-    String,
-    Vec<String>,
-    Vec<String>,
-);
+type Meta = (String, String, Version, Vec<Dep>, String, Vec<String>, Vec<String>);
 
 fn meta(a: &Path) -> Result<Meta, Error> {
     let d = PathBuf::from(format!("{}.meta", a.display()));
@@ -549,10 +483,7 @@ fn meta(a: &Path) -> Result<Meta, Error> {
         _ => return Err(Error::Targets(d.join("targets"))),
     };
 
-    let hash = std::fs::read_to_string(d.join("hash"))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let hash = std::fs::read_to_string(d.join("hash")).unwrap_or_default().trim().to_string();
     let users = pkg::lines(&d.join("users"))?;
     let flags = pkg::lines(&d.join("flags"))?;
 
@@ -570,9 +501,7 @@ mod tests {
     const SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-in-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-in-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -583,24 +512,9 @@ mod tests {
             name: name.to_string(),
             target: "x86_64-musl".to_string(),
             version: Version::parse("1.0 1").unwrap(),
-            depends: deps
-                .iter()
-                .map(|d| Dep {
-                    name: d.to_string(),
-                    make: false,
-                    host: false,
-                    only: None,
-                })
-                .collect(),
+            depends: deps.iter().map(|d| Dep { name: d.to_string(), make: false, host: false, only: None }).collect(),
             archive: PathBuf::from(format!("{name}.tar.zst")),
-            members: paths
-                .iter()
-                .map(|p| Member {
-                    what: What::File,
-                    mode: 0o644,
-                    path: p.to_string(),
-                })
-                .collect(),
+            members: paths.iter().map(|p| Member { what: What::File, mode: 0o644, path: p.to_string() }).collect(),
             hash: String::new(),
             users: Vec::new(),
             flags: Vec::new(),
@@ -617,11 +531,7 @@ mod tests {
                 depends: Vec::new(),
                 manifest: paths
                     .iter()
-                    .map(|p| db::Entry {
-                        mode: 0o644,
-                        kind: db::Kind::File(SHA.to_string()),
-                        path: p.to_string(),
-                    })
+                    .map(|p| db::Entry { mode: 0o644, kind: db::Kind::File(SHA.to_string()), path: p.to_string() })
                     .collect(),
                 hash: String::new(),
                 users: Vec::new(),
@@ -651,10 +561,7 @@ mod tests {
 
         let mut j = job("glibc", &[], &["usr/include/stdio.h"]);
         j.target = "x86_64-gnu".to_string();
-        assert_eq!(
-            paths(&root, &[j]).unwrap(),
-            vec![("usr/include/stdio.h".to_string(), "musl".to_string())]
-        );
+        assert_eq!(paths(&root, &[j]).unwrap(), vec![("usr/include/stdio.h".to_string(), "musl".to_string())]);
     }
 
     // the same name on both targets is one recipe built twice, not a package taking its
@@ -664,20 +571,13 @@ mod tests {
         let root = scratch("bothtargets");
         record(&root, "linux-headers", &["usr/include/linux/fs.h"]);
 
-        let mut j = job(
-            "linux-headers",
-            &[],
-            &["usr/x86_64-linux-gnu/usr/include/linux/fs.h"],
-        );
+        let mut j = job("linux-headers", &[], &["usr/x86_64-linux-gnu/usr/include/linux/fs.h"]);
         j.target = "x86_64-gnu".to_string();
         assert!(paths(&root, &[j]).unwrap().is_empty());
 
         let mut clash = job("linux-headers", &[], &["usr/include/linux/fs.h"]);
         clash.target = "x86_64-gnu".to_string();
-        assert!(
-            !paths(&root, &[clash]).unwrap().is_empty(),
-            "the musl build's path was taken without a word"
-        );
+        assert!(!paths(&root, &[clash]).unwrap().is_empty(), "the musl build's path was taken without a word");
     }
 
     #[test]
@@ -707,11 +607,7 @@ mod tests {
         let root = scratch("allowned");
         record(&root, "procps-ng", &["usr/bin/vmstat", "usr/bin/top", "usr/bin/free"]);
 
-        let taking = job(
-            "busybox",
-            &[],
-            &["usr/bin/vmstat", "usr/bin/sh", "usr/bin/top", "usr/bin/free"],
-        );
+        let taking = job("busybox", &[], &["usr/bin/vmstat", "usr/bin/sh", "usr/bin/top", "usr/bin/free"]);
         let at = paths(&root, &[taking]).unwrap();
         let took: Vec<&str> = at.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(took, ["usr/bin/vmstat", "usr/bin/top", "usr/bin/free"]);
@@ -777,10 +673,7 @@ mod tests {
         assert!(matches!(meta(&d.join("foo.tar.zst")), Err(Error::Empty(_))));
 
         fs::write(side.join("targets"), "musl\ngnu\n").unwrap();
-        assert!(matches!(
-            meta(&d.join("foo.tar.zst")),
-            Err(Error::Targets(_))
-        ));
+        assert!(matches!(meta(&d.join("foo.tar.zst")), Err(Error::Targets(_))));
     }
 }
 
@@ -814,12 +707,7 @@ pub struct Removed {
 // the whole batch is read and checked before anything is unlinked, so a package that is
 // only needed by something else going away in the same breath is not needed at all, and
 // the order the names were typed in decides nothing
-pub fn remove(
-    root: &Path,
-    target: &str,
-    names: &[String],
-    force: bool,
-) -> Result<Vec<(String, Removed)>, Error> {
+pub fn remove(root: &Path, target: &str, names: &[String], force: bool) -> Result<Vec<(String, Removed)>, Error> {
     let mut recs = Vec::new();
     for name in names {
         recs.push((name.clone(), db::read(root, target, name)?));
@@ -831,15 +719,8 @@ pub fn remove(
                 continue;
             }
             let o = db::read(root, target, &other)?;
-            if let Some(d) = o
-                .depends
-                .iter()
-                .find(|d| !d.make && names.contains(&d.name))
-            {
-                return Err(Error::Needed {
-                    pkg: d.name.clone(),
-                    by: other,
-                });
+            if let Some(d) = o.depends.iter().find(|d| !d.make && names.contains(&d.name)) {
+                return Err(Error::Needed { pkg: d.name.clone(), by: other });
             }
         }
     }

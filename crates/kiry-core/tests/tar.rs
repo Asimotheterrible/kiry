@@ -8,23 +8,11 @@ use std::process::Command;
 
 use kiry_core::{archive, db};
 
-const TARS: &[(&str, &str)] = &[
-    ("gnu", "tar"),
-    ("bsdtar", "bsdtar"),
-    ("busybox", "busybox tar"),
-];
+const TARS: &[(&str, &str)] = &[("gnu", "tar"), ("bsdtar", "bsdtar"), ("busybox", "busybox tar")];
 
 fn have(cmd: &str) -> bool {
-    let probe = format!(
-        "command -v {} >/dev/null",
-        cmd.split(' ').next().unwrap_or(cmd)
-    );
-    Command::new("sh")
-        .arg("-c")
-        .arg(probe)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let probe = format!("command -v {} >/dev/null", cmd.split(' ').next().unwrap_or(cmd));
+    Command::new("sh").arg("-c").arg(probe).status().map(|s| s.success()).unwrap_or(false)
 }
 
 fn tmp(name: &str) -> PathBuf {
@@ -45,20 +33,12 @@ fn build_tree(at: &Path) {
     fs::write(at.join("usr/bin/tool"), b"#!/bin/sh\necho hi\n").unwrap();
     fs::set_permissions(at.join("usr/bin/tool"), perms(0o755)).unwrap();
 
-    fs::write(
-        at.join("usr/share/with space/file with spaces.txt"),
-        b"spaces\n",
-    )
-    .unwrap();
+    fs::write(at.join("usr/share/with space/file with spaces.txt"), b"spaces\n").unwrap();
     fs::write(at.join(format!("usr/share/doc/{long}/readme")), b"long\n").unwrap();
     fs::write(at.join("usr/share/empty"), b"").unwrap();
 
     std::os::unix::fs::symlink("tool", at.join("usr/bin/link")).unwrap();
-    std::os::unix::fs::symlink(
-        format!("../share/doc/{long}/readme"),
-        at.join("usr/bin/faraway"),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink(format!("../share/doc/{long}/readme"), at.join("usr/bin/faraway")).unwrap();
 
     // no hardlink here. which of the two names ends up as the link depends on
     // readdir order, not on the tar, so it would fail on some filesystems for a
@@ -74,11 +54,7 @@ fn extract_with(tar: &str, src: &Path, at: &Path, name: &str) -> Vec<db::Entry> 
     let root = at.join(format!("{name}-root"));
     fs::create_dir_all(&root).unwrap();
 
-    let sh = format!(
-        "cd {} && {tar} cf - . | zstd -q -o {}",
-        src.display(),
-        arc.display()
-    );
+    let sh = format!("cd {} && {tar} cf - . | zstd -q -o {}", src.display(), arc.display());
     let ok = Command::new("sh").arg("-c").arg(&sh).status().unwrap();
     assert!(ok.success(), "{tar} failed to build the corpus");
 
@@ -89,12 +65,7 @@ fn extract_with(tar: &str, src: &Path, at: &Path, name: &str) -> Vec<db::Entry> 
 
 #[test]
 fn every_tar_extracts_to_the_same_tree() {
-    let missing: Vec<&str> = TARS
-        .iter()
-        .map(|(_, c)| *c)
-        .chain(["zstd"])
-        .filter(|c| !have(c))
-        .collect();
+    let missing: Vec<&str> = TARS.iter().map(|(_, c)| *c).chain(["zstd"]).filter(|c| !have(c)).collect();
 
     if !missing.is_empty() {
         // skipping would certify a package manager that cannot install a normal
@@ -117,10 +88,7 @@ fn every_tar_extracts_to_the_same_tree() {
 
     let (first_name, first) = &seen[0];
     for (name, m) in &seen[1..] {
-        assert_eq!(
-            first, m,
-            "{first_name} and {name} disagree about what the tree is"
-        );
+        assert_eq!(first, m, "{first_name} and {name} disagree about what the tree is");
     }
 
     let paths: Vec<&str> = first.iter().map(|e| e.path.as_str()).collect();

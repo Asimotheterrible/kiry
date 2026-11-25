@@ -12,10 +12,7 @@ fn shipping(text: &str) -> usize {
     let Some(start) = lines.iter().position(|l| *l == "#[cfg(test)]") else {
         return lines.len();
     };
-    let end = lines[start..]
-        .iter()
-        .position(|l| *l == "}")
-        .map_or(lines.len(), |i| start + i + 1);
+    let end = lines[start..].iter().position(|l| *l == "}").map_or(lines.len(), |i| start + i + 1);
     start + lines.len() - end
 }
 
@@ -41,10 +38,7 @@ fn kiry_core_fits_in_its_budget() {
     for f in &files {
         let n = shipping(&fs::read_to_string(f).unwrap());
         total += n;
-        rows.push_str(&format!(
-            "\n  {n:>5}  {}",
-            f.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        rows.push_str(&format!("\n  {n:>5}  {}", f.file_name().unwrap_or_default().to_string_lossy()));
     }
 
     assert!(

@@ -45,12 +45,7 @@ pub fn toolchain(root: &Path) -> Result<Vec<Dep>, String> {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| Dep {
-            name: l.to_string(),
-            make: true,
-            host: true,
-            only: None,
-        })
+        .map(|l| Dep { name: l.to_string(), make: true, host: true, only: None })
         .collect())
 }
 
@@ -95,23 +90,14 @@ pub fn closure(root: &Path, target: &str, deps: &[Dep]) -> Result<Vec<Member>, S
     // your libc" -- this makes it true for both targets instead of one
     let implicit: Vec<Dep> = substrate(target)
         .iter()
-        .map(|(n, make)| Dep {
-            name: (*n).to_string(),
-            make: *make,
-            host: *make,
-            only: None,
-        })
+        .map(|(n, make)| Dep { name: (*n).to_string(), make: *make, host: *make, only: None })
         .collect();
 
     for d in toolchain(root)?.iter().chain(implicit.iter()).chain(deps) {
         // the toolchain set is make deps, so it comes from the host either way
         let t = if d.host { host.as_str() } else { target };
         if seen.insert((d.name.clone(), t.to_string())) {
-            out.push(Member {
-                name: d.name.clone(),
-                direct: true,
-                target: t.to_string(),
-            });
+            out.push(Member { name: d.name.clone(), direct: true, target: t.to_string() });
             queue.push((d.name.clone(), t.to_string()));
         }
     }
@@ -138,11 +124,7 @@ pub fn closure(root: &Path, target: &str, deps: &[Dep]) -> Result<Vec<Member>, S
         // target's. the edge inherits the target of the package it came from
         for d in rec.depends.iter().filter(|d| !d.make) {
             if seen.insert((d.name.clone(), t.clone())) {
-                out.push(Member {
-                    name: d.name.clone(),
-                    direct: false,
-                    target: t.clone(),
-                });
+                out.push(Member { name: d.name.clone(), direct: false, target: t.clone() });
                 queue.push((d.name.clone(), t.clone()));
             }
         }
@@ -186,11 +168,8 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
     // pkgconf reads Requires and Requires.private even for --cflags, so a .pc naming one
     // that is not here fails the dependency that named it rather than itself. what no .pc
     // names is still absent, which is the closure doing the job it is for
-    let mut dev: BTreeSet<(String, String)> = members
-        .iter()
-        .filter(|m| m.direct)
-        .map(|m| (m.target.clone(), m.name.clone()))
-        .collect();
+    let mut dev: BTreeSet<(String, String)> =
+        members.iter().filter(|m| m.direct).map(|m| (m.target.clone(), m.name.clone())).collect();
     let mut todo: Vec<(String, String)> = dev.iter().cloned().collect();
     let mut owners: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut configs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
@@ -228,11 +207,8 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
         let whole = dev.remove(&(m.target.clone(), m.name.clone()));
         // a pruned library exports what installed code asked for. a build is how new code
         // arrives, and it links against the first link, which kiry keeps for exactly this
-        let full: BTreeMap<&str, &str> = rec
-            .manifest
-            .iter()
-            .filter_map(|e| Some((e.path.strip_prefix(PRUNED)?, e.path.as_str())))
-            .collect();
+        let full: BTreeMap<&str, &str> =
+            rec.manifest.iter().filter_map(|e| Some((e.path.strip_prefix(PRUNED)?, e.path.as_str()))).collect();
         for e in &rec.manifest {
             if !whole && (builds_against(&e.path) || (m.target != target && config(&e.path))) {
                 continue;
@@ -280,10 +256,7 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
     // the closure, so this only writes where nothing did
     let etc = into.join("etc");
     fs::create_dir_all(&etc).map_err(|e| format!("etc: {e}"))?;
-    for (n, body) in [
-        ("passwd", "root:x:0:0:root:/root:/bin/sh\n"),
-        ("group", "root:x:0:\n"),
-    ] {
+    for (n, body) in [("passwd", "root:x:0:0:root:/root:/bin/sh\n"), ("group", "root:x:0:\n")] {
         let at = etc.join(n);
         if at.exists() {
             continue;
@@ -296,9 +269,7 @@ pub fn assemble(root: &Path, target: &str, members: &[Member], into: &Path) -> R
 // where a config file declares what else it needs. ConfigVersion and the Targets files
 // beside it declare nothing, so reading them is only work
 fn declares(path: &str) -> bool {
-    path.ends_with("Config.cmake")
-        || path.ends_with("-config.cmake")
-        || path.ends_with("Dependencies.cmake")
+    path.ends_with("Config.cmake") || path.ends_with("-config.cmake") || path.ends_with("Dependencies.cmake")
 }
 
 // cmake finds a package by a directory named after it, and loads the one file in there
@@ -312,8 +283,8 @@ fn installed_cmake(root: &Path, t: &str) -> BTreeMap<String, String> {
         for e in &rec.manifest {
             let Some(under) = e.path.split("/cmake/").nth(1) else { continue };
             let Some((dir, file)) = under.split_once('/') else { continue };
-            let named = file == format!("{dir}Config.cmake")
-                || file.eq_ignore_ascii_case(&format!("{dir}-config.cmake"));
+            let named =
+                file == format!("{dir}Config.cmake") || file.eq_ignore_ascii_case(&format!("{dir}-config.cmake"));
             if named {
                 out.entry(dir.to_string()).or_insert_with(|| name.clone());
             }
@@ -341,10 +312,7 @@ fn cmake_requires(text: &str) -> Vec<String> {
         }
         // qt keeps its non-qt dependencies in one string: NAME\;REQUIRED\;VERSION\;
         // COMPONENTS;NAME2\;... where a plain ; ends an entry and an escaped one a field
-        let list = l
-            .split_once("_third_party_deps \"")
-            .and_then(|(_, r)| r.split_once('"'))
-            .map(|(list, _)| list);
+        let list = l.split_once("_third_party_deps \"").and_then(|(_, r)| r.split_once('"')).map(|(list, _)| list);
         if let Some(list) = list {
             let mut next = true;
             for tok in list.split(';') {
@@ -366,8 +334,7 @@ fn installed_pcs(root: &Path, t: &str) -> BTreeMap<String, String> {
         let Ok(rec) = db::read(root, t, &name) else { continue };
         for e in &rec.manifest {
             let Some(f) = e.path.strip_suffix(".pc") else { continue };
-            out.entry(f.rsplit('/').next().unwrap_or(f).to_string())
-                .or_insert_with(|| name.clone());
+            out.entry(f.rsplit('/').next().unwrap_or(f).to_string()).or_insert_with(|| name.clone());
         }
     }
     out
@@ -388,10 +355,7 @@ fn pc_requires(text: &str) -> Vec<String> {
 // keeps everything else -- autoconf is not autoconf without the perl that runs it, and
 // perl is three levels of module tree, not one soname
 fn builds_against(path: &str) -> bool {
-    path.starts_with("usr/include/")
-        || path.ends_with(".pc")
-        || path.ends_with(".m4")
-        || path.ends_with(".cmake")
+    path.starts_with("usr/include/") || path.ends_with(".pc") || path.ends_with(".m4") || path.ends_with(".cmake")
 }
 
 // manifest paths are relative to the root and carry no leading slash, so an absolute
@@ -416,8 +380,7 @@ fn place(root: &Path, into: &Path, e: &db::Entry) -> Result<(), String> {
         }
         db::Kind::File(_) => clone(&root.join(&e.path), &dst)?,
     }
-    fs::set_permissions(&dst, fs::Permissions::from_mode(e.mode))
-        .map_err(|x| format!("{}: {x}", dst.display()))
+    fs::set_permissions(&dst, fs::Permissions::from_mode(e.mode)).map_err(|x| format!("{}: {x}", dst.display()))
 }
 
 // FICLONE is a metadata operation, so a closure of twenty thousand files costs no data
@@ -429,9 +392,7 @@ fn clone(src: &Path, dst: &Path) -> Result<(), String> {
         return Ok(());
     }
     drop(to);
-    fs::copy(src, dst)
-        .map(|_| ())
-        .map_err(|e| format!("{}: {e}", dst.display()))
+    fs::copy(src, dst).map(|_| ()).map_err(|e| format!("{}: {e}", dst.display()))
 }
 
 // a child that dies with the thread that started it. otherwise kiry killed under a build
@@ -470,9 +431,7 @@ pub const GOMOD_AT: &str = "var/cache/kiry-gomod";
 // process to kiry and the build to this process, that is the whole tree going with kiry
 // -- a pdeathsig alone reaches sh and not the make under it
 pub fn init() -> Result<(), String> {
-    let work = PathBuf::from(
-        std::env::var("KIRY_SANDBOX").map_err(|_| "KIRY_SANDBOX is not set".to_string())?,
-    );
+    let work = PathBuf::from(std::env::var("KIRY_SANDBOX").map_err(|_| "KIRY_SANDBOX is not set".to_string())?);
     let root = work.join("sysroot");
 
     let (uid, gid) = (process::getuid().as_raw(), process::getgid().as_raw());
@@ -481,10 +440,7 @@ pub fn init() -> Result<(), String> {
     // and a process this new has no second thread to hand a descriptor to anyway
     unsafe {
         thread::unshare_unsafe(
-            UnshareFlags::NEWUSER
-                | UnshareFlags::NEWNS
-                | UnshareFlags::NEWNET
-                | UnshareFlags::NEWPID,
+            UnshareFlags::NEWUSER | UnshareFlags::NEWNS | UnshareFlags::NEWNET | UnshareFlags::NEWPID,
         )
     }
     .map_err(|e| format!("unshare: {e}"))?;
@@ -493,11 +449,8 @@ pub fn init() -> Result<(), String> {
     write("/proc/self/uid_map", &format!("0 {uid} 1"))?;
 
     // ours alone, so nothing below leaks back out to the host
-    mount::mount_change(
-        "/",
-        MountPropagationFlags::REC | MountPropagationFlags::PRIVATE,
-    )
-    .map_err(|e| format!("private /: {e}"))?;
+    mount::mount_change("/", MountPropagationFlags::REC | MountPropagationFlags::PRIVATE)
+        .map_err(|e| format!("private /: {e}"))?;
     mount::mount_bind(&root, &root).map_err(|e| format!("bind sysroot: {e}"))?;
 
     mount::mount_bind(work.join("src"), root.join("src")).map_err(|e| format!("src: {e}"))?;
@@ -515,35 +468,21 @@ pub fn init() -> Result<(), String> {
     // a fresh procfs wants CAP_SYS_ADMIN in the user namespace owning the pid namespace,
     // and there is none here, so the host's is bound in. recursive because a user
     // namespace locks the mounts it inherited and refuses to bind one on its own
-    mount::mount_bind_recursive("/proc", root.join("proc"))
-        .map_err(|e| format!("bind proc: {e}"))?;
-    mount::mount(
-        "tmpfs",
-        root.join("tmp"),
-        "tmpfs",
-        MountFlags::empty(),
-        None,
-    )
-    .map_err(|e| format!("mount tmp: {e}"))?;
+    mount::mount_bind_recursive("/proc", root.join("proc")).map_err(|e| format!("bind proc: {e}"))?;
+    mount::mount("tmpfs", root.join("tmp"), "tmpfs", MountFlags::empty(), None)
+        .map_err(|e| format!("mount tmp: {e}"))?;
     devices(&root)?;
 
     // the closure is readable and nothing more. src, dest and tmp are mounts on top of
     // it, so they stay writable
-    mount::mount_remount(&root, MountFlags::BIND | MountFlags::RDONLY, "")
-        .map_err(|e| format!("seal sysroot: {e}"))?;
+    mount::mount_remount(&root, MountFlags::BIND | MountFlags::RDONLY, "").map_err(|e| format!("seal sysroot: {e}"))?;
 
     process::chdir(&root).map_err(|e| format!("chdir sysroot: {e}"))?;
     process::pivot_root(".", ".").map_err(|e| format!("pivot_root: {e}"))?;
     mount::unmount(".", UnmountFlags::DETACH).map_err(|e| format!("detach old root: {e}"))?;
 
-    process::setrlimit(
-        process::Resource::Nofile,
-        process::Rlimit {
-            current: Some(4096),
-            maximum: Some(4096),
-        },
-    )
-    .map_err(|e| format!("rlimit: {e}"))?;
+    process::setrlimit(process::Resource::Nofile, process::Rlimit { current: Some(4096), maximum: Some(4096) })
+        .map_err(|e| format!("rlimit: {e}"))?;
     // a build that allocates without bound takes the machine down rather than itself,
     // and the process the oom killer picks is whatever else was running. binutils'
     // configure probe for ada handed clang a .adb and it ran until there was no memory
@@ -551,14 +490,8 @@ pub fn init() -> Result<(), String> {
     // what a runaway allocator uses, and it does not count address space a linker only
     // reserves
     if let Some(cap) = memcap() {
-        process::setrlimit(
-            process::Resource::Data,
-            process::Rlimit {
-                current: Some(cap),
-                maximum: Some(cap),
-            },
-        )
-        .map_err(|e| format!("rlimit: {e}"))?;
+        process::setrlimit(process::Resource::Data, process::Rlimit { current: Some(cap), maximum: Some(cap) })
+            .map_err(|e| format!("rlimit: {e}"))?;
     }
 
     let cwd = crate::unpacked(Path::new("/src"));
@@ -577,14 +510,8 @@ pub fn init() -> Result<(), String> {
 // enough for a build to run and nothing that reads or writes hardware
 fn devices(root: &Path) -> Result<(), String> {
     let dev = root.join("dev");
-    mount::mount(
-        "tmpfs",
-        &dev,
-        "tmpfs",
-        MountFlags::empty(),
-        Some(c"mode=755"),
-    )
-    .map_err(|e| format!("mount dev: {e}"))?;
+    mount::mount("tmpfs", &dev, "tmpfs", MountFlags::empty(), Some(c"mode=755"))
+        .map_err(|e| format!("mount dev: {e}"))?;
     for n in ["null", "zero", "full", "random", "urandom"] {
         let at = dev.join(n);
         fs::write(&at, "").map_err(|e| format!("{}: {e}", at.display()))?;
@@ -607,14 +534,8 @@ fn devices(root: &Path) -> Result<(), String> {
     // starts a python process pool dies on an import rather than on a missing tool
     let shm = dev.join("shm");
     fs::create_dir(&shm).map_err(|e| format!("{}: {e}", shm.display()))?;
-    mount::mount(
-        "tmpfs",
-        &shm,
-        "tmpfs",
-        MountFlags::empty(),
-        Some(c"mode=1777"),
-    )
-    .map_err(|e| format!("mount shm: {e}"))?;
+    mount::mount("tmpfs", &shm, "tmpfs", MountFlags::empty(), Some(c"mode=1777"))
+        .map_err(|e| format!("mount shm: {e}"))?;
     Ok(())
 }
 
@@ -630,18 +551,9 @@ fn memcap() -> Option<u64> {
         };
     }
     let info = fs::read_to_string("/proc/meminfo").ok()?;
-    let kb = info
-        .lines()
-        .find_map(|l| l.strip_prefix("MemTotal:"))?
-        .trim()
-        .trim_end_matches(" kB")
-        .parse::<u64>()
-        .ok()?;
-    let share = std::env::var("KIRY_SHARE")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(1)
-        .max(1);
+    let kb =
+        info.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.trim().trim_end_matches(" kB").parse::<u64>().ok()?;
+    let share = std::env::var("KIRY_SHARE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).max(1);
     Some(kb * 1024 / 2 / share)
 }
 
@@ -660,9 +572,7 @@ mod tests {
     const SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-sb-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-sb-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -681,18 +591,11 @@ mod tests {
 
     // and it is never what a test is asking about, so it comes back out here
     fn declared(c: &[Member]) -> Vec<&Member> {
-        c.iter()
-            .filter(|m| !substrate(T).iter().any(|(n, _)| *n == m.name))
-            .collect()
+        c.iter().filter(|m| !substrate(T).iter().any(|(n, _)| *n == m.name)).collect()
     }
 
     fn dep(name: &str, make: bool) -> Dep {
-        Dep {
-            name: name.to_string(),
-            make,
-            host: make,
-            only: None,
-        }
+        Dep { name: name.to_string(), make, host: make, only: None }
     }
 
     // one more file on a package already installed, for the cases where the fixture's
@@ -702,11 +605,7 @@ mod tests {
         fs::create_dir_all(f.parent().unwrap()).unwrap();
         fs::write(&f, body).unwrap();
         let mut rec = db::read(root, t, name).unwrap();
-        rec.manifest.push(db::Entry {
-            mode: 0o644,
-            kind: db::Kind::File(SHA.to_string()),
-            path: path.to_string(),
-        });
+        rec.manifest.push(db::Entry { mode: 0o644, kind: db::Kind::File(SHA.to_string()), path: path.to_string() });
         db::write(root, &rec).unwrap();
     }
 
@@ -714,11 +613,7 @@ mod tests {
     fn install(root: &Path, t: &str, name: &str, deps: &[Dep]) {
         let dir = if t == host() { "usr/lib" } else { "usr/lib64" };
         let lib = format!("{dir}/lib{name}.so.1");
-        let paths = [
-            format!("usr/include/{name}.h"),
-            format!("{dir}/pkgconfig/{name}.pc"),
-            lib.clone(),
-        ];
+        let paths = [format!("usr/include/{name}.h"), format!("{dir}/pkgconfig/{name}.pc"), lib.clone()];
         for p in &paths {
             let f = root.join(p);
             fs::create_dir_all(f.parent().unwrap()).unwrap();
@@ -733,11 +628,7 @@ mod tests {
                 depends: deps.to_vec(),
                 manifest: paths
                     .iter()
-                    .map(|p| db::Entry {
-                        mode: 0o644,
-                        kind: db::Kind::File(SHA.to_string()),
-                        path: p.clone(),
-                    })
+                    .map(|p| db::Entry { mode: 0o644, kind: db::Kind::File(SHA.to_string()), path: p.clone() })
                     .collect(),
                 hash: String::new(),
                 users: Vec::new(),
@@ -749,11 +640,7 @@ mod tests {
             root,
             t,
             name,
-            &[db::Provide {
-                soname: format!("lib{name}.so.1"),
-                versioned: false,
-                path: lib,
-            }],
+            &[db::Provide { soname: format!("lib{name}.so.1"), versioned: false, path: lib }],
         )
         .unwrap();
     }
@@ -775,7 +662,11 @@ mod tests {
 
         let c = closure(&root, T, &[dep("wayland", false), dep("zlib", false)]).unwrap();
         let has = |n: &str, t: &str| c.iter().any(|m| m.name == n && m.target == t);
-        assert!(has("wayland", &h) && has("ffi", &h), "{:?}", declared(&c).iter().map(|m| (&m.name, &m.target)).collect::<Vec<_>>());
+        assert!(
+            has("wayland", &h) && has("ffi", &h),
+            "{:?}",
+            declared(&c).iter().map(|m| (&m.name, &m.target)).collect::<Vec<_>>()
+        );
         // a host build with no programs has nothing to offer a gnu build
         assert!(!has("zlib", &h));
 
@@ -791,18 +682,11 @@ mod tests {
         install(&root, &host(), "busybox", &[]);
         install(&root, T, "zlib", &[]);
         fs::create_dir_all(root.join("etc/kiry")).unwrap();
-        fs::write(
-            root.join("etc/kiry/toolchain"),
-            "# a shell, at least\nbusybox\n",
-        )
-        .unwrap();
+        fs::write(root.join("etc/kiry/toolchain"), "# a shell, at least\nbusybox\n").unwrap();
 
         let c = closure(&root, T, &[dep("zlib", false)]).unwrap();
         let names: Vec<&str> = declared(&c).iter().map(|m| m.name.as_str()).collect();
-        assert!(
-            names.contains(&"busybox"),
-            "no shell in the sandbox: {names:?}"
-        );
+        assert!(names.contains(&"busybox"), "no shell in the sandbox: {names:?}");
         assert!(names.contains(&"zlib"), "{names:?}");
     }
 
@@ -822,10 +706,7 @@ mod tests {
         let into = scratch("splitinto");
         assemble(&root, T, &c, &into).unwrap();
         assert!(into.join("usr/lib/libzlib.so.1").exists(), "no host build");
-        assert!(
-            into.join("usr/lib64/libzlib.so.1").exists(),
-            "no target build"
-        );
+        assert!(into.join("usr/lib64/libzlib.so.1").exists(), "no target build");
     }
 
     // clang asks whether a directory is there before it puts -L in front of it, so an
@@ -864,14 +745,8 @@ mod tests {
 
         let c = closure(&root, T, &[dep("gcc", true), dep("zlib", false)]).unwrap();
         let names: Vec<&str> = c.iter().map(|m| m.name.as_str()).collect();
-        assert!(
-            names.contains(&"gcc") && names.contains(&"zlib"),
-            "{names:?}"
-        );
-        assert!(
-            !names.contains(&"gccdep"),
-            "a make dep's make deps came along"
-        );
+        assert!(names.contains(&"gcc") && names.contains(&"zlib"), "{names:?}");
+        assert!(!names.contains(&"gccdep"), "a make dep's make deps came along");
     }
 
     #[test]
@@ -895,17 +770,11 @@ mod tests {
         let into = root.join("sysroot");
         assemble(&root, T, &c, &into).unwrap();
 
-        assert!(
-            into.join("usr/include/png.h").exists(),
-            "direct dep lost its header"
-        );
+        assert!(into.join("usr/include/png.h").exists(), "direct dep lost its header");
         assert!(into.join("usr/lib64/pkgconfig/png.pc").exists());
         assert!(into.join("usr/lib64/libpng.so.1").exists());
 
-        assert!(
-            into.join("usr/lib64/libzlib.so.1").exists(),
-            "closure lost a library"
-        );
+        assert!(into.join("usr/lib64/libzlib.so.1").exists(), "closure lost a library");
         assert!(
             !into.join("usr/include/zlib.h").exists(),
             "a transitive dependency's header reached the build, which is what makes a \
@@ -920,11 +789,7 @@ mod tests {
         install(&root, T, "png", &[dep("zlib", false), dep("jpeg", false)]);
         install(&root, T, "zlib", &[]);
         install(&root, T, "jpeg", &[]);
-        fs::write(
-            root.join("usr/lib64/pkgconfig/png.pc"),
-            "Name: png\nRequires.private: zlib >= 1.2\n",
-        )
-        .unwrap();
+        fs::write(root.join("usr/lib64/pkgconfig/png.pc"), "Name: png\nRequires.private: zlib >= 1.2\n").unwrap();
 
         let c = closure(&root, T, &[dep("png", false)]).unwrap();
         let into = root.join("sysroot");
@@ -1007,9 +872,7 @@ mod tests {
     // thing telling a package name apart from TRUE or a version
     #[test]
     fn qts_third_party_names_are_read_apart_from_its_fields() {
-        let one = cmake_requires(
-            "set(__qt_GuiPrivate_third_party_deps \"XKB\\;FALSE\\;0.9.0\\;\\;\")\n",
-        );
+        let one = cmake_requires("set(__qt_GuiPrivate_third_party_deps \"XKB\\;FALSE\\;0.9.0\\;\\;\")\n");
         assert_eq!(one, vec!["XKB"]);
 
         let two = cmake_requires(
@@ -1026,7 +889,6 @@ mod tests {
         assert!(!declares("usr/lib/cmake/Qt6Gui/Qt6GuiConfigVersion.cmake"));
         assert!(!declares("usr/lib/cmake/Qt6Gui/Qt6GuiTargets.cmake"));
     }
-
 
     // qt6-qtwayland drops its plugin configs into Qt6Gui/, which qt6-qtbase is the
     // package for. a directory somebody put a file in is not a package, and reading it

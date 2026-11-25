@@ -32,9 +32,7 @@ impl Entry {
 
         // path last, so one with a space in it needs no quoting
         let mut f = line.splitn(4, ' ');
-        let (Some(kind), Some(mode), Some(third), Some(path)) =
-            (f.next(), f.next(), f.next(), f.next())
-        else {
+        let (Some(kind), Some(mode), Some(third), Some(path)) = (f.next(), f.next(), f.next(), f.next()) else {
             return Err(bad("wanted four fields"));
         };
 
@@ -66,11 +64,7 @@ impl Entry {
             return Err(bad("path must be relative to the root"));
         }
 
-        Ok(Entry {
-            mode,
-            kind,
-            path: path.to_string(),
-        })
+        Ok(Entry { mode, kind, path: path.to_string() })
     }
 }
 
@@ -168,26 +162,14 @@ pub fn parse_provides(text: &str) -> Result<Vec<Provide>, Error> {
         }
         let mut f = line.splitn(3, ' ');
         let (Some(soname), Some(v), Some(path)) = (f.next(), f.next(), f.next()) else {
-            return Err(Error::Manifest {
-                line: n + 1,
-                why: "wants soname, flag, path",
-            });
+            return Err(Error::Manifest { line: n + 1, why: "wants soname, flag, path" });
         };
         let versioned = match v {
             "v" => true,
             "-" => false,
-            _ => {
-                return Err(Error::Manifest {
-                    line: n + 1,
-                    why: "flag is v or -",
-                })
-            }
+            _ => return Err(Error::Manifest { line: n + 1, why: "flag is v or -" }),
         };
-        out.push(Provide {
-            soname: soname.to_string(),
-            versioned,
-            path: path.to_string(),
-        });
+        out.push(Provide { soname: soname.to_string(), versioned, path: path.to_string() });
     }
     Ok(out)
 }
@@ -295,10 +277,7 @@ pub fn read(root: &Path, target: &str, name: &str) -> Result<Installed, Error> {
         version: Version::parse(&pkg::required(&d.join("version"))?)?,
         depends: pkg::depends_from(pkg::lines(&d.join("depends"))?),
         manifest: parse_manifest(&pkg::required(&d.join("manifest"))?)?,
-        hash: fs::read_to_string(d.join("hash"))
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
+        hash: fs::read_to_string(d.join("hash")).unwrap_or_default().trim().to_string(),
         users: pkg::lines(&d.join("users"))?,
         flags: pkg::lines(&d.join("flags"))?,
     })
@@ -358,22 +337,13 @@ pub fn read_queue(root: &Path) -> Result<Vec<Queued>, Error> {
         }
         let mut f = line.splitn(4, ' ');
         let (Some(t), Some(so), Some(name)) = (f.next(), f.next(), f.next()) else {
-            return Err(Error::Manifest {
-                line: n + 1,
-                why: "wants target, soname, package",
-            });
+            return Err(Error::Manifest { line: n + 1, why: "wants target, soname, package" });
         };
         out.push(Queued {
             target: t.to_string(),
             soname: so.to_string(),
             name: name.to_string(),
-            changed: f
-                .next()
-                .unwrap_or("")
-                .split(',')
-                .filter(|x| !x.is_empty())
-                .map(str::to_string)
-                .collect(),
+            changed: f.next().unwrap_or("").split(',').filter(|x| !x.is_empty()).map(str::to_string).collect(),
         });
     }
     Ok(out)
@@ -422,9 +392,7 @@ mod tests {
     const SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-db-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-db-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -442,31 +410,19 @@ mod tests {
     #[test]
     fn a_provides_line_round_trips() {
         let ps = vec![
-            Provide {
-                soname: "libz.so.1".into(),
-                versioned: true,
-                path: "usr/lib/libz.so.1".into(),
-            },
-            Provide {
-                soname: "libfoo.so.2".into(),
-                versioned: false,
-                path: "usr/lib/some dir/libfoo.so.2".into(),
-            },
+            Provide { soname: "libz.so.1".into(), versioned: true, path: "usr/lib/libz.so.1".into() },
+            Provide { soname: "libfoo.so.2".into(), versioned: false, path: "usr/lib/some dir/libfoo.so.2".into() },
         ];
         let text = format_provides(&ps).unwrap();
-        assert_eq!(
-            text,
-            "libz.so.1 v usr/lib/libz.so.1\nlibfoo.so.2 - usr/lib/some dir/libfoo.so.2\n"
-        );
+        assert_eq!(text, "libz.so.1 v usr/lib/libz.so.1\nlibfoo.so.2 - usr/lib/some dir/libfoo.so.2\n");
         assert_eq!(parse_provides(&text).unwrap(), ps);
     }
 
     #[test]
     fn a_provides_line_that_makes_no_sense_names_its_line() {
-        for (raw, why) in [
-            ("libz.so.1 x usr/lib/libz.so.1", "flag is v or -"),
-            ("libz.so.1", "wants soname, flag, path"),
-        ] {
+        for (raw, why) in
+            [("libz.so.1 x usr/lib/libz.so.1", "flag is v or -"), ("libz.so.1", "wants soname, flag, path")]
+        {
             match parse_provides(raw) {
                 Err(Error::Manifest { line, why: got }) => {
                     assert_eq!(line, 1);
@@ -479,11 +435,7 @@ mod tests {
 
     #[test]
     fn an_absolute_provides_path_is_refused_before_writing() {
-        let p = Provide {
-            soname: "libz.so.1".into(),
-            versioned: false,
-            path: "/usr/lib/libz.so.1".into(),
-        };
+        let p = Provide { soname: "libz.so.1".into(), versioned: false, path: "/usr/lib/libz.so.1".into() };
         assert!(matches!(format_provides(&[p]), Err(Error::BadPath(_))));
     }
 
@@ -522,14 +474,8 @@ mod tests {
             ("x 0644 {SHA} usr/bin/foo", "kind is not one of f d l h"),
             ("f 08x9 {SHA} usr/bin/foo", "mode is not octal"),
             ("f 0644 deadbeef usr/bin/foo", "not a sha256"),
-            (
-                "d 0755 nope usr/share/foo",
-                "a directory takes - in field three",
-            ),
-            (
-                "f 0644 {SHA} /usr/bin/foo",
-                "path must be relative to the root",
-            ),
+            ("d 0755 nope usr/share/foo", "a directory takes - in field three"),
+            ("f 0644 {SHA} /usr/bin/foo", "path must be relative to the root"),
         ];
         for (raw, want) in cases {
             let line = raw.replace("{SHA}", SHA);
@@ -546,21 +492,11 @@ mod tests {
 
     #[test]
     fn unrepresentable_paths_are_refused_before_writing() {
-        let mut e = Entry {
-            mode: 0o644,
-            kind: Kind::File(SHA.to_string()),
-            path: "usr/bin/with\nnewline".to_string(),
-        };
-        assert!(matches!(
-            format_manifest(&[e.clone()]),
-            Err(Error::BadPath(_))
-        ));
+        let mut e = Entry { mode: 0o644, kind: Kind::File(SHA.to_string()), path: "usr/bin/with\nnewline".to_string() };
+        assert!(matches!(format_manifest(&[e.clone()]), Err(Error::BadPath(_))));
 
         e.path = "/absolute".to_string();
-        assert!(matches!(
-            format_manifest(&[e.clone()]),
-            Err(Error::BadPath(_))
-        ));
+        assert!(matches!(format_manifest(&[e.clone()]), Err(Error::BadPath(_))));
 
         e.path = "usr/bin/baz".to_string();
         e.kind = Kind::Link("../some dir/bar".to_string());
@@ -599,10 +535,7 @@ mod tests {
     #[test]
     fn reading_something_not_installed_says_so() {
         let root = scratch("empty");
-        assert!(matches!(
-            read(&root, "x86_64-musl", "nothing"),
-            Err(Error::NoPackage(_))
-        ));
+        assert!(matches!(read(&root, "x86_64-musl", "nothing"), Err(Error::NoPackage(_))));
     }
 
     #[test]
@@ -613,11 +546,7 @@ mod tests {
             target: "x86_64-musl".to_string(),
             version: Version::parse("1 1").unwrap(),
             depends: Vec::new(),
-            manifest: vec![Entry {
-                mode: 0o644,
-                kind: Kind::Dir,
-                path: "/nope".to_string(),
-            }],
+            manifest: vec![Entry { mode: 0o644, kind: Kind::Dir, path: "/nope".to_string() }],
             hash: String::new(),
             users: Vec::new(),
             flags: Vec::new(),
@@ -650,19 +579,12 @@ mod tests {
             &root,
             "x86_64-musl",
             "gone",
-            &[Provide {
-                soname: "libgone.so.1".into(),
-                versioned: false,
-                path: "usr/lib/libgone.so.1".into(),
-            }],
+            &[Provide { soname: "libgone.so.1".into(), versioned: false, path: "usr/lib/libgone.so.1".into() }],
         )
         .unwrap();
         assert!(provides(&root, "x86_64-musl", "gone").is_file());
 
         forget(&root, "x86_64-musl", "gone").unwrap();
-        assert!(
-            !provides(&root, "x86_64-musl", "gone").exists(),
-            "the record went and the sonames it claimed stayed"
-        );
+        assert!(!provides(&root, "x86_64-musl", "gone").exists(), "the record went and the sonames it claimed stayed");
     }
 }

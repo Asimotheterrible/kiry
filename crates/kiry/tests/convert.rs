@@ -3,19 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir()
-        .join(format!("kiry-c-{}", std::process::id()))
-        .join(name);
+    let d = std::env::temp_dir().join(format!("kiry-c-{}", std::process::id())).join(name);
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
 }
 
 fn kiry(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_kiry"))
-        .args(args)
-        .output()
-        .unwrap()
+    Command::new(env!("CARGO_BIN_EXE_kiry")).args(args).output().unwrap()
 }
 
 // an apkbuild is sourced, not parsed, so the shell abuild uses is not optional here
@@ -35,17 +30,9 @@ fn convert(at: &Path, body: &str) -> (PathBuf, String) {
     fs::create_dir_all(&d).unwrap();
     fs::write(d.join("APKBUILD"), body).unwrap();
     let out = at.join("out");
-    let o = kiry(&[
-        "convert",
-        "-n",
-        d.join("APKBUILD").to_str().unwrap(),
-        out.to_str().unwrap(),
-    ]);
+    let o = kiry(&["convert", "-n", d.join("APKBUILD").to_str().unwrap(), out.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    (
-        out.join("thing"),
-        String::from_utf8_lossy(&o.stdout).into_owned(),
-    )
+    (out.join("thing"), String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 // $CARCH picks the value and only a shell knows which branch ran. a regex over the text
@@ -109,14 +96,8 @@ fn source_holds_the_entries_and_patch_args_comes_with_them() {
          package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
     );
     let script = fs::read_to_string(d.join("build")).unwrap();
-    assert!(
-        script.contains("thing-1.0.tar.gz::https://example.invalid/get?id=7"),
-        "{script}"
-    );
-    assert!(
-        script.contains("https://example.invalid/patches/thing-001"),
-        "{script}"
-    );
+    assert!(script.contains("thing-1.0.tar.gz::https://example.invalid/get?id=7"), "{script}");
+    assert!(script.contains("https://example.invalid/patches/thing-001"), "{script}");
     assert!(script.contains("patch_args=\"-p0\""), "{script}");
 
     // and a pattern with a slash in it still finds the entry, which is the whole point
@@ -136,12 +117,7 @@ fn source_holds_the_entries_and_patch_args_comes_with_them() {
         ])
         .output()
         .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&o.stdout).trim(),
-        "hit thing-001",
-        "{}",
-        String::from_utf8_lossy(&o.stderr)
-    );
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "hit thing-001", "{}", String::from_utf8_lossy(&o.stderr));
 }
 
 // abuild runs default_prepare when an apkbuild writes no prepare() of its own. 1505
@@ -166,10 +142,7 @@ fn an_apkbuild_with_no_prepare_still_applies_its_patches() {
     // called in order, and prepare before the two that need what it applied
     let p = script.rfind("\nprepare\n").unwrap();
     let b = script.rfind("\nbuild\n").unwrap();
-    assert!(
-        p < b && b < script.rfind("\npackage\n").unwrap(),
-        "{script}"
-    );
+    assert!(p < b && b < script.rfind("\npackage\n").unwrap(), "{script}");
 
     // one that writes its own is left alone
     let at = scratch("ownprep");
@@ -209,10 +182,7 @@ fn a_private_helper_comes_across_and_a_subpackage_one_does_not() {
     assert!(script.contains("_configure() {"), "{script}");
     assert!(script.contains("./configure --prefix=/usr"), "{script}");
     // defined before the cd, so a helper can be the body's first line
-    assert!(
-        script.find("_configure() {").unwrap() < script.find("cd \"$builddir\"").unwrap(),
-        "{script}"
-    );
+    assert!(script.find("_configure() {").unwrap() < script.find("cd \"$builddir\"").unwrap(), "{script}");
     assert!(!script.contains("amove"), "{script}");
     for f in ["dev() {", "manuals() {", "c__() {"] {
         assert!(!script.contains(f), "{f} came across: {script}");
@@ -374,10 +344,7 @@ fn the_script_cds_where_the_body_expects_to_be() {
          package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
     );
     let script = fs::read_to_string(d.join("build")).unwrap();
-    assert!(
-        script.contains("builddir=\"/src/thing-1.0-rc1\""),
-        "{script}"
-    );
+    assert!(script.contains("builddir=\"/src/thing-1.0-rc1\""), "{script}");
 }
 
 // $pkgdir is where abuild stages and $DESTDIR is where kiry does. nothing else in a
@@ -426,10 +393,7 @@ fn a_phase_is_a_function_because_local_only_works_in_one() {
     assert!(script.rfind("\npackage\n").unwrap() > cd, "{script}");
 
     // and the shell that runs it agrees
-    let o = Command::new("busybox")
-        .args(["ash", "-n", d.join("build").to_str().unwrap()])
-        .output()
-        .unwrap();
+    let o = Command::new("busybox").args(["ash", "-n", d.join("build").to_str().unwrap()]).output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }
 
@@ -450,10 +414,7 @@ fn a_renamed_source_keeps_its_name_and_its_checksum() {
          package() {\n\tmake install DESTDIR=\"$pkgdir\"\n}\n",
     );
     let srcs = fs::read_to_string(d.join("sources")).unwrap();
-    assert_eq!(
-        srcs, "thing-1.0.tar.gz::https://example.invalid/download?id=7\n",
-        "{srcs}"
-    );
+    assert_eq!(srcs, "thing-1.0.tar.gz::https://example.invalid/download?id=7\n", "{srcs}");
     // found under the renamed key, which is the only place alpine files it
     let sums = fs::read_to_string(d.join("checksums")).unwrap();
     assert_eq!(sums.trim(), "abc", "{said}");
@@ -474,23 +435,14 @@ fn a_renamed_source_keeps_its_name_and_its_checksum() {
     .unwrap();
     let fetcher = at.join("fetch.sh");
     fs::write(&fetcher, "#!/bin/sh\necho hello > \"$2\"\n").unwrap();
-    Command::new("chmod")
-        .arg("+x")
-        .arg(&fetcher)
-        .status()
-        .unwrap();
+    Command::new("chmod").arg("+x").arg(&fetcher).status().unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_kiry"))
-        .args([
-            "convert",
-            d.join("APKBUILD").to_str().unwrap(),
-            at.join("out").to_str().unwrap(),
-        ])
+        .args(["convert", d.join("APKBUILD").to_str().unwrap(), at.join("out").to_str().unwrap()])
         .env("KIRY_FETCH", format!("{} %u %o", fetcher.display()))
         .output()
         .unwrap();
     assert!(!o.status.success());
-    let said =
-        String::from_utf8_lossy(&o.stderr).into_owned() + &String::from_utf8_lossy(&o.stdout);
+    let said = String::from_utf8_lossy(&o.stderr).into_owned() + &String::from_utf8_lossy(&o.stdout);
     assert!(said.contains("the apkbuild says deadbeef"), "{said}");
 }
 
@@ -505,11 +457,7 @@ fn aliases_rename_and_drop() {
     let repo = at.join("repo");
     fs::create_dir_all(repo.join("llvm")).unwrap();
     fs::write(repo.join("llvm/build"), "make\n").unwrap();
-    fs::write(
-        repo.join("aliases"),
-        "# alpine        here\nllvm22          llvm\nlibselinux      -\n",
-    )
-    .unwrap();
+    fs::write(repo.join("aliases"), "# alpine        here\nllvm22          llvm\nlibselinux      -\n").unwrap();
     let root = at.join("root");
     fs::create_dir_all(root.join("etc/kiry")).unwrap();
     fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
@@ -538,15 +486,9 @@ fn aliases_rename_and_drop() {
 
     let deps = fs::read_to_string(out.join("thing/depends")).unwrap();
     assert_eq!(deps, "cowsay make\nllvm make\n", "{deps}");
-    assert!(
-        said.contains("libselinux-dev has no equivalent here"),
-        "{said}"
-    );
+    assert!(said.contains("libselinux-dev has no equivalent here"), "{said}");
     // llvm is carried, cowsay is not, and only one of those should be said out loud
-    assert!(
-        said.contains("cowsay is a dependency no repo carries"),
-        "{said}"
-    );
+    assert!(said.contains("cowsay is a dependency no repo carries"), "{said}");
     assert!(!said.contains("llvm is a dependency no repo"), "{said}");
 }
 
@@ -633,12 +575,7 @@ fn a_recipe_converted_offline_still_loads() {
     )
     .unwrap();
     let out = at.join("out");
-    let o = kiry(&[
-        "convert",
-        "-n",
-        d.join("APKBUILD").to_str().unwrap(),
-        out.to_str().unwrap(),
-    ]);
+    let o = kiry(&["convert", "-n", d.join("APKBUILD").to_str().unwrap(), out.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
     let made = out.join("thing");
@@ -691,11 +628,7 @@ fn a_dependency_on_a_subpackage_is_a_dependency_on_its_parent() {
     // lua is a name two apkbuilds claim, and picking one is a decision
     let l1 = apkbuild(&at, "lua5.3", "provides=\"lua\"");
     let l2 = apkbuild(&at, "lua5.4", "provides=\"lua\"");
-    let b = apkbuild(
-        &at,
-        "app",
-        "depends=\"db-client libdb lua\"\nmakedepends=\"db-dev\"",
-    );
+    let b = apkbuild(&at, "app", "depends=\"db-client libdb lua\"\nmakedepends=\"db-dev\"");
     let out = at.join("out");
     // a root of its own: this machine's aliases may well have chosen a lua already, and
     // what is under test is that convert does not
@@ -778,17 +711,12 @@ fn an_offline_conversion_keeps_alpines_sha512() {
     let a = apkbuild(
         &at,
         "thing",
-        &format!(
-            "source=\"https://example.invalid/thing-1.0.tar.gz\"\nsha512sums=\"{sum}  thing-1.0.tar.gz\""
-        ),
+        &format!("source=\"https://example.invalid/thing-1.0.tar.gz\"\nsha512sums=\"{sum}  thing-1.0.tar.gz\""),
     );
     let out = at.join("out");
     let o = kiry(&["convert", "-n", a.to_str().unwrap(), out.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert_eq!(
-        fs::read_to_string(out.join("thing/checksums")).unwrap().trim(),
-        sum
-    );
+    assert_eq!(fs::read_to_string(out.join("thing/checksums")).unwrap().trim(), sum);
 }
 
 // kiry never runs check(), so a suite the configure line asks for is built for nothing,

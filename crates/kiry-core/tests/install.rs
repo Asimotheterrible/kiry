@@ -10,9 +10,7 @@ use kiry_core::install::{Job, Removed};
 use kiry_core::{archive, db, install, Error};
 
 fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir()
-        .join(format!("kiry-e2e-{}", std::process::id()))
-        .join(name);
+    let d = std::env::temp_dir().join(format!("kiry-e2e-{}", std::process::id())).join(name);
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
@@ -45,17 +43,8 @@ fn packed(at: &Path, name: &str, deps: &[&str], files: &[&str], body: &str) -> P
     }
 
     let arc = at.join(format!("{name}.tar.zst"));
-    let sh = format!(
-        "cd {} && tar cf - . | zstd -q -o {}",
-        src.display(),
-        arc.display()
-    );
-    assert!(std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh)
-        .status()
-        .unwrap()
-        .success());
+    let sh = format!("cd {} && tar cf - . | zstd -q -o {}", src.display(), arc.display());
+    assert!(std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap().success());
 
     let meta = at.join(format!("{name}.tar.zst.meta"));
     fs::create_dir_all(&meta).unwrap();
@@ -109,12 +98,7 @@ fn one(root: &Path, name: &str, force: bool) -> Removed {
 #[test]
 fn removing_takes_the_files_and_the_record() {
     let (d, root) = rooted("rm");
-    run(
-        &root,
-        &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])],
-        false,
-    )
-    .unwrap();
+    run(&root, &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])], false).unwrap();
 
     let r = one(&root, "foo", false);
     assert_eq!(r.gone, 1);
@@ -126,32 +110,19 @@ fn removing_takes_the_files_and_the_record() {
 #[test]
 fn a_modified_file_is_left_where_it_is() {
     let (d, root) = rooted("modified");
-    run(
-        &root,
-        &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])],
-        false,
-    )
-    .unwrap();
+    run(&root, &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])], false).unwrap();
     fs::write(root.join("usr/share/doc/foo/x"), b"edited by hand").unwrap();
 
     let r = one(&root, "foo", false);
     assert_eq!(r.kept, 1);
     assert_eq!(r.gone, 0);
-    assert_eq!(
-        fs::read_to_string(root.join("usr/share/doc/foo/x")).unwrap(),
-        "edited by hand"
-    );
+    assert_eq!(fs::read_to_string(root.join("usr/share/doc/foo/x")).unwrap(), "edited by hand");
 }
 
 #[test]
 fn a_symlink_where_the_file_belongs_counts_as_modified() {
     let (d, root) = rooted("swapped");
-    run(
-        &root,
-        &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])],
-        false,
-    )
-    .unwrap();
+    run(&root, &[pack(&d, "foo", &[], &["usr/share/doc/foo/x"])], false).unwrap();
     let p = root.join("usr/share/doc/foo/x");
     fs::remove_file(&p).unwrap();
     std::os::unix::fs::symlink("/etc/passwd", &p).unwrap();
@@ -171,12 +142,7 @@ fn at(d: &Path, sub: &str) -> PathBuf {
 #[test]
 fn a_new_version_takes_the_files_it_stopped_shipping() {
     let (d, root) = rooted("prune");
-    let v1 = pack(
-        &at(&d, "v1"),
-        "foo",
-        &[],
-        &["usr/share/foo/keep", "usr/share/foo/gone"],
-    );
+    let v1 = pack(&at(&d, "v1"), "foo", &[], &["usr/share/foo/keep", "usr/share/foo/gone"]);
     run(&root, &[v1], false).unwrap();
     assert!(root.join("usr/share/foo/gone").exists());
 
@@ -197,10 +163,7 @@ fn a_dropped_file_edited_by_hand_stays() {
 
     let v2 = pack(&at(&d, "v2"), "foo", &[], &["usr/share/foo/y"]);
     run(&root, &[v2], false).unwrap();
-    assert_eq!(
-        fs::read_to_string(root.join("usr/share/foo/x")).unwrap(),
-        "edited by hand"
-    );
+    assert_eq!(fs::read_to_string(root.join("usr/share/foo/x")).unwrap(), "edited by hand");
 }
 
 // the whole batch decides what survives. a path one member gives up and another takes
@@ -229,7 +192,7 @@ fn one_plan_names_the_conflicts_and_the_missing_deps_together() {
     run(&root, &[pack(&d, "procps-ng", &[], &["usr/bin/top"])], false).unwrap();
 
     let bb = pack(&d, "busybox", &["libnope"], &["usr/bin/top"]);
-    match install::plan(&root, &[bb.clone()], false) {
+    match install::plan(&root, std::slice::from_ref(&bb), false) {
         Err(Error::Refused { owned, missing }) => {
             assert_eq!(owned, [("usr/bin/top".to_string(), "procps-ng".to_string())]);
             assert_eq!(missing, [("busybox".to_string(), "libnope".to_string())]);
@@ -314,16 +277,8 @@ fn it_reads_a_tarball_the_real_tools_made() {
     std::os::unix::fs::symlink("foo", src.join("usr/bin/bar")).unwrap();
 
     let arc = r.join("p.tar.zst");
-    let sh = format!(
-        "cd {} && tar cf - . | zstd -q -o {}",
-        src.display(),
-        arc.display()
-    );
-    let ok = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh)
-        .status()
-        .unwrap();
+    let sh = format!("cd {} && tar cf - . | zstd -q -o {}", src.display(), arc.display());
+    let ok = std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap();
     assert!(ok.success(), "the suite needs tar and zstd on PATH");
 
     let dest = r.join("dest");
@@ -333,27 +288,13 @@ fn it_reads_a_tarball_the_real_tools_made() {
     let got = paths(&m);
     assert!(got.contains(&"usr/bin/foo"), "got {got:?}");
     assert!(got.contains(&"usr/bin"), "got {got:?}");
-    assert!(
-        !got.iter().any(|p| p.is_empty()),
-        "the ./ root leaked in: {got:?}"
-    );
-    assert!(
-        m.iter().any(|e| e.what == What::Link("foo".into())),
-        "the symlink did not survive: {m:?}"
-    );
+    assert!(!got.iter().any(|p| p.is_empty()), "the ./ root leaked in: {got:?}");
+    assert!(m.iter().any(|e| e.what == What::Link("foo".into())), "the symlink did not survive: {m:?}");
 }
 
 fn build(dir: &Path, arc: &Path) {
-    let sh = format!(
-        "cd {} && tar cf - . | zstd -q -o {}",
-        dir.display(),
-        arc.display()
-    );
-    let ok = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh)
-        .status()
-        .unwrap();
+    let sh = format!("cd {} && tar cf - . | zstd -q -o {}", dir.display(), arc.display());
+    let ok = std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap();
     assert!(ok.success(), "the suite needs tar and zstd on PATH");
 }
 
@@ -377,28 +318,14 @@ fn it_extracts_a_real_tarball() {
     fs::create_dir_all(&dest).unwrap();
     let man = archive::extract(&dest, &arc, &[]).unwrap();
 
-    assert_eq!(
-        fs::read_to_string(dest.join("usr/bin/foo")).unwrap(),
-        "hello there"
-    );
-    assert_eq!(
-        fs::read_link(dest.join("usr/bin/bar"))
-            .unwrap()
-            .display()
-            .to_string(),
-        "foo"
-    );
+    assert_eq!(fs::read_to_string(dest.join("usr/bin/foo")).unwrap(), "hello there");
+    assert_eq!(fs::read_link(dest.join("usr/bin/bar")).unwrap().display().to_string(), "foo");
 
     let foo = man.iter().find(|e| e.path == "usr/bin/foo").unwrap();
     assert_eq!(foo.mode, 0o755);
-    let db::Kind::File(sha) = &foo.kind else {
-        panic!("usr/bin/foo is not a file in the manifest")
-    };
+    let db::Kind::File(sha) = &foo.kind else { panic!("usr/bin/foo is not a file in the manifest") };
 
-    let out = std::process::Command::new("sha256sum")
-        .arg(dest.join("usr/bin/foo"))
-        .output()
-        .unwrap();
+    let out = std::process::Command::new("sha256sum").arg(dest.join("usr/bin/foo")).output().unwrap();
     let want = String::from_utf8_lossy(&out.stdout);
     assert_eq!(sha, want.split_whitespace().next().unwrap());
 }
@@ -419,16 +346,9 @@ fn a_file_replaces_a_symlink_already_on_disk() {
 
     archive::extract(&dest, &arc, &[]).unwrap();
 
-    assert_eq!(
-        fs::read_to_string(dest.join("canary")).unwrap(),
-        "do not touch"
-    );
+    assert_eq!(fs::read_to_string(dest.join("canary")).unwrap(), "do not touch");
     assert_eq!(fs::read_to_string(dest.join("usr/bin/foo")).unwrap(), "new");
-    assert!(!dest
-        .join("usr/bin/foo")
-        .symlink_metadata()
-        .unwrap()
-        .is_symlink());
+    assert!(!dest.join("usr/bin/foo").symlink_metadata().unwrap().is_symlink());
 }
 
 // the allowlist is what /etc/kiry/setuid is for, and a root that has not got the file
@@ -440,28 +360,19 @@ fn a_listed_path_keeps_its_setuid_bit() {
     fs::create_dir_all(src.join("usr/bin")).unwrap();
     let p = src.join("usr/bin/doas");
     fs::write(&p, b"x").unwrap();
-    fs::set_permissions(
-        &p,
-        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o4755),
-    )
-    .unwrap();
+    fs::set_permissions(&p, <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o4755)).unwrap();
     let arc = r.join("p.tar.zst");
     build(&src, &arc);
 
     let dest = r.join("dest");
     fs::create_dir_all(dest.join("etc/kiry")).unwrap();
-    fs::write(
-        dest.join("etc/kiry/setuid"),
-        "# a comment\n\n/usr/bin/doas\n/usr/bin/never-shipped\n",
-    )
-    .unwrap();
+    fs::write(dest.join("etc/kiry/setuid"), "# a comment\n\n/usr/bin/doas\n/usr/bin/never-shipped\n").unwrap();
     let man = archive::extract(&dest, &arc, &[]).unwrap();
 
     let e = man.iter().find(|e| e.path == "usr/bin/doas").unwrap();
     assert_eq!(e.mode, 0o4755, "setuid missing from the manifest");
-    let on_disk = <fs::Metadata as std::os::unix::fs::MetadataExt>::mode(
-        &fs::metadata(dest.join("usr/bin/doas")).unwrap(),
-    );
+    let on_disk =
+        <fs::Metadata as std::os::unix::fs::MetadataExt>::mode(&fs::metadata(dest.join("usr/bin/doas")).unwrap());
     assert_eq!(on_disk & 0o7777, 0o4755, "setuid missing on disk");
 }
 
@@ -472,11 +383,7 @@ fn setuid_bits_do_not_survive() {
     fs::create_dir_all(src.join("usr/bin")).unwrap();
     let p = src.join("usr/bin/ping");
     fs::write(&p, b"x").unwrap();
-    fs::set_permissions(
-        &p,
-        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o4755),
-    )
-    .unwrap();
+    fs::set_permissions(&p, <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o4755)).unwrap();
     let arc = r.join("p.tar.zst");
     build(&src, &arc);
 
@@ -486,9 +393,8 @@ fn setuid_bits_do_not_survive() {
 
     let e = man.iter().find(|e| e.path == "usr/bin/ping").unwrap();
     assert_eq!(e.mode, 0o755, "setuid survived into the manifest");
-    let on_disk = <fs::Metadata as std::os::unix::fs::MetadataExt>::mode(
-        &fs::metadata(dest.join("usr/bin/ping")).unwrap(),
-    );
+    let on_disk =
+        <fs::Metadata as std::os::unix::fs::MetadataExt>::mode(&fs::metadata(dest.join("usr/bin/ping")).unwrap());
     assert_eq!(on_disk & 0o7000, 0, "setuid survived onto disk");
 }
 
@@ -509,10 +415,7 @@ fn installing_a_library_records_what_it_provides() {
     match built {
         Ok(s) if s.success() => {}
         _ => {
-            assert!(
-                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-                "cc cannot build a shared library"
-            );
+            assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "cc cannot build a shared library");
             return;
         }
     }
@@ -538,24 +441,11 @@ fn installing_a_library_records_what_it_provides() {
     fs::copy(&vso, stage.join("usr/lib/libver.so.1")).unwrap();
     fs::write(stage.join("usr/bin/greet-hi"), "#!/bin/sh\necho hi\n").unwrap();
     // the same library under a second name is one soname, not two
-    fs::hard_link(
-        stage.join("usr/lib/libgreet.so.1"),
-        stage.join("usr/lib/libgreet.so"),
-    )
-    .unwrap();
+    fs::hard_link(stage.join("usr/lib/libgreet.so.1"), stage.join("usr/lib/libgreet.so")).unwrap();
 
     let arc = at.join("libgreet.tar.zst");
-    let sh = format!(
-        "cd {} && tar cf - . | zstd -q -o {}",
-        stage.display(),
-        arc.display()
-    );
-    assert!(std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh)
-        .status()
-        .unwrap()
-        .success());
+    let sh = format!("cd {} && tar cf - . | zstd -q -o {}", stage.display(), arc.display());
+    assert!(std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap().success());
     let meta = at.join("libgreet.tar.zst.meta");
     fs::create_dir_all(&meta).unwrap();
     fs::write(meta.join("name"), "libgreet\n").unwrap();
@@ -570,16 +460,10 @@ fn installing_a_library_records_what_it_provides() {
 
     let plain = got.iter().find(|p| p.soname == "libgreet.so.1").unwrap();
     assert_eq!(plain.path, "usr/lib/libgreet.so.1");
-    assert!(
-        !plain.versioned,
-        "a plain -shared build defines no versions"
-    );
+    assert!(!plain.versioned, "a plain -shared build defines no versions");
 
     let ver = got.iter().find(|p| p.soname == "libver.so.1").unwrap();
-    assert!(
-        ver.versioned,
-        "a --version-script build carries .gnu.version_d"
-    );
+    assert!(ver.versioned, "a --version-script build carries .gnu.version_d");
 
     // the shell script sits in the same package and is not an elf
     assert!(!got.iter().any(|p| p.path.contains("greet-hi")));
@@ -600,14 +484,8 @@ fn forcing_a_path_takes_it_off_the_previous_owner() {
 
     let old = db::read(&root, "x86_64-musl", "first").unwrap();
     let kept: Vec<&str> = old.manifest.iter().map(|e| e.path.as_str()).collect();
-    assert!(
-        !kept.contains(&"usr/bin/tool"),
-        "first still claims the path second took: {kept:?}"
-    );
-    assert!(
-        kept.contains(&"usr/share/first/note"),
-        "the rest of first went with it: {kept:?}"
-    );
+    assert!(!kept.contains(&"usr/bin/tool"), "first still claims the path second took: {kept:?}");
+    assert!(kept.contains(&"usr/share/first/note"), "the rest of first went with it: {kept:?}");
 
     let new = db::read(&root, "x86_64-musl", "second").unwrap();
     assert!(new.manifest.iter().any(|e| e.path == "usr/bin/tool"));
@@ -619,12 +497,7 @@ fn forcing_a_path_takes_it_off_the_previous_owner() {
 #[test]
 fn forcing_a_path_takes_it_out_of_provides_as_well() {
     let (at, root) = rooted("dispossess-provides");
-    let first = pack(
-        &at,
-        "first",
-        &[],
-        &["usr/lib/libthing.so.1", "usr/lib/libkept.so.1"],
-    );
+    let first = pack(&at, "first", &[], &["usr/lib/libthing.so.1", "usr/lib/libkept.so.1"]);
     let second = pack(&at, "second", &[], &["usr/lib/libthing.so.1"]);
 
     install::apply(&root, &run(&root, &[first], false).unwrap()).unwrap();
@@ -633,16 +506,8 @@ fn forcing_a_path_takes_it_out_of_provides_as_well() {
         "x86_64-musl",
         "first",
         &[
-            db::Provide {
-                soname: "libthing.so.1".into(),
-                versioned: false,
-                path: "usr/lib/libthing.so.1".into(),
-            },
-            db::Provide {
-                soname: "libkept.so.1".into(),
-                versioned: false,
-                path: "usr/lib/libkept.so.1".into(),
-            },
+            db::Provide { soname: "libthing.so.1".into(), versioned: false, path: "usr/lib/libthing.so.1".into() },
+            db::Provide { soname: "libkept.so.1".into(), versioned: false, path: "usr/lib/libkept.so.1".into() },
         ],
     )
     .unwrap();
@@ -676,17 +541,8 @@ fn shipped(at: &Path, pkg: &str, ver: &str, soname: &str, real: &str) -> Option<
     std::os::unix::fs::symlink(real, lib.join(soname)).unwrap();
 
     let arc = at.join(format!("{pkg}-{ver}.tar.zst"));
-    let sh = format!(
-        "cd {} && tar cf - . | zstd -q -o {}",
-        stage.display(),
-        arc.display()
-    );
-    assert!(std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&sh)
-        .status()
-        .unwrap()
-        .success());
+    let sh = format!("cd {} && tar cf - . | zstd -q -o {}", stage.display(), arc.display());
+    assert!(std::process::Command::new("sh").arg("-c").arg(&sh).status().unwrap().success());
 
     let meta = PathBuf::from(format!("{}.meta", arc.display()));
     fs::create_dir_all(&meta).unwrap();
@@ -697,10 +553,7 @@ fn shipped(at: &Path, pkg: &str, ver: &str, soname: &str, real: &str) -> Option<
 }
 
 fn no_cc() -> bool {
-    assert!(
-        std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-        "cc cannot build a shared library"
-    );
+    assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "cc cannot build a shared library");
     true
 }
 
@@ -722,14 +575,8 @@ fn a_library_whose_soname_moved_is_kept_back() {
     let done = install::apply(&root, &jobs).unwrap();
 
     assert_eq!(done.preserved, ["libfoo.so.1"]);
-    assert!(
-        root.join("usr/lib/libfoo.so.1.0.0").is_file(),
-        "the file every consumer still resolves to was pruned"
-    );
-    assert!(
-        root.join("usr/lib/libfoo.so.1").is_symlink(),
-        "the soname link is the only name a consumer knows it by"
-    );
+    assert!(root.join("usr/lib/libfoo.so.1.0.0").is_file(), "the file every consumer still resolves to was pruned");
+    assert!(root.join("usr/lib/libfoo.so.1").is_symlink(), "the soname link is the only name a consumer knows it by");
     assert!(root.join("usr/lib/libfoo.so.2.0.0").is_file());
 
     let held = db::read_preserved(&root, "x86_64-musl", "foo").unwrap();
@@ -758,9 +605,7 @@ fn a_bump_that_keeps_its_soname_keeps_nothing_back() {
 
     assert!(done.preserved.is_empty(), "{:?}", done.preserved);
     assert!(!root.join("usr/lib/libfoo.so.1.0.0").exists());
-    assert!(db::read_preserved(&root, "x86_64-musl", "foo")
-        .unwrap()
-        .is_empty());
+    assert!(db::read_preserved(&root, "x86_64-musl", "foo").unwrap().is_empty());
 }
 
 // a bump back to a soname that is being carried takes its own path back, and a record
@@ -779,10 +624,7 @@ fn a_version_that_takes_the_path_back_clears_the_record() {
 
     run(&root, &[one], false).unwrap();
     run(&root, &[two], false).unwrap();
-    assert_eq!(
-        db::read_preserved(&root, "x86_64-musl", "foo").unwrap().len(),
-        2
-    );
+    assert_eq!(db::read_preserved(&root, "x86_64-musl", "foo").unwrap().len(), 2);
 
     run(&root, &[three], false).unwrap();
     let held = db::read_preserved(&root, "x86_64-musl", "foo").unwrap();
@@ -891,7 +733,7 @@ fn a_file_cut_off_partway_leaves_the_old_one_whole() {
         })
         .collect();
     let arc = packed(&at(&d, "v2"), "foo", &[], &["usr/lib/big"], &body);
-    let jobs = install::plan(&root, &[arc.clone()], false).unwrap();
+    let jobs = install::plan(&root, std::slice::from_ref(&arc), false).unwrap();
     let whole = fs::read(&arc).unwrap();
     fs::write(&arc, &whole[..whole.len() * 9 / 10]).unwrap();
 

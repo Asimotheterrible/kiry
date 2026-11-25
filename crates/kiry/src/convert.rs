@@ -72,8 +72,7 @@ pub fn aliases(repos: &[PathBuf]) -> HashMap<String, String> {
                 if own && carried.as_ref().is_some_and(|c| c.contains(from)) {
                     continue;
                 }
-                out.entry(from.to_string())
-                    .or_insert_with(|| to.to_string());
+                out.entry(from.to_string()).or_insert_with(|| to.to_string());
             }
         }
     }
@@ -196,12 +195,7 @@ pub fn recipe(
     let d = out.join(&name);
     fs::create_dir_all(&d).map_err(|e| format!("{}: {e}", d.display()))?;
 
-    for entry in v
-        .get("source")
-        .map(String::as_str)
-        .unwrap_or("")
-        .split_whitespace()
-    {
+    for entry in v.get("source").map(String::as_str).unwrap_or("").split_whitespace() {
         // name::url, which kiry spells the same way. the sha512 is keyed by the name,
         // so reading the url's basename instead loses the checksum as well as the name
         let (file, url) = match entry.split_once("::") {
@@ -265,18 +259,10 @@ pub fn recipe(
 
     let mut depends = Vec::new();
     let mut dev = Vec::new();
-    for (key, make) in [
-        ("depends", false),
-        ("makedepends", true),
-        ("makedepends_host", true),
-        ("makedepends_build", true),
-    ] {
-        for raw in v
-            .get(key)
-            .map(String::as_str)
-            .unwrap_or("")
-            .split_whitespace()
-        {
+    for (key, make) in
+        [("depends", false), ("makedepends", true), ("makedepends_host", true), ("makedepends_build", true)]
+    {
+        for raw in v.get(key).map(String::as_str).unwrap_or("").split_whitespace() {
             let Some(n) = dep(raw) else {
                 notes.push(format!("dropped {key} entry {raw}"));
                 continue;
@@ -292,18 +278,8 @@ pub fn recipe(
                 // it converts to " make". a header-only one wants " build" instead and
                 // the apkbuild does not say which it is -- corrected by hand when a
                 // gnu target of the recipe cannot find its headers
-                Some(to) => depends.push(Dep {
-                    name: to.to_string(),
-                    make,
-                    host: make,
-                    only: None,
-                }),
-                None => depends.push(Dep {
-                    name: n,
-                    make,
-                    host: make,
-                    only: None,
-                }),
+                Some(to) => depends.push(Dep { name: to.to_string(), make, host: make, only: None }),
+                None => depends.push(Dep { name: n, make, host: make, only: None }),
             }
         }
     }
@@ -319,25 +295,16 @@ pub fn recipe(
     depends.dedup_by(|a, b| a.name == b.name && a.make == b.make && a.host == b.host);
 
     for x in depends.iter().filter(|x| !x.name.contains(':')) {
-        if !repos
-            .iter()
-            .any(|r| r.join(&x.name).join("build").is_file())
-            && x.name != name
-        {
+        if !repos.iter().any(|r| r.join(&x.name).join("build").is_file()) && x.name != name {
             notes.push(format!("{} is a dependency no repo carries", x.name));
         }
     }
 
-    let builddir = v
-        .get("builddir")
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .unwrap_or_else(|| format!("/src/{name}-{ver}"));
+    let builddir = v.get("builddir").filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| format!("/src/{name}-{ver}"));
     // a body says $pkgver as readily as it says $srcdir, and an unset one expands to
     // nothing rather than failing, so libbz2.so.$pkgver installs as libbz2.so
-    let mut script = format!(
-        ". /usr/share/kiry/lib.sh\nsrcdir=/src\npkgname=\"{name}\"\npkgver=\"{ver}\"\npkgrel=\"{rev}\"\n"
-    );
+    let mut script =
+        format!(". /usr/share/kiry/lib.sh\nsrcdir=/src\npkgname=\"{name}\"\npkgver=\"{ver}\"\npkgrel=\"{rev}\"\n");
     for n in &mine {
         if let Some(val) = v.get(n).filter(|s| !s.is_empty()) {
             script.push_str(&format!("{n}=\"{val}\"\n"));
@@ -347,10 +314,7 @@ pub fn recipe(
     // apkbuild wrote, and 64 recipes reach for ${p##*/} to get a name back out of it --
     // bash matches */bash[0-9][0-9]-[0-9]* to find its vendor patches, and a bare name
     // never matches, so nine security patches went unapplied and nothing said so
-    script.push_str(&format!(
-        "source=\"{}\"\nbuilddir=\"{builddir}\"\n",
-        sources.join(" ")
-    ));
+    script.push_str(&format!("source=\"{}\"\nbuilddir=\"{builddir}\"\n", sources.join(" ")));
     for k in ["patch_args", "options"] {
         if let Some(a) = v.get(k).filter(|a| !a.is_empty()) {
             script.push_str(&format!("{k}=\"{a}\"\n"));
@@ -361,10 +325,7 @@ pub fn recipe(
     // definitions rather than inlined bodies, which is what abuild runs too. 852 scripts
     // declare a local in a phase and ash refuses one outside a function. it also puts a
     // helper like _configure in scope wherever in the file it happens to be written
-    let subs = subpackage_funcs(
-        &name,
-        v.get("subpackages").map(String::as_str).unwrap_or(""),
-    );
+    let subs = subpackage_funcs(&name, v.get("subpackages").map(String::as_str).unwrap_or(""));
     let mut wrote: Vec<String> = Vec::new();
     let unshipped = variants(&text, &subs);
     for f in functions(&text) {
@@ -379,10 +340,7 @@ pub fn recipe(
         wrote.push(f.clone());
         script.push_str(&format!(
             "\n{f}() {{\n{}}}\n",
-            untested(
-                &b.replace("$pkgdir", "$DESTDIR")
-                    .replace("${pkgdir}", "$DESTDIR")
-            )
+            untested(&b.replace("$pkgdir", "$DESTDIR").replace("${pkgdir}", "$DESTDIR"))
         ));
     }
     // abuild runs default_prepare when an apkbuild defines no prepare() of its own, and
@@ -445,10 +403,7 @@ pub fn recipe(
     // the tarball
     let checksums = if unchecked > 0 { Vec::new() } else { checksums };
     put(&d.join("checksums"), &joined(&checksums))?;
-    put(
-        &d.join("depends"),
-        &joined(&depends.iter().map(|x| x.to_string()).collect::<Vec<_>>()),
-    )?;
+    put(&d.join("depends"), &joined(&depends.iter().map(|x| x.to_string()).collect::<Vec<_>>()))?;
     put(&d.join("build"), &script)?;
 
     if !absent.is_empty() {
@@ -580,10 +535,7 @@ fn put(p: &Path, body: &str) -> Result<(), String> {
 // values hold newlines, so they come back nul separated rather than a line each
 fn variables(apkbuild: &Path) -> Result<(HashMap<String, String>, Vec<String>), String> {
     let dir = apkbuild.parent().unwrap_or(Path::new("."));
-    let file = apkbuild
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("apkbuild has no file name")?;
+    let file = apkbuild.file_name().and_then(|n| n.to_str()).ok_or("apkbuild has no file name")?;
 
     let mut prog = format!(". ./{file}\n");
     for v in WANT {
@@ -615,20 +567,12 @@ fn variables(apkbuild: &Path) -> Result<(HashMap<String, String>, Vec<String>), 
         .output()
         .map_err(|e| format!("busybox ash: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "{}: {}",
-            apkbuild.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(format!("{}: {}", apkbuild.display(), String::from_utf8_lossy(&out.stderr).trim()));
     }
 
     let mut got = HashMap::new();
     let mut mine = Vec::new();
-    let parts: Vec<String> = out
-        .stdout
-        .split(|b| *b == 0)
-        .map(|p| String::from_utf8_lossy(p).to_string())
-        .collect();
+    let parts: Vec<String> = out.stdout.split(|b| *b == 0).map(|p| String::from_utf8_lossy(p).to_string()).collect();
     for (i, key) in WANT.iter().enumerate() {
         if let Some(v) = parts.get(i) {
             got.insert((*key).to_string(), v.trim().to_string());
@@ -789,10 +733,8 @@ fn off(word: &str) -> String {
     let bare = inner.trim_end_matches(['"', '\'']);
     let (lead, tail) = (&word[..word.len() - inner.len()], &inner[bare.len()..]);
     let flipped = if let Some(name) = bare.strip_prefix("--enable-") {
-        (!name.contains('=') && (tests(name) || dropped(name)))
-            .then(|| format!("--disable-{name}"))
-    } else if let Some((name, val)) = bare.strip_prefix("-D").and_then(|r| r.split_once('='))
-    {
+        (!name.contains('=') && (tests(name) || dropped(name))).then(|| format!("--disable-{name}"))
+    } else if let Some((name, val)) = bare.strip_prefix("-D").and_then(|r| r.split_once('=')) {
         let no = match val {
             "ON" => Some("OFF"),
             "on" => Some("off"),
@@ -834,19 +776,14 @@ fn dropped(name: &str) -> bool {
 pub fn tests(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
     let seg: Vec<&str> = up.split(['_', '-']).collect();
-    if seg.iter().any(|s| {
-        matches!(
-            *s,
-            "NO" | "DISABLE" | "DISABLED" | "SKIP" | "IGNORE" | "WITHOUT"
-        ) || s.contains("GTEST")
-    }) {
+    if seg
+        .iter()
+        .any(|s| matches!(*s, "NO" | "DISABLE" | "DISABLED" | "SKIP" | "IGNORE" | "WITHOUT") || s.contains("GTEST"))
+    {
         return false;
     }
     seg.iter().any(|s| matches!(*s, "TESTS" | "TESTING" | "TESTSUITE"))
-        || matches!(
-            seg.as_slice(),
-            ["TEST"] | [.., "BUILD" | "ENABLE" | "WITH" | "INCLUDE", "TEST"]
-        )
+        || matches!(seg.as_slice(), ["TEST"] | [.., "BUILD" | "ENABLE" | "WITH" | "INCLUDE", "TEST"])
 }
 
 // alpine deps carry three things kiry's do not: a version constraint, a ! meaning a
@@ -923,11 +860,7 @@ fn sha512sums(text: &str) -> HashMap<String, String> {
 }
 
 fn sha512(p: &Path) -> Result<String, String> {
-    let out = Command::new("busybox")
-        .arg("sha512sum")
-        .arg(p)
-        .output()
-        .map_err(|e| format!("sha512sum: {e}"))?;
+    let out = Command::new("busybox").arg("sha512sum").arg(p).output().map_err(|e| format!("sha512sum: {e}"))?;
     if !out.status.success() {
         return Err(format!("sha512sum {}", p.display()));
     }
@@ -959,9 +892,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-cv-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-cv-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -974,11 +905,7 @@ mod tests {
     fn a_generated_pair_does_not_shadow_a_recipe_a_repo_carries() {
         let at = scratch("shadow");
         fs::create_dir_all(at.join("libpulse")).unwrap();
-        fs::write(
-            at.join("aliases"),
-            format!("{GENERATED}\nlibpulse\tpulseaudio\nlibpq\tpostgresql\n"),
-        )
-        .unwrap();
+        fs::write(at.join("aliases"), format!("{GENERATED}\nlibpulse\tpulseaudio\nlibpq\tpostgresql\n")).unwrap();
 
         let got = aliases(std::slice::from_ref(&at));
         assert_eq!(got.get("libpulse"), None, "{got:?}");

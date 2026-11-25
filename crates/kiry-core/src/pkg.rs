@@ -19,14 +19,9 @@ impl Version {
         let (Some(upstream), Some(rev)) = (f.next(), f.next()) else {
             return Err(Error::Version(s.trim().to_string()));
         };
-        let rev = rev
-            .parse()
-            .map_err(|_| Error::Version(s.trim().to_string()))?;
+        let rev = rev.parse().map_err(|_| Error::Version(s.trim().to_string()))?;
 
-        Ok(Version {
-            upstream: upstream.to_string(),
-            rev,
-        })
+        Ok(Version { upstream: upstream.to_string(), rev })
     }
 }
 
@@ -78,12 +73,7 @@ pub fn lines(p: &Path) -> Result<Vec<String>, Error> {
         Err(e) => return Err(Error::Io(p.to_path_buf(), e)),
     };
 
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(String::from)
-        .collect())
+    Ok(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from).collect())
 }
 
 // both suffixes mean build-only and they differ in which target answers. " make" is a

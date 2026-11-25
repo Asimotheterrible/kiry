@@ -20,9 +20,7 @@ const TRIPLE: &str = "--target=x86_64-linux-gnu";
 const LOADER: &str = "/lib64/ld-linux-x86-64.so.2";
 
 fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir()
-        .join(format!("kiry-doc-{}", std::process::id()))
-        .join(name);
+    let d = std::env::temp_dir().join(format!("kiry-doc-{}", std::process::id())).join(name);
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
@@ -59,12 +57,7 @@ fn gnu_cc() -> bool {
         if fs::write(&src, "void _start(void){}\n").is_err() {
             return false;
         }
-        let ok = cc()
-            .args(["-nostdlib", "-o"])
-            .arg(d.join("probe"))
-            .arg(&src)
-            .status()
-            .is_ok_and(|s| s.success());
+        let ok = cc().args(["-nostdlib", "-o"]).arg(d.join("probe")).arg(&src).status().is_ok_and(|s| s.success());
         let _ = fs::remove_dir_all(&d);
         ok
     })
@@ -86,12 +79,7 @@ fn versioned(at: &Path, soname: &str, body: &str, script: Option<&str>) -> PathB
     fs::write(&src, body).unwrap();
     let out = at.join(soname);
     let mut c = cc();
-    c.args([
-        "-shared",
-        "-fPIC",
-        "-nostdlib",
-        &format!("-Wl,-soname,{soname}"),
-    ]);
+    c.args(["-shared", "-fPIC", "-nostdlib", &format!("-Wl,-soname,{soname}")]);
     if let Some(v) = script {
         let map = at.join("v.map");
         fs::write(&map, v).unwrap();
@@ -103,13 +91,7 @@ fn versioned(at: &Path, soname: &str, body: &str, script: Option<&str>) -> PathB
 }
 
 fn bin(at: &Path, name: &str, against: &Path, rpath: Option<&str>) -> PathBuf {
-    binsrc(
-        at,
-        name,
-        "void p(void);\nvoid _start(void){p();}\n",
-        against,
-        rpath,
-    )
+    binsrc(at, name, "void p(void);\nvoid _start(void){p();}\n", against, rpath)
 }
 
 fn binsrc(at: &Path, name: &str, body: &str, against: &Path, rpath: Option<&str>) -> PathBuf {
@@ -124,13 +106,7 @@ fn binsrc(at: &Path, name: &str, body: &str, against: &Path, rpath: Option<&str>
     if let Some(r) = rpath {
         c.arg(format!("-Wl,-rpath,{r}"));
     }
-    let ok = c
-        .arg("-o")
-        .arg(&out)
-        .arg(&src)
-        .arg(against)
-        .status()
-        .unwrap();
+    let ok = c.arg("-o").arg(&out).arg(&src).arg(against).status().unwrap();
     assert!(ok.success());
     out
 }
@@ -144,15 +120,7 @@ fn install(root: &Path, name: &str, files: &[(&str, &Path)]) {
 // depends names nothing is a second finding on top. so they declare what they link
 fn needs(root: &Path, name: &str, deps: &[&str]) {
     let mut rec = db::read(root, TARGET, name).unwrap();
-    rec.depends = deps
-        .iter()
-        .map(|d| Dep {
-            name: (*d).to_string(),
-            make: false,
-            host: false,
-            only: None,
-        })
-        .collect();
+    rec.depends = deps.iter().map(|d| Dep { name: (*d).to_string(), make: false, host: false, only: None }).collect();
     db::write(root, &rec).unwrap();
 }
 
@@ -191,11 +159,7 @@ fn installed(root: &Path, name: &str, files: &[(&str, &Path)], links: &[(&str, &
             let install::Seen::Elf(o) = s else {
                 return None;
             };
-            Some(db::Provide {
-                soname: o.soname?,
-                versioned: o.versioned,
-                path,
-            })
+            Some(db::Provide { soname: o.soname?, versioned: o.versioned, path })
         })
         .collect();
     db::write_provides(root, TARGET, name, &provides).unwrap();
@@ -207,47 +171,30 @@ fn add_links(root: &Path, manifest: &mut Vec<db::Entry>, links: &[(&str, &str)])
         fs::create_dir_all(dst.parent().unwrap()).unwrap();
         let _ = fs::remove_file(&dst);
         std::os::unix::fs::symlink(to, &dst).unwrap();
-        manifest.push(db::Entry {
-            kind: db::Kind::Link((*to).to_string()),
-            mode: 0o777,
-            path: (*at).to_string(),
-        });
+        manifest.push(db::Entry { kind: db::Kind::Link((*to).to_string()), mode: 0o777, path: (*at).to_string() });
     }
 }
 
 fn doctor(root: &Path) -> (bool, String) {
-    let o: Output = Command::new(KIRY)
-        .args(["doctor", "--root", root.to_str().unwrap()])
-        .output()
-        .unwrap();
-    (
-        o.status.success(),
-        String::from_utf8_lossy(&o.stdout).into(),
-    )
+    let o: Output = Command::new(KIRY).args(["doctor", "--root", root.to_str().unwrap()]).output().unwrap();
+    (o.status.success(), String::from_utf8_lossy(&o.stdout).into())
 }
 
 // LD_TRACE_LOADED_OBJECTS is the whole of ldd; LD_WARN and LD_BIND_NOW are what it adds
 // for -r. the loader traces and exits, so a fixture with a bare _start never runs
 fn traced(bin: &Path, relocs: bool) -> String {
     let mut c = Command::new(LOADER);
-    c.env_remove("LD_LIBRARY_PATH")
-        .env("LD_TRACE_LOADED_OBJECTS", "1");
+    c.env_remove("LD_LIBRARY_PATH").env("LD_TRACE_LOADED_OBJECTS", "1");
     if relocs {
         c.env("LD_WARN", "1").env("LD_BIND_NOW", "1");
     }
     let o = c.arg(bin).output().unwrap();
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    )
+    format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
 }
 
 // ldd resolves against the real filesystem, which is what the fixture root is
 fn ldd_finds(bin: &Path, soname: &str) -> bool {
-    traced(bin, false)
-        .lines()
-        .any(|l| l.contains(soname) && !l.contains("not found"))
+    traced(bin, false).lines().any(|l| l.contains(soname) && !l.contains("not found"))
 }
 
 // -r resolves every relocation instead of stopping at the libraries, which is the
@@ -286,10 +233,7 @@ fn a_library_nothing_installs_is_unresolved() {
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "doctor passed a root with nothing providing libp.so.1");
-    assert!(
-        out.contains(&format!("usr/bin/app {TARGET} unresolved libp.so.1")),
-        "{out}"
-    );
+    assert!(out.contains(&format!("usr/bin/app {TARGET} unresolved libp.so.1")), "{out}");
     assert!(!ldd_finds(&root.join("usr/bin/app"), "libp.so.1"));
 }
 
@@ -315,10 +259,7 @@ fn a_library_off_the_search_path_does_not_count_as_provided() {
         out.contains(&format!("usr/bin/bare {TARGET} unresolved libp.so.1")),
         "the one with no runpath should not resolve: {out}"
     );
-    assert!(
-        !out.contains("usr/bin/rp "),
-        "the one whose runpath points at the library should resolve: {out}"
-    );
+    assert!(!out.contains("usr/bin/rp "), "the one whose runpath points at the library should resolve: {out}");
 
     // and that is exactly what the loader does with the same two files
     assert!(!ldd_finds(&root.join("usr/bin/bare"), "libp.so.1"));
@@ -386,10 +327,7 @@ fn a_manifest_file_that_vanished_is_reported_rather_than_skipped() {
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "a root missing an installed file is not healthy");
-    assert!(
-        out.contains(&format!("usr/lib64/libp.so.1 {TARGET} unreadable")),
-        "{out}"
-    );
+    assert!(out.contains(&format!("usr/lib64/libp.so.1 {TARGET} unreadable")), "{out}");
 }
 
 #[test]
@@ -408,10 +346,7 @@ fn a_soname_that_moved_out_from_under_the_db_shows_as_stale() {
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "{out}");
-    assert!(
-        out.contains(&format!("libp {TARGET} stale-provides")),
-        "{out}"
-    );
+    assert!(out.contains(&format!("libp {TARGET} stale-provides")), "{out}");
 }
 
 // a real root is usrmerged, so a runpath may spell one directory /lib64 and another
@@ -451,12 +386,7 @@ fn dt_rpath_resolves_when_there_is_no_runpath() {
     fs::write(&src, "void p(void);\nvoid _start(void){p();}\n").unwrap();
     let b = at.join("app");
     let ok = cc()
-        .args([
-            "-nostdlib",
-            "-Wl,--disable-new-dtags",
-            "-Wl,-rpath,$ORIGIN/../lib64/priv",
-            "-o",
-        ])
+        .args(["-nostdlib", "-Wl,--disable-new-dtags", "-Wl,-rpath,$ORIGIN/../lib64/priv", "-o"])
         .arg(&b)
         .arg(&src)
         .arg(&l)
@@ -467,11 +397,7 @@ fn dt_rpath_resolves_when_there_is_no_runpath() {
     install(&root, "libp", &[("usr/lib64/priv/libp.so.1", &l)]);
     install(&root, "app", &[("usr/bin/app", &b)]);
 
-    let raw = Command::new("readelf")
-        .args(["-dW"])
-        .arg(root.join("usr/bin/app"))
-        .output()
-        .unwrap();
+    let raw = Command::new("readelf").args(["-dW"]).arg(root.join("usr/bin/app")).output().unwrap();
     assert!(
         String::from_utf8_lossy(&raw.stdout).contains("(RPATH)"),
         "the linker emitted RUNPATH, so this fixture no longer reaches the rpath branch"
@@ -513,32 +439,17 @@ fn a_symbol_the_library_dropped_is_reported() {
     }
     let at = scratch("dropped");
     let root = at.join("root");
-    let full = libsrc(
-        &at.join("was"),
-        "libt.so.1",
-        "void p(void){}\nvoid q(void){}\n",
-    );
+    let full = libsrc(&at.join("was"), "libt.so.1", "void p(void){}\nvoid q(void){}\n");
     let thin = libsrc(&at.join("now"), "libt.so.1", "void p(void){}\n");
-    let app = binsrc(
-        &at.join("was"),
-        "app",
-        "void q(void);\nvoid _start(void){q();}\n",
-        &full,
-        Some("$ORIGIN/../lib64"),
-    );
+    let app =
+        binsrc(&at.join("was"), "app", "void q(void);\nvoid _start(void){q();}\n", &full, Some("$ORIGIN/../lib64"));
     install(&root, "libt", &[("usr/lib64/libt.so.1", &thin)]);
     install(&root, "app", &[("usr/bin/app", &app)]);
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "doctor passed a binary whose symbol is gone");
-    assert!(
-        out.contains(&format!("usr/bin/app {TARGET} missing-symbol q")),
-        "{out}"
-    );
-    assert!(
-        !out.contains("unresolved"),
-        "the library itself resolves, only the symbol is gone: {out}"
-    );
+    assert!(out.contains(&format!("usr/bin/app {TARGET} missing-symbol q")), "{out}");
+    assert!(!out.contains("unresolved"), "the library itself resolves, only the symbol is gone: {out}");
 
     let ldd = ldd_relocs(&root.join("usr/bin/app"));
     assert!(ldd.contains("undefined symbol: q"), "ldd disagrees: {ldd}");
@@ -580,22 +491,14 @@ fn a_symbol_that_kept_its_name_and_changed_version_does_not_satisfy() {
     let root = at.join("root");
     let was = versioned_lib(&at.join("was"), "V1");
     let now = versioned_lib(&at.join("now"), "V2");
-    let app = binsrc(
-        &at.join("was"),
-        "app",
-        "void p(void);\nvoid _start(void){p();}\n",
-        &was,
-        Some("$ORIGIN/../lib64"),
-    );
+    let app =
+        binsrc(&at.join("was"), "app", "void p(void);\nvoid _start(void){p();}\n", &was, Some("$ORIGIN/../lib64"));
     install(&root, "libt", &[("usr/lib64/libt.so.1", &now)]);
     install(&root, "app", &[("usr/bin/app", &app)]);
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "doctor passed a binary asking for a version that left");
-    assert!(
-        out.contains(&format!("usr/bin/app {TARGET} missing-symbol p@V1")),
-        "{out}"
-    );
+    assert!(out.contains(&format!("usr/bin/app {TARGET} missing-symbol p@V1")), "{out}");
 
     let ldd = ldd_relocs(&root.join("usr/bin/app"));
     assert!(ldd.contains("V1"), "ldd disagrees: {ldd}");
@@ -653,12 +556,7 @@ fn a_library_reached_through_a_symlink_resolves() {
     let l = nameless(&at, "libt.so.1");
     let app = against_name(&at, "app", &l, "libt.so.1", Some("$ORIGIN/../lib64"));
     install(&root, "libt", &[("usr/lib64/libreal.so.1", &l)]);
-    installed(
-        &root,
-        "app",
-        &[("usr/bin/app", &app)],
-        &[("usr/lib64/libt.so.1", "libreal.so.1")],
-    );
+    installed(&root, "app", &[("usr/bin/app", &app)], &[("usr/lib64/libt.so.1", "libreal.so.1")]);
 
     needs(&root, "app", &["libt"]);
     let (ok, out) = doctor(&root);
@@ -671,13 +569,7 @@ fn nameless(at: &Path, name: &str) -> PathBuf {
     let src = at.join(format!("{name}.c"));
     fs::write(&src, "void p(void){}\n").unwrap();
     let out = at.join(name);
-    let ok = cc()
-        .args(["-shared", "-fPIC", "-nostdlib"])
-        .arg("-o")
-        .arg(&out)
-        .arg(&src)
-        .status()
-        .unwrap();
+    let ok = cc().args(["-shared", "-fPIC", "-nostdlib"]).arg("-o").arg(&out).arg(&src).status().unwrap();
     assert!(ok.success());
     out
 }
@@ -739,31 +631,16 @@ fn a_library_reached_only_through_a_dlopened_one_is_not_asked_either() {
         .unwrap();
     assert!(ok.success());
 
-    install(
-        &root,
-        "chain",
-        &[
-            ("usr/lib64/libdeep.so.1", &deep),
-            ("usr/lib64/libmod.so.1", &module),
-        ],
-    );
+    install(&root, "chain", &[("usr/lib64/libdeep.so.1", &deep), ("usr/lib64/libmod.so.1", &module)]);
     let (ok, out) = doctor(&root);
     assert!(ok && out.is_empty(), "expected silence, got {out:?}");
 
     // a program that links the module makes the whole chain answerable again
-    let app = bin_calling(
-        &at,
-        "app",
-        "void m(void);\nvoid _start(void){m();}\n",
-        &module,
-    );
+    let app = bin_calling(&at, "app", "void m(void);\nvoid _start(void){m();}\n", &module);
     install(&root, "app", &[("usr/bin/app", &app)]);
     let (ok, out) = doctor(&root);
     assert!(!ok, "a chain a program can reach still owes its symbols");
-    assert!(
-        out.contains(&format!("usr/lib64/libdeep.so.1 {TARGET} missing-symbol q")),
-        "{out}"
-    );
+    assert!(out.contains(&format!("usr/lib64/libdeep.so.1 {TARGET} missing-symbol q")), "{out}");
 }
 
 fn bin_calling(at: &Path, name: &str, body: &str, against: &Path) -> PathBuf {
@@ -792,10 +669,7 @@ fn a_library_nothing_links_is_not_asked_about_its_symbols() {
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "a linked library still owes its undefined symbols");
-    assert!(
-        out.contains(&format!("usr/lib64/libplug.so.1 {TARGET} missing-symbol q")),
-        "{out}"
-    );
+    assert!(out.contains(&format!("usr/lib64/libplug.so.1 {TARGET} missing-symbol q")), "{out}");
 }
 
 // perl installs /usr/bin/perl as a second name for perl5.44.0, and every script it ships
@@ -816,11 +690,7 @@ fn an_interpreter_reached_by_hardlink_is_there() {
     let sum = kiry_core::sha256(fs::File::open(&real).unwrap()).unwrap();
     fs::create_dir_all(root.join("usr/bin")).unwrap();
     fs::copy(&real, root.join("usr/bin/fictionsh-1.0")).unwrap();
-    fs::hard_link(
-        root.join("usr/bin/fictionsh-1.0"),
-        root.join("usr/bin/fictionsh"),
-    )
-    .unwrap();
+    fs::hard_link(root.join("usr/bin/fictionsh-1.0"), root.join("usr/bin/fictionsh")).unwrap();
     db::write(
         &root,
         &db::Installed {
@@ -829,11 +699,7 @@ fn an_interpreter_reached_by_hardlink_is_there() {
             version: Version::parse("1.0 1").unwrap(),
             depends: Vec::new(),
             manifest: vec![
-                db::Entry {
-                    mode: 0o755,
-                    kind: db::Kind::File(sum),
-                    path: "usr/bin/fictionsh-1.0".to_string(),
-                },
+                db::Entry { mode: 0o755, kind: db::Kind::File(sum), path: "usr/bin/fictionsh-1.0".to_string() },
                 db::Entry {
                     mode: 0o755,
                     kind: db::Kind::Hard("usr/bin/fictionsh-1.0".to_string()),
@@ -901,11 +767,7 @@ fn an_interpreter_the_other_target_owns_is_there() {
                     kind: db::Kind::File(kiry_core::sha256(fs::File::open(&dst).unwrap()).unwrap()),
                     path: "usr/bin/sh".to_string(),
                 },
-                db::Entry {
-                    mode: 0o777,
-                    kind: db::Kind::Link("usr/bin".to_string()),
-                    path: "bin".to_string(),
-                },
+                db::Entry { mode: 0o777, kind: db::Kind::Link("usr/bin".to_string()), path: "bin".to_string() },
             ],
             hash: String::new(),
             users: Vec::new(),
@@ -915,10 +777,7 @@ fn an_interpreter_the_other_target_owns_is_there() {
     .unwrap();
 
     let (ok, out) = doctor(&root);
-    assert!(
-        ok,
-        "a shell the other target owns was called missing: {out}"
-    );
+    assert!(ok, "a shell the other target owns was called missing: {out}");
     assert!(!out.contains("no-interpreter"), "{out}");
 }
 
@@ -937,12 +796,7 @@ fn a_script_whose_interpreter_is_missing_is_reported() {
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "doctor passed a script with no interpreter");
-    assert!(
-        out.contains(&format!(
-            "usr/bin/thing {TARGET} no-interpreter /usr/bin/env fictionsh"
-        )),
-        "{out}"
-    );
+    assert!(out.contains(&format!("usr/bin/thing {TARGET} no-interpreter /usr/bin/env fictionsh")), "{out}");
 
     // env takes options of its own before the program name, and -S is common enough
     // that reading the word after env finds a flag rather than an interpreter
@@ -950,10 +804,7 @@ fn a_script_whose_interpreter_is_missing_is_reported() {
     fs::write(&dashs, "#!/usr/bin/env -S fictionsh -u\necho hi\n").unwrap();
     install(&root, "dashs", &[("usr/bin/dashs", &dashs)]);
     let (_, out) = doctor(&root);
-    assert!(
-        out.contains(&format!("usr/bin/dashs {TARGET} no-interpreter")),
-        "{out}"
-    );
+    assert!(out.contains(&format!("usr/bin/dashs {TARGET} no-interpreter")), "{out}");
     assert!(!out.contains("no-interpreter /usr/bin/env -S\n"), "{out}");
 
     // install the interpreter and the findings go away
@@ -973,11 +824,7 @@ fn two_libraries_exporting_one_name_are_reported() {
     }
     let at = scratch("dupes");
     let root = at.join("root");
-    let one = libsrc(
-        &at.join("one"),
-        "libone.so.1",
-        "void p(void){}\nvoid q(void){}\n",
-    );
+    let one = libsrc(&at.join("one"), "libone.so.1", "void p(void){}\nvoid q(void){}\n");
     let two = libsrc(&at.join("two"), "libtwo.so.1", "void p(void){}\n");
     // the binary links both, so both are in the namespace where the clash happens
     let app = binsrc(
@@ -999,13 +846,8 @@ fn two_libraries_exporting_one_name_are_reported() {
     }
 
     // a second program on libtwo alone. two processes, one answer each, no clash
-    let other = binsrc(
-        &at.join("other"),
-        "other",
-        "void p(void);\nvoid _start(void){p();}\n",
-        &two,
-        Some("$ORIGIN/../lib64"),
-    );
+    let other =
+        binsrc(&at.join("other"), "other", "void p(void);\nvoid _start(void){p();}\n", &two, Some("$ORIGIN/../lib64"));
     install(&root, "other", &[("usr/bin/other", &other)]);
     let (_, out) = doctor(&root);
     assert!(!out.contains("duplicate-symbols"), "{out}");
@@ -1028,9 +870,7 @@ fn two_libraries_exporting_one_name_are_reported() {
     let (ok, out) = doctor(&root);
     assert!(!ok, "doctor passed a root where two libraries export p");
     assert!(
-        out.contains(&format!(
-            "usr/lib64/libone.so.1 {TARGET} duplicate-symbols 1 usr/lib64/libtwo.so.1"
-        )),
+        out.contains(&format!("usr/lib64/libone.so.1 {TARGET} duplicate-symbols 1 usr/lib64/libtwo.so.1")),
         "{out}"
     );
 }
@@ -1045,11 +885,7 @@ fn two_libraries_out_of_one_package_are_not_a_clash() {
     }
     let at = scratch("dupesame");
     let root = at.join("root");
-    let one = libsrc(
-        &at.join("one"),
-        "libone.so.1",
-        "void p(void){}\nvoid q(void){}\n",
-    );
+    let one = libsrc(&at.join("one"), "libone.so.1", "void p(void){}\nvoid q(void){}\n");
     let two = libsrc(&at.join("two"), "libtwo.so.1", "void p(void){}\n");
     let app = binsrc(
         &at,
@@ -1058,23 +894,11 @@ fn two_libraries_out_of_one_package_are_not_a_clash() {
         &one,
         Some("$ORIGIN/../lib64"),
     );
-    let both = binsrc(
-        &at.join("both"),
-        "both",
-        "void p(void);\nvoid _start(void){p();}\n",
-        &two,
-        Some("$ORIGIN/../lib64"),
-    );
+    let both =
+        binsrc(&at.join("both"), "both", "void p(void);\nvoid _start(void){p();}\n", &two, Some("$ORIGIN/../lib64"));
     // one owner for both libraries, which is the only thing that differs from the
     // pair above that is reported
-    install(
-        &root,
-        "pair",
-        &[
-            ("usr/lib64/libone.so.1", &one),
-            ("usr/lib64/libtwo.so.1", &two),
-        ],
-    );
+    install(&root, "pair", &[("usr/lib64/libone.so.1", &one), ("usr/lib64/libtwo.so.1", &two)]);
     install(&root, "app", &[("usr/bin/app", &app)]);
     install(&root, "both", &[("usr/bin/both", &both)]);
 
@@ -1093,24 +917,11 @@ fn the_names_every_object_carries_are_not_a_clash() {
     }
     let at = scratch("housekeeping");
     let root = at.join("root");
-    let body =
-        |own: &str| format!("void _init(void){{}}\nvoid _fini(void){{}}\nvoid {own}(void){{}}\n");
+    let body = |own: &str| format!("void _init(void){{}}\nvoid _fini(void){{}}\nvoid {own}(void){{}}\n");
     let one = libsrc(&at.join("one"), "libone.so.1", &body("a"));
     let two = libsrc(&at.join("two"), "libtwo.so.1", &body("b"));
-    let ua = binsrc(
-        &at.join("ua"),
-        "ua",
-        "void a(void);\nvoid _start(void){a();}\n",
-        &one,
-        Some("$ORIGIN/../lib64"),
-    );
-    let ub = binsrc(
-        &at.join("ub"),
-        "ub",
-        "void b(void);\nvoid _start(void){b();}\n",
-        &two,
-        Some("$ORIGIN/../lib64"),
-    );
+    let ua = binsrc(&at.join("ua"), "ua", "void a(void);\nvoid _start(void){a();}\n", &one, Some("$ORIGIN/../lib64"));
+    let ub = binsrc(&at.join("ub"), "ub", "void b(void);\nvoid _start(void){b();}\n", &two, Some("$ORIGIN/../lib64"));
     install(&root, "one", &[("usr/lib64/libone.so.1", &one)]);
     install(&root, "two", &[("usr/lib64/libtwo.so.1", &two)]);
     install(&root, "ua", &[("usr/bin/ua", &ua)]);
@@ -1140,13 +951,8 @@ fn one_library_exporting_a_name_at_two_versions_is_not_a_clash() {
          void p_new(void){}\n__asm__(\".symver p_new,p@@V2\");\n",
         Some("V1 { global: p; local: *; };\nV2 { global: p; local: *; } V1;\n"),
     );
-    let app = binsrc(
-        &at.join("app"),
-        "app",
-        "void p(void);\nvoid _start(void){p();}\n",
-        &lib,
-        Some("$ORIGIN/../lib64"),
-    );
+    let app =
+        binsrc(&at.join("app"), "app", "void p(void);\nvoid _start(void){p();}\n", &lib, Some("$ORIGIN/../lib64"));
     install(&root, "v", &[("usr/lib64/libv.so.1", &lib)]);
     install(&root, "app", &[("usr/bin/app", &app)]);
 
@@ -1166,24 +972,11 @@ fn a_weak_export_in_two_libraries_is_not_a_clash() {
     }
     let at = scratch("vague");
     let root = at.join("root");
-    let body =
-        |own: &str| format!("__attribute__((weak)) void shared(void){{}}\nvoid {own}(void){{}}\n");
+    let body = |own: &str| format!("__attribute__((weak)) void shared(void){{}}\nvoid {own}(void){{}}\n");
     let one = libsrc(&at.join("one"), "libone.so.1", &body("a"));
     let two = libsrc(&at.join("two"), "libtwo.so.1", &body("b"));
-    let ua = binsrc(
-        &at.join("ua"),
-        "ua",
-        "void a(void);\nvoid _start(void){a();}\n",
-        &one,
-        Some("$ORIGIN/../lib64"),
-    );
-    let ub = binsrc(
-        &at.join("ub"),
-        "ub",
-        "void b(void);\nvoid _start(void){b();}\n",
-        &two,
-        Some("$ORIGIN/../lib64"),
-    );
+    let ua = binsrc(&at.join("ua"), "ua", "void a(void);\nvoid _start(void){a();}\n", &one, Some("$ORIGIN/../lib64"));
+    let ub = binsrc(&at.join("ub"), "ub", "void b(void);\nvoid _start(void){b();}\n", &two, Some("$ORIGIN/../lib64"));
     install(&root, "one", &[("usr/lib64/libone.so.1", &one)]);
     install(&root, "two", &[("usr/lib64/libtwo.so.1", &two)]);
     install(&root, "ua", &[("usr/bin/ua", &ua)]);
@@ -1208,32 +1001,10 @@ fn a_version_label_in_two_libraries_is_not_a_clash() {
     let root = at.join("root");
     // a script may only name symbols the library defines, so the label is what the two
     // share and the symbol under it is each library's own
-    let one = versioned(
-        &at.join("one"),
-        "libone.so.1",
-        "void a(void){}\n",
-        Some("V1 { global: a; local: *; };\n"),
-    );
-    let two = versioned(
-        &at.join("two"),
-        "libtwo.so.1",
-        "void b(void){}\n",
-        Some("V1 { global: b; local: *; };\n"),
-    );
-    let ua = binsrc(
-        &at.join("ua"),
-        "ua",
-        "void a(void);\nvoid _start(void){a();}\n",
-        &one,
-        Some("$ORIGIN/../lib64"),
-    );
-    let ub = binsrc(
-        &at.join("ub"),
-        "ub",
-        "void b(void);\nvoid _start(void){b();}\n",
-        &two,
-        Some("$ORIGIN/../lib64"),
-    );
+    let one = versioned(&at.join("one"), "libone.so.1", "void a(void){}\n", Some("V1 { global: a; local: *; };\n"));
+    let two = versioned(&at.join("two"), "libtwo.so.1", "void b(void){}\n", Some("V1 { global: b; local: *; };\n"));
+    let ua = binsrc(&at.join("ua"), "ua", "void a(void);\nvoid _start(void){a();}\n", &one, Some("$ORIGIN/../lib64"));
+    let ub = binsrc(&at.join("ub"), "ub", "void b(void);\nvoid _start(void){b();}\n", &two, Some("$ORIGIN/../lib64"));
     install(&root, "one", &[("usr/lib64/libone.so.1", &one)]);
     install(&root, "two", &[("usr/lib64/libtwo.so.1", &two)]);
     install(&root, "ua", &[("usr/bin/ua", &ua)]);
@@ -1262,16 +1033,8 @@ fn a_gnu_binary_reaching_into_the_musl_tree_is_flagged() {
     install(&root, "app", &[("usr/bin/app", &app)]);
 
     let (ok, out) = doctor(&root);
-    assert!(
-        !ok,
-        "a gnu binary resolved into the musl tree and doctor was happy"
-    );
-    assert!(
-        out.contains(&format!(
-            "usr/bin/app {TARGET} cross-tier usr/lib/libp.so.1"
-        )),
-        "{out}"
-    );
+    assert!(!ok, "a gnu binary resolved into the musl tree and doctor was happy");
+    assert!(out.contains(&format!("usr/bin/app {TARGET} cross-tier usr/lib/libp.so.1")), "{out}");
 }
 
 // nothing in app's depends reaches libp, so this root works and a root built from the
@@ -1290,10 +1053,7 @@ fn a_package_linking_a_library_its_depends_cannot_reach_is_reported() {
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "doctor passed a package that declares nothing it links");
-    assert!(
-        out.contains("app x86_64-gnu build-only libp libp.so.1"),
-        "{out}"
-    );
+    assert!(out.contains("app x86_64-gnu build-only libp libp.so.1"), "{out}");
 }
 
 // app declares mid, mid declares libp, and app links libp itself. it resolves today
@@ -1315,10 +1075,7 @@ fn a_library_reached_only_through_another_dep_is_undeclared() {
 
     let (ok, out) = doctor(&root);
     assert!(!ok, "doctor passed a dep reached only through another one");
-    assert!(
-        out.contains("app x86_64-gnu undeclared libp libp.so.1"),
-        "{out}"
-    );
+    assert!(out.contains("app x86_64-gnu undeclared libp libp.so.1"), "{out}");
 }
 
 // what install keeps back when a soname moves, placed the way install places it
@@ -1402,10 +1159,7 @@ fn a_preserved_library_is_not_an_orphan() {
     install(&root, "libp", &[("usr/lib64/libp.so.2", &new)]);
     preserving(&root, "libp", &[("usr/lib64/libp.so.1", &old)]);
 
-    let o = Command::new(KIRY)
-        .args(["doctor", "--orphans", "--root", root.to_str().unwrap()])
-        .output()
-        .unwrap();
+    let o = Command::new(KIRY).args(["doctor", "--orphans", "--root", root.to_str().unwrap()]).output().unwrap();
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(!out.contains("usr/lib64/libp.so.1 unowned"), "{out}");
 }
@@ -1438,11 +1192,7 @@ fn a_library_only_its_own_package_loads_may_lean_on_what_that_package_loaded() {
     let at = scratch("jvm");
     let root = at.join("root");
     let (jvm, java) = jvm_like(&at);
-    install(
-        &root,
-        "jdk",
-        &[("usr/lib/jvm/j/lib/server/libjvm.so", &jvm), ("usr/lib/jvm/j/lib/libjava.so", &java)],
-    );
+    install(&root, "jdk", &[("usr/lib/jvm/j/lib/server/libjvm.so", &jvm), ("usr/lib/jvm/j/lib/libjava.so", &java)]);
 
     let (_, out) = doctor(&root);
     assert!(!out.contains("unresolved"), "{out}");
@@ -1554,12 +1304,7 @@ fn a_plugin_gets_no_pass_for_what_no_program_loads() {
 }
 
 fn remove(root: &Path, args: &[&str]) -> Output {
-    Command::new(KIRY)
-        .arg("r")
-        .args(["--root", root.to_str().unwrap()])
-        .args(args)
-        .output()
-        .unwrap()
+    Command::new(KIRY).arg("r").args(["--root", root.to_str().unwrap()]).args(args).output().unwrap()
 }
 
 // jq names oniguruma as make only and links libonig.so.5 all the same. what the files
@@ -1648,11 +1393,15 @@ fn a_python_import_is_checked_like_a_library() {
     let (_, out) = doctor(&root);
     let mut rows: Vec<&str> = out.lines().filter(|l| !l.contains("no-interpreter")).collect();
     rows.sort_unstable();
-    assert_eq!(rows, vec![
-        format!("app {TARGET} build-only py3-yaml py:yaml app"),
-        format!("app {TARGET} no-module elftools py3-elftools"),
-        format!("app {TARGET} no-module missingmod"),
-    ], "{out}");
+    assert_eq!(
+        rows,
+        vec![
+            format!("app {TARGET} build-only py3-yaml py:yaml app"),
+            format!("app {TARGET} no-module elftools py3-elftools"),
+            format!("app {TARGET} no-module missingmod"),
+        ],
+        "{out}"
+    );
 
     // the edge written down, the row goes
     needs(&root, "app", &["python3", "py3-yaml"]);

@@ -399,11 +399,7 @@ fn batch_took(key: &str, secs: u64) {
 // counting the ones still to finish at what they took last time. one known time is no
 // batch to be slow in, so a lone build stays dim
 fn slowest(b: &Batch, key: &str, secs: u64) -> bool {
-    let known: Vec<u64> = b
-        .builds
-        .iter()
-        .filter_map(|k| b.took.get(k).or_else(|| b.eta.get(k)).copied())
-        .collect();
+    let known: Vec<u64> = b.builds.iter().filter_map(|k| b.took.get(k).or_else(|| b.eta.get(k)).copied()).collect();
     b.took.get(key) == Some(&secs)
         && known.len() >= 2
         && known.iter().filter(|&&v| v >= secs).count() <= known.len().div_ceil(10)
@@ -460,7 +456,7 @@ fn setting(root: &Path, key: &str) -> Option<String> {
         .filter_map(|l| l.split_once(char::is_whitespace))
         .filter(|(k, _)| *k == key)
         .map(|(_, v)| v.trim().to_string())
-        .last()
+        .next_back()
 }
 
 // art and a quote beside a block of lines, pfetch-style, for stats and the end of a
@@ -740,9 +736,7 @@ fn build_cmd(args: &[String]) {
 // mid-tar. the dir is deleted and remade, so the lock is a file beside it, held until
 // the build function returns
 fn claim(root: &Path, p: &Package) -> Result<fs::File, String> {
-    let at = root
-        .join("var/kiry/stage")
-        .join(format!("{}-{}-{}.lock", p.name, p.version.upstream, p.version.rev));
+    let at = root.join("var/kiry/stage").join(format!("{}-{}-{}.lock", p.name, p.version.upstream, p.version.rev));
     if let Some(d) = at.parent() {
         mkdirs(d)?;
     }
@@ -772,13 +766,7 @@ fn writer(root: &Path) -> fs::File {
     if let Some(Err(e)) = at.parent().map(mkdirs) {
         die(e);
     }
-    let mut f = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&at)
-    {
+    let mut f = match fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&at) {
         Ok(f) => f,
         Err(e) => die(format!("{}: {e}", at.display())),
     };
@@ -803,9 +791,8 @@ fn writer(root: &Path) -> fs::File {
 
 // whether a build holds this lock right now. a lock nobody holds is a file like any other
 fn locked(lock: &Path) -> bool {
-    fs::File::open(lock).is_ok_and(|f| {
-        rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockShared).is_err()
-    })
+    fs::File::open(lock)
+        .is_ok_and(|f| rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockShared).is_err())
 }
 
 fn build(
@@ -1043,7 +1030,12 @@ fn shadowed(root: &Path, p: &Package) -> Vec<Dep> {
         .filter(|d| d.make && d.name != "busybox" && !refused(root, p, &d.name))
         .filter(|d| {
             let progs: Vec<String> = match db::read(root, &host, &d.name) {
-                Ok(r) => r.manifest.iter().filter(|e| !matches!(e.kind, db::Kind::Dir)).filter_map(|e| bin(&e.path)).collect(),
+                Ok(r) => r
+                    .manifest
+                    .iter()
+                    .filter(|e| !matches!(e.kind, db::Kind::Dir))
+                    .filter_map(|e| bin(&e.path))
+                    .collect(),
                 Err(_) => shape(root, &host, &d.name).map(|s| s.2).unwrap_or_default(),
             };
             progs.iter().any(|x| applets.contains(x) || x.strip_prefix('g').is_some_and(|a| applets.contains(a)))
@@ -1057,11 +1049,8 @@ fn shadowed(root: &Path, p: &Package) -> Vec<Dep> {
 // off until somebody asks
 fn flagged(root: &Path, p: &Package) -> Vec<Dep> {
     let Ok(f) = flags(root, &p.name, Some(&p.dir)) else { return Vec::new() };
-    let mut out: Vec<Dep> = f
-        .use_flags
-        .iter()
-        .filter_map(|x| p.depends.iter().find(|d| d.name == *x).cloned())
-        .collect();
+    let mut out: Vec<Dep> =
+        f.use_flags.iter().filter_map(|x| p.depends.iter().find(|d| d.name == *x).cloned()).collect();
     let Some(g) = gentoo(&p.dir) else { return out };
     let set = chosen(&f.use_flags);
     for (a, needs) in g.wanted(&set) {
@@ -1096,11 +1085,8 @@ fn prove(root: &Path, t: &str, name: &str, line: &str) -> Result<(), String> {
 fn disprove(root: &Path, t: &str, name: &str, dep: &str) {
     let at = closure_at(root, t, name);
     let Ok(text) = fs::read_to_string(&at) else { return };
-    let kept: String = text
-        .lines()
-        .filter(|l| l.split_whitespace().next() != Some(dep))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let kept: String =
+        text.lines().filter(|l| l.split_whitespace().next() != Some(dep)).map(|l| format!("{l}\n")).collect();
     let _ = put(&at, &kept);
 }
 
@@ -1141,8 +1127,17 @@ fn unprove(root: &Path, p: &Package, t: &str, work: &Path, linked: &[String]) {
     for d in &deps {
         let listed = star && !p.depends.iter().all(|x| x.name != d.name);
         let rec = db::read(root, if d.host { &host } else { t }, &d.name);
-        let heads: Vec<&str> = rec.iter().flat_map(|r| r.manifest.iter()).map(|e| e.path.as_str()).filter(|f| f.starts_with(&inc)).collect();
-        let runs = listed && rec.iter().flat_map(|r| r.manifest.iter()).any(|e| ["usr/bin/", "usr/sbin/", "bin/", "sbin/"].iter().any(|b| e.path.starts_with(b)));
+        let heads: Vec<&str> = rec
+            .iter()
+            .flat_map(|r| r.manifest.iter())
+            .map(|e| e.path.as_str())
+            .filter(|f| f.starts_with(&inc))
+            .collect();
+        let runs = listed
+            && rec
+                .iter()
+                .flat_map(|r| r.manifest.iter())
+                .any(|e| ["usr/bin/", "usr/sbin/", "bin/", "sbin/"].iter().any(|b| e.path.starts_with(b)));
         // a .pc under share is an arch-independent package, wayland-protocols or xorgproto:
         // its xml is found through a variable in the .pc and its headers come in through
         // other headers, neither of which the log sees
@@ -1219,7 +1214,9 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
     // autoconf-archive's macros come through a release tarball's configure unexpanded and
     // configure goes on: fontconfig's AX_FUNC_SNPRINTF was the anchor and the gperf make
     // died wanting, 300 lines on, was never looked at
-    let archive = |l: &str| l.strip_suffix(": not found").and_then(|r| r.rsplit(": ").next()).is_some_and(|n| n.starts_with("AX_"));
+    let archive = |l: &str| {
+        l.strip_suffix(": not found").and_then(|r| r.rsplit(": ").next()).is_some_and(|n| n.starts_with("AX_"))
+    };
     let fatal = |l: &str| {
         l.contains(" error required dependency not found")
             || l.contains(" error program not found")
@@ -1268,13 +1265,21 @@ fn misses(log: &str, noted: &str) -> Vec<String> {
     let squash = |s: &str| s.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_lowercase();
     for t in lines.iter().filter_map(|l| between_in(l, "PkgConfig::", " is not a valid target")) {
         let want = squash(&t);
-        out.extend(noted.lines().filter_map(|l| l.strip_prefix("pc ")).filter(|n| squash(n) == want).map(|n| format!("pc:{}", n.trim())));
+        out.extend(
+            noted
+                .lines()
+                .filter_map(|l| l.strip_prefix("pc "))
+                .filter(|n| squash(n) == want)
+                .map(|n| format!("pc:{}", n.trim())),
+        );
     }
     out.extend(noted.lines().rev().filter_map(|l| l.split_once(' ')).map(|(k, n)| format!("{k}:{}", n.trim())));
     // setuptools warns about a setup() keyword nobody registered and builds on, so the
     // fatal line is wherever the missing plugin's absence surfaced later: trove-classifiers
     // packed version 0.0.0 without calver and died installing the wheel by its real name
-    out.extend(lines.iter().filter_map(|l| between_in(l, "Unknown distribution option: '", "'")).map(|o| format!("pykw:{o}")));
+    out.extend(
+        lines.iter().filter_map(|l| between_in(l, "Unknown distribution option: '", "'")).map(|o| format!("pykw:{o}")),
+    );
     // the same for a python traceback configure swallowed: volume_key's AM_PATH_PYTHON asked
     // distutils for the extension dir, got nothing, and libtool died on an empty -rpath
     // hundreds of lines on
@@ -1311,7 +1316,9 @@ fn lacking(log: &str) -> bool {
     }
     lines[f..(f + 4).min(lines.len())].iter().any(|l| {
         let l = l.to_lowercase();
-        ["found", "find", "missing", "no package", "no such file", "needed", "required", "no module"].iter().any(|w| l.contains(w))
+        ["found", "find", "missing", "no package", "no such file", "needed", "required", "no module"]
+            .iter()
+            .any(|w| l.contains(w))
     })
 }
 
@@ -1397,7 +1404,9 @@ fn miss(l: &str) -> Option<String> {
     if let Some((_, r)) = l.split_once("unable to find library -l") {
         return word(r).map(|n| format!("lib:{n}"));
     }
-    if let Some(h) = l.strip_prefix("checking for ").and_then(|r| r.strip_suffix("... no")).filter(|h| h.ends_with(".h")) {
+    if let Some(h) =
+        l.strip_prefix("checking for ").and_then(|r| r.strip_suffix("... no")).filter(|h| h.ends_with(".h"))
+    {
         return Some(format!("h:{h}"));
     }
     // cmake
@@ -1420,7 +1429,9 @@ fn miss(l: &str) -> Option<String> {
     }
     // mozbuild's check_prog, by the name configure gave it, which can be the recipe's rather
     // than the program's: checking for nodejs... not found
-    if let Some(n) = l.strip_prefix("checking for ").and_then(|r| r.strip_suffix("... not found")).filter(|n| !n.contains(' ')) {
+    if let Some(n) =
+        l.strip_prefix("checking for ").and_then(|r| r.strip_suffix("... not found")).filter(|n| !n.contains(' '))
+    {
         return Some(format!("cmd:{n}"));
     }
     if let Some(n) = between("No module named '", "'") {
@@ -1438,7 +1449,9 @@ fn miss(l: &str) -> Option<String> {
     }
     // lttng-ust's configure: the 'setuptools' module needs to be installed for the selected
     // interpreter. flatpak's meson.build: python3 "pyparsing" module is required
-    if let Some(n) = between("the '", "' module needs to be installed").or_else(|| between("\"", "\" module is required")) {
+    if let Some(n) =
+        between("the '", "' module needs to be installed").or_else(|| between("\"", "\" module is required"))
+    {
         return Some(format!("py:{n}"));
     }
     // a macro aclocal never found goes into configure as it is, and sh trips on it there:
@@ -1462,7 +1475,8 @@ fn miss(l: &str) -> Option<String> {
         return word(r).and_then(|n| n.split('.').next().map(|m| format!("py:{m}")));
     }
     // make, perl and cargo each say a program is missing their own way
-    let make = l.strip_prefix("make: ").or_else(|| l.strip_prefix("make[").and_then(|r| r.split_once("]: ")).map(|(_, r)| r));
+    let make =
+        l.strip_prefix("make: ").or_else(|| l.strip_prefix("make[").and_then(|r| r.split_once("]: ")).map(|(_, r)| r));
     if let Some(n) = make.and_then(|r| r.strip_suffix(": No such file or directory")) {
         // @LIBTOOL@ is configure's substitution that never happened, not a program. a
         // relative path is a script of the tree's own whose #! names what is missing:
@@ -1485,7 +1499,9 @@ fn miss(l: &str) -> Option<String> {
     }
     // sip-build: pyproject.toml: 'tool.sip.project.qmake': '/usr/lib/qt6/bin/qmake' is not a
     // working qmake
-    if let Some(n) = between_in(l, "", "' is not a working ").and_then(|r| r.rsplit_once('\'').map(|(_, n)| n.to_string())) {
+    if let Some(n) =
+        between_in(l, "", "' is not a working ").and_then(|r| r.rsplit_once('\'').map(|(_, n)| n.to_string()))
+    {
         return (n.starts_with('/') && !n.contains(' ')).then(|| format!("path:{n}"));
     }
     // a #!/usr/bin/env bash with no bash, busybox's env and then coreutils'
@@ -1576,7 +1592,9 @@ fn miss(l: &str) -> Option<String> {
     }
     // PKG_CHECK_VAR with its own message: Unable to retrieve girdir from
     // gobject-introspection-1.0.pc
-    if let Some(n) = between("Unable to retrieve ", ".pc").and_then(|r| r.split_once(" from ").map(|(_, n)| n.to_string())) {
+    if let Some(n) =
+        between("Unable to retrieve ", ".pc").and_then(|r| r.split_once(" from ").map(|(_, n)| n.to_string()))
+    {
         return (!n.contains(' ')).then(|| format!("pc:{n}"));
     }
     // apr's find_apr.m4 when its config script is absent: the --with-apr-util parameter is
@@ -1634,9 +1652,8 @@ fn stubbed(log: &str) -> Vec<String> {
 // under a marker is for some other python
 fn build_requires(src: &Path) -> Vec<String> {
     let tops = fs::read_dir(src).into_iter().flatten().flatten().map(|e| e.path());
-    let Some(text) = std::iter::once(src.to_path_buf())
-        .chain(tops)
-        .find_map(|d| fs::read_to_string(d.join("pyproject.toml")).ok())
+    let Some(text) =
+        std::iter::once(src.to_path_buf()).chain(tops).find_map(|d| fs::read_to_string(d.join("pyproject.toml")).ok())
     else {
         return Vec::new();
     };
@@ -1651,7 +1668,8 @@ fn build_requires(src: &Path) -> Vec<String> {
             (None, '"' | '\'') => quote = Some(c),
             (Some(q), _) if c == q => {
                 quote = None;
-                let name: String = cur.chars().take_while(|x| x.is_ascii_alphanumeric() || "-_.".contains(*x)).collect();
+                let name: String =
+                    cur.chars().take_while(|x| x.is_ascii_alphanumeric() || "-_.".contains(*x)).collect();
                 if !name.is_empty() && !cur.contains(';') {
                     out.push(format!("py:{}", pydist(&name)));
                 }
@@ -1683,7 +1701,10 @@ fn shebang_of(src: &Path, rel: &str) -> Option<String> {
 fn unexpanded(src: &Path, n: usize) -> Option<String> {
     let mut files = Vec::new();
     under(src, &mut files);
-    let f = files.iter().filter(|f| f.file_name().is_some_and(|x| x == "configure")).min_by_key(|f| f.components().count())?;
+    let f = files
+        .iter()
+        .filter(|f| f.file_name().is_some_and(|x| x == "configure"))
+        .min_by_key(|f| f.components().count())?;
     let text = read_log(f);
     let lines: Vec<&str> = text.lines().take(n).collect();
     lines.iter().rev().take(5).find_map(|l| {
@@ -1709,7 +1730,9 @@ fn apkindex(root: &Path) -> HashMap<String, String> {
             } else if let Some(o) = l.strip_prefix("o:") {
                 origin = o.to_string();
             } else if let Some(ps) = l.strip_prefix("p:") {
-                names.extend(ps.split_whitespace().map(|x| x.split(['=', '<', '>', '~']).next().unwrap_or(x).to_string()));
+                names.extend(
+                    ps.split_whitespace().map(|x| x.split(['=', '<', '>', '~']).next().unwrap_or(x).to_string()),
+                );
             }
         }
     }
@@ -1731,7 +1754,10 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
         match k {
             "pc" => path.ends_with(&format!("/pkgconfig/{n}.pc")),
             "cmd" => ["usr/bin/", "usr/sbin/", "bin/", "sbin/"].iter().any(|d| path.strip_prefix(d) == Some(n)),
-            "lib" => path.strip_prefix(lib).and_then(|r| r.strip_prefix('/')).is_some_and(|f| f.starts_with(&format!("lib{n}.so"))),
+            "lib" => path
+                .strip_prefix(lib)
+                .and_then(|r| r.strip_prefix('/'))
+                .is_some_and(|f| f.starts_with(&format!("lib{n}.so"))),
             "h" => path.strip_prefix(inc).and_then(|r| r.strip_prefix('/')) == Some(n),
             // setuptools ships distutils as distutils-precedence.pth, the way pykey() reads it
             "py" => path.split_once("/site-packages/").is_some_and(|(_, f)| {
@@ -1744,7 +1770,9 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
                 path.starts_with("usr/share/aclocal/")
                     && path.ends_with(".m4")
                     && fs::read_to_string(root.join(path)).is_ok_and(|s| {
-                        [format!("AC_DEFUN([{n}]"), format!("AC_DEFUN({n},"), format!("AU_DEFUN([{n}]")].iter().any(|d| s.contains(d.as_str()))
+                        [format!("AC_DEFUN([{n}]"), format!("AC_DEFUN({n},"), format!("AU_DEFUN([{n}]")]
+                            .iter()
+                            .any(|d| s.contains(d.as_str()))
                     })
             }
             // under any of perl's dirs: usr/share/perl5/vendor_perl/XML/Parser.pm
@@ -1755,7 +1783,10 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
             "path" => path == n.trim_start_matches('/'),
             "el" => {
                 path.starts_with("usr/share/emacs/")
-                    && path.rsplit('/').next().is_some_and(|f| [".el", ".elc", ".el.gz"].iter().any(|x| f == format!("{n}{x}")))
+                    && path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|f| [".el", ".elc", ".el.gz"].iter().any(|x| f == format!("{n}{x}")))
             }
             "cmake" => {
                 let pl = path.to_lowercase();
@@ -1801,7 +1832,10 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     // on the path itself. only off the recipe's own list, config.h is in a hundred packages
     if k == "h" {
         let under = |e: &str| e.strip_prefix(inc).is_some_and(|r| r.ends_with(&format!("/{n}")));
-        if let Some(d) = pool.iter().find(|d| fresh(d) && db::read(root, t, d).is_ok_and(|r| r.manifest.iter().any(|e| under(&e.path)))) {
+        if let Some(d) = pool
+            .iter()
+            .find(|d| fresh(d) && db::read(root, t, d).is_ok_and(|r| r.manifest.iter().any(|e| under(&e.path))))
+        {
             return Some(((*d).to_string(), "name"));
         }
     }
@@ -1810,14 +1844,18 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     let origin = match k {
         "pc" | "cmd" => index.get(m).cloned(),
         "py" => {
-            let mut hits: Vec<&String> =
-                index.iter().filter(|(key, _)| key.starts_with("py3.") && key.ends_with(&format!(":{n}"))).map(|(_, o)| o).collect();
+            let mut hits: Vec<&String> = index
+                .iter()
+                .filter(|(key, _)| key.starts_with("py3.") && key.ends_with(&format!(":{n}")))
+                .map(|(_, o)| o)
+                .collect();
             hits.sort();
             hits.first().map(|o| (*o).clone())
         }
         "lib" => {
             let pre = format!("so:lib{n}.so");
-            let mut hits: Vec<&String> = index.iter().filter(|(key, _)| key.starts_with(&pre)).map(|(_, o)| o).collect();
+            let mut hits: Vec<&String> =
+                index.iter().filter(|(key, _)| key.starts_with(&pre)).map(|(_, o)| o).collect();
             hits.sort();
             hits.first().map(|o| (*o).clone())
         }
@@ -1857,7 +1895,9 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     // a binding is named for what it binds, Lpeg is lua-lpeg. a whole word of a name on the
     // recipe's own list, never a guess across the tree, lib on either end of it allowed:
     // cmake's GIF is giflib and its JPEG is libjpeg-turbo
-    let named_for = |w: &str| w == stem || w.strip_prefix("lib") == Some(stem.as_str()) || w.strip_suffix("lib") == Some(stem.as_str());
+    let named_for = |w: &str| {
+        w == stem || w.strip_prefix("lib") == Some(stem.as_str()) || w.strip_suffix("lib") == Some(stem.as_str())
+    };
     let word = pool.iter().find(|c| c.split('-').any(named_for) && fresh(c)).map(|c| ((*c).to_string(), "name"));
     // a module several dists share goes to the one the recipe lists: py3-crashtest's
     // poetry is py3-poetry-core and not poetry, which ships poetry too and needs crashtest
@@ -1873,7 +1913,11 @@ fn answers(root: &Path, t: &str, m: &str, p: &Package, have: &[Dep]) -> Option<(
     // a cmake package is named without the version a recipe carries: Lua is lua5.1 on a
     // list that has lua5.1 to lua5.5, and the first one listed is the one taken
     pool.iter()
-        .find(|c| c.strip_prefix(stem.as_str()).is_some_and(|r| !r.is_empty() && r.chars().all(|x| x.is_ascii_digit() || x == '.')) && fresh(c))
+        .find(|c| {
+            c.strip_prefix(stem.as_str())
+                .is_some_and(|r| !r.is_empty() && r.chars().all(|x| x.is_ascii_digit() || x == '.'))
+                && fresh(c)
+        })
         .map(|c| ((*c).to_string(), "name"))
 }
 
@@ -2166,17 +2210,9 @@ fn undeclared(
     // what will still be there once the build is over. a make dep is a tool, and nothing
     // installs one on the strength of something linking it -- so a shipped file linking
     // a make dep's library is a package that works here and not on a clean root
-    let mut declared: HashSet<String> = deps
-        .iter()
-        .filter(|d| !d.make && d.applies(target))
-        .map(|d| d.name.clone())
-        .collect();
-    declared.extend(
-        sandbox::substrate(target)
-            .iter()
-            .filter(|(_, make)| !make)
-            .map(|(n, _)| (*n).to_string()),
-    );
+    let mut declared: HashSet<String> =
+        deps.iter().filter(|d| !d.make && d.applies(target)).map(|d| d.name.clone()).collect();
+    declared.extend(sandbox::substrate(target).iter().filter(|(_, make)| !make).map(|(n, _)| (*n).to_string()));
 
     let mut runtime: HashSet<String> = HashSet::new();
     let mut queue: Vec<String> = declared.iter().cloned().collect();
@@ -2185,12 +2221,7 @@ fn undeclared(
             continue;
         }
         if let Ok(rec) = db::read(root, target, &n) {
-            queue.extend(
-                rec.depends
-                    .iter()
-                    .filter(|d| !d.make && d.applies(target))
-                    .map(|d| d.name.clone()),
-            );
+            queue.extend(rec.depends.iter().filter(|d| !d.make && d.applies(target)).map(|d| d.name.clone()));
         }
     }
 
@@ -2216,11 +2247,7 @@ fn undeclared(
             }
             // reachable through a declared dep's own deps, so it is there today and
             // nothing wrote down that it has to be
-            let kind = if runtime.contains(who) {
-                "undeclared"
-            } else {
-                "build-only"
-            };
+            let kind = if runtime.contains(who) { "undeclared" } else { "build-only" };
             Some((w, who.clone(), kind))
         })
         .collect()
@@ -2241,11 +2268,7 @@ fn undeclared(
 fn unbacked(root: &Path, deps: &[Dep], t: &str, dest: &Path) -> Vec<String> {
     let mut files = Vec::new();
     under(dest, &mut files);
-    let needed: HashSet<String> = files
-        .iter()
-        .filter_map(|x| elf::read(x).ok())
-        .flat_map(|o| o.needed)
-        .collect();
+    let needed: HashSet<String> = files.iter().filter_map(|x| elf::read(x).ok()).flat_map(|o| o.needed).collect();
 
     let mut doubt: Vec<(String, Vec<String>)> = Vec::new();
     for d in deps.iter().filter(|d| !d.make && d.applies(t)) {
@@ -2301,7 +2324,8 @@ fn loaded(root: &Path, deps: &[Dep], t: &str, dest: &Path, linked: &BTreeSet<Str
     let mut want: Vec<(String, Vec<String>)> = Vec::new();
     for d in deps.iter().filter(|d| d.make && d.applies(t) && !linked.contains(&d.name)) {
         let ps = db::read_provides(root, t, &d.name).unwrap_or_default();
-        let stems: Vec<String> = ps.iter().map(|p| p.soname.split(".so").next().unwrap_or(&p.soname).to_string() + ".so").collect();
+        let stems: Vec<String> =
+            ps.iter().map(|p| p.soname.split(".so").next().unwrap_or(&p.soname).to_string() + ".so").collect();
         if !stems.is_empty() {
             want.push((d.name.clone(), stems));
         }
@@ -2332,9 +2356,9 @@ fn names_at_runtime(b: &[u8]) -> bool {
     b.split(|c| *c == 0).any(|w| {
         w.len() < 256
             && w.iter().all(|c| (0x20..0x7f).contains(c))
-            && w.windows(2).position(|p| p[0] == b'%' && matches!(p[1], b's' | b'd' | b'.')).is_some_and(|at| {
-                w[at..].windows(3).any(|x| x == b".so") || w[..at].ends_with(b"lib")
-            })
+            && w.windows(2)
+                .position(|p| p[0] == b'%' && matches!(p[1], b's' | b'd' | b'.'))
+                .is_some_and(|at| w[at..].windows(3).any(|x| x == b".so") || w[..at].ends_with(b"lib"))
     })
 }
 
@@ -2349,7 +2373,8 @@ fn names_at_runtime(b: &[u8]) -> bool {
 fn dlnotes(b: &[u8]) -> Vec<(String, Vec<String>)> {
     let u16at = |at: usize| b.get(at..at + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize);
     let u32at = |at: usize| b.get(at..at + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]) as usize);
-    let u64at = |at: usize| b.get(at..at + 8).and_then(|x| usize::try_from(u64::from_le_bytes(x.try_into().ok()?)).ok());
+    let u64at =
+        |at: usize| b.get(at..at + 8).and_then(|x| usize::try_from(u64::from_le_bytes(x.try_into().ok()?)).ok());
     let mut out = Vec::new();
     if b.get(..5) != Some(b"\x7fELF\x02".as_slice()) {
         return out;
@@ -2535,10 +2560,7 @@ fn interpreters(root: &Path, t: &str, dest: &Path) -> Vec<(String, String)> {
     let own = owners(root);
     want.into_iter()
         .filter_map(|w| {
-            let cmd = ["usr/bin/", "usr/sbin/", "bin/", "sbin/"]
-                .iter()
-                .find_map(|d| w.strip_prefix(d))
-                .unwrap_or(&w);
+            let cmd = ["usr/bin/", "usr/sbin/", "bin/", "sbin/"].iter().find_map(|d| w.strip_prefix(d)).unwrap_or(&w);
             if cmd.contains('/') {
                 return None;
             }
@@ -2621,7 +2643,12 @@ fn pyimports(text: &str) -> Vec<(usize, String, Vec<String>)> {
             }
             let names = names
                 .split(',')
-                .map(|n| n.split(" as ").next().unwrap_or_default().trim_matches(|c: char| c.is_whitespace() || "()\\".contains(c)))
+                .map(|n| {
+                    n.split(" as ")
+                        .next()
+                        .unwrap_or_default()
+                        .trim_matches(|c: char| c.is_whitespace() || "()\\".contains(c))
+                })
                 .filter(|n| !n.is_empty() && *n != "*")
                 .map(str::to_string)
                 .collect();
@@ -2640,10 +2667,43 @@ fn pyimports(text: &str) -> Vec<(usize, String, Vec<String>)> {
 // always compiled into the interpreter, so no file anywhere ships them. sys.builtin_module_names
 // of a static 3.14, and the edge to the interpreter comes from site-packages or the #!
 const PY_BUILTIN: &[&str] = &[
-    "_abc", "_ast", "_codecs", "_collections", "_contextvars", "_datetime", "_functools", "_imp", "_io",
-    "_locale", "_opcode", "_operator", "_signal", "_sre", "_stat", "_string", "_suggestions", "_symtable",
-    "_sysconfig", "_thread", "_tokenize", "_tracemalloc", "_types", "_typing", "_warnings", "_weakref",
-    "atexit", "builtins", "errno", "faulthandler", "gc", "itertools", "marshal", "posix", "pwd", "sys", "time",
+    "_abc",
+    "_ast",
+    "_codecs",
+    "_collections",
+    "_contextvars",
+    "_datetime",
+    "_functools",
+    "_imp",
+    "_io",
+    "_locale",
+    "_opcode",
+    "_operator",
+    "_signal",
+    "_sre",
+    "_stat",
+    "_string",
+    "_suggestions",
+    "_symtable",
+    "_sysconfig",
+    "_thread",
+    "_tokenize",
+    "_tracemalloc",
+    "_types",
+    "_typing",
+    "_warnings",
+    "_weakref",
+    "atexit",
+    "builtins",
+    "errno",
+    "faulthandler",
+    "gc",
+    "itertools",
+    "marshal",
+    "posix",
+    "pwd",
+    "sys",
+    "time",
 ];
 
 // the top-level modules a package's python cannot start without and does not ship itself.
@@ -2654,7 +2714,11 @@ const PY_BUILTIN: &[&str] = &[
 //
 // a module under site-packages runs on the interpreter whose stdlib sits beside it, and os
 // is the stdlib file every python has, so that is the edge to the interpreter
-fn pyneeds(files: &BTreeSet<String>, read: &dyn Fn(&str) -> Option<String>, script: &dyn Fn(&str) -> bool) -> BTreeSet<String> {
+fn pyneeds(
+    files: &BTreeSet<String>,
+    read: &dyn Fn(&str) -> Option<String>,
+    script: &dyn Fn(&str) -> bool,
+) -> BTreeSet<String> {
     let mut need = BTreeSet::new();
     let mut queue: Vec<String> = Vec::new();
     for f in files {
@@ -2709,15 +2773,20 @@ fn pyneeds(files: &BTreeSet<String>, read: &dyn Fn(&str) -> Option<String>, scri
             // the files an import runs, resolved against one directory. a.b.c runs
             // a/__init__.py and a/b/__init__.py on the way
             let resolve = |from: &str| -> Vec<String> {
-                let path = |m: &str| if m.is_empty() { from.to_string() } else { format!("{from}/{}", m.replace('.', "/")) };
+                let path =
+                    |m: &str| if m.is_empty() { from.to_string() } else { format!("{from}/{}", m.replace('.', "/")) };
                 let mut hit = Vec::new();
                 for i in 1..=parts.len() {
                     let p = path(&parts[..i].join("."));
-                    hit.extend([format!("{p}/__init__.py"), format!("{p}.py")].into_iter().filter(|c| files.contains(c)));
+                    hit.extend(
+                        [format!("{p}/__init__.py"), format!("{p}.py")].into_iter().filter(|c| files.contains(c)),
+                    );
                 }
                 for n in &names {
                     let p = path(&if m.is_empty() { n.clone() } else { format!("{m}.{n}") });
-                    hit.extend([format!("{p}/__init__.py"), format!("{p}.py")].into_iter().filter(|c| files.contains(c)));
+                    hit.extend(
+                        [format!("{p}/__init__.py"), format!("{p}.py")].into_iter().filter(|c| files.contains(c)),
+                    );
                 }
                 hit
             };
@@ -2779,7 +2848,10 @@ fn pykey(path: &str) -> Option<(String, bool)> {
     let (real, space) = match deeper {
         "" => (top.ends_with(".py") || top.ends_with(".so"), false),
         "__init__.py" => (true, false),
-        d => (false, d.ends_with(".py") && (!d.contains('/') || d.matches('/').count() == 1 && d.ends_with("/__init__.py"))),
+        d => (
+            false,
+            d.ends_with(".py") && (!d.contains('/') || d.matches('/').count() == 1 && d.ends_with("/__init__.py")),
+        ),
     };
     (real || space).then(|| (format!("py:{name}"), real))
 }
@@ -2823,10 +2895,7 @@ const KEPT: &[&str] = &[
 fn trim(dest: &Path, t: &str, name: &str) -> Result<(), String> {
     // nitro is the init, so an openrc service has no openrc-run to start it. alpine's
     // recipes install them and so do plenty of make installs
-    let openrc: Vec<&str> = ["etc/init.d", "etc/conf.d"]
-        .into_iter()
-        .filter(|d| dest.join(d).exists())
-        .collect();
+    let openrc: Vec<&str> = ["etc/init.d", "etc/conf.d"].into_iter().filter(|d| dest.join(d).exists()).collect();
     for d in &openrc {
         let at = dest.join(d);
         fs::remove_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
@@ -2927,10 +2996,7 @@ fn sources(root: &Path, p: &Package) -> Result<Vec<(String, PathBuf, String)>, S
                     _ => sum.clone(),
                 };
                 if want != &got {
-                    return Err(format!(
-                        "{}: checksum is {got}, recipe says {want}",
-                        path.display()
-                    ));
+                    return Err(format!("{}: checksum is {got}, recipe says {want}", path.display()));
                 }
             }
             None => complain(&format!("{}: no checksum, sha256 is {sum}", path.display())),
@@ -3016,7 +3082,7 @@ fn branches(near: &Path) -> Result<Vec<String>, String> {
             Some((x.parse().ok()?, y.parse().ok()?, b.to_string()))
         })
         .collect();
-    v.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    v.sort_by_key(|x| std::cmp::Reverse((x.0, x.1)));
     Ok(v.into_iter().map(|(_, _, b)| format!("{DISTFILES}{b}")).collect())
 }
 
@@ -3038,10 +3104,7 @@ fn fetcher(url: &str, dst: &Path) -> Result<Command, String> {
         c.arg("-sS");
     }
     for w in words {
-        c.arg(
-            w.replace("%o", &dst.display().to_string())
-                .replace("%u", url),
-        );
+        c.arg(w.replace("%o", &dst.display().to_string()).replace("%u", url));
     }
     Ok(c)
 }
@@ -3060,12 +3123,8 @@ fn fetcher(url: &str, dst: &Path) -> Result<Command, String> {
 // -march comes off as a filter rather than a CFLAGS_MARCH line with nothing after it,
 // which reads as a setting someone forgot to finish, and would take rust's target-cpu
 // with it
-const LADDER: &[(bool, &str)] = &[
-    (true, "filter-lto"),
-    (false, "OPT -O2"),
-    (true, "filter-flags -march=*"),
-    (true, "strip-flags"),
-];
+const LADDER: &[(bool, &str)] =
+    &[(true, "filter-lto"), (false, "OPT -O2"), (true, "filter-flags -march=*"), (true, "strip-flags")];
 
 fn note(at: &Path, line: &str, why: &str) -> Result<(), String> {
     let had = fs::read_to_string(at).unwrap_or_default();
@@ -3076,8 +3135,7 @@ fn note(at: &Path, line: &str, why: &str) -> Result<(), String> {
         fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
     let gap = if had.is_empty() || had.ends_with('\n') { "" } else { "\n" };
-    fs::write(at, format!("{had}{gap}# {} {why}\n{line}\n", today()))
-        .map_err(|e| format!("{}: {e}", at.display()))
+    fs::write(at, format!("{had}{gap}# {} {why}\n{line}\n", today())).map_err(|e| format!("{}: {e}", at.display()))
 }
 
 fn stuck(p: &Package, t: &str, why: &str) -> String {
@@ -3144,11 +3202,7 @@ fn compiled(log: &str) -> bool {
 // it, and past all of those the line make's first failure comes right after is: rrdtool's
 // was `The setup requires setuptools.`, with no word in it to look for
 fn blame(log: &str) -> String {
-    let lines: Vec<String> = log
-        .lines()
-        .map(|l| unescaped(l).trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let lines: Vec<String> = log.lines().map(|l| unescaped(l).trim().to_string()).filter(|l| !l.is_empty()).collect();
     let summary = |l: &str| {
         let w: Vec<&str> = l.split_whitespace().collect();
         matches!(w[..], [.., "Error", n] | [.., "Error", n, "(ignored)"] if n.parse::<u32>().is_ok())
@@ -3160,10 +3214,7 @@ fn blame(log: &str) -> String {
     let hit = |words: &[&str]| {
         lines.iter().find(|l| {
             let s = l.to_lowercase();
-            !summary(l)
-                && !s.starts_with("checking ")
-                && !s.contains("warning:")
-                && words.iter().any(|w| s.contains(w))
+            !summary(l) && !s.starts_with("checking ") && !s.contains("warning:") && words.iter().any(|w| s.contains(w))
         })
     };
     let stopped = lines.iter().position(|l| summary(l) && !l.ends_with("(ignored)"));
@@ -3264,11 +3315,8 @@ fn recover(root: &Path, p: &Package, ts: &[String], verbose: bool, at_once: usiz
             loud!("{e}");
         }
         // build() stops at the first target that fails and its errors lead with it
-        let t = ts
-            .iter()
-            .find(|t| e.starts_with(&format!("{} {t}:", p.name)))
-            .or(ts.first())
-            .map_or("", String::as_str);
+        let t =
+            ts.iter().find(|t| e.starts_with(&format!("{} {t}:", p.name))).or(ts.first()).map_or("", String::as_str);
         let first = firstlog(root, p, t);
         let log = read_log(&logpath(root, p, t));
         // every retry truncates the log, so without this the failure that started it all
@@ -3306,11 +3354,7 @@ fn recover(root: &Path, p: &Package, ts: &[String], verbose: bool, at_once: usiz
             // no note anywhere: the recipe and the settings are both innocent here
             loud!("first failure is {}", first.display());
             undo();
-            return Err(format!(
-                "{} {t}: stuck, nothing compiled: {}",
-                p.name,
-                blame(&log)
-            ));
+            return Err(format!("{} {t}: stuck, nothing compiled: {}", p.name, blame(&log)));
         }
 
         // a rung that resolves to the flags already in force rebuilds into a result
@@ -3398,9 +3442,7 @@ fn bisect_cmd(args: &[String]) {
 // comments above that belong to whoever wrote them
 fn unrung(text: &str) -> String {
     let dated = |c: &&str| {
-        c.split_whitespace()
-            .nth(1)
-            .is_some_and(|d| d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-')
+        c.split_whitespace().nth(1).is_some_and(|d| d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-')
     };
     let mut out: Vec<&str> = Vec::new();
     let mut block: Vec<&str> = Vec::new();
@@ -3428,10 +3470,7 @@ fn unrung(text: &str) -> String {
 }
 
 fn artifact(root: &Path, p: &Package, t: &str) -> PathBuf {
-    root.join("var/kiry/cache").join(format!(
-        "{}-{}-{}.{t}.tar.zst",
-        p.name, p.version.upstream, p.version.rev
-    ))
+    root.join("var/kiry/cache").join(format!("{}-{}-{}.{t}.tar.zst", p.name, p.version.upstream, p.version.rev))
 }
 
 // cached() without the line it prints, for planning, which asks before anything runs
@@ -3475,12 +3514,7 @@ fn stale(root: &Path, p: &Package, t: &str, art: &Path) -> Option<&'static str> 
         }
     }
     if let Ok(was) = fs::read_to_string(d.join("flags")) {
-        let had: Vec<String> = was
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect();
+        let had: Vec<String> = was.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
         match flags(root, &p.name, Some(&p.dir)) {
             Ok(f) if f.record() == had => {}
             _ => return Some("flags changed"),
@@ -3499,10 +3533,7 @@ fn stale(root: &Path, p: &Package, t: &str, art: &Path) -> Option<&'static str> 
 // a trained profile outlives the build that made it, which is what spares the next build
 // its training run. per target, because musl and gnu compile different code
 fn profile(root: &Path, p: &Package, t: &str) -> PathBuf {
-    root.join("var/kiry/profiles")
-        .join(&p.name)
-        .join(t)
-        .join("merged.profdata")
+    root.join("var/kiry/profiles").join(&p.name).join(t).join("merged.profdata")
 }
 
 // the bolt profile is a second word only when there is one, so an artifact recorded
@@ -3530,12 +3561,7 @@ fn keep_bolt(out: &Path, stored: &Path) -> Result<(), String> {
 // generated-for is for whoever wonders how old it is: an indexed profile only reads
 // forward, so after a clang bump the version it was written by is the first question.
 // its last word is how many functions the training build itself discarded
-fn keep_profile(
-    p: &Package,
-    out: &Path,
-    stored: &Path,
-    missed: Option<usize>,
-) -> Result<(), String> {
+fn keep_profile(p: &Package, out: &Path, stored: &Path, missed: Option<usize>) -> Result<(), String> {
     let dir = stored.parent().unwrap_or(stored);
     mkdirs(dir)?;
     let part = dir.join("merged.profdata.part");
@@ -3561,17 +3587,11 @@ fn keep_profile(
 
 // the attempt that started a recovery, kept beside the log the retries keep overwriting
 fn firstlog(root: &Path, p: &Package, t: &str) -> PathBuf {
-    root.join("var/kiry/log").join(format!(
-        "{}-{}-{}.{t}.first.log",
-        p.name, p.version.upstream, p.version.rev
-    ))
+    root.join("var/kiry/log").join(format!("{}-{}-{}.{t}.first.log", p.name, p.version.upstream, p.version.rev))
 }
 
 fn logpath(root: &Path, p: &Package, t: &str) -> PathBuf {
-    root.join("var/kiry/log").join(format!(
-        "{}-{}-{}.{t}.log",
-        p.name, p.version.upstream, p.version.rev
-    ))
+    root.join("var/kiry/log").join(format!("{}-{}-{}.{t}.log", p.name, p.version.upstream, p.version.rev))
 }
 
 // lossy bc one byte that is not utf-8 made the whole log read as empty. libbsd's had
@@ -3580,6 +3600,7 @@ fn read_log(at: &Path) -> String {
     String::from_utf8_lossy(&fs::read(at).unwrap_or_default()).into_owned()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile(
     root: &Path,
     p: &Package,
@@ -3592,10 +3613,7 @@ fn compile(
     closure: &[Dep],
 ) -> Result<(PathBuf, Vec<String>, Vec<String>), Fail> {
     let start = Instant::now();
-    let work = root.join("var/kiry/stage").join(format!(
-        "{}-{}-{}.{t}",
-        p.name, p.version.upstream, p.version.rev
-    ));
+    let work = root.join("var/kiry/stage").join(format!("{}-{}-{}.{t}", p.name, p.version.upstream, p.version.rev));
     let src = work.join("src");
     let dest = work.join("dest");
 
@@ -3611,7 +3629,7 @@ fn compile(
     let mut script = p.dir.join("build");
     if boot {
         let at = p.dir.join("bootstrap");
-        let has = fs::read_to_string(&at).map_or(false, |t| {
+        let has = fs::read_to_string(&at).is_ok_and(|t| {
             t.lines().any(|l| {
                 let l = l.trim();
                 !l.is_empty() && !l.starts_with('#')
@@ -3662,8 +3680,7 @@ fn compile(
     // carry locks and build from what they ship, and a go.sum inside a vendored crate is
     // no go build. options net alone is every npm and pip recipe too
     let net = text.lines().any(|l| {
-        l.strip_prefix("options=")
-            .is_some_and(|o| o.trim_matches(['"', '\'']).split_whitespace().any(|w| w == "net"))
+        l.strip_prefix("options=").is_some_and(|o| o.trim_matches(['"', '\'']).split_whitespace().any(|w| w == "net"))
     });
     let cargo = root.join("var/kiry/cargo");
     mkdirs(&cargo)?;
@@ -3707,9 +3724,8 @@ fn compile(
     // go build fetches what go.sum lists the moment it runs, so saying it counts. a word
     // pair, since cargo build has go build in it
     let words: Vec<&str> = text.split_whitespace().collect();
-    let downloads = text.contains("go mod download")
-        || words.windows(2).any(|w| w == ["go", "build"])
-        || net && names(&text, "go");
+    let downloads =
+        text.contains("go mod download") || words.windows(2).any(|w| w == ["go", "build"]) || net && names(&text, "go");
     for sum in shallowest(&src, "go.sum", 3).into_iter().filter(|_| downloads) {
         if sum.with_file_name("vendor/modules.txt").is_file() {
             continue;
@@ -3733,8 +3749,7 @@ fn compile(
     let stored = profile(root, p, t);
     let fed = stored.is_file();
     if fed {
-        fs::copy(&stored, share.join("profile.profdata"))
-            .map_err(|e| format!("{}: {e}", stored.display()))?;
+        fs::copy(&stored, share.join("profile.profdata")).map_err(|e| format!("{}: {e}", stored.display()))?;
     }
     let bolt = stored.with_file_name("bolt.yaml");
     let bolted = bolt.is_file();
@@ -3776,10 +3791,7 @@ fn compile(
     let config_site = share.join("config.site");
     fs::write(
         &config_site,
-        CONFIG_SITE
-            .replace("@LIBDIR@", libdir(t))
-            .replace("@INCLUDEDIR@", incdir(t))
-            .replace("@DATADIR@", datadir(t)),
+        CONFIG_SITE.replace("@LIBDIR@", libdir(t)).replace("@INCLUDEDIR@", incdir(t)).replace("@DATADIR@", datadir(t)),
     )
     .map_err(|e| format!("config.site: {e}"))?;
 
@@ -3819,36 +3831,24 @@ fn compile(
     // flags come out empty and a c++ compile then fails at its first include, which says
     // more than a wrapper that refused to be written
     let cxx_extra = match gcc_headers(&sysroot) {
-        Some(d) => format!(
-            " -cxx-isystem {d} -cxx-isystem {d}/x86_64-linux-gnu -cxx-isystem {d}/backward"
-        ),
+        Some(d) => format!(" -cxx-isystem {d} -cxx-isystem {d}/x86_64-linux-gnu -cxx-isystem {d}/backward"),
         None => String::new(),
     };
 
     for (n, body) in [
         ("abuild-meson", meson_wrapper(t)),
         ("abuild-muon", meson_wrapper(t)),
-        (
-            "meson",
-            "#!/bin/sh -e\nexec muon meson \"$@\"\n".to_string(),
-        ),
+        ("meson", "#!/bin/sh -e\nexec muon meson \"$@\"\n".to_string()),
         ("kirycc", cc.replace("@REAL@", "clang").replace("@EXTRA@", "")),
-        (
-            "kiryc++",
-            cc.replace("@REAL@", "clang++").replace("@EXTRA@", &cxx_extra),
-        ),
+        ("kiryc++", cc.replace("@REAL@", "clang++").replace("@EXTRA@", &cxx_extra)),
         // the names these had once, which whatever was built then baked in: libtool on
         // navi says CC="kiry-cc", and libvterm and libmpack died running it
         ("kiry-cc", cc.replace("@REAL@", "clang").replace("@EXTRA@", "")),
-        (
-            "kiry-c++",
-            cc.replace("@REAL@", "clang++").replace("@EXTRA@", &cxx_extra),
-        ),
+        ("kiry-c++", cc.replace("@REAL@", "clang++").replace("@EXTRA@", &cxx_extra)),
     ] {
         let at = bin.join(n);
         fs::write(&at, &body).map_err(|e| format!("{n}: {e}"))?;
-        fs::set_permissions(&at, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("{n}: {e}"))?;
+        fs::set_permissions(&at, fs::Permissions::from_mode(0o755)).map_err(|e| format!("{n}: {e}"))?;
     }
     // a module pkg-config could not find is a miss discover() can name a package for, and
     // plenty of configures send pkg-config's own complaint to /dev/null. the symlink goes
@@ -3903,10 +3903,7 @@ fn compile(
         // asking for libdrm would be handed the musl one's cflags and libs and link
         // against it without a word, which is the whole failure the split directory
         // exists to prevent, arriving through a text file
-        .env(
-            "PKG_CONFIG_LIBDIR",
-            format!("{}/pkgconfig:{}/pkgconfig", libdir(t), datadir(t)),
-        )
+        .env("PKG_CONFIG_LIBDIR", format!("{}/pkgconfig:{}/pkgconfig", libdir(t), datadir(t)))
         // named rather than left to cc, because a configure that goes looking finds
         // clang either way and the point is the flags that come with it
         .env("CC", "kirycc")
@@ -3921,10 +3918,7 @@ fn compile(
         .env("KIRY_NAME", &p.name)
         .env("KIRY_VERSION", &p.version.upstream)
         .env("KIRY_REV", p.version.rev.to_string())
-        .env(
-            "KIRY_PROFILE",
-            if fed { "/usr/share/kiry/profile.profdata" } else { "" },
-        )
+        .env("KIRY_PROFILE", if fed { "/usr/share/kiry/profile.profdata" } else { "" })
         // /src because /tmp dies with the namespace and /dest gets packaged
         .env("KIRY_PROFILE_OUT", "/src/.kiry-profile.profdata")
         .env("KIRY_BOLT_PROFILE", if bolted { "/usr/share/kiry/profile.bolt.yaml" } else { "" })
@@ -3972,9 +3966,7 @@ fn compile(
     if !verbose {
         mkdirs(&root.join("var/kiry/log"))?;
         let out = fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
-        let err = out
-            .try_clone()
-            .map_err(|e| format!("{}: {e}", log.display()))?;
+        let err = out.try_clone().map_err(|e| format!("{}: {e}", log.display()))?;
         c.stdout(out).stderr(err);
     }
 
@@ -4014,7 +4006,8 @@ fn compile(
                     "{} {t}: staged under dest/, so DESTDIR went in twice. a PREFIX or \
                      prefix naming $DESTDIR on a make that honours DESTDIR too",
                     p.name
-                ).into());
+                )
+                .into());
             }
             // clang drops the counts of a function whose cfg moved and compiles it cold,
             // so an old profile costs speed, never correctness. retraining is hours for
@@ -4023,11 +4016,7 @@ fn compile(
             // that each have a main collide by name in a profile and never match
             let missed = match verbose {
                 true => None,
-                false => Some(
-                    read_log(&log)
-                        .matches("(hash mismatch)")
-                        .count(),
-                ),
+                false => Some(read_log(&log).matches("(hash mismatch)").count()),
             };
             let bolt_out = src.join(".kiry-profile.bolt.yaml");
             if bolt_out.is_file() {
@@ -4110,11 +4099,7 @@ fn compile(
             }
             Ok((work, linked.into_iter().collect(), dropped))
         }
-        Ok(_) => Err(Fail::Build {
-            log: (!verbose).then_some(log),
-            work,
-            secs: start.elapsed().as_secs(),
-        }),
+        Ok(_) => Err(Fail::Build { log: (!verbose).then_some(log), work, secs: start.elapsed().as_secs() }),
         Err(e) => Err(Fail::Other(format!("{} {t}: {e}", p.name))),
     }
 }
@@ -4369,9 +4354,7 @@ fn cache_rate(root: &Path, p: &Package, t: &str, work: &Path) -> Option<String> 
     let got = fs::read_to_string(work.join("thinlto")).ok()?;
     let mut w = got.split_whitespace().map(|n| n.parse::<usize>().ok());
     let (hits, misses) = (w.next()??, w.next()??);
-    let now = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let _ = mkdirs(&root.join("var/kiry/log"));
     let _ = fs::OpenOptions::new()
         .create(true)
@@ -4650,23 +4633,14 @@ fn datadir(t: &str) -> &'static str {
 // them, so it looks in /usr/include/c++, which is musl's side
 fn gcc_headers(sysroot: &Path) -> Option<String> {
     let at = sysroot.join("usr/x86_64-linux-gnu/usr/include/c++");
-    let mut v: Vec<String> = fs::read_dir(&at)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
+    let mut v: Vec<String> =
+        fs::read_dir(&at).ok()?.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     v.sort();
-    Some(format!(
-        "/usr/x86_64-linux-gnu/usr/include/c++/{}",
-        v.pop()?
-    ))
+    Some(format!("/usr/x86_64-linux-gnu/usr/include/c++/{}", v.pop()?))
 }
 
 fn meson_wrapper(t: &str) -> String {
-    MESON
-        .replace("@LIBDIR@", libdir(t))
-        .replace("@INCLUDEDIR@", incdir(t))
-        .replace("@DATADIR@", datadir(t))
+    MESON.replace("@LIBDIR@", libdir(t)).replace("@INCLUDEDIR@", incdir(t)).replace("@DATADIR@", datadir(t))
 }
 
 fn libdir(t: &str) -> &'static str {
@@ -4712,11 +4686,7 @@ fn makeflags(jobs: usize, at_once: usize) -> String {
 // a level gets here, which is the first point that ordering changes anything. the first
 // failure stops anything new starting and waits out what is already running, because a
 // build killed halfway leaves a stage directory behind that nothing claims
-fn parallel<T: Sync>(
-    items: &[T],
-    width: usize,
-    f: impl Fn(&T) -> Result<(), String> + Sync,
-) -> Result<(), String> {
+fn parallel<T: Sync>(items: &[T], width: usize, f: impl Fn(&T) -> Result<(), String> + Sync) -> Result<(), String> {
     let next = AtomicUsize::new(0);
     let failed: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     std::thread::scope(|s| {
@@ -4806,8 +4776,7 @@ fn prefetch(c: &mut Command, lock: &Path, patches: &[PathBuf]) -> Result<(), Str
             .status()
             .is_ok_and(|s| s.success())
     };
-    let on: Vec<&PathBuf> =
-        patches.iter().filter(|p| patch(p, Some("--dry-run")) && patch(p, None)).collect();
+    let on: Vec<&PathBuf> = patches.iter().filter(|p| patch(p, Some("--dry-run")) && patch(p, None)).collect();
     let o = c.stdin(Stdio::null()).output();
     for p in on.iter().rev() {
         if !patch(p, Some("-R")) {
@@ -4883,9 +4852,7 @@ fn untar(path: &Path, into: &Path, name: &str) -> Result<(), String> {
         return Err(format!("{name}: {prog} gave us no pipe"));
     };
 
-    let t = tar(Some(Stdio::from(pipe)))
-        .status()
-        .map_err(|e| format!("{name}: tar: {e}"))?;
+    let t = tar(Some(Stdio::from(pipe))).status().map_err(|e| format!("{name}: tar: {e}"))?;
     let x = x.wait().map_err(|e| format!("{name}: {prog}: {e}"))?;
     if !x.success() {
         return Err(format!("{name}: {prog}: {x}"));
@@ -4926,10 +4893,7 @@ fn pack(root: &Path, p: &Package, t: &str, work: &Path) -> Result<(PathBuf, Path
     let cache = root.join("var/kiry/cache");
     mkdirs(&cache)?;
 
-    let art = cache.join(format!(
-        "{}-{}-{}.{t}.tar.zst",
-        p.name, p.version.upstream, p.version.rev
-    ));
+    let art = cache.join(format!("{}-{}-{}.{t}.tar.zst", p.name, p.version.upstream, p.version.rev));
     let mut part = art.as_os_str().to_owned();
     part.push(".part");
     let part = PathBuf::from(part);
@@ -4968,6 +4932,7 @@ fn pack(root: &Path, p: &Package, t: &str, work: &Path) -> Result<(PathBuf, Path
     Ok((art, part))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn meta(
     root: &Path,
     p: &Package,
@@ -5026,11 +4991,7 @@ fn meta(
             continue;
         }
         if linked.contains(&x.name) {
-            let run = Dep {
-                make: false,
-                host: false,
-                ..x.clone()
-            };
+            let run = Dep { make: false, host: false, ..x.clone() };
             deps.push_str(&format!("{run}\n"));
         } else {
             deps.push_str(&format!("{x}\n"));
@@ -5136,10 +5097,7 @@ impl Flags {
 
 fn settings(root: &Path, name: &str) -> Result<Vec<(String, String, String)>, String> {
     let mut out = Vec::new();
-    for f in [
-        PathBuf::from("etc/kiry/config"),
-        Path::new("etc/kiry/pkg").join(name),
-    ] {
+    for f in [PathBuf::from("etc/kiry/config"), Path::new("etc/kiry/pkg").join(name)] {
         let at = root.join(&f);
         let text = match fs::read_to_string(&at) {
             Ok(t) => t,
@@ -5169,14 +5127,8 @@ fn settings(root: &Path, name: &str) -> Result<Vec<(String, String, String)>, St
 // translation step would be one more thing to get wrong. subtractive on purpose: the
 // recipe takes something out of what resolved, it does not restate the set, so raising
 // -O2 to -O3 globally still reaches a package that only dropped lto
-const VERBS: &[&str] = &[
-    "filter-lto",
-    "filter-flags",
-    "filter-ldflags",
-    "strip-flags",
-    "append-flags",
-    "replace-flags",
-];
+const VERBS: &[&str] =
+    &["filter-lto", "filter-flags", "filter-ldflags", "strip-flags", "append-flags", "replace-flags"];
 
 // what strip-flags leaves standing. anything that changes code generation in a way a
 // build can be picky about goes, and the ones that decide how fast and for what stay
@@ -5274,12 +5226,7 @@ fn flags(root: &Path, name: &str, dir: Option<&Path>) -> Result<Flags, String> {
 
 // the same resolve with one ladder rung on top as though it had been written, so whether
 // a rung changes anything is known before a build is spent on it and nothing touches disk
-fn flags_with(
-    root: &Path,
-    name: &str,
-    dir: Option<&Path>,
-    rung: Option<&(bool, &str)>,
-) -> Result<Flags, String> {
+fn flags_with(root: &Path, name: &str, dir: Option<&Path>, rung: Option<&(bool, &str)>) -> Result<Flags, String> {
     let entry = |l: &str| {
         let (k, v) = l.split_once(' ').unwrap_or((l, ""));
         ("ladder".to_string(), k.to_string(), v.to_string())
@@ -5288,8 +5235,7 @@ fn flags_with(
     if let Some((false, l)) = rung {
         from.push(entry(l));
     }
-    let mut knob: HashMap<&str, String> =
-        KNOBS.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+    let mut knob: HashMap<&str, String> = KNOBS.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
     let (mut c, mut cxx, mut ld) = (Vec::new(), Vec::new(), Vec::new());
     let mut rs: Vec<String> = Vec::new();
     let mut use_flags: Vec<String> = Vec::new();
@@ -5373,10 +5319,10 @@ fn flags_with(
     }
 
     // the file's own lines last, so appending -O0 or -g really does win
-    let mut cf: Vec<String> = base.iter().chain(c.iter()).flat_map(words).collect();
-    let mut cxf: Vec<String> = base.iter().chain(cxx.iter()).flat_map(words).collect();
-    let mut ldf: Vec<String> = link.iter().chain(ld.iter()).flat_map(words).collect();
-    let rsf: Vec<String> = rbase.iter().chain(rs.iter()).flat_map(words).collect();
+    let mut cf: Vec<String> = base.iter().chain(c.iter()).flat_map(|s| words(s)).collect();
+    let mut cxf: Vec<String> = base.iter().chain(cxx.iter()).flat_map(|s| words(s)).collect();
+    let mut ldf: Vec<String> = link.iter().chain(ld.iter()).flat_map(|s| words(s)).collect();
+    let rsf: Vec<String> = rbase.iter().chain(rs.iter()).flat_map(|s| words(s)).collect();
 
     if let Some(d) = dir {
         let mut f = filters(d)?;
@@ -5394,12 +5340,11 @@ fn flags_with(
     // or where the recipe lists a package by that name. a converted build starts from what
     // it proved it needs, so a dep it can do without -- htop's lm-sensors -- is off until a
     // flag named after it puts it in the closure, and -name keeps one out
-    let mut declared: HashSet<String> = dir
-        .and_then(gentoo)
-        .map(|g| g.iuse.into_iter().map(|(n, _)| n).collect())
-        .unwrap_or_default();
+    let mut declared: HashSet<String> =
+        dir.and_then(gentoo).map(|g| g.iuse.into_iter().map(|(n, _)| n).collect()).unwrap_or_default();
     if let Some(d) = dir {
-        declared.extend(pkg::depends_from(pkg::lines(&d.join("depends")).unwrap_or_default()).into_iter().map(|x| x.name));
+        declared
+            .extend(pkg::depends_from(pkg::lines(&d.join("depends")).unwrap_or_default()).into_iter().map(|x| x.name));
     }
     use_flags.retain(|f| declared.contains(f.trim_start_matches('-')));
     use_flags.sort();
@@ -5416,7 +5361,7 @@ fn flags_with(
 
 // a setting holds a whole line of flags and a filter names one at a time, so the line
 // has to come apart before anything can be taken out of it
-fn words(s: &String) -> Vec<String> {
+fn words(s: &str) -> Vec<String> {
     s.split_whitespace().map(str::to_string).collect()
 }
 
@@ -5431,14 +5376,7 @@ const MOST_HEADERS: usize = 2000;
 // compiled against the old header passes a wrong-sized struct. clang is the oracle --
 // each installed header compiled alone, since no package's set compiles as one tu and
 // about one in seven does not compile alone either, which is counted and said
-fn probe_layouts(
-    p: &Package,
-    t: &str,
-    work: &Path,
-    c: &mut Command,
-    log: &Path,
-    verbose: bool,
-) -> Result<(), String> {
+fn probe_layouts(p: &Package, t: &str, work: &Path, c: &mut Command, log: &Path, verbose: bool) -> Result<(), String> {
     let inc = format!("/dest{}", incdir(t));
     if !work.join("dest").join(incdir(t).trim_start_matches('/')).is_dir() {
         return Ok(());
@@ -5447,10 +5385,7 @@ fn probe_layouts(
     fs::write(work.join("sysroot/build"), script).map_err(|e| format!("probe script: {e}"))?;
     c.env("KIRY_PRUNE", "");
     if !verbose {
-        let out = fs::OpenOptions::new()
-            .append(true)
-            .open(log)
-            .map_err(|e| format!("{}: {e}", log.display()))?;
+        let out = fs::OpenOptions::new().append(true).open(log).map_err(|e| format!("{}: {e}", log.display()))?;
         let err = out.try_clone().map_err(|e| format!("{}: {e}", log.display()))?;
         c.stdout(out).stderr(err);
     }
@@ -5589,25 +5524,16 @@ fn layouts_moved(root: &Path, jobs: &[install::Job]) -> Vec<(String, String, Vec
         let mut d = a.as_os_str().to_owned();
         d.push(".meta/layout");
         let text = fs::read_to_string(PathBuf::from(d)).ok()?;
-        Some(
-            text.lines()
-                .filter_map(|l| l.split_once(' ').map(|(h, k)| (k.to_string(), h.to_string())))
-                .collect(),
-        )
+        Some(text.lines().filter_map(|l| l.split_once(' ').map(|(h, k)| (k.to_string(), h.to_string()))).collect())
     };
     let mut out = Vec::new();
     for j in jobs {
         let Ok(rec) = db::read(root, &j.target, &j.name) else { continue };
-        let old = root.join("var/kiry/cache").join(format!(
-            "{}-{}-{}.{}.tar.zst",
-            j.name, rec.version.upstream, rec.version.rev, j.target
-        ));
+        let old = root
+            .join("var/kiry/cache")
+            .join(format!("{}-{}-{}.{}.tar.zst", j.name, rec.version.upstream, rec.version.rev, j.target));
         let (Some(was), Some(now)) = (read(&old), read(&j.archive)) else { continue };
-        let moved: Vec<String> = was
-            .iter()
-            .filter(|(k, h)| now.get(*k) != Some(*h))
-            .map(|(k, _)| k.clone())
-            .collect();
+        let moved: Vec<String> = was.iter().filter(|(k, h)| now.get(*k) != Some(*h)).map(|(k, _)| k.clone()).collect();
         if !moved.is_empty() {
             out.push((j.target.clone(), j.name.clone(), moved));
         }
@@ -5691,11 +5617,7 @@ fn keep_list(
             elves.push((f.display().to_string(), o));
         }
     }
-    let others: Vec<String> = db::installed(root, t)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|n| *n != p.name)
-        .collect();
+    let others: Vec<String> = db::installed(root, t).unwrap_or_default().into_iter().filter(|n| *n != p.name).collect();
     for (rec, seen) in scans(root, t, &others).into_iter().flatten() {
         for (path, what) in seen {
             if let install::Seen::Elf(o) = what {
@@ -5781,11 +5703,8 @@ fn prune_pass(
     let links = fs::read(src.join(".kiry-links")).map_err(|_| "no shared link was written down")?;
     let mut by_out: HashMap<String, Vec<String>> = HashMap::new();
     for rec in links.split(|b| *b == b'\n').filter(|r| !r.is_empty()) {
-        let f: Vec<String> = rec
-            .split(|b| *b == 0)
-            .map(|x| String::from_utf8_lossy(x).into_owned())
-            .filter(|x| !x.is_empty())
-            .collect();
+        let f: Vec<String> =
+            rec.split(|b| *b == 0).map(|x| String::from_utf8_lossy(x).into_owned()).filter(|x| !x.is_empty()).collect();
         let Some(i) = f.iter().skip(3).position(|a| a == "-o").map(|i| i + 3) else { continue };
         let Some(out) = f.get(i + 1).and_then(|o| o.rsplit('/').next()) else { continue };
         by_out.insert(out.to_string(), f);
@@ -5831,10 +5750,7 @@ fn prune_pass(
     fs::write(work.join("sysroot/build"), script).map_err(|e| format!("prune script: {e}"))?;
     c.env("KIRY_PRUNE", "");
     if !verbose {
-        let out = fs::OpenOptions::new()
-            .append(true)
-            .open(log)
-            .map_err(|e| format!("{}: {e}", log.display()))?;
+        let out = fs::OpenOptions::new().append(true).open(log).map_err(|e| format!("{}: {e}", log.display()))?;
         let err = out.try_clone().map_err(|e| format!("{}: {e}", log.display()))?;
         c.stdout(out).stderr(err);
     }
@@ -5881,11 +5797,7 @@ fn unlinked(root: &Path, p: &Package, f: &Flags, t: &str, dest: &Path) -> Vec<(S
         .collect();
     let mut files = Vec::new();
     under(dest, &mut files);
-    let needed: HashSet<String> = files
-        .iter()
-        .filter_map(|x| elf::read(x).ok())
-        .flat_map(|o| o.needed)
-        .collect();
+    let needed: HashSet<String> = files.iter().filter_map(|x| elf::read(x).ok()).flat_map(|o| o.needed).collect();
     let mut out = Vec::new();
     for dep in brought {
         let Ok(ps) = db::read_provides(root, t, &dep) else { continue };
@@ -5911,11 +5823,8 @@ fn gentoo_says(root: &Path, d: &Path, f: &Flags) {
     let set = chosen(&f.use_flags);
     let Ok(p) = read_recipe(d) else { return };
     let host = sandbox::host();
-    let have: Vec<String> = p
-        .depends
-        .iter()
-        .map(|x| called(root, &x.name, &host).unwrap_or_else(|| x.name.clone()))
-        .collect();
+    let have: Vec<String> =
+        p.depends.iter().map(|x| called(root, &x.name, &host).unwrap_or_else(|| x.name.clone())).collect();
     for n in &have {
         if g.unwanted(&set, n) {
             say!("drops {n}");
@@ -5959,6 +5868,7 @@ struct Gentoo {
     // declared flags, and whether each is on by default
     iuse: Vec<(String, bool)>,
     // every conditional atom, with the flags it sits under and the state each one wants
+    #[allow(clippy::type_complexity)]
     conds: Vec<(Vec<(String, bool)>, String, Needs)>,
     // atoms under no condition at all, which no flag can take out
     plain: Vec<String>,
@@ -5976,11 +5886,7 @@ fn gentoo(dir: &Path) -> Option<Gentoo> {
     if Some(pv) != ver.split_whitespace().next() {
         return None;
     }
-    let mut g = Gentoo {
-        iuse: Vec::new(),
-        conds: Vec::new(),
-        plain: Vec::new(),
-    };
+    let mut g = Gentoo { iuse: Vec::new(), conds: Vec::new(), plain: Vec::new() };
     for l in text.lines() {
         let Some((k, v)) = l.split_once('=') else { continue };
         match k {
@@ -6009,11 +5915,8 @@ fn pf(s: &str) -> Option<(&str, &str)> {
         Some((b, r)) if !r.is_empty() && r.bytes().all(|c| c.is_ascii_digit()) => b,
         _ => s,
     };
-    let at = base
-        .match_indices('-')
-        .map(|(i, _)| i)
-        .filter(|&i| base[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
-        .last()?;
+    let at =
+        base.match_indices('-').map(|(i, _)| i).rfind(|&i| base[i + 1..].starts_with(|c: char| c.is_ascii_digit()))?;
     Some((&base[..at], &base[at + 1..]))
 }
 
@@ -6071,7 +5974,7 @@ fn same(atom: &str, name: &str) -> bool {
     let a = atom.rsplit('/').next().unwrap_or(atom).to_lowercase();
     let b = name.to_lowercase();
     let b = match b.split_once('-') {
-        Some((p, rest)) if matches!(p, "py3" | "perl" | "qt5" | "qt6" | "kf5" | "kf6") => rest.to_string(),
+        Some(("py3" | "perl" | "qt5" | "qt6" | "kf5" | "kf6", rest)) => rest.to_string(),
         _ => b,
     };
     let bare = b.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
@@ -6099,10 +6002,7 @@ fn recipe_for(root: &Path, atom: &str) -> Option<String> {
     if let Some(x) = prefix {
         names.insert(0, format!("{x}-{pn}"));
     }
-    names
-        .into_iter()
-        .map(|n| called(root, &n, &sandbox::host()).unwrap_or(n))
-        .find(|n| recipe(root, n).is_some())
+    names.into_iter().map(|n| called(root, &n, &sandbox::host()).unwrap_or(n)).find(|n| recipe(root, n).is_some())
 }
 
 // a flag's meson name is the option of the same name, and its value is the option's
@@ -6115,13 +6015,8 @@ fn meson_args(src: &Path, use_flags: &[String]) -> String {
     // newer projects say meson.options and mesa has already moved, so looking only for
     // the old name finds nothing and says nothing
     let mut dirs = vec![src.to_path_buf()];
-    let mut tops: Vec<PathBuf> = fs::read_dir(src)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
+    let mut tops: Vec<PathBuf> =
+        fs::read_dir(src).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     tops.sort();
     dirs.extend(tops);
     let Some(text) = dirs
@@ -6248,10 +6143,11 @@ fn options(text: &str) -> Vec<(String, String, Vec<String>, String)> {
                         kind = t.clone();
                     }
                 }
-                T::W(w) if w == "value" => match toks.get(i + 2) {
-                    Some(T::S(v) | T::W(v)) => value = v.clone(),
-                    _ => {}
-                },
+                T::W(w) if w == "value" => {
+                    if let Some(T::S(v) | T::W(v)) = toks.get(i + 2) {
+                        value = v.clone()
+                    }
+                }
                 T::W(w) if w == "choices" => {
                     let mut j = i + 3;
                     while let Some(T::S(c)) = toks.get(j) {
@@ -6300,9 +6196,7 @@ impl Gentoo {
             .iter()
             .filter(|(under, _, _)| {
                 under.iter().any(|(f, _)| set.contains_key(f.as_str()))
-                    && under
-                        .iter()
-                        .all(|(f, w)| set.get(f.as_str()).copied().unwrap_or_else(|| default(f)) == *w)
+                    && under.iter().all(|(f, w)| set.get(f.as_str()).copied().unwrap_or_else(|| default(f)) == *w)
             })
             .map(|(_, a, n)| (a.clone(), *n))
             .collect();
@@ -6340,10 +6234,7 @@ fn flags_cmd(args: &[String]) {
         // a settings file of its own is enough to be asked about
         let known = dir.is_some()
             || root.join("etc/kiry/pkg").join(name).is_file()
-            || db::targets(&root)
-                .unwrap_or_default()
-                .iter()
-                .any(|t| db::read(&root, t, name).is_ok());
+            || db::targets(&root).unwrap_or_default().iter().any(|t| db::read(&root, t, name).is_ok());
         if !known {
             die(format!("no recipe, settings or installed package {name}"));
         }
@@ -6380,18 +6271,9 @@ fn flags_cmd(args: &[String]) {
             if rec.flags == now {
                 continue;
             }
-            let why = if rec.flags.is_empty() {
-                "unrecorded"
-            } else {
-                "stale"
-            };
+            let why = if rec.flags.is_empty() { "unrecorded" } else { "stale" };
             say!("{name} {t} {why}");
-            stale.push(db::Queued {
-                target: t.clone(),
-                name,
-                soname: "flags".into(),
-                changed: Vec::new(),
-            });
+            stale.push(db::Queued { target: t.clone(), name, soname: "flags".into(), changed: Vec::new() });
         }
     }
     if !queue {
@@ -6400,11 +6282,8 @@ fn flags_cmd(args: &[String]) {
     let _w = writer(&root);
     // this command owns the flags rows. a package that resolves clean now should not
     // still be listed because it was stale an hour ago
-    let mut all: Vec<db::Queued> = db::read_queue(&root)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|q| q.soname != "flags")
-        .collect();
+    let mut all: Vec<db::Queued> =
+        db::read_queue(&root).unwrap_or_default().into_iter().filter(|q| q.soname != "flags").collect();
     all.extend(stale);
     all.sort();
     all.dedup();
@@ -6554,11 +6433,7 @@ impl Rx {
         let cs: Vec<char> = src.chars().collect();
         let (mut i, mut groups) = (0, 0);
         let prog = pieces(&cs, &mut i, &mut groups, true)?;
-        Ok(Rx {
-            prog,
-            groups,
-            src: src.to_string(),
-        })
+        Ok(Rx { prog, groups, src: src.to_string() })
     }
 
     // unanchored, leftmost. the whole line is the haystack and the table's patterns are
@@ -6685,10 +6560,7 @@ fn rules(root: &Path) -> Result<Vec<Rule>, String> {
         let (Some(rx), Some(act)) = (f.next(), f.next()) else {
             return Err(format!("failures:{}: wants a pattern and an action", n + 1));
         };
-        out.push(Rule {
-            rx: Rx::new(rx).map_err(|e| format!("failures:{}: {e}", n + 1))?,
-            act: act.to_string(),
-        });
+        out.push(Rule { rx: Rx::new(rx).map_err(|e| format!("failures:{}: {e}", n + 1))?, act: act.to_string() });
     }
     Ok(out)
 }
@@ -6728,11 +6600,7 @@ fn scan(rules: &[Rule], log: &str) -> Option<Fix> {
             for (i, c) in caps.iter().enumerate() {
                 act = act.replace(&format!("${}", i + 1), c);
             }
-            return Some(Fix {
-                rule: r.rx.as_str().to_string(),
-                line: l.trim().to_string(),
-                act,
-            });
+            return Some(Fix { rule: r.rx.as_str().to_string(), line: l.trim().to_string(), act });
         }
     }
     None
@@ -6771,10 +6639,7 @@ fn write_fix(root: &Path, dir: &Path, name: &str, f: &Fix, log: &str) -> Result<
                 }
                 None => v.to_string(),
             };
-            (
-                root.join("etc/kiry/pkg").join(name),
-                format!("{k} {v}"),
-            )
+            (root.join("etc/kiry/pkg").join(name), format!("{k} {v}"))
         }
         "notaflag" => return Ok(None),
         _ => return Err(format!("{verb} is not an action")),
@@ -6804,9 +6669,7 @@ fn write_fix(root: &Path, dir: &Path, name: &str, f: &Fix, log: &str) -> Result<
 // civil-from-days, for the one date a provenance line needs. a calendar crate to format
 // nine characters is the trade thiserror already lost
 fn today() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let z = (secs / 86400) as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -6882,11 +6745,7 @@ fn keep_time(root: &Path, p: &Package, t: &str, secs: u64, cpu: Option<u64>) {
     }
     let cpu = cpu.map_or(String::new(), |c| format!(" {c}"));
     let line = format!("{} {} {t} {secs} {}{cpu}\n", p.name, p.version.upstream, today());
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&at)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+    let _ = fs::OpenOptions::new().create(true).append(true).open(&at).and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
 // what each package and target took the last time it was built. later lines win, which
@@ -7018,8 +6877,7 @@ fn install(root: &Path, names: Vec<String>, how: &How) {
 
     // an archive or a package. told apart by the suffix a built artifact always carries,
     // which no recipe directory is named after
-    let (archives, asked): (Vec<String>, Vec<String>) =
-        names.into_iter().partition(|n| n.ends_with(".tar.zst"));
+    let (archives, asked): (Vec<String>, Vec<String>) = names.into_iter().partition(|n| n.ends_with(".tar.zst"));
     if asked.is_empty() {
         let paths: Vec<PathBuf> = archives.iter().map(PathBuf::from).collect();
         let going: Vec<(String, String)> = paths.iter().filter_map(|a| sidecar(a)).collect();
@@ -7162,18 +7020,13 @@ fn install(root: &Path, names: Vec<String>, how: &How) {
         // a level has to be in place before the one above it can build against it, which is
         // what forces the install to happen a level at a time. when every member is already
         // built that ordering buys nothing, so the set goes in as one transaction instead
-        let ready: Option<Vec<PathBuf>> = set
-            .iter()
-            .map(|(n, t)| cached(&root, &recipes[n], t))
-            .collect();
+        let ready: Option<Vec<PathBuf>> = set.iter().map(|(n, t)| cached(&root, &recipes[n], t)).collect();
         // decided once, before any of it is built, so a batch cannot change its mind halfway
         settle(&root, &set, live);
         let builds = forecast(&root, &set, &recipes);
         if let Some(all) = ready {
-            let rows: Vec<[&str; 3]> = set
-                .iter()
-                .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
-                .collect();
+            let rows: Vec<[&str; 3]> =
+                set.iter().map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()]).collect();
             widths(&rows);
             for [n, v, t] in rows {
                 say!("{}", row(n, v, installed_version(&root, t, n).as_deref(), t, "cached", None));
@@ -7191,10 +7044,8 @@ fn install(root: &Path, names: Vec<String>, how: &How) {
         let mut names: Vec<&String> = set.iter().map(|(n, _)| n).collect();
         names.sort();
         names.dedup();
-        let rows: Vec<[&str; 3]> = set
-            .iter()
-            .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
-            .collect();
+        let rows: Vec<[&str; 3]> =
+            set.iter().map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()]).collect();
         let building: Vec<[&str; 3]> = builds.iter().map(|&i| rows[i]).collect();
         batch_begin(&root, names.len(), &building, &rows);
         for level in plan {
@@ -7306,11 +7157,7 @@ fn skew(root: &Path) {
         return;
     }
     requeue_pruned(root, &hurt);
-    let queued: HashSet<String> = db::read_queue(root)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|q| q.name)
-        .collect();
+    let queued: HashSet<String> = db::read_queue(root).unwrap_or_default().into_iter().map(|q| q.name).collect();
     for (t, f) in &hurt {
         let note = if queued.contains(&f.pkg) { "  queued" } else { "" };
         say!("{} {t} {}{note}", f.path, f.what);
@@ -7512,7 +7359,9 @@ fn first_tools(root: &Path, recipes: &mut HashMap<String, Package>) -> Vec<(Stri
         let p = &recipes[&n];
         let a = artifact(root, p, &host);
         if !a.is_file() {
-            die(format!("{n} is in the toolchain and not installed, and there is no {host} artifact of it to start from"));
+            die(format!(
+                "{n} is in the toolchain and not installed, and there is no {host} artifact of it to start from"
+            ));
         }
         queue.extend(p.depends.iter().filter(|d| !d.make && d.applies(&host)).map(|d| d.name.clone()));
         out.push((n, host.clone(), a));
@@ -7550,31 +7399,20 @@ fn mounted_at<'a>(text: &'a str, at: &str) -> Option<(&'a str, &'a str)> {
 
 // which of the pair is running and which is not, and the device they share
 fn pair(text: &str) -> Result<(String, String, String), String> {
-    let (dev, now) =
-        mounted_at(text, "/").ok_or("nothing in /proc/mounts says which subvolume / is on")?;
+    let (dev, now) = mounted_at(text, "/").ok_or("nothing in /proc/mounts says which subvolume / is on")?;
     // a root that is not one of the pair has no other half, and guessing one would name
     // a subvolume that means nothing on this machine
     if !ROOTS.contains(&now) {
-        return Err(format!(
-            "/ is on {now} and the two roots are {}",
-            ROOTS.join(" and ")
-        ));
+        return Err(format!("/ is on {now} and the two roots are {}", ROOTS.join(" and ")));
     }
-    let other = ROOTS
-        .iter()
-        .find(|r| **r != now)
-        .ok_or("there is only one root subvolume")?;
+    let other = ROOTS.iter().find(|r| **r != now).ok_or("there is only one root subvolume")?;
     Ok((dev.to_string(), now.to_string(), (*other).to_string()))
 }
 
 // the running root as it was before a risky transaction, in the other half of the pair.
 // once a boot: a tree that booted is the proven one, and a second risky install in the
 // same boot would otherwise swap it for a tree only the first install has touched
-fn fallback(
-    text: &str,
-    taken: &Path,
-    list: impl Fn() -> Result<String, String>,
-) -> Result<(), String> {
+fn fallback(text: &str, taken: &Path, list: impl Fn() -> Result<String, String>) -> Result<(), String> {
     let (dev, now, other) = pair(text)?;
     fled(text, taken, list)?;
     if taken.exists() {
@@ -7586,18 +7424,15 @@ fn fallback(
 
     // the subvolumes sit at the top of the filesystem and nothing mounts that, so it has
     // to be reachable before one of them can be replaced
-    run(
-        Command::new("mount")
-            .args(["-o", "subvolid=5"])
-            .arg(&dev)
-            .arg(&top),
-        "mount subvolid=5",
-    )?;
+    run(Command::new("mount").args(["-o", "subvolid=5"]).arg(&dev).arg(&top), "mount subvolid=5")?;
     let made = snapshot(&top, &now, &other);
     let _ = run(Command::new("umount").arg(&top), "umount");
     made?;
     put(taken, &format!("{other}\n"))?;
-    say!("            {other} is the fallback, a snapshot of {now}. boot {} from the firmware menu if this goes wrong", label(&other));
+    say!(
+        "            {other} is the fallback, a snapshot of {now}. boot {} from the firmware menu if this goes wrong",
+        label(&other)
+    );
     Ok(())
 }
 
@@ -7618,12 +7453,7 @@ fn snapshot_of(list: &str, sub: &str, of: &str) -> bool {
     let field = |sub: &str, key: &str| {
         list.lines().find_map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            let at = |k: &str| {
-                f.iter()
-                    .position(|w| *w == k)
-                    .and_then(|i| f.get(i + 1))
-                    .copied()
-            };
+            let at = |k: &str| f.iter().position(|w| *w == k).and_then(|i| f.get(i + 1)).copied();
             if at("path") == Some(sub) {
                 at(key)
             } else {
@@ -7654,19 +7484,12 @@ fn snapshot(top: &Path, now: &str, other: &str) -> Result<(), String> {
     let at = top.join(other);
     if at.exists() {
         run(
-            Command::new("btrfs")
-                .args(["subvolume", "delete"])
-                .arg(&at)
-                .stdout(Stdio::null()),
+            Command::new("btrfs").args(["subvolume", "delete"]).arg(&at).stdout(Stdio::null()),
             &format!("btrfs subvolume delete {other}"),
         )?;
     }
     run(
-        Command::new("btrfs")
-            .args(["subvolume", "snapshot"])
-            .arg(top.join(now))
-            .arg(&at)
-            .stdout(Stdio::null()),
+        Command::new("btrfs").args(["subvolume", "snapshot"]).arg(top.join(now)).arg(&at).stdout(Stdio::null()),
         &format!("btrfs subvolume snapshot {now} {other}"),
     )
 }
@@ -7680,9 +7503,7 @@ fn label(sub: &str) -> String {
 }
 
 fn efi() -> Result<String, String> {
-    let out = Command::new("efibootmgr")
-        .output()
-        .map_err(|e| format!("efibootmgr: {e}"))?;
+    let out = Command::new("efibootmgr").output().map_err(|e| format!("efibootmgr: {e}"))?;
     if !out.status.success() {
         return Err(format!("efibootmgr: {}", out.status));
     }
@@ -7708,8 +7529,7 @@ fn entry(l: &str) -> Option<(&str, &str)> {
 
 fn entry_for(text: &str, sub: &str) -> Option<String> {
     let want = label(sub);
-    text.lines()
-        .find_map(|l| entry(l).filter(|(_, n)| *n == want).map(|(n, _)| n.to_string()))
+    text.lines().find_map(|l| entry(l).filter(|(_, n)| *n == want).map(|(n, _)| n.to_string()))
 }
 
 // the subvolume this kernel was told to mount. the kernel takes the last rootflags it is given
@@ -7732,16 +7552,8 @@ fn keeps(now: &str, cmdline: &str, seen: &str) -> Result<Option<String>, String>
     let num = entry_for(seen, now).ok_or_else(|| format!("no uefi entry named {}", label(now)))?;
     match booted(cmdline) {
         Some(b) if b == now => {}
-        Some(b) => {
-            return Err(format!(
-                "this boot is {b} and / is {now}, so there is nothing here to keep"
-            ))
-        }
-        None => {
-            return Err(
-                "/proc/cmdline names no subvol, so nothing says which root this boot is".into(),
-            )
-        }
+        Some(b) => return Err(format!("this boot is {b} and / is {now}, so there is nothing here to keep")),
+        None => return Err("/proc/cmdline names no subvol, so nothing says which root this boot is".into()),
     }
     Ok((order(seen).first() != Some(&num)).then_some(num))
 }
@@ -7766,10 +7578,7 @@ fn reorder(num: &str, was: &[String]) -> Vec<String> {
 }
 
 fn commits(num: &str, was: &[String]) -> Result<(), String> {
-    run(
-        Command::new("efibootmgr").args(["-o", &reorder(num, was).join(",")]),
-        "efibootmgr -o",
-    )
+    run(Command::new("efibootmgr").args(["-o", &reorder(num, was).join(",")]), "efibootmgr -o")
 }
 
 // what says an installed elf cannot run, which is what an install has to say about the
@@ -8007,7 +7816,12 @@ fn seen(root: &Path, t: &str, name: &str) -> Vec<(String, String)> {
 
 // the files a process mapped that its DT_NEEDED closure does not explain, less what one
 // of those pulled in after it: what was dlopened, by the name each file is asked for
-fn dlopened(exe: &str, mapped: &BTreeSet<String>, needed: &dyn Fn(&str) -> Vec<String>, soname: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+fn dlopened(
+    exe: &str,
+    mapped: &BTreeSet<String>,
+    needed: &dyn Fn(&str) -> Vec<String>,
+    soname: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
     let mut by_name: HashMap<String, &str> = HashMap::new();
     for m in mapped {
         by_name.insert(m.rsplit('/').next().unwrap_or(m).to_string(), m);
@@ -8023,7 +7837,8 @@ fn dlopened(exe: &str, mapped: &BTreeSet<String>, needed: &dyn Fn(&str) -> Vec<S
         }
     }
     let opened: Vec<&String> = mapped.iter().filter(|m| !explained.contains(m.as_str())).collect();
-    let pulled: HashSet<&str> = opened.iter().flat_map(|m| needed(m)).filter_map(|n| by_name.get(&n).copied()).collect();
+    let pulled: HashSet<&str> =
+        opened.iter().flat_map(|m| needed(m)).filter_map(|n| by_name.get(&n).copied()).collect();
     opened.into_iter().filter(|m| !pulled.contains(m.as_str())).cloned().collect()
 }
 
@@ -8114,7 +7929,9 @@ fn arm(root: &Path) {
     if stamp.is_empty() || (was == stamp && inst.join("events/kiry").is_dir()) {
         return;
     }
-    let events = |s: &str| fs::OpenOptions::new().append(true).open(tr.join("uprobe_events")).and_then(|mut f| f.write_all(s.as_bytes()));
+    let events = |s: &str| {
+        fs::OpenOptions::new().append(true).open(tr.join("uprobe_events")).and_then(|mut f| f.write_all(s.as_bytes()))
+    };
     let _ = fs::create_dir(&inst);
     let _ = fs::create_dir(&ex);
     let _ = put(&inst.join("events/kiry/enable"), "0");
@@ -8133,7 +7950,9 @@ fn arm(root: &Path) {
     }
     // argv[1..3] at execve, so python3 foo.py says foo.py after the process is gone.
     // __x64_sys_execve takes the caller's pt_regs, argv is its si at 104
-    let kp = |s: &str| fs::OpenOptions::new().append(true).open(tr.join("kprobe_events")).and_then(|mut f| f.write_all(s.as_bytes()));
+    let kp = |s: &str| {
+        fs::OpenOptions::new().append(true).open(tr.join("kprobe_events")).and_then(|mut f| f.write_all(s.as_bytes()))
+    };
     let _ = kp("-:kiryexec/args\n");
     let _ = kp("p:kiryexec/args __x64_sys_execve a1=+0(+8(+104(%di))):ustring a2=+0(+16(+104(%di))):ustring a3=+0(+24(+104(%di))):ustring\n");
     let _ = put(&ex.join("buffer_size_kb"), "4096");
@@ -8198,7 +8017,8 @@ fn trace_events(text: &str, probes: &HashMap<String, String>) -> Vec<(f64, Ev)> 
         let Some((stamp, r)) = rest.split_once(": ") else { continue };
         let Some((ev, args)) = r.split_once(": ") else { continue };
         let ts = stamp.rsplit(' ').next().and_then(|t| t.parse::<f64>().ok()).unwrap_or_default();
-        let field = |k: &str| args.split_whitespace().find_map(|w| w.strip_prefix(k)).and_then(|v| v.parse::<u32>().ok());
+        let field =
+            |k: &str| args.split_whitespace().find_map(|w| w.strip_prefix(k)).and_then(|v| v.parse::<u32>().ok());
         if ev == "sched_process_exec" {
             if let Some(f) = args.strip_prefix("filename=").and_then(|a| a.rsplit_once(" pid=")).map(|(f, _)| f) {
                 out.push((ts, Ev::Exec(pid, f.to_string(), argv.remove(&pid).unwrap_or_default())));
@@ -8295,7 +8115,9 @@ fn lineage(
                     built.remove(child);
                 }
             }
-            Ev::Asked(key, t, name, ok) => out.push((*key, *ts, known.get(key).cloned(), Some(t.clone()), name.clone(), *ok)),
+            Ev::Asked(key, t, name, ok) => {
+                out.push((*key, *ts, known.get(key).cloned(), Some(t.clone()), name.clone(), *ok))
+            }
         }
     }
     out
@@ -8362,7 +8184,12 @@ fn regular(p: &str) -> bool {
 }
 
 fn argv_of(cmdline: &[u8]) -> Vec<String> {
-    cmdline.split(|c| *c == 0).skip(1).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect()
+    cmdline
+        .split(|c| *c == 0)
+        .skip(1)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
 }
 
 // only on the live root, the one the processes run from, and only processes in this
@@ -8426,7 +8253,11 @@ fn observe(root: &Path) {
                 })
             }
         };
-        let file = if name.starts_with('/') { real(Path::new(&name)) } else { real(&root.join(libdir(&t).trim_start_matches('/')).join(&name)) };
+        let file = if name.starts_with('/') {
+            real(Path::new(&name))
+        } else {
+            real(&root.join(libdir(&t).trim_start_matches('/')).join(&name))
+        };
         if let (Some(p), Some(f), true) = (prog, file, ok) {
             traced.push((p, f));
         }
@@ -8438,8 +8269,11 @@ fn observe(root: &Path) {
         .map(|(p, f)| format!("{}{p} {f}\n", if built.contains(p) { "b" } else { "" }))
         .collect();
     let _ = put(&carried, &live);
-    let shells: HashSet<String> =
-        fs::read_to_string("/etc/shells").unwrap_or_default().lines().filter_map(|l| real(Path::new(l.trim()))).collect();
+    let shells: HashSet<String> = fs::read_to_string("/etc/shells")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| real(Path::new(l.trim())))
+        .collect();
     traced.extend(named_runs(&ran, &shells, &|p| fs::read(root.join(p)).ok()));
 
     // (exe, the script an interpreter runs, the shared objects it has mapped), paths
@@ -8569,11 +8403,7 @@ fn apply_batch(root: &Path, archives: &[PathBuf], force: bool) {
         let _ = fs::remove_file(root.join(SEEN).join(&j.target).join(&j.name));
     }
     for k in &done.edits {
-        say!(
-            "kept /{}, edited since it was installed. the package's is in {}",
-            k.path,
-            k.from.display()
-        );
+        say!("kept /{}, edited since it was installed. the package's is in {}", k.path, k.from.display());
     }
     for so in &done.preserved {
         say!("preserved {so}, its soname left the package. kiry gc takes it once nothing links or maps it");
@@ -8624,9 +8454,7 @@ fn hooks(root: &Path, targets: BTreeSet<String>) {
 }
 
 fn named(jobs: &[install::Job]) -> HashSet<(String, String)> {
-    jobs.iter()
-        .map(|j| (j.target.clone(), j.name.clone()))
-        .collect()
+    jobs.iter().map(|j| (j.target.clone(), j.name.clone())).collect()
 }
 
 fn remove_cmd(args: &[String]) {
@@ -8676,11 +8504,7 @@ fn remove_cmd(args: &[String]) {
             if r.missing > 0 {
                 notes.push(format!("{} already gone", r.missing));
             }
-            let note = if notes.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", notes.join(", "))
-            };
+            let note = if notes.is_empty() { String::new() } else { format!("  {}", notes.join(", ")) };
             let s = if r.gone == 1 { "" } else { "s" };
             say!("{name} {t} removed {} file{s}{note}", r.gone);
         }
@@ -8711,10 +8535,8 @@ fn held_by(root: &Path, plan: &[(&String, Vec<String>)]) {
         }
     }
 
-    let gone: Vec<(String, String)> = plan
-        .iter()
-        .flat_map(|(t, mine)| mine.iter().map(|n| ((*t).clone(), n.clone())))
-        .collect();
+    let gone: Vec<(String, String)> =
+        plan.iter().flat_map(|(t, mine)| mine.iter().map(|n| ((*t).clone(), n.clone()))).collect();
     let mut by: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     for (t, f) in would_break(root, &gone) {
         by.entry((f.pkg.clone(), t)).or_default().insert(f.what.to_string());
@@ -8731,8 +8553,7 @@ fn held_by(root: &Path, plan: &[(&String, Vec<String>)]) {
 // what doctor would newly find with these (target, name) gone, and nothing it finds today
 fn would_break(root: &Path, gone: &[(String, String)]) -> Vec<(String, Finding)> {
     let row = |t: &String, f: &Finding| (t.clone(), f.path.clone(), f.what.to_string());
-    let before: HashSet<(String, String, String)> =
-        broken(root).iter().map(|(t, f)| row(t, f)).collect();
+    let before: HashSet<(String, String, String)> = broken(root).iter().map(|(t, f)| row(t, f)).collect();
     checks_without(root, gone)
         .0
         .into_iter()
@@ -8749,12 +8570,7 @@ const WORLD: &str = "etc/kiry/world";
 
 fn asked_for(root: &Path) -> Option<Vec<String>> {
     let text = fs::read_to_string(root.join(WORLD)).ok()?;
-    Some(
-        text.lines()
-            .filter_map(|l| l.split('#').next()?.split_whitespace().next())
-            .map(str::to_string)
-            .collect(),
-    )
+    Some(text.lines().filter_map(|l| l.split('#').next()?.split_whitespace().next()).map(str::to_string).collect())
 }
 
 // installed and needed by nothing else installed on its target, which is what somebody
@@ -8821,7 +8637,9 @@ fn unwish(root: &Path, names: &[String]) {
     let Ok(text) = fs::read_to_string(&at) else { return };
     let kept: String = text
         .lines()
-        .filter(|l| !l.split('#').next().and_then(|w| w.split_whitespace().next()).is_some_and(|w| names.iter().any(|n| n == w)))
+        .filter(|l| {
+            !l.split('#').next().and_then(|w| w.split_whitespace().next()).is_some_and(|w| names.iter().any(|n| n == w))
+        })
         .map(|l| format!("{l}\n"))
         .collect();
     if kept != text {
@@ -8903,7 +8721,8 @@ fn leave(root: &Path) {
                     let words: Vec<String> = w.split_whitespace().map(str::to_string).collect();
                     let cmd = interpreter(&words).unwrap_or_default();
                     let cmd = cmd.rsplit('/').next().unwrap_or_default().to_string();
-                    own.get(&(t.clone(), format!("cmd:{cmd}"))).and_then(|o| gone.iter().find(|(gt, n)| gt == t && n == o))
+                    own.get(&(t.clone(), format!("cmd:{cmd}")))
+                        .and_then(|o| gone.iter().find(|(gt, n)| gt == t && n == o))
                 }
                 What::NoModule(m, _) => {
                     own.get(&(t.clone(), format!("py:{m}"))).and_then(|o| gone.iter().find(|(gt, n)| gt == t && n == o))
@@ -8975,12 +8794,8 @@ const REPOS_AT: &str = "var/db/kiry";
 // because a recipe is written by hand and /var/kiry is the part you may delete
 fn repos(root: &Path) -> Vec<PathBuf> {
     if let Ok(text) = fs::read_to_string(root.join("etc/kiry/repos")) {
-        let out: Vec<PathBuf> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(PathBuf::from)
-            .collect();
+        let out: Vec<PathBuf> =
+            text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(PathBuf::from).collect();
         if !out.is_empty() {
             return out;
         }
@@ -9052,10 +8867,7 @@ fn outdated(root: &Path) -> Result<Vec<(String, String, String)>, String> {
 }
 
 fn recipe(root: &Path, name: &str) -> Option<PathBuf> {
-    repos(root)
-        .into_iter()
-        .map(|d| d.join(name))
-        .find(|d| d.join("build").is_file())
+    repos(root).into_iter().map(|d| d.join(name)).find(|d| d.join("build").is_file())
 }
 
 // a recipe dir as it is written. the repair path never reads one -- it installs from an
@@ -9077,11 +8889,8 @@ fn read_recipe(dir: &Path) -> Result<Package, kiry_core::Error> {
         return Err(kiry_core::Error::NoPackage(dir.to_path_buf()));
     }
 
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| kiry_core::Error::Name(dir.to_path_buf()))?
-        .to_string();
+    let name =
+        dir.file_name().and_then(|n| n.to_str()).ok_or_else(|| kiry_core::Error::Name(dir.to_path_buf()))?.to_string();
 
     let version = pkg::Version::parse(&pkg::required(&dir.join("version"))?)?;
 
@@ -9089,10 +8898,7 @@ fn read_recipe(dir: &Path) -> Result<Package, kiry_core::Error> {
     let checksums = pkg::lines(&dir.join("checksums"))?;
     // a hand written recipe can have sources and no checksums yet
     if !checksums.is_empty() && sources.len() != checksums.len() {
-        return Err(kiry_core::Error::Counts {
-            sources: sources.len(),
-            checksums: checksums.len(),
-        });
+        return Err(kiry_core::Error::Counts { sources: sources.len(), checksums: checksums.len() });
     }
 
     let depends = pkg::depends_from(pkg::lines(&dir.join("depends"))?);
@@ -9107,16 +8913,7 @@ fn read_recipe(dir: &Path) -> Result<Package, kiry_core::Error> {
         return Err(kiry_core::Error::Empty(dir.join("targets")));
     }
 
-    Ok(Package {
-        name,
-        dir: dir.to_path_buf(),
-        version,
-        sources,
-        checksums,
-        depends,
-        targets,
-        users,
-    })
+    Ok(Package { name, dir: dir.to_path_buf(), version, sources, checksums, depends, targets, users })
 }
 
 #[cfg(test)]
@@ -9126,9 +8923,7 @@ mod recipes {
 
     // no tempfile, and CARGO_TARGET_TMPDIR is integration-tests only
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-t-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-t-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -9143,11 +8938,7 @@ mod recipes {
         let d = scratch("mesa");
         write(&d, "version", "25.2.0 1\n");
         write(&d, "targets", "x86_64-musl x86_64-gnu\n");
-        write(
-            &d,
-            "sources",
-            "https://example.invalid/mesa-25.2.0.tar.xz\n",
-        );
+        write(&d, "sources", "https://example.invalid/mesa-25.2.0.tar.xz\n");
         write(&d, "checksums", &format!("{}\n", "e3b0c442".repeat(8)));
         write(&d, "depends", "libdrm\nwayland\nmuon make\n");
 
@@ -9245,8 +9036,7 @@ fn load(root: &Path, at: &Path) -> Result<Package, String> {
     for d in std::mem::take(&mut p.depends) {
         // one soname can be two packages, mesa on musl and libglvnd on gnu, so a name is
         // answered once per target the line is for and split by target where they differ
-        let mut on: Vec<&str> =
-            p.targets.iter().filter(|t| d.applies(t)).map(String::as_str).collect();
+        let mut on: Vec<&str> = p.targets.iter().filter(|t| d.applies(t)).map(String::as_str).collect();
         if d.host || on.is_empty() {
             on = vec![host.as_str()];
         }
@@ -9280,12 +9070,7 @@ fn load(root: &Path, at: &Path) -> Result<Package, String> {
                 if n == p.name || out.iter().any(|d| d.name == n) {
                     continue;
                 }
-                out.push(Dep {
-                    name: n,
-                    make: needs != Needs::Run,
-                    host: needs == Needs::Tool,
-                    only: None,
-                });
+                out.push(Dep { name: n, make: needs != Needs::Run, host: needs == Needs::Tool, only: None });
             }
         }
     }
@@ -9296,10 +9081,7 @@ fn load(root: &Path, at: &Path) -> Result<Package, String> {
         for d in &out {
             let Some(at) = recipe(root, &d.name) else { continue };
             if let Some(r) = repo(&at).filter(|r| r == "extra" || r == "testing") {
-                return Err(format!(
-                    "core/{} depends on {r}/{}, and core may never depend on extra",
-                    p.name, d.name
-                ));
+                return Err(format!("core/{} depends on {r}/{}, and core may never depend on extra", p.name, d.name));
             }
         }
     }
@@ -9389,10 +9171,8 @@ fn owners(root: &Path) -> HashMap<(String, String), String> {
                     .filter(|c| !c.contains('/'))
                 {
                     format!("cmd:{c}")
-                } else if let Some(m) = path
-                    .strip_suffix(".pc")
-                    .and_then(|s| s.rsplit_once("/pkgconfig/"))
-                    .map(|(_, m)| m)
+                } else if let Some(m) =
+                    path.strip_suffix(".pc").and_then(|s| s.rsplit_once("/pkgconfig/")).map(|(_, m)| m)
                 {
                     format!("pc:{m}")
                 } else {
@@ -9414,20 +9194,13 @@ fn resolve(root: &Path, arg: &str) -> Result<PathBuf, String> {
         return Ok(at);
     }
     if let Some((repo, name)) = arg.split_once('/') {
-        let want = repos(root)
-            .into_iter()
-            .find(|r| r.file_name().is_some_and(|f| f == repo))
-            .map(|r| r.join(name));
+        let want = repos(root).into_iter().find(|r| r.file_name().is_some_and(|f| f == repo)).map(|r| r.join(name));
         if let Some(d) = want.filter(|d| d.join("build").is_file()) {
             return Ok(d);
         }
     }
     recipe(root, arg).ok_or_else(|| {
-        let where_ = repos(root)
-            .iter()
-            .map(|r| r.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let where_ = repos(root).iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(" ");
         format!("no recipe {arg} in {where_}")
     })
 }
@@ -9481,10 +9254,7 @@ fn levels(
                 .collect();
             if boot.is_empty() {
                 let names: Vec<&str> = left.iter().map(|i| want[*i].0.as_str()).collect();
-                die(format!(
-                    "these need each other and none says how to start: {}",
-                    names.join(" ")
-                ));
+                die(format!("these need each other and none says how to start: {}", names.join(" ")));
             }
             done.extend(&boot);
             out.push(boot.into_iter().map(|i| (i, true)).collect());
@@ -9499,19 +9269,12 @@ fn levels(
 // within a level nothing depends on anything else, so the order is free, and a level
 // takes as long as its slowest member wherever that one starts. longest first is what
 // leaves the short tail at the end
-fn longest_first(
-    plan: &mut [Vec<(usize, bool)>],
-    want: &[(String, String)],
-    past: &HashMap<(String, String), u64>,
-) {
+fn longest_first(plan: &mut [Vec<(usize, bool)>], want: &[(String, String)], past: &HashMap<(String, String), u64>) {
     for level in plan.iter_mut() {
         // never built here goes first. an unknown cost is the one worth starting early
         // and it is the only guess on offer
         level.sort_by_key(|(i, _)| {
-            (
-                std::cmp::Reverse(past.get(&want[*i]).copied().unwrap_or(u64::MAX)),
-                want[*i].clone(),
-            )
+            (std::cmp::Reverse(past.get(&want[*i]).copied().unwrap_or(u64::MAX)), want[*i].clone())
         });
     }
 }
@@ -9599,10 +9362,7 @@ mod order {
     }
 
     fn three() -> Vec<(String, String)> {
-        ["quick", "slow", "new"]
-            .iter()
-            .map(|n| ((*n).to_string(), "x86_64-musl".to_string()))
-            .collect()
+        ["quick", "slow", "new"].iter().map(|n| ((*n).to_string(), "x86_64-musl".to_string())).collect()
     }
 
     #[test]
@@ -9727,16 +9487,11 @@ mod order {
             users: Vec::new(),
         };
         let attr = pkg::Dep { name: "attr".to_string(), make: true, host: true, only: None };
-        let recipes = HashMap::from([
-            ("acl".to_string(), pkg("acl", vec![attr])),
-            ("attr".to_string(), pkg("attr", Vec::new())),
-        ]);
+        let recipes =
+            HashMap::from([("acl".to_string(), pkg("acl", vec![attr])), ("attr".to_string(), pkg("attr", Vec::new()))]);
         let edges: Vec<Vec<Dep>> = want.iter().map(|(n, _)| recipes[n].depends.clone()).collect();
         let plan = levels(&want, &recipes, &[false, false], &edges);
-        let order: Vec<Vec<&str>> = plan
-            .iter()
-            .map(|l| l.iter().map(|(i, _)| want[*i].0.as_str()).collect())
-            .collect();
+        let order: Vec<Vec<&str>> = plan.iter().map(|l| l.iter().map(|(i, _)| want[*i].0.as_str()).collect()).collect();
         assert_eq!(order, [["attr"], ["acl"]]);
 
         // acl is in the cache, so nothing builds with attr and neither waits
@@ -9806,9 +9561,7 @@ fn rebuild_cmd(args: &[String]) {
             continue;
         }
         let Some(dir) = recipe(&root, name) else {
-            die(format!(
-                "{name} needs rebuilding and no repo has a recipe for it"
-            ));
+            die(format!("{name} needs rebuilding and no repo has a recipe for it"));
         };
         match load(&root, &dir) {
             Ok(p) => recipes.insert(name.clone(), p),
@@ -9830,10 +9583,8 @@ fn rebuild_cmd(args: &[String]) {
     let mut names: Vec<&String> = want.iter().map(|(n, _)| n).collect();
     names.sort();
     names.dedup();
-    let rows: Vec<[&str; 3]> = want
-        .iter()
-        .map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()])
-        .collect();
+    let rows: Vec<[&str; 3]> =
+        want.iter().map(|(n, t)| [n.as_str(), recipes[n].version.upstream.as_str(), t.as_str()]).collect();
     batch_begin(&root, names.len(), &rows, &rows);
     let mut brought = false;
     for (name, t) in &want {
@@ -9907,7 +9658,8 @@ fn rebuild_cmd(args: &[String]) {
             errs.retain(|(n, _)| !waiting.contains(n));
             for name in waiting {
                 let p = &recipes[&name];
-                let mine: Vec<String> = level.iter().filter(|(i, _)| want[*i].0 == name).map(|(i, _)| want[*i].1.clone()).collect();
+                let mine: Vec<String> =
+                    level.iter().filter(|(i, _)| want[*i].0 == name).map(|(i, _)| want[*i].1.clone()).collect();
                 let mut waits = 0;
                 let r = loop {
                     for t in &mine {
@@ -9950,19 +9702,14 @@ fn rebuild_cmd(args: &[String]) {
             Ok(j) => j,
             Err(e) => die(e.to_string()),
         };
-        let was: Vec<Option<db::Installed>> =
-            jobs.iter().map(|j| db::read(&root, &j.target, &j.name).ok()).collect();
+        let was: Vec<Option<db::Installed>> = jobs.iter().map(|j| db::read(&root, &j.target, &j.name).ok()).collect();
         let done = match install::apply(&root, &jobs) {
             Ok(b) => b,
             Err(e) => die(e.to_string()),
         };
         let broke = done.broke;
         for k in &done.edits {
-            say!(
-                "kept /{}, edited since it was installed. the package's is in {}",
-                k.path,
-                k.from.display()
-            );
+            say!("kept /{}, edited since it was installed. the package's is in {}", k.path, k.from.display());
         }
         for (j, old) in jobs.iter().zip(&was) {
             let now = db::read(&root, &j.target, &j.name).ok();
@@ -10031,21 +9778,13 @@ fn rebuilt_log(root: &Path, name: &str, target: &str, why: &str, same: bool) {
     let when = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let line = format!("{name} {target} {why} {} {when}\n", if same { "same" } else { "changed" });
     let _ = at.parent().map(fs::create_dir_all);
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&at)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+    let _ = fs::OpenOptions::new().create(true).append(true).open(&at).and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
 // an abi break is only a break for the consumers that used what moved. everything that
 // links libfoo is the set doctor would give; the ones whose undefined symbols name a
 // symbol that actually changed is the set worth rebuilding
-fn affected(
-    root: &Path,
-    broke: &[install::Broke],
-    just: &HashSet<(String, String)>,
-) -> Vec<db::Queued> {
+fn affected(root: &Path, broke: &[install::Broke], just: &HashSet<(String, String)>) -> Vec<db::Queued> {
     let mut out = Vec::new();
     for b in broke {
         let versions = b.target.ends_with("gnu");
@@ -10087,9 +9826,7 @@ fn affected(
                     && reaches(root, o, at, &b.target, &b.soname, &b.path, &own)
                     && (b.changed.is_empty()
                         || (typed && o.undefined.iter().any(|u| DL.contains(&u.name.as_str())))
-                        || o.undefined
-                            .iter()
-                            .any(|u| moved.contains(symbol(u, versions).as_str())))
+                        || o.undefined.iter().any(|u| moved.contains(symbol(u, versions).as_str())))
             });
             if uses {
                 out.push(db::Queued {
@@ -10323,11 +10060,7 @@ fn compare_as(a: &str, b: &str, letters: bool) -> Option<std::cmp::Ordering> {
 
     // 1.2 against 1.2.1 is older and 1.2 against 1.2rc1 is newer, so what is left over
     // decides only while it stays numeric. trailing zeros make it the same version
-    let rest = if x.len() > y.len() {
-        &x[y.len()..]
-    } else {
-        &y[x.len()..]
-    };
+    let rest = if x.len() > y.len() { &x[y.len()..] } else { &y[x.len()..] };
     let mut bigger = false;
     for p in rest {
         match p {
@@ -10444,10 +10177,7 @@ fn from_aports(root: &Path, name: &str, pin: Option<&str>) -> Option<Up> {
             let repo = f.next().unwrap_or_default().to_string();
             (vec![repo], f.next().unwrap_or(name).to_string())
         }
-        None => (
-            ["main", "community", "testing"].map(String::from).to_vec(),
-            name.to_string(),
-        ),
+        None => (["main", "community", "testing"].map(String::from).to_vec(), name.to_string()),
     };
     for repo in &repos {
         let f = at.join(repo).join(&name).join("APKBUILD");
@@ -10457,10 +10187,7 @@ fn from_aports(root: &Path, name: &str, pin: Option<&str>) -> Option<Up> {
         let Some(version) = pkgver(&text) else {
             continue;
         };
-        return Some(Up {
-            version,
-            from: format!("aports/{repo}/{name}"),
-        });
+        return Some(Up { version, from: format!("aports/{repo}/{name}") });
     }
     None
 }
@@ -10490,10 +10217,7 @@ fn from_tracker(dir: &Path) -> Result<Up, &'static str> {
             v.to_string()
         }
     };
-    Ok(Up {
-        version: v,
-        from: "tracker".to_string(),
-    })
+    Ok(Up { version: v, from: "tracker".to_string() })
 }
 
 fn version_in(body: &str, pat: &str) -> Result<String, &'static str> {
@@ -10525,15 +10249,10 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
     // extra carries all of aports, which makes it a catalogue rather than a list of what
     // this machine keeps. asked about nothing in particular, only what is installed from
     // it is worth an answer -- the rest is a bump nobody would build, fetched for nothing
-    let kept: HashSet<String> = db::targets(root)
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|t| db::installed(root, t).unwrap_or_default())
-        .collect();
+    let kept: HashSet<String> =
+        db::targets(root).unwrap_or_default().iter().flat_map(|t| db::installed(root, t).unwrap_or_default()).collect();
     for r in repos(root) {
-        let repo = r
-            .file_name()
-            .map_or_else(String::new, |x| x.to_string_lossy().into_owned());
+        let repo = r.file_name().map_or_else(String::new, |x| x.to_string_lossy().into_owned());
         let Ok(rd) = fs::read_dir(&r) else { continue };
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         dirs.sort();
@@ -10590,10 +10309,9 @@ fn survey(root: &Path, want: &[String], net: bool) -> Vec<Row> {
             let (status, mut note) = match &up {
                 Some(u) => match compare_as(&p.version.upstream, &u.version, d.join("scheme").is_file()) {
                     Some(std::cmp::Ordering::Equal) => ("ok", String::new()),
-                    Some(std::cmp::Ordering::Less) => (
-                        "behind",
-                        level(&d, &p.version.upstream, &u.version).unwrap_or("no scheme").to_string(),
-                    ),
+                    Some(std::cmp::Ordering::Less) => {
+                        ("behind", level(&d, &p.version.upstream, &u.version).unwrap_or("no scheme").to_string())
+                    }
                     Some(std::cmp::Ordering::Greater) => ("ahead", String::new()),
                     None => ("unknown", "unordered".to_string()),
                 },
@@ -10640,15 +10358,7 @@ fn ahead_cmd(args: &[String]) {
             Some(u) => format!("{} {} {}", u.version, u.from, r.note),
             None => r.note.clone(),
         };
-        say!(
-            "{:w$} {:v$} {:t$} {:8} {:5} {}",
-            r.name,
-            r.ours,
-            r.target,
-            r.status,
-            "-",
-            note.trim()
-        );
+        say!("{:w$} {:v$} {:t$} {:8} {:5} {}", r.name, r.ours, r.target, r.status, "-", note.trim());
     }
 
     let count = |s: &str| rows.iter().filter(|r| r.status == s).count();
@@ -10695,11 +10405,7 @@ fn sync_cmd(args: &[String]) {
     let rows: Vec<&Row> = all.iter().filter(|r| r.status == "behind").collect();
     let w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
     let v = rows.iter().map(|r| r.ours.len()).max().unwrap_or(0);
-    let u = rows
-        .iter()
-        .filter_map(|r| r.up.as_ref().map(|u| u.version.len()))
-        .max()
-        .unwrap_or(0);
+    let u = rows.iter().filter_map(|r| r.up.as_ref().map(|u| u.version.len())).max().unwrap_or(0);
 
     let alias = convert::aliases(&list);
     if !dry {
@@ -10733,12 +10439,7 @@ fn sync_cmd(args: &[String]) {
             continue;
         }
         if let Some(why) = held(&root, &r.name, &fresh, &up.version) {
-            say!(
-                "{:w$} {:v$} -> {:u$}  held",
-                r.name,
-                r.ours,
-                up.version
-            );
+            say!("{:w$} {:v$} -> {:u$}  held", r.name, r.ours, up.version);
             match why.is_empty() {
                 true => say!("  hold {}", up.version),
                 false => say!("  hold {}  {why}", up.version),
@@ -10760,13 +10461,7 @@ fn sync_cmd(args: &[String]) {
         }
 
         if dry {
-            say!(
-                "{:w$} {:v$} -> {:u$}  {}",
-                r.name,
-                r.ours,
-                up.version,
-                fresh.display()
-            );
+            say!("{:w$} {:v$} -> {:u$}  {}", r.name, r.ours, up.version, fresh.display());
             say!("  {}", at.display());
             continue;
         }
@@ -10865,13 +10560,11 @@ fn sync_cmd(args: &[String]) {
                         }
                         for f in &b.differ {
                             match f.as_str() {
-                                "build" if b.carried.iter().any(|c| c == "build") => notes
-                                    .push(format!(
-                                        "build is this tree's, alpine's is at {}",
-                                        conv.join("pending").display()
-                                    )),
-                                _ => notes
-                                    .push(format!("{f} differs from {}", old.join(f).display())),
+                                "build" if b.carried.iter().any(|c| c == "build") => notes.push(format!(
+                                    "build is this tree's, alpine's is at {}",
+                                    conv.join("pending").display()
+                                )),
+                                _ => notes.push(format!("{f} differs from {}", old.join(f).display())),
                             }
                         }
                         // the note above says where alpine's build is. this says what
@@ -10907,13 +10600,7 @@ fn sync_cmd(args: &[String]) {
         if let Ok(b) = fs::read_to_string(fresh.join("build")) {
             let _ = fs::write(conv.join("testing"), b);
         }
-        say!(
-            "{:w$} {:v$} -> {:u$}  {}",
-            r.name,
-            r.ours,
-            up.version,
-            outcome
-        );
+        say!("{:w$} {:v$} -> {:u$}  {}", r.name, r.ours, up.version, outcome);
         for n in notes {
             say!("  {n}");
         }
@@ -11068,11 +10755,7 @@ fn portage_entry(
         if cats.len() != 1 {
             continue;
         }
-        let rev = |f: &str| {
-            f.rsplit_once("-r")
-                .and_then(|(_, r)| r.parse::<u32>().ok())
-                .unwrap_or(0)
-        };
+        let rev = |f: &str| f.rsplit_once("-r").and_then(|(_, r)| r.parse::<u32>().ok()).unwrap_or(0);
         let best = all
             .iter()
             .filter(|(_, f)| pf(f).is_some_and(|(_, v)| v == ver))
@@ -11186,10 +10869,7 @@ fn heading(line: &str) -> Option<&'static str> {
 // versions of one recipe have in common. blank lines go too, since a bump that moves a
 // paragraph break has not moved a decision
 fn undated(text: &str) -> Vec<&str> {
-    text.lines()
-        .map(|l| heading(l).unwrap_or(l))
-        .filter(|l| !l.trim().is_empty())
-        .collect()
+    text.lines().map(|l| heading(l).unwrap_or(l)).filter(|l| !l.trim().is_empty()).collect()
 }
 
 // the new version's assignments written into the build this tree already has, so a bump
@@ -11215,16 +10895,8 @@ fn reheaded(ours: &str, fresh: &str) -> Option<String> {
 // position would call a reordered configure list a change
 fn moved_upstream(was: &str, is: &str) -> Vec<String> {
     let (a, b) = (undated(was), undated(is));
-    let mut out: Vec<String> = b
-        .iter()
-        .filter(|l| !a.contains(l))
-        .map(|l| format!("+ {}", l.trim()))
-        .collect();
-    out.extend(
-        a.iter()
-            .filter(|l| !b.contains(l))
-            .map(|l| format!("- {}", l.trim())),
-    );
+    let mut out: Vec<String> = b.iter().filter(|l| !a.contains(l)).map(|l| format!("+ {}", l.trim())).collect();
+    out.extend(a.iter().filter(|l| !b.contains(l)).map(|l| format!("- {}", l.trim())));
     out
 }
 
@@ -11281,11 +10953,7 @@ fn prepared(text: &str) -> Vec<&str> {
 // and reading that back as a finding is a page of saying nothing
 fn unprepared(ours: &str, fresh: &str) -> Vec<String> {
     let mine = prepared(ours);
-    prepared(fresh)
-        .into_iter()
-        .filter(|l| !mine.contains(l))
-        .map(|l| format!("+ {l}"))
-        .collect()
+    prepared(fresh).into_iter().filter(|l| !mine.contains(l)).map(|l| format!("+ {l}")).collect()
 }
 
 #[cfg(test)]
@@ -11361,13 +11029,7 @@ fn held(root: &Path, name: &str, at: &Path, version: &str) -> Option<String> {
     if lines.next()?.trim() != version {
         return None;
     }
-    Some(
-        lines
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    Some(lines.map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
 }
 
 // the generated build from the last time this package was converted. a bump has to say
@@ -11385,11 +11047,7 @@ fn seed(root: &Path, rows: &[Row], alias: &HashMap<String, String>, list: &[Path
     // survey walks every repo, so a bump already waiting in testing/ turns up as a
     // second row for the same name at alpine's version. seeding from that one measures
     // the bump against itself, finds nothing moved, and promotes it unread
-    let pending: BTreeSet<&str> = rows
-        .iter()
-        .filter(|r| r.status == "behind")
-        .map(|r| r.name.as_str())
-        .collect();
+    let pending: BTreeSet<&str> = rows.iter().filter(|r| r.status == "behind").map(|r| r.name.as_str()).collect();
     let scratch = root.join("var/kiry/converted/.seed");
     let mut done = 0;
     for r in rows {
@@ -11476,9 +11134,8 @@ fn keep_local(old: &Path, fresh: &Path, base: Option<&Path>) -> Result<Vec<Strin
     if kept.is_empty() {
         return Ok(kept);
     }
-    let column = |pick: fn(&(String, String)) -> &String| -> String {
-        now.iter().map(|r| pick(r).clone() + "\n").collect()
-    };
+    let column =
+        |pick: fn(&(String, String)) -> &String| -> String { now.iter().map(|r| pick(r).clone() + "\n").collect() };
     fs::write(fresh.join("sources"), column(|r| &r.0)).map_err(|e| format!("sources: {e}"))?;
     fs::write(fresh.join("checksums"), column(|r| &r.1)).map_err(|e| format!("checksums: {e}"))?;
     resource(&fresh.join("build"), &now)?;
@@ -11536,16 +11193,14 @@ fn vet(root: &Path, fresh: &Path, kept: &[String], notes: &mut Vec<String>) -> V
         c.arg("-d").arg(&tree).arg("-i").arg(fresh.join(p));
         c.stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
     };
-    let gone: Vec<String> =
-        patches.into_iter().filter(|p| !applies(p, false) && applies(p, true)).cloned().collect();
+    let gone: Vec<String> = patches.into_iter().filter(|p| !applies(p, false) && applies(p, true)).cloned().collect();
     let _ = fs::remove_dir_all(&tmp);
     if gone.is_empty() {
         return gone;
     }
     let now: Vec<(String, String)> = rows.into_iter().filter(|(s, _)| !gone.contains(s)).collect();
-    let column = |pick: fn(&(String, String)) -> &String| -> String {
-        now.iter().map(|r| pick(r).clone() + "\n").collect()
-    };
+    let column =
+        |pick: fn(&(String, String)) -> &String| -> String { now.iter().map(|r| pick(r).clone() + "\n").collect() };
     let wrote = fs::write(fresh.join("sources"), column(|r| &r.0))
         .and_then(|()| fs::write(fresh.join("checksums"), column(|r| &r.1)))
         .map_err(|e| e.to_string())
@@ -11567,12 +11222,7 @@ fn resource(build: &Path, now: &[(String, String)]) -> Result<(), String> {
         return Ok(());
     };
     let mut lines: Vec<String> = text.lines().map(String::from).collect();
-    let at: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.starts_with("source="))
-        .map(|(i, _)| i)
-        .collect();
+    let at: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.starts_with("source=")).map(|(i, _)| i).collect();
     // convert writes the whole list on one line. anything else is a shape this cannot
     // rewrite without guessing where the assignment ends
     if at.len() != 1 || !lines[at[0]].ends_with('"') {
@@ -11802,9 +11452,7 @@ fn promote_one(root: &Path, list: &[PathBuf], n: &str) -> Result<PathBuf, String
             return Err(format!("{n} moves with {m} and {m} is not in testing"));
         }
     }
-    let to = recipe(root, n)
-        .filter(|d| *d != from)
-        .unwrap_or_else(|| named_repo(list, "extra").join(n));
+    let to = recipe(root, n).filter(|d| *d != from).unwrap_or_else(|| named_repo(list, "extra").join(n));
     if let Some(up) = to.parent() {
         mkdirs(up)?;
     }
@@ -11991,9 +11639,8 @@ fn stats_cmd(args: &[String]) {
 
     let mut recipes = 0;
     for r in repos(&root) {
-        let n = fs::read_dir(&r)
-            .map(|rd| rd.flatten().filter(|e| e.path().join("build").is_file()).count())
-            .unwrap_or(0);
+        let n =
+            fs::read_dir(&r).map(|rd| rd.flatten().filter(|e| e.path().join("build").is_file()).count()).unwrap_or(0);
         out.push(format!("recipes {} {n}", r.display()));
         recipes += n;
     }
@@ -12032,10 +11679,7 @@ fn stats_cmd(args: &[String]) {
         }
     }
     // every build since they were first recorded, not the last of each like world
-    let cpu: Vec<u64> = plain(&times(&root))
-        .iter()
-        .filter_map(|l| l.split_whitespace().nth(5)?.parse().ok())
-        .collect();
+    let cpu: Vec<u64> = plain(&times(&root)).iter().filter_map(|l| l.split_whitespace().nth(5)?.parse().ok()).collect();
     if !cpu.is_empty() {
         out.push(format!("cpu {} over {} builds", clock(cpu.iter().sum()), cpu.len()));
     }
@@ -12054,8 +11698,7 @@ fn stats_cmd(args: &[String]) {
         let last = text
             .lines()
             .filter_map(|l| l.strip_prefix("# ")?.split_once(' ').map(|(_, w)| w))
-            .filter(|w| w.starts_with("rung ") || w.starts_with("stuck on "))
-            .last();
+            .rfind(|w| w.starts_with("rung ") || w.starts_with("stuck on "));
         match last {
             Some(w) if w.starts_with("stuck") => stuck += 1,
             Some(_) => recovered += 1,
@@ -12082,8 +11725,8 @@ fn stats_cmd(args: &[String]) {
             Some((w.get(2)?.parse::<u64>().ok()?, w.get(3)?.parse::<u64>().ok()?))
         })
         .fold((0, 0), |(h, a), (x, y)| (h + x, a + x + y));
-    if all > 0 {
-        out.push(format!("thinlto {}% of {all} modules", hit * 100 / all));
+    if let Some(pct) = (hit * 100).checked_div(all) {
+        out.push(format!("thinlto {pct}% of {all} modules"));
     }
     with_art(&root, "idle", &out);
 }
@@ -12162,13 +11805,10 @@ fn gc_cmd(args: &[String]) {
         let one = |f: &str| plain(&meta.join(f)).into_iter().next();
         // no sidecar is an artifact from before they were written, and nothing can say
         // what it is. left alone rather than guessed at from the file name
-        let (Some(name), Some(target), Some(version)) = (one("name"), one("targets"), one("version"))
-        else {
+        let (Some(name), Some(target), Some(version)) = (one("name"), one("targets"), one("version")) else {
             continue;
         };
-        let when = fs::metadata(&a)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let when = fs::metadata(&a).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
         arts.push((name, target, version, a, when));
     }
 
@@ -12236,11 +11876,7 @@ fn gc_cmd(args: &[String]) {
     }
     let (gone, kept): (Vec<PathBuf>, Vec<PathBuf>) = listing(&var.join("cache/sources"))
         .into_iter()
-        .partition(|f| {
-            f.file_name()
-                .and_then(|n| n.to_str())
-                .is_none_or(|n| !live.contains(n))
-        });
+        .partition(|f| f.file_name().and_then(|n| n.to_str()).is_none_or(|n| !live.contains(n)));
     sweep("sources", gone, kept.len());
 
     // a log for a version no recipe builds any more. kiry log answers for the current
@@ -12251,21 +11887,16 @@ fn gc_cmd(args: &[String]) {
         for d in listing(&r) {
             if let Ok(p) = read_recipe(&d) {
                 named.insert(p.name.clone());
-                now_building.insert(format!(
-                    "{}-{}-{}.",
-                    p.name, p.version.upstream, p.version.rev
-                ));
+                now_building.insert(format!("{}-{}-{}.", p.name, p.version.upstream, p.version.rev));
             }
         }
     }
     // build logs and nothing else. rebuilds sits beside them and is what stats reads
-    let (old, kept): (Vec<PathBuf>, Vec<PathBuf>) = listing(&var.join("log"))
-        .into_iter()
-        .filter(|f| f.extension().is_some_and(|e| e == "log"))
-        .partition(|f| {
-            f.file_name().and_then(|n| n.to_str()).is_none_or(|n| {
-                !now_building.iter().any(|pre| n.starts_with(pre.as_str()))
-            })
+    let (old, kept): (Vec<PathBuf>, Vec<PathBuf>) =
+        listing(&var.join("log")).into_iter().filter(|f| f.extension().is_some_and(|e| e == "log")).partition(|f| {
+            f.file_name()
+                .and_then(|n| n.to_str())
+                .is_none_or(|n| !now_building.iter().any(|pre| n.starts_with(pre.as_str())))
         });
     sweep("log", old, kept.len());
 
@@ -12318,14 +11949,12 @@ fn gc_cmd(args: &[String]) {
             };
             // the same rule removal uses: a file that no longer hashes to what was
             // written down was touched by hand and is not ours to delete
-            let edited: HashSet<String> =
-                install::modified(&root, &m).unwrap_or_default().into_iter().collect();
+            let edited: HashSet<String> = install::modified(&root, &m).unwrap_or_default().into_iter().collect();
             let groups = generations(&root, &m);
             // an entry no library in the record answers for is left standing rather than
             // guessed at, which is also what stops the record being dropped early
             let grouped: HashSet<&String> = groups.iter().flat_map(|(_, e)| e).map(|e| &e.path).collect();
-            let mut stay: Vec<db::Entry> =
-                m.iter().filter(|e| !grouped.contains(&e.path)).cloned().collect();
+            let mut stay: Vec<db::Entry> = m.iter().filter(|e| !grouped.contains(&e.path)).cloned().collect();
             for (soname, entries) in groups {
                 let busy = entries.iter().any(|e| open.contains_key(&e.path));
                 let touched = entries.iter().any(|e| edited.contains(&e.path));
@@ -12439,11 +12068,7 @@ fn convert_cmd(args: &[String]) {
     // what this batch derives outranks what an earlier one wrote, and neither outranks a
     // pair somebody kept by hand. so the file convert wrote is read apart from the others
     let table = out.join("aliases");
-    let hand_kept: Vec<PathBuf> = repos
-        .iter()
-        .filter(|r| !convert::generated(&r.join("aliases")))
-        .cloned()
-        .collect();
+    let hand_kept: Vec<PathBuf> = repos.iter().filter(|r| !convert::generated(&r.join("aliases"))).cloned().collect();
     let hand = convert::aliases(&hand_kept);
     let before = match convert::generated(&table) {
         true => convert::aliases(std::slice::from_ref(&out)),
@@ -12501,10 +12126,7 @@ fn owns_cmd(args: &[String]) {
                 continue;
             };
             for e in rec.manifest {
-                owner
-                    .entry(e.path)
-                    .or_default()
-                    .push((name.clone(), t.clone()));
+                owner.entry(e.path).or_default().push((name.clone(), t.clone()));
             }
         }
     }
@@ -12612,11 +12234,7 @@ fn changed(root: &Path, targets: &[String]) -> Vec<Finding> {
                 continue;
             };
             for p in install::modified(root, &m).unwrap_or_default() {
-                out.push(Finding {
-                    pkg: name.clone(),
-                    path: p,
-                    what: What::Modified,
-                });
+                out.push(Finding { pkg: name.clone(), path: p, what: What::Modified });
             }
         }
         for name in db::installed(root, t).unwrap_or_default() {
@@ -12624,11 +12242,7 @@ fn changed(root: &Path, targets: &[String]) -> Vec<Finding> {
                 continue;
             };
             for p in install::modified(root, &rec.manifest).unwrap_or_default() {
-                out.push(Finding {
-                    pkg: name.clone(),
-                    path: p,
-                    what: What::Modified,
-                });
+                out.push(Finding { pkg: name.clone(), path: p, what: What::Modified });
             }
         }
     }
@@ -12690,11 +12304,7 @@ fn unowned(root: &Path, targets: &[String]) -> (Vec<Finding>, usize) {
             // a directory nobody claims is where an unowned file lives, and saying both
             // is the same finding twice
             if !dir {
-                out.push(Finding {
-                    pkg: "-".into(),
-                    path,
-                    what: What::Unowned,
-                });
+                out.push(Finding { pkg: "-".into(), path, what: What::Unowned });
             }
         }
     }
@@ -12724,11 +12334,7 @@ fn drift(root: &Path, targets: &[String]) -> Vec<Finding> {
             continue;
         };
         if let Some((t, _)) = ts.iter().find(|(_, h)| h != first) {
-            out.push(Finding {
-                pkg: t.clone(),
-                path: name,
-                what: What::TargetDrift(ts[0].0.clone()),
-            });
+            out.push(Finding { pkg: t.clone(), path: name, what: What::TargetDrift(ts[0].0.clone()) });
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -12744,11 +12350,7 @@ fn missing_users(root: &Path, users: &[(String, Vec<String>)]) -> Vec<Finding> {
     let mut out = Vec::new();
     for (name, wants) in users {
         for u in wants.iter().filter(|u| !have.contains(u.as_str())) {
-            out.push(Finding {
-                pkg: name.clone(),
-                path: name.clone(),
-                what: What::MissingUser(u.clone()),
-            });
+            out.push(Finding { pkg: name.clone(), path: name.clone(), what: What::MissingUser(u.clone()) });
         }
     }
     out
@@ -12814,10 +12416,7 @@ impl What {
 
     // the ones that mean a file on disk will not run, as against the ones worth reading
     fn breaks(&self) -> bool {
-        matches!(
-            self,
-            What::Unresolved(_) | What::MissingSymbol(_) | What::NoInterpreter(_) | What::NoModule(..)
-        )
+        matches!(self, What::Unresolved(_) | What::MissingSymbol(_) | What::NoInterpreter(_) | What::NoModule(..))
     }
 }
 
@@ -12830,11 +12429,7 @@ fn scans(root: &Path, target: &str, names: &[String]) -> Vec<Scan> {
     each(names.len(), |i| {
         db::read(root, target, &names[i])
             .map_err(|e| e.to_string())
-            .and_then(|rec| {
-                install::scan(root, &rec.manifest)
-                    .map_err(|e| e.to_string())
-                    .map(|seen| (rec, seen))
-            })
+            .and_then(|rec| install::scan(root, &rec.manifest).map_err(|e| e.to_string()).map(|seen| (rec, seen)))
     })
 }
 
@@ -12902,22 +12497,13 @@ fn accounted(
             if !said.insert((me, who, soname)) {
                 continue;
             }
-            let kind = if reach.contains(who) {
-                "undeclared"
-            } else {
-                "build-only"
-            };
+            let kind = if reach.contains(who) { "undeclared" } else { "build-only" };
             // the package, not the file: the fix is a line in its depends, and every
             // other file of it linking the same library is the same missing line
             out.push(Finding {
                 pkg: me.to_string(),
                 path: me.to_string(),
-                what: What::Undeclared(
-                    kind,
-                    who.to_string(),
-                    soname.to_string(),
-                    elves[i].0.clone(),
-                ),
+                what: What::Undeclared(kind, who.to_string(), soname.to_string(), elves[i].0.clone()),
             });
         }
     }
@@ -12928,17 +12514,9 @@ fn accounted(
 // those reach in turn
 fn reached(target: &str, deps: &HashMap<String, Vec<Dep>>, name: &str) -> Option<(HashSet<String>, HashSet<String>)> {
     let own = deps.get(name)?;
-    let mut direct: HashSet<String> = own
-        .iter()
-        .filter(|d| !d.make && d.applies(target))
-        .map(|d| d.name.clone())
-        .collect();
-    direct.extend(
-        sandbox::substrate(target)
-            .iter()
-            .filter(|(_, make)| !make)
-            .map(|(n, _)| (*n).to_string()),
-    );
+    let mut direct: HashSet<String> =
+        own.iter().filter(|d| !d.make && d.applies(target)).map(|d| d.name.clone()).collect();
+    direct.extend(sandbox::substrate(target).iter().filter(|(_, make)| !make).map(|(n, _)| (*n).to_string()));
     let mut reach: HashSet<String> = HashSet::new();
     let mut queue: Vec<String> = direct.iter().cloned().collect();
     while let Some(n) = queue.pop() {
@@ -12946,11 +12524,7 @@ fn reached(target: &str, deps: &HashMap<String, Vec<Dep>>, name: &str) -> Option
             continue;
         }
         if let Some(r) = deps.get(&n) {
-            queue.extend(
-                r.iter()
-                    .filter(|d| !d.make && d.applies(target))
-                    .map(|d| d.name.clone()),
-            );
+            queue.extend(r.iter().filter(|d| !d.make && d.applies(target)).map(|d| d.name.clone()));
         }
     }
     Some((direct, reach))
@@ -13019,11 +12593,7 @@ type Script = (String, String, Vec<String>);
 // would break. the count is preserved libraries something still links
 fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Script>, World, usize) {
     let Some(dirs) = defaults(target) else {
-        let bad = Finding {
-            pkg: "-".into(),
-            path: target.to_string(),
-            what: What::UnknownTarget,
-        };
+        let bad = Finding { pkg: "-".into(), path: target.to_string(), what: What::UnknownTarget };
         return (vec![bad], Vec::new(), (HashSet::new(), HashMap::new()), 0);
     };
 
@@ -13073,7 +12643,9 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
                 }
             }
         }
-        if rec.manifest.iter().any(|e| e.path.ends_with(".py")) || seen.iter().any(|(_, w)| matches!(w, install::Seen::Script(_))) {
+        if rec.manifest.iter().any(|e| e.path.ends_with(".py"))
+            || seen.iter().any(|(_, w)| matches!(w, install::Seen::Script(_)))
+        {
             // the line imported() draws: dbus' examples/GetAllMatchRules.py is not dbus running python
             let files = rec
                 .manifest
@@ -13089,7 +12661,9 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
             let o = match what {
                 install::Seen::Elf(o) => o,
                 install::Seen::Script(words) => {
-                    if interpreter(&words).is_some_and(|w| w.rsplit('/').next().unwrap_or_default().starts_with("python")) {
+                    if interpreter(&words)
+                        .is_some_and(|w| w.rsplit('/').next().unwrap_or_default().starts_with("python"))
+                    {
                         pyrun.insert(path.clone());
                     }
                     shebangs.push((name.clone(), path, words));
@@ -13097,21 +12671,13 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
                 }
                 install::Seen::Other => continue,
                 install::Seen::Bad => {
-                    out.push(Finding {
-                        pkg: name.clone(),
-                        path,
-                        what: What::Unreadable,
-                    });
+                    out.push(Finding { pkg: name.clone(), path, what: What::Unreadable });
                     continue;
                 }
             };
             here.insert(fold(&path), elves.len());
             if let Some(soname) = &o.soname {
-                mine.push(db::Provide {
-                    soname: soname.clone(),
-                    versioned: o.versioned,
-                    path: path.clone(),
-                });
+                mine.push(db::Provide { soname: soname.clone(), versioned: o.versioned, path: path.clone() });
             }
             owners.push(name.clone());
             elves.push((path, o));
@@ -13125,11 +12691,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
                 was.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
                 is.sort_by(|a, b| (&a.path, &a.soname).cmp(&(&b.path, &b.soname)));
                 if was != is {
-                    out.push(Finding {
-                        pkg: name.clone(),
-                        path: name.clone(),
-                        what: What::StaleProvides,
-                    });
+                    out.push(Finding { pkg: name.clone(), path: name.clone(), what: What::StaleProvides });
                 }
             }
             Err(e) => die(e.to_string()),
@@ -13222,11 +12784,9 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
                 linked.insert(j);
                 needs[i].push(j);
             }
-            None => out.push(Finding {
-                pkg: owners[i].clone(),
-                path: elves[i].0.clone(),
-                what: What::Unresolved(want),
-            }),
+            None => {
+                out.push(Finding { pkg: owners[i].clone(), path: elves[i].0.clone(), what: What::Unresolved(want) })
+            }
         }
     }
 
@@ -13256,12 +12816,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
     // whatever interpreter loads it. what decides is reachability from something the
     // loader itself resolves, not whether anything at all names the file
     let mut asked: HashSet<usize> = HashSet::new();
-    let mut walk: Vec<usize> = elves
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, o))| o.interp)
-        .map(|(i, _)| i)
-        .collect();
+    let mut walk: Vec<usize> = elves.iter().enumerate().filter(|(_, (_, o))| o.interp).map(|(i, _)| i).collect();
     while let Some(i) = walk.pop() {
         if !asked.insert(i) {
             continue;
@@ -13275,11 +12830,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
             continue;
         }
         for want in missing(&elves, &sets, &here, &links, dirs, &own, i) {
-            out.push(Finding {
-                pkg: owners[i].clone(),
-                path: path.clone(),
-                what: What::MissingSymbol(want),
-            });
+            out.push(Finding { pkg: owners[i].clone(), path: path.clone(), what: What::MissingSymbol(want) });
         }
     }
 
@@ -13307,9 +12858,7 @@ fn check(root: &Path, target: &str, gone: &[String]) -> (Vec<Finding>, Vec<Scrip
     for (_, who) in by_name {
         for a in 0..who.len() {
             for b in a + 1..who.len() {
-                *pairs
-                    .entry((who[a].min(who[b]), who[a].max(who[b])))
-                    .or_default() += 1;
+                *pairs.entry((who[a].min(who[b]), who[a].max(who[b]))).or_default() += 1;
             }
         }
     }
@@ -13361,8 +12910,7 @@ fn checks_without(root: &Path, gone: &[(String, String)]) -> (Vec<(String, Findi
     let (mut anywhere, mut anylinks) = (HashSet::new(), HashMap::new());
     let mut scripts = Vec::new();
     for t in db::targets(root).unwrap_or_default() {
-        let mine: Vec<String> =
-            gone.iter().filter(|(gt, _)| *gt == t).map(|(_, n)| n.clone()).collect();
+        let mine: Vec<String> = gone.iter().filter(|(gt, _)| *gt == t).map(|(_, n)| n.clone()).collect();
         let (found, shebangs, (present, links), linked) = check(root, &t, &mine);
         waiting += linked;
         out.extend(found.into_iter().map(|f| (t.clone(), f)));
@@ -13383,18 +12931,12 @@ fn checks_without(root: &Path, gone: &[(String, String)]) -> (Vec<(String, Findi
         let there = if want.contains('/') {
             exists(&anywhere, &anylinks, &want)
         } else {
-            ["usr/bin", "usr/sbin"]
-                .iter()
-                .any(|d| exists(&anywhere, &anylinks, &format!("{d}/{want}")))
+            ["usr/bin", "usr/sbin"].iter().any(|d| exists(&anywhere, &anylinks, &format!("{d}/{want}")))
         };
         if !there {
             out.push((
                 t.clone(),
-                Finding {
-                    pkg: pkg.clone(),
-                    path: path.clone(),
-                    what: What::NoInterpreter(words.join(" ")),
-                },
+                Finding { pkg: pkg.clone(), path: path.clone(), what: What::NoInterpreter(words.join(" ")) },
             ));
         }
     }
@@ -13407,11 +12949,7 @@ fn interpreter(words: &[String]) -> Option<String> {
     // env looks the real one up on PATH, so that is the name that has to exist
     if want.ends_with("/env") || want == "env" {
         // env takes its own options and VAR=value pairs first. -S is the common one
-        return words
-            .iter()
-            .skip(1)
-            .find(|w| !w.starts_with('-') && !w.contains('='))
-            .cloned();
+        return words.iter().skip(1).find(|w| !w.starts_with('-') && !w.contains('=')).cloned();
     }
     Some(want)
 }
@@ -13426,30 +12964,21 @@ fn provider(
     want: &str,
     where_: &[String],
 ) -> Option<usize> {
-    where_
-        .iter()
-        .find_map(|d| at_path(here, links, &format!("{d}/{want}")))
+    where_.iter().find_map(|d| at_path(here, links, &format!("{d}/{want}")))
 }
 
 // the loader opens a path, so a symlink on the way to a library is part of resolution
 // musl reaches its libc through one: usr/lib/libc.musl-x86_64.so.1 points at the loader
 // itself. a hardlink is a file too, which is how perl ships /usr/bin/perl beside
 // perl5.44.0
-fn index(
-    manifest: &[db::Entry],
-    present: &mut HashSet<String>,
-    links: &mut HashMap<String, String>,
-) {
+fn index(manifest: &[db::Entry], present: &mut HashSet<String>, links: &mut HashMap<String, String>) {
     for e in manifest {
         if matches!(e.kind, db::Kind::File(_) | db::Kind::Hard(_)) {
             present.insert(fold(&e.path));
         }
         if let db::Kind::Link(t) = &e.kind {
-            let to = if let Some(abs) = t.strip_prefix('/') {
-                abs.to_string()
-            } else {
-                format!("{}/{t}", dirname(&e.path))
-            };
+            let to =
+                if let Some(abs) = t.strip_prefix('/') { abs.to_string() } else { format!("{}/{t}", dirname(&e.path)) };
             links.insert(fold(&e.path), fold(&to));
         }
     }
@@ -13474,11 +13003,7 @@ fn exists(present: &HashSet<String>, links: &HashMap<String, String>, path: &str
     false
 }
 
-fn at_path(
-    here: &HashMap<String, usize>,
-    links: &HashMap<String, String>,
-    path: &str,
-) -> Option<usize> {
+fn at_path(here: &HashMap<String, usize>, links: &HashMap<String, String>, path: &str) -> Option<usize> {
     let mut at = fold(path);
     // a chain of eight is past anything real and short of looping forever
     for _ in 0..8 {
@@ -13546,8 +13071,7 @@ fn missing(
                 // an unversioned definition still satisfies a versioned request, which
                 // is the case where the loader binds it and only warns
                 Some(v) => {
-                    sets[i].1.contains(&(s.name.as_str(), Some(v)))
-                        || sets[i].1.contains(&(s.name.as_str(), None))
+                    sets[i].1.contains(&(s.name.as_str(), Some(v))) || sets[i].1.contains(&(s.name.as_str(), None))
                 }
             })
         })
@@ -13608,11 +13132,8 @@ fn bundles<'a>(paths: impl Iterator<Item = &'a str>, target: &str) -> Vec<(Strin
 
 // search() for an elf inside a bundle: the bundle's directory goes first
 fn searched(o: &elf::Elf, path: &str, dirs: &[&str], bundles: &[(String, String)]) -> Vec<String> {
-    let mut out: Vec<String> = bundles
-        .iter()
-        .filter(|(top, _)| fold(path).starts_with(&format!("{top}/")))
-        .map(|(_, d)| d.clone())
-        .collect();
+    let mut out: Vec<String> =
+        bundles.iter().filter(|(top, _)| fold(path).starts_with(&format!("{top}/"))).map(|(_, d)| d.clone()).collect();
     out.extend(search(o, path, dirs));
     out
 }
@@ -13690,11 +13211,7 @@ fn show(args: &[String]) {
     }
 
     for (i, src) in p.sources.iter().enumerate() {
-        let sum = p
-            .checksums
-            .get(i)
-            .and_then(|s| s.get(..8))
-            .unwrap_or("--------");
+        let sum = p.checksums.get(i).and_then(|s| s.get(..8)).unwrap_or("--------");
         say!("src {sum} {src}");
     }
 }
@@ -13738,10 +13255,7 @@ Boot0002  kiry @root-b\tHD(1,GPT,1cb30d84,0x800,0x100000)/\\EFI\\Linux\\kiry-b.e
         let at = std::env::temp_dir().join(format!("kiry-taken-{}", std::process::id()));
         let _ = fs::remove_file(&at);
         let list = || Ok(SUBS.to_string());
-        assert!(
-            fallback(&fake, &at, list).is_err(),
-            "it did not try to snapshot"
-        );
+        assert!(fallback(&fake, &at, list).is_err(), "it did not try to snapshot");
         fs::write(&at, "@root-b\n").unwrap();
         assert_eq!(fallback(&fake, &at, list), Ok(()));
         // a root outside the pair has no other half to hold a fallback, marker or not
@@ -13772,10 +13286,8 @@ ID 339 gen 40830 top level 5 parent_uuid 958276a8-6210-0543-99cc-399d12a456b0 uu
         let at = std::env::temp_dir().join(format!("kiry-fled-{}", std::process::id()));
         let _ = fs::remove_file(&at);
         // before: @root-a a snapshot of a @root-b that still exists, and @root-a is running
-        let before = SUBS.replace(
-            "uuid 794d77e5-26df-b243-927e-7bdb57391a77",
-            "uuid 8cbe17e6-0370-b842-8fdd-a975107b9cd1",
-        );
+        let before =
+            SUBS.replace("uuid 794d77e5-26df-b243-927e-7bdb57391a77", "uuid 8cbe17e6-0370-b842-8fdd-a975107b9cd1");
         let got = fallback(&fake, &at, || Ok(before.clone()));
         assert!(refused(&got), "{got:?}");
         // the root that was snapshotted is free to replace its own snapshot, and a parent
@@ -13788,11 +13300,7 @@ ID 339 gen 40830 top level 5 parent_uuid 958276a8-6210-0543-99cc-399d12a456b0 uu
         assert!(refused(&got), "{got:?}");
         // the other half not existing yet has nothing to lose
         let got = fallback(&fake, &at, || {
-            Ok(SUBS
-                .lines()
-                .filter(|l| !l.ends_with("@root-b"))
-                .collect::<Vec<_>>()
-                .join("\n"))
+            Ok(SUBS.lines().filter(|l| !l.ends_with("@root-b")).collect::<Vec<_>>().join("\n"))
         });
         assert!(got.is_err() && !refused(&got), "{got:?}");
         // not being able to tell is no licence to delete a root
@@ -13845,14 +13353,8 @@ ID 339 gen 40830 top level 5 parent_uuid 958276a8-6210-0543-99cc-399d12a456b0 uu
     #[test]
     fn the_root_a_boot_was_given_is_the_last_rootflags_on_the_cmdline() {
         assert_eq!(booted(CMDLINE), Some("@root-a"));
-        assert_eq!(
-            booted("rootflags=subvol=@root-a rootflags=compress=zstd,subvol=/@root-b"),
-            Some("@root-b")
-        );
-        assert_eq!(
-            booted("root=/dev/sda1 rootflags=subvol=@root-a rootflags=ro"),
-            None
-        );
+        assert_eq!(booted("rootflags=subvol=@root-a rootflags=compress=zstd,subvol=/@root-b"), Some("@root-b"));
+        assert_eq!(booted("root=/dev/sda1 rootflags=subvol=@root-a rootflags=ro"), None);
         assert_eq!(booted("root=/dev/sda1 rw"), None);
     }
 
@@ -13867,10 +13369,7 @@ Boot0000  kiry @root-b\tHD(1,GPT,x)/\\EFI\\LINUX\\KIRY-B.EFI
 Boot0001  UEFI OS\tHD(1,GPT,x)/\\EFI\\BOOT\\BOOTX64.EFI
 Boot0004  kiry @root-a\tHD(1,GPT,x)/\\EFI\\LINUX\\KIRY-A.EFI
 ";
-        assert_eq!(
-            keeps("@root-a", CMDLINE, seen),
-            Ok(Some("0004".to_string()))
-        );
+        assert_eq!(keeps("@root-a", CMDLINE, seen), Ok(Some("0004".to_string())));
         // already at the front is nothing to do
         let first = seen.replace("BootOrder: 0000,0001,0004", "BootOrder: 0004,0000,0001");
         assert_eq!(keeps("@root-a", CMDLINE, &first), Ok(None));
@@ -13891,9 +13390,7 @@ Boot0004  kiry @root-a\tHD(1,GPT,x)/\\EFI\\LINUX\\KIRY-A.EFI
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-m-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-m-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -13998,10 +13495,7 @@ mod tests {
     #[test]
     fn the_table_patterns_match_the_lines_they_are_for() {
         for (pat, line) in [
-            (
-                "unknown argument: '(-[fm][\\w=-]+)'",
-                "clang: error: unknown argument: '-fno-semantic-interposition'",
-            ),
+            ("unknown argument: '(-[fm][\\w=-]+)'", "clang: error: unknown argument: '-fno-semantic-interposition'"),
             ("(out of memory|signal 9|exit status 137)", "make: *** [all] Error 137 exit status 137"),
             ("(Not a valid object file|invalid bitcode)", "ld.lld: error: Not a valid object file"),
             ("recompile with -fPIC", "relocation R_X86_64_32 can not be used; recompile with -fPIC"),
@@ -14119,9 +13613,7 @@ mod tests {
     }
 
     fn scratch(n: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-rx-{}", std::process::id()))
-            .join(n);
+        let d = std::env::temp_dir().join(format!("kiry-rx-{}", std::process::id())).join(n);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -14137,7 +13629,10 @@ mod tests {
         fs::write(at.join("failures"), FAILURES).unwrap();
 
         let rs = rules(&root).unwrap();
-        assert_eq!(rs.len(), FAILURES.lines().filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty()).count());
+        assert_eq!(
+            rs.len(),
+            FAILURES.lines().filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty()).count()
+        );
         assert_eq!(scan(&rs, "ld.lld: error: invalid bitcode").unwrap().act, "filter-lto");
     }
 
@@ -14267,19 +13762,12 @@ mod sidecar {
     // a library the build linked lands there whether the recipe named it or not
     #[test]
     fn a_library_the_build_linked_lands_in_the_sidecar() {
-        let at = std::env::temp_dir()
-            .join(format!("kiry-meta-{}", std::process::id()))
-            .join("derived");
+        let at = std::env::temp_dir().join(format!("kiry-meta-{}", std::process::id())).join("derived");
         let _ = fs::remove_dir_all(&at);
         mkdirs(&at).unwrap();
 
         let declared = pkg::Dep { name: "zlib".into(), make: false, host: false, only: None };
-        let only_gnu = pkg::Dep {
-            name: "argp".into(),
-            make: false,
-            host: false,
-            only: Some("musl".into()),
-        };
+        let only_gnu = pkg::Dep { name: "argp".into(), make: false, host: false, only: Some("musl".into()) };
         let recipe = at.join("thing");
         mkdirs(&recipe).unwrap();
         fs::write(recipe.join("version"), "1.0 1\n").unwrap();
@@ -14317,9 +13805,7 @@ mod sidecar {
     // make: 32 installed packages linked a library their record called build-only
     #[test]
     fn a_build_only_dep_the_build_linked_becomes_a_runtime_one() {
-        let at = std::env::temp_dir()
-            .join(format!("kiry-meta-{}", std::process::id()))
-            .join("promoted");
+        let at = std::env::temp_dir().join(format!("kiry-meta-{}", std::process::id())).join("promoted");
         let _ = fs::remove_dir_all(&at);
         mkdirs(&at).unwrap();
 
@@ -14360,8 +13846,7 @@ mod sidecar {
         };
         meta(&at, &p, "x86_64-musl", "0", &f, &art, &linked, &[], &p.depends).unwrap();
 
-        let got =
-            fs::read_to_string(at.join("thing-1.0-1.x86_64-musl.tar.zst.meta/depends")).unwrap();
+        let got = fs::read_to_string(at.join("thing-1.0-1.x86_64-musl.tar.zst.meta/depends")).unwrap();
         let lines: Vec<&str> = got.lines().collect();
         assert_eq!(lines, vec!["libpng", "cmake make", "argp musl"], "{got}");
     }
@@ -14444,7 +13929,12 @@ mod sidecar {
         installed(&root, "plain", &[("usr/lib/libxau.so.6", 0o755)], &["libxau.so.6"]);
         installed(&root, "tool", &[("usr/lib/libjvm.so.1", 0o755), ("usr/lib/jvm/bin/java", 0o755)], &["libjvm.so.1"]);
         so(&root.join("usr/lib/qt6/plugins/libqwayland.so"), None, &[]);
-        installed(&root, "plugin", &[("usr/lib/libQt6Wl.so.6", 0o755), ("usr/lib/qt6/plugins/libqwayland.so", 0o755)], &["libQt6Wl.so.6"]);
+        installed(
+            &root,
+            "plugin",
+            &[("usr/lib/libQt6Wl.so.6", 0o755), ("usr/lib/qt6/plugins/libqwayland.so", 0o755)],
+            &["libQt6Wl.so.6"],
+        );
         installed(&root, "data", &[("usr/share/icons/hicolor/index.theme", 0o644)], &[]);
         // a library with a cli nobody here runs, the way bzip2 and libxml2 ship one
         installed(&root, "cli", &[("usr/lib/libxml9.so.2", 0o755), ("usr/bin/xmllint9", 0o755)], &["libxml9.so.2"]);
@@ -14476,13 +13966,28 @@ mod sidecar {
 
         so(&dest.join("usr/bin/thing"), None, &[&root.join("usr/lib/libfoo.so.1")]);
         mkdirs(&dest.join("usr/share/thing")).unwrap();
-        fs::write(dest.join("usr/share/thing/probe"), "dlopen(\"libsensors.so.5\")\nexec java\nexec wwctl\nstart the bar, x.ar archive\n").unwrap();
+        fs::write(
+            dest.join("usr/share/thing/probe"),
+            "dlopen(\"libsensors.so.5\")\nexec java\nexec wwctl\nstart the bar, x.ar archive\n",
+        )
+        .unwrap();
 
-        let deps: Vec<pkg::Dep> =
-            ["linked", "loaded", "plain", "tool", "plugin", "data", "cli", "short", "unbuiltplain", "unbuilttool", "absent"]
-                .iter()
-                .map(|n| dep(n))
-                .collect();
+        let deps: Vec<pkg::Dep> = [
+            "linked",
+            "loaded",
+            "plain",
+            "tool",
+            "plugin",
+            "data",
+            "cli",
+            "short",
+            "unbuiltplain",
+            "unbuilttool",
+            "absent",
+        ]
+        .iter()
+        .map(|n| dep(n))
+        .collect();
         let mut make = dep("plainmake");
         make.make = true;
         installed(&root, "plainmake", &[("usr/lib/libz.so.1", 0o755)], &["libz.so.1"]);
@@ -14499,7 +14004,12 @@ mod sidecar {
             mkdirs(out.parent().unwrap()).unwrap();
             let at = out.with_extension("c");
             fs::write(&at, src).unwrap();
-            let ok = Command::new("clang").args(["-shared", "-fPIC", "-nostdlib", "-o"]).arg(&out).arg(&at).status().unwrap();
+            let ok = Command::new("clang")
+                .args(["-shared", "-fPIC", "-nostdlib", "-o"])
+                .arg(&out)
+                .arg(&at)
+                .status()
+                .unwrap();
             assert!(ok.success());
             fs::remove_file(&at).unwrap();
         };
@@ -14529,12 +14039,21 @@ mod sidecar {
         mkdirs(out.parent().unwrap()).unwrap();
         let c = at.join("app.c");
         fs::write(&c, src).unwrap();
-        assert!(Command::new("clang").args(["-shared", "-fPIC", "-nostdlib", "-o"]).arg(&out).arg(&c).status().unwrap().success());
+        assert!(Command::new("clang")
+            .args(["-shared", "-fPIC", "-nostdlib", "-o"])
+            .arg(&out)
+            .arg(&c)
+            .status()
+            .unwrap()
+            .success());
 
         let (found, none) = noted(&root, T, &dest);
         assert_eq!(
             found,
-            vec![("alt".to_string(), "libalt.so.2".to_string()), ("libxkbcommon".to_string(), "libxkbcommon.so.0".to_string())]
+            vec![
+                ("alt".to_string(), "libalt.so.2".to_string()),
+                ("libxkbcommon".to_string(), "libxkbcommon.so.0".to_string())
+            ]
         );
         assert_eq!(none, vec!["libnone.so.1"]);
     }
@@ -14737,7 +14256,8 @@ mod sidecar {
         fs::write(&at_, "hdr build\nlib build\nunused build\n").unwrap();
         let work = at.join("work");
         mkdirs(&work.join("src")).unwrap();
-        fs::write(work.join("src/.kiry-headers"), "{\"source\":\"/src/a.c\",\"includes\":[\"/usr/include/hdr.h\"]}\n").unwrap();
+        fs::write(work.join("src/.kiry-headers"), "{\"source\":\"/src/a.c\",\"includes\":[\"/usr/include/hdr.h\"]}\n")
+            .unwrap();
 
         unprove(&root, &p, T, &work, &["lib".to_string()]);
         assert_eq!(fs::read_to_string(&at_).unwrap(), "hdr build\nlib build\n");
@@ -14779,8 +14299,17 @@ mod sidecar {
         installed(&root, "xz", &[("usr/lib/liblzma.so.5", 0o755)], &["liblzma.so.5"]);
         so(&root.join("usr/lib/libatspi.so.0"), Some("libatspi.so.0"), &[]);
         installed(&root, "at-spi2-core", &[("usr/lib/libatspi.so.0", 0o755)], &["libatspi.so.0"]);
-        so(&root.join("usr/lib/libxml2.so.2"), Some("libxml2.so.2"), &[&root.join("usr/lib/libz.so.1"), &root.join("usr/lib/libatspi.so.0")]);
-        installed(&root, "libxml2", &[("usr/lib/libxml2.so.2", 0o755), ("usr/share/doc/libxml2/README", 0o644)], &["libxml2.so.2"]);
+        so(
+            &root.join("usr/lib/libxml2.so.2"),
+            Some("libxml2.so.2"),
+            &[&root.join("usr/lib/libz.so.1"), &root.join("usr/lib/libatspi.so.0")],
+        );
+        installed(
+            &root,
+            "libxml2",
+            &[("usr/lib/libxml2.so.2", 0o755), ("usr/share/doc/libxml2/README", 0o644)],
+            &["libxml2.so.2"],
+        );
         // a runtime line the record carries and the recipe never named
         let mut rec = db::read(&root, T, "libxml2").unwrap();
         rec.depends = vec![dep("at-spi2-core")];
@@ -14860,10 +14389,7 @@ mod sidecar {
 
         assert_eq!(
             interpreters(&root, T, &dest),
-            vec![
-                ("python3".to_string(), "python3".to_string()),
-                ("usr/bin/lua5.4".to_string(), "lua".to_string()),
-            ]
+            vec![("python3".to_string(), "python3".to_string()), ("usr/bin/lua5.4".to_string(), "lua".to_string()),]
         );
     }
 
@@ -14900,9 +14426,7 @@ mod provenance {
     use super::*;
 
     fn root(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-drift-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-drift-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -14991,20 +14515,13 @@ mod deps {
     }
 
     fn dep(name: &str, make: bool) -> Dep {
-        Dep {
-            name: name.into(),
-            make,
-            host: make,
-            only: None,
-        }
+        Dep { name: name.into(), make, host: make, only: None }
     }
 
     // a real binary with real DT_NEEDED entries, so what gets tested is the walk from a
     // soname to the member carrying it rather than a fixture's idea of what one is
     fn fixture(name: &str) -> (PathBuf, Vec<sandbox::Member>, PathBuf, String) {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-undecl-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-undecl-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         let (root, dest) = (d.join("root"), d.join("dest"));
         fs::create_dir_all(&dest).unwrap();
@@ -15018,19 +14535,11 @@ mod deps {
             &root,
             T,
             "carrier",
-            &[db::Provide {
-                soname: want.clone(),
-                versioned: false,
-                path: "usr/lib/carrier.so".into(),
-            }],
+            &[db::Provide { soname: want.clone(), versioned: false, path: "usr/lib/carrier.so".into() }],
         )
         .unwrap();
 
-        let members = vec![sandbox::Member {
-            name: "carrier".into(),
-            direct: false,
-            target: T.into(),
-        }];
+        let members = vec![sandbox::Member { name: "carrier".into(), direct: false, target: T.into() }];
         (root, members, dest, want)
     }
 
@@ -15049,11 +14558,7 @@ mod deps {
         rec(&root, "parent", &[dep("carrier", false)]);
         let deps = [dep("parent", false)];
         let got = undeclared(&root, &members, &deps, T, &dest);
-        assert!(
-            got.iter()
-                .any(|(s, who, k)| *s == want && who == "carrier" && *k == "undeclared"),
-            "{got:?}"
-        );
+        assert!(got.iter().any(|(s, who, k)| *s == want && who == "carrier" && *k == "undeclared"), "{got:?}");
     }
 
     // the package ships a library by that name and links its own, which a closure member
@@ -15073,11 +14578,7 @@ mod deps {
         let (root, members, dest, want) = fixture("makeonly");
         let deps = [dep("carrier", true)];
         let got = undeclared(&root, &members, &deps, T, &dest);
-        assert!(
-            got.iter()
-                .any(|(s, who, k)| *s == want && who == "carrier" && *k == "build-only"),
-            "{got:?}"
-        );
+        assert!(got.iter().any(|(s, who, k)| *s == want && who == "carrier" && *k == "build-only"), "{got:?}");
     }
 }
 
@@ -15089,9 +14590,7 @@ mod names {
     const T: &str = "x86_64-musl";
 
     fn root(name: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-names-{}", std::process::id()))
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-names-{}", std::process::id())).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -15121,11 +14620,7 @@ mod names {
                 depends: Vec::new(),
                 manifest: files
                     .iter()
-                    .map(|f| db::Entry {
-                        mode: 0o755,
-                        kind: db::Kind::File("0".repeat(64)),
-                        path: (*f).to_string(),
-                    })
+                    .map(|f| db::Entry { mode: 0o755, kind: db::Kind::File("0".repeat(64)), path: (*f).to_string() })
                     .collect(),
                 hash: String::new(),
                 users: Vec::new(),
@@ -15135,11 +14630,7 @@ mod names {
         .unwrap();
         let ps: Vec<db::Provide> = sonames
             .iter()
-            .map(|s| db::Provide {
-                soname: (*s).to_string(),
-                versioned: false,
-                path: format!("usr/lib/{s}"),
-            })
+            .map(|s| db::Provide { soname: (*s).to_string(), versioned: false, path: format!("usr/lib/{s}") })
             .collect();
         db::write_provides(root, t, name, &ps).unwrap();
     }
@@ -15208,10 +14699,7 @@ mod names {
 
         // a recipe for both gets both answers, each held to its own target
         fs::write(at.join("targets"), "x86_64-musl\nx86_64-gnu\n").unwrap();
-        assert_eq!(
-            deps(&load(&r, &at).unwrap()),
-            vec!["mesa x86_64-musl", "libglvnd x86_64-gnu"]
-        );
+        assert_eq!(deps(&load(&r, &at).unwrap()), vec!["mesa x86_64-musl", "libglvnd x86_64-gnu"]);
     }
 
     // nothing installed has the command, and a recipe named after it is the likely
@@ -15233,7 +14721,7 @@ mod names {
         let r = root("setupkw");
         let ep = "usr/lib/python3.14/site-packages/calver-2025.10.20.dist-info/entry_points.txt";
         installed(&r, "py3-calver", &[ep], &[]);
-        mkdirs(&r.join(ep).parent().unwrap().to_path_buf()).unwrap();
+        mkdirs(r.join(ep).parent().unwrap()).unwrap();
         fs::write(r.join(ep), "[distutils.setup_keywords]\nuse_calver = calver.integration:version\n").unwrap();
         installed(&r, "py3-other", &["usr/lib/python3.14/site-packages/other-1.dist-info/entry_points.txt"], &[]);
         let at = recipe(&r, "extra", "py3-trove-classifiers", "py3-calver make\n");
@@ -15282,7 +14770,8 @@ mod names {
         let r = root("m4");
         installed(&r, "gpgme", &["usr/share/aclocal/gpgme.m4"], &[]);
         mkdirs(&r.join("usr/share/aclocal")).unwrap();
-        fs::write(r.join("usr/share/aclocal/gpgme.m4"), "AC_DEFUN([AM_PATH_GPGME],\n[ _AM_PATH_GPGME_CONFIG ])\n").unwrap();
+        fs::write(r.join("usr/share/aclocal/gpgme.m4"), "AC_DEFUN([AM_PATH_GPGME],\n[ _AM_PATH_GPGME_CONFIG ])\n")
+            .unwrap();
         installed(&r, "caller", &["usr/share/aclocal/caller.m4"], &[]);
         fs::write(r.join("usr/share/aclocal/caller.m4"), "AC_DEFUN([CALLER], [AM_PATH_GPGME])\n").unwrap();
         let at = recipe(&r, "extra", "volume_key", "");
@@ -15296,7 +14785,11 @@ mod names {
     fn the_macro_configure_stopped_on_is_read_off_its_line() {
         let src = root("unexpanded");
         mkdirs(&src.join("sassc-3.6.2/sub")).unwrap();
-        fs::write(src.join("sassc-3.6.2/configure"), "#!/bin/sh\nac_cv=1\nLT_INIT(dlopen)\nas_fn_set_status(1)\ncase x in\nesac\n").unwrap();
+        fs::write(
+            src.join("sassc-3.6.2/configure"),
+            "#!/bin/sh\nac_cv=1\nLT_INIT(dlopen)\nas_fn_set_status(1)\ncase x in\nesac\n",
+        )
+        .unwrap();
         fs::write(src.join("sassc-3.6.2/sub/configure"), "OTHER_MACRO(x)\n").unwrap();
         assert_eq!(unexpanded(&src, 3).as_deref(), Some("LT_INIT"));
         assert_eq!(unexpanded(&src, 5).as_deref(), Some("LT_INIT"));
@@ -15351,7 +14844,12 @@ mod names {
         recipe(&r, "extra", "py3-poetry-core", "");
         recipe(&r, "extra", "py3-setuptools", "");
         recipe(&r, "extra", "py3-setuptools-scm", "");
-        let at = recipe(&r, "extra", "py3-crashtest", "py3-poetry-core make\npy3-setuptools-scm make\npy3-setuptools make\n");
+        let at = recipe(
+            &r,
+            "extra",
+            "py3-crashtest",
+            "py3-poetry-core make\npy3-setuptools-scm make\npy3-setuptools make\n",
+        );
         let p = load(&r, &at).unwrap();
         assert_eq!(answers(&r, T, "py:poetry", &p, &[]), Some(("py3-poetry-core".to_string(), "name")));
         // a name the list carries still beats a longer one with the word in it
@@ -15383,7 +14881,11 @@ mod names {
         assert!(build_requires(&deep).is_empty());
         // hatch's [tool.hatch...] requires is its own, not what the backend builds with
         let none = root("pyreq-none");
-        fs::write(none.join("pyproject.toml"), "[build-system]\nbuild-backend = \"x\"\n\n[tool.y]\nrequires = [\"no\"]\n").unwrap();
+        fs::write(
+            none.join("pyproject.toml"),
+            "[build-system]\nbuild-backend = \"x\"\n\n[tool.y]\nrequires = [\"no\"]\n",
+        )
+        .unwrap();
         assert!(build_requires(&none).is_empty());
     }
 
@@ -15500,11 +15002,19 @@ mod python {
         let root = at.join("root");
         let dest = at.join("dest");
         let sp = "usr/lib/python3.14/site-packages";
-        names_installed(&root, "python3", &["usr/lib/python3.14/os.py", "usr/lib/python3.14/lib-dynload/_bz2.cpython-314-x86_64-linux-musl.so"]);
+        names_installed(
+            &root,
+            "python3",
+            &["usr/lib/python3.14/os.py", "usr/lib/python3.14/lib-dynload/_bz2.cpython-314-x86_64-linux-musl.so"],
+        );
         names_installed(&root, "py3-requests", &[&format!("{sp}/requests/__init__.py")]);
         names_installed(&root, "at-spi2-core", &[&format!("{sp}/gi/overrides/Atspi.py")]);
         names_installed(&root, "py3-jaraco", &[&format!("{sp}/jaraco/functools/__init__.py")]);
-        put(&dest.join(format!("{sp}/app/__init__.py")), "import requests\nimport gi\nimport jaraco.functools\nimport _bz2\n", 0o644);
+        put(
+            &dest.join(format!("{sp}/app/__init__.py")),
+            "import requests\nimport gi\nimport jaraco.functools\nimport _bz2\n",
+            0o644,
+        );
 
         let (found, none) = imported(&root, T, &dest);
         let mut found: Vec<String> = found.into_iter().map(|(w, m)| format!("{w} {m}")).collect();
@@ -15616,9 +15126,7 @@ mod gentoo_flags {
             "wayland? ( dev-libs/wayland-extra ) \
              vulkan? ( media-libs/vulkan-loader wayland? ( dev-libs/wayland ) X? ( x11-libs/libX11 ) )",
         );
-        let names = |fs: &[&str]| -> Vec<String> {
-            g.wanted(&chosen(&set(fs))).into_iter().map(|(a, _)| a).collect()
-        };
+        let names = |fs: &[&str]| -> Vec<String> { g.wanted(&chosen(&set(fs))).into_iter().map(|(a, _)| a).collect() };
         assert_eq!(names(&["vulkan"]), vec!["media-libs/vulkan-loader", "dev-libs/wayland"]);
         assert_eq!(names(&["vulkan", "X"]).len(), 3);
         assert!(names(&[]).is_empty());
@@ -15705,10 +15213,7 @@ mod bump_policy {
     use super::*;
 
     fn at(repo: &str, name: &str, files: &[(&str, &str)]) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("kiry-policy-{}", std::process::id()))
-            .join(repo)
-            .join(name);
+        let d = std::env::temp_dir().join(format!("kiry-policy-{}", std::process::id())).join(repo).join(name);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         for (f, body) in files {
@@ -15974,8 +15479,12 @@ mod leaving {
     #[test]
     fn what_no_needed_entry_explains_was_dlopened() {
         let mapped: BTreeSet<String> = [
-            "usr/lib/libSDL2.so.0.3", "usr/lib/libwayland-client.so.0.2", "usr/lib/libffi.so.8.1",
-            "usr/lib/libdecor-0.so.0", "usr/lib/libdecor/plugins-1/libdecor-cairo.so", "usr/lib/libcairo.so.2",
+            "usr/lib/libSDL2.so.0.3",
+            "usr/lib/libwayland-client.so.0.2",
+            "usr/lib/libffi.so.8.1",
+            "usr/lib/libdecor-0.so.0",
+            "usr/lib/libdecor/plugins-1/libdecor-cairo.so",
+            "usr/lib/libcairo.so.2",
         ]
         .into_iter()
         .map(str::to_string)
@@ -16023,15 +15532,20 @@ mod leaving {
         electron-100     [001] .....    10.100100: sched_process_exec: filename=/usr/bin/electron pid=100 old_pid=100
         electron-100     [001] .....    10.200000: sched_process_fork: comm=electron pid=100 child_comm=electron child_pid=101
 "#;
-        let probes: HashMap<String, String> =
-            [("dl_x86_64_musl", "x86_64-musl"), ("dl_x86_64_gnu", "x86_64-gnu")].map(|(a, b)| (a.to_string(), b.to_string())).into();
+        let probes: HashMap<String, String> = [("dl_x86_64_musl", "x86_64-musl"), ("dl_x86_64_gnu", "x86_64-gnu")]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .into();
         let asked = |k: u32, n: &str, ok: bool| Ev::Asked(k, "x86_64-musl".into(), n.into(), ok);
         let got: Vec<Ev> = trace_events(&(dl.to_string() + ex), &probes).into_iter().map(|(_, e)| e).collect();
         assert_eq!(
             got,
             vec![
                 Ev::Exec(100, "/usr/bin/vesktop".into(), vec![]),
-                Ev::Exec(100, "/usr/bin/electron".into(), vec!["--ozone-platform=wayland".into(), "/usr/lib/vesktop/app.asar".into()]),
+                Ev::Exec(
+                    100,
+                    "/usr/bin/electron".into(),
+                    vec!["--ozone-platform=wayland".into(), "/usr/lib/vesktop/app.asar".into()]
+                ),
                 Ev::Fork(100, 101),
                 asked(101, "libnotify.so.4", true),
                 asked(400, "libcairo.so.2", true),
@@ -16052,7 +15566,9 @@ mod leaving {
             _ => None,
         };
         let script = |a: &[String]| a.iter().find(|x| x.ends_with(".py")).cloned();
-        let exec = |t: f64, pid: u32, f: &str, a: &[&str]| (t, Ev::Exec(pid, f.into(), a.iter().map(|s| (*s).to_string()).collect()));
+        let exec = |t: f64, pid: u32, f: &str, a: &[&str]| {
+            (t, Ev::Exec(pid, f.into(), a.iter().map(|s| (*s).to_string()).collect()))
+        };
         let ask = |t: f64, pid: u32, n: &str| (t, Ev::Asked(pid, "x86_64-musl".into(), n.into(), true));
         let events = vec![
             exec(1.0, 100, "/usr/bin/vesktop", &[]),
@@ -16202,7 +15718,7 @@ mod leaving {
         let (tx, rx) = std::sync::mpsc::channel();
         let f = fifo.clone();
         std::thread::spawn(move || {
-            let _ = tx.send((script_of(&[f.clone()]), hashbang(&f)));
+            let _ = tx.send((script_of(std::slice::from_ref(&f)), hashbang(&f)));
         });
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).expect("blocked on the fifo"), (None, None));
     }
@@ -16214,19 +15730,27 @@ mod leaving {
         let mut checked = 0;
         for lib in ["/usr/lib/libc.so", "/usr/lib64/libc.so.6"] {
             let Ok(b) = fs::read(lib) else { continue };
-            let run = |a: &[&str]| String::from_utf8(Command::new("readelf").args(a).arg(lib).output().expect("readelf").stdout).unwrap();
+            let run = |a: &[&str]| {
+                String::from_utf8(Command::new("readelf").args(a).arg(lib).output().expect("readelf").stdout).unwrap()
+            };
             let value = run(&["-W", "--dyn-syms"])
                 .lines()
                 .find_map(|l| {
                     let w: Vec<&str> = l.split_whitespace().collect();
-                    (w.len() >= 8 && w[3] == "FUNC" && w[7].split('@').next() == Some("dlopen")).then(|| u64::from_str_radix(w[1], 16).unwrap())
+                    (w.len() >= 8 && w[3] == "FUNC" && w[7].split('@').next() == Some("dlopen"))
+                        .then(|| u64::from_str_radix(w[1], 16).unwrap())
                 })
                 .unwrap();
             let off = run(&["-lW"])
                 .lines()
                 .filter(|l| l.trim_start().starts_with("LOAD"))
                 .find_map(|l| {
-                    let w: Vec<u64> = l.split_whitespace().skip(1).take(5).map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).unwrap()).collect();
+                    let w: Vec<u64> = l
+                        .split_whitespace()
+                        .skip(1)
+                        .take(5)
+                        .map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).unwrap())
+                        .collect();
                     (w[1] <= value && value < w[1] + w[3]).then(|| value - w[1] + w[0])
                 })
                 .unwrap();
@@ -16273,7 +15797,8 @@ mod misses_from_logs {
                       /src/zathura/meson.build:47:21: error required dependency not found\n\
                       47 | girara = dependency('girara', version: '>=2026.07.07')\n";
         assert_eq!(first(girara).as_deref(), Some("pc:girara"));
-        let two = "dependency libtiff-4, tiff found: NO\n/src/gtk/meson.build:484:45: error required dependency not found\n";
+        let two =
+            "dependency libtiff-4, tiff found: NO\n/src/gtk/meson.build:484:45: error required dependency not found\n";
         assert_eq!(first(two).as_deref(), Some("pc:libtiff-4"));
 
         // mach stamps every line, and librewolf's closure without rust read as nothing
@@ -16286,7 +15811,10 @@ mod misses_from_logs {
         assert_eq!(unstamped("foo.c:12:5: error: y"), "foo.c:12:5: error: y");
 
         assert_eq!(first("/usr/bin/libtool: eval: line 11083: kiry-cc: not found\n").as_deref(), Some("cmd:kiry-cc"));
-        assert_eq!(first("foo.c:1:10: fatal error: 'sensors/sensors.h' file not found\n").as_deref(), Some("h:sensors/sensors.h"));
+        assert_eq!(
+            first("foo.c:1:10: fatal error: 'sensors/sensors.h' file not found\n").as_deref(),
+            Some("h:sensors/sensors.h")
+        );
         let coloured = "\x1b[1m../tools/gold/gold-plugin.cpp:40:10: \x1b[0m\x1b[0;1;31mfatal error: \x1b[0m\x1b[1m'plugin-api.h' file not found\x1b[0m\n";
         assert_eq!(first(coloured).as_deref(), Some("h:plugin-api.h"));
         let unibilium = "./configure: line 1744: LT_INIT: not found\nconfig.status: creating Makefile\n\
@@ -16312,7 +15840,11 @@ mod misses_from_logs {
             Some("h:lzma.h")
         );
         assert_eq!(first("ld.lld: error: unable to find library -lucontext\n").as_deref(), Some("lib:ucontext"));
-        assert_eq!(first("make: libtool: No such file or directory\nmake: *** [Makefile:60: src/encoding.lo] Error 127\n").as_deref(), Some("cmd:libtool"));
+        assert_eq!(
+            first("make: libtool: No such file or directory\nmake: *** [Makefile:60: src/encoding.lo] Error 127\n")
+                .as_deref(),
+            Some("cmd:libtool")
+        );
         let mut late = String::from("msgfmt --check -o po/ca.mo po/ca.po\nmake: msgfmt: No such file or directory\nmake: *** [Makefile:281: po/ca.mo] Error 127\n");
         for i in 0..200 {
             late.push_str(&format!("   Compiling crate{i} v1.0.0\n"));
@@ -16320,19 +15852,36 @@ mod misses_from_logs {
         assert_eq!(first(&late).as_deref(), Some("cmd:msgfmt"));
         assert_eq!(first("Can't exec \"aclocal\": No such file or directory at /usr/share/autoconf/Autom4te/FileUtils.pm line 297.\n").as_deref(), Some("cmd:aclocal"));
         assert_eq!(first("error: no such command: `auditable`\n").as_deref(), Some("cmd:cargo-auditable"));
-        assert_eq!(first("You need perl in your PATH to make a build from GIT.\nCannot proceed.\n").as_deref(), Some("cmd:perl"));
-        assert_eq!(first("libtoolize:   error: Please install GNU M4, or 'export M4=/path/to/gnu/m4'.\n").as_deref(), Some("cmd:m4"));
+        assert_eq!(
+            first("You need perl in your PATH to make a build from GIT.\nCannot proceed.\n").as_deref(),
+            Some("cmd:perl")
+        );
+        assert_eq!(
+            first("libtoolize:   error: Please install GNU M4, or 'export M4=/path/to/gnu/m4'.\n").as_deref(),
+            Some("cmd:m4")
+        );
         assert_eq!(first("-- Could NOT find Lua (missing: LUA_LIBRARIES LUA_INCLUDE_DIR)\nCMake Error at CMakeLists.txt:142 (message):\n").as_deref(), Some("cmake:Lua"));
-        assert_eq!(first("./Configure: line 4978: ./lib/dialects/linux/Mksrc: not found\n").as_deref(), Some("cmd:./lib/dialects/linux/Mksrc"));
+        assert_eq!(
+            first("./Configure: line 4978: ./lib/dialects/linux/Mksrc: not found\n").as_deref(),
+            Some("cmd:./lib/dialects/linux/Mksrc")
+        );
         let itstool = "checking for python module libxml2... not found\nconfigure: error: Python module libxml2 is needed to run this package\n";
         assert_eq!(first(itstool).as_deref(), Some("py:libxml2"));
         assert!(lacking(itstool));
         assert!(lacking("Looking for a system-wide yasm...\nconfigure: error: no system-wide yasm found\n"));
-        assert_eq!(first("../meson.build:1:0: ERROR: Unknown compiler(s): [['cython'], ['cython3']]\n").as_deref(), Some("cmd:cython"));
-        assert_eq!(first("OS unsupported - missing ExtUtils::CChecker at Build.PL line 6.\n").as_deref(), Some("pl:ExtUtils/CChecker.pm"));
-        let sip = "sip-build: pyproject.toml: 'tool.sip.project.qmake': '/usr/lib/qt6/bin/qmake' is not a working qmake\n";
+        assert_eq!(
+            first("../meson.build:1:0: ERROR: Unknown compiler(s): [['cython'], ['cython3']]\n").as_deref(),
+            Some("cmd:cython")
+        );
+        assert_eq!(
+            first("OS unsupported - missing ExtUtils::CChecker at Build.PL line 6.\n").as_deref(),
+            Some("pl:ExtUtils/CChecker.pm")
+        );
+        let sip =
+            "sip-build: pyproject.toml: 'tool.sip.project.qmake': '/usr/lib/qt6/bin/qmake' is not a working qmake\n";
         assert_eq!(first(sip).as_deref(), Some("path:/usr/lib/qt6/bin/qmake"));
-        let vala = "warn unable to detect compiler type\n/src/x/meson.build:2:31: error unable to detect vala compiler\n";
+        let vala =
+            "warn unable to detect compiler type\n/src/x/meson.build:2:31: error unable to detect vala compiler\n";
         assert_eq!(first(vala).as_deref(), Some("cmd:valac"));
         assert_eq!(first("ModuleNotFoundError: No module named 'docutils.core'\n").as_deref(), Some("py:docutils"));
         let rakudo = "make: *** No rule to make target '/usr/bin/nqp-m', needed by 'gen/moar/nqp-version'.  Stop.\n";
@@ -16342,7 +15891,8 @@ mod misses_from_logs {
         assert_eq!(first(epkg).as_deref(), Some("el:llama"));
         let cbor = "===SORRY!=== Error while compiling /src/C/vendor#sources/6F54 (CBOR::Simple)\nCould not find TinyFloats in:\n    /usr/share/rakudo/vendor\nat /src/C/vendor#sources/6F54 (CBOR::Simple):4\n\n  in sub MAIN at /usr/share/rakudo/tools/install-dist.raku line 19\n";
         assert_eq!(first(cbor).as_deref(), Some("rk:TinyFloats"));
-        let gir = "checking for GI_GIRDIR... configure: error: Unable to retrieve girdir from gobject-introspection-1.0.pc\n";
+        let gir =
+            "checking for GI_GIRDIR... configure: error: Unable to retrieve girdir from gobject-introspection-1.0.pc\n";
         assert_eq!(first(gir).as_deref(), Some("pc:gobject-introspection-1.0"));
         let apr = "checking for APR-util... configure: error: the --with-apr-util parameter is incorrect. It must specify an install prefix, a build directory, or an apu-config file.\n";
         assert_eq!(first(apr).as_deref(), Some("with:apr-util"));
@@ -16353,7 +15903,10 @@ mod misses_from_logs {
         assert_eq!(first("  Foo::Bar is not a valid target.\n").as_deref(), Some("cmake:Bar"));
         // the target names the noted probe, newer probes noted after it or not
         let qt = "CMake Error at cmake/QtTargetHelpers.cmake:1599 (message):\n  PkgConfig::ATSPI2 is not a valid target.\n-- Configuring incomplete, errors occurred!\n";
-        assert_eq!(misses(qt, "pc jemalloc\npc atspi-2\npc directfb\n").first().map(String::as_str), Some("pc:atspi-2"));
+        assert_eq!(
+            misses(qt, "pc jemalloc\npc atspi-2\npc directfb\n").first().map(String::as_str),
+            Some("pc:atspi-2")
+        );
         // configure carried on past the traceback and libtool died far below it
         let mut vk = String::from("checking for /usr/bin/python3 extension module directory... Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'distutils'\n");
         for i in 0..120 {
@@ -16366,13 +15919,25 @@ mod misses_from_logs {
         assert_eq!(first(lttng).as_deref(), Some("py:setuptools"));
         let flatpak = "error /src/flatpak-1.18.4/meson.build:257:3: python3 \"pyparsing\" module is required\n";
         assert_eq!(first(flatpak).as_deref(), Some("py:pyparsing"));
-        assert_eq!(first("configure.ac:198: error: undefined or overquoted macro: AM_PATH_GPGME\n").as_deref(), Some("m4:AM_PATH_GPGME"));
+        assert_eq!(
+            first("configure.ac:198: error: undefined or overquoted macro: AM_PATH_GPGME\n").as_deref(),
+            Some("m4:AM_PATH_GPGME")
+        );
         let xfs = "../install-sh -o root -g root -m 755 -d /usr/include/xfs\nmake[1]: ../install-sh: No such file or directory\n";
         assert_eq!(first(xfs).as_deref(), Some("cmd:../install-sh"));
         assert_eq!(first("make[2]: /usr/bin/foo: No such file or directory\n"), None);
-        assert_eq!(first("configure.ac:12: error: possibly undefined macro: AM_PATH_GLIB_2_0\n").as_deref(), Some("m4:AM_PATH_GLIB_2_0"));
-        assert_eq!(first("./configure: line 6259: syntax error: unexpected word (expecting \")\")\n").as_deref(), Some("sh:configure:6259"));
-        assert_eq!(first("./configure: line 12: syntax error near unexpected token `dlopen'\n").as_deref(), Some("sh:configure:12"));
+        assert_eq!(
+            first("configure.ac:12: error: possibly undefined macro: AM_PATH_GLIB_2_0\n").as_deref(),
+            Some("m4:AM_PATH_GLIB_2_0")
+        );
+        assert_eq!(
+            first("./configure: line 6259: syntax error: unexpected word (expecting \")\")\n").as_deref(),
+            Some("sh:configure:6259")
+        );
+        assert_eq!(
+            first("./configure: line 12: syntax error near unexpected token `dlopen'\n").as_deref(),
+            Some("sh:configure:12")
+        );
         assert_eq!(
             first("hatchling.plugin.exceptions.UnknownPluginError: Unknown version source: vcs\n").as_deref(),
             Some("py:hatch_vcs")
@@ -16389,22 +15954,36 @@ mod misses_from_logs {
             libbsd.push_str(&format!("checking for f{i}... yes\n"));
         }
         libbsd.push_str("/src/libbsd-0.12.2/build-aux/missing: line 81: automake-1.16: not found\nmake: *** [Makefile:363: Makefile.in] Error 1\n");
-        assert_eq!(misses(&libbsd, "").first().map(String::as_str), Some("cmd:libtoolize"), "{:?}", misses(&libbsd, ""));
+        assert_eq!(
+            misses(&libbsd, "").first().map(String::as_str),
+            Some("cmd:libtoolize"),
+            "{:?}",
+            misses(&libbsd, "")
+        );
         let rakudo = "rm: 'dynext' is a directory\nmake: *** [Makefile:1724: m-clean] Error 1\nYou can now use 'make' to build Rakudo.\nAfter that, 'make test' will run some tests and\n'make install' will install Rakudo.\nmake: *** No rule to make target '/usr/bin/nqp-m', needed by 'gen/moar/nqp-version'.  Stop.\n";
         assert_eq!(misses(rakudo, "").first().map(String::as_str), Some("cmd:nqp-m"), "{:?}", misses(rakudo, ""));
         // 2026-10-15, the packages built before discovery
         let xmltoman = "Can't locate XML/Parser.pm in @INC (you may need to install the XML::Parser module) (@INC entries checked: /usr/lib/perl5/vendor_perl) at ./xmltoman line 22.\nBEGIN failed--compilation aborted at ./xmltoman line 22.\nmake: *** [Makefile:11: xmltoman.1] Error 2\n";
         assert_eq!(first(xmltoman).as_deref(), Some("pl:XML/Parser.pm"));
-        assert_eq!(first("Can't locate loadable object for module Foo::Bar in @INC (@INC contains: /usr/lib/perl5)\n"), None);
+        assert_eq!(
+            first("Can't locate loadable object for module Foo::Bar in @INC (@INC contains: /usr/lib/perl5)\n"),
+            None
+        );
         assert_eq!(first("/src/libnvme-1.16.2/meson.build:52:9: error command failed\nenv: can't execute 'bash': No such file or directory\n").as_deref(), Some("cmd:bash"));
         // 2026-10-17, recipes never built before
         let acsccid = "configure: WARNING: libpcsclite not found by pkg-config\nchecking for SCardEstablishContext... no\nconfigure: error: install pcsc-lite 1.8.3 or later, or use ./configure PCSC_CFLAGS=...\n";
         assert_eq!(first(acsccid).as_deref(), Some("pc:libpcsclite"));
         let rdedup = "error: could not find native static library `sodium`, perhaps an -L flag is missing?\n\nerror: could not compile `libsodium-sys` (lib) due to 1 previous error\n";
         assert_eq!(first(rdedup).as_deref(), Some("lib:sodium"));
-        assert_eq!(first("/build: line 11: /usr/share/rakudo/tools/install-dist.raku: not found\n").as_deref(), Some("path:/usr/share/rakudo/tools/install-dist.raku"));
+        assert_eq!(
+            first("/build: line 11: /usr/share/rakudo/tools/install-dist.raku: not found\n").as_deref(),
+            Some("path:/usr/share/rakudo/tools/install-dist.raku")
+        );
         assert_eq!(first("/build: line 3: /usr/bin/gem: not found\n").as_deref(), Some("cmd:gem"));
-        assert_eq!(first("File \"bin/dune\", line 3:\nError: Program ocamlc not found in the tree or in PATH\n").as_deref(), Some("cmd:ocamlc"));
+        assert_eq!(
+            first("File \"bin/dune\", line 3:\nError: Program ocamlc not found in the tree or in PATH\n").as_deref(),
+            Some("cmd:ocamlc")
+        );
         let emacs = "Checking for autoconf (need at least version 2.65) ... missing\nYour system seems to be missing the following tool(s):\nautoconf (missing)\n";
         assert_eq!(first(emacs).as_deref(), Some("cmd:autoconf"));
         let makefun = "importlib.metadata.PackageNotFoundError: No package metadata was found for setuptools-scm\n";
@@ -16414,16 +15993,44 @@ mod misses_from_logs {
                     *** Please install libxfce4util-1.0 (atleast version 4.18.0) or adjust\n";
         assert_eq!(first(xfce).as_deref(), Some("pc:libxfce4util-1.0"));
         assert_eq!(first("/usr/bin/env: 'bash': No such file or directory\n").as_deref(), Some("cmd:bash"));
-        let cursor = "checking for m4 that supports -I option... configure: error: could not find m4 that supports -I option\n";
+        let cursor =
+            "checking for m4 that supports -I option... configure: error: could not find m4 that supports -I option\n";
         assert_eq!(first(cursor).as_deref(), Some("cmd:m4"));
         let secret = "I/O error : Attempt to load network entity: http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl\nwarning: failed to load external entity \"http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl\"\nninja: subcommand failed\n";
-        assert_eq!(first(secret).as_deref(), Some("xml:http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl"));
-        assert_eq!(first("checking for flex... no\nchecking for lex... no\nconfigure: error: Neither flex nor lex was found.\n").as_deref(), Some("cmd:flex"));
-        assert_eq!(first("xmlto: Can't continue, xsltproc tool not found or not executable.\n").as_deref(), Some("cmd:xsltproc"));
-        assert_eq!(first("Neither yasm nor nasm have been found. See the prerequisites section in the README for more info.\n").as_deref(), Some("cmd:yasm"));
-        assert_eq!(first("Building NSS requires an installation of gyp: https://gyp.gsrc.io/\n").as_deref(), Some("cmd:gyp"));
-        assert_eq!(first("configure: error: Neither bison, byacc, nor yacc was found.\n").as_deref(), Some("cmd:bison"));
-        assert_eq!(first("autoreconf: error: failed to run libtoolize: No such file or directory\n").as_deref(), Some("cmd:libtoolize"));
+        assert_eq!(
+            first(secret).as_deref(),
+            Some("xml:http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl")
+        );
+        assert_eq!(
+            first(
+                "checking for flex... no\nchecking for lex... no\nconfigure: error: Neither flex nor lex was found.\n"
+            )
+            .as_deref(),
+            Some("cmd:flex")
+        );
+        assert_eq!(
+            first("xmlto: Can't continue, xsltproc tool not found or not executable.\n").as_deref(),
+            Some("cmd:xsltproc")
+        );
+        assert_eq!(
+            first(
+                "Neither yasm nor nasm have been found. See the prerequisites section in the README for more info.\n"
+            )
+            .as_deref(),
+            Some("cmd:yasm")
+        );
+        assert_eq!(
+            first("Building NSS requires an installation of gyp: https://gyp.gsrc.io/\n").as_deref(),
+            Some("cmd:gyp")
+        );
+        assert_eq!(
+            first("configure: error: Neither bison, byacc, nor yacc was found.\n").as_deref(),
+            Some("cmd:bison")
+        );
+        assert_eq!(
+            first("autoreconf: error: failed to run libtoolize: No such file or directory\n").as_deref(),
+            Some("cmd:libtoolize")
+        );
         assert_eq!(first("    raise child_exception_type(errno_num, err_msg, err_filename)\nFileNotFoundError: [Errno 2] No such file or directory: 'perl'\nninja: subcommands failed\n").as_deref(), Some("cmd:perl"));
         assert_eq!(first("FileNotFoundError: [Errno 2] No such file or directory: 'config.json'\n"), None);
         assert_eq!(first("Found no assembler\nMinimum version is nasm-2.13\nIf you really want to compile without asm, configure with --disable-asm.\n").as_deref(), Some("cmd:nasm"));

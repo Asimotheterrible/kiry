@@ -10,9 +10,7 @@ use kiry_core::{db, install};
 const KIRY: &str = env!("CARGO_BIN_EXE_kiry");
 
 fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir()
-        .join(format!("kiry-b-{}", std::process::id()))
-        .join(name);
+    let d = std::env::temp_dir().join(format!("kiry-b-{}", std::process::id())).join(name);
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
     d
@@ -50,8 +48,7 @@ fn recipe(at: &Path, targets: &str, script: &str) -> PathBuf {
     d
 }
 
-const GOOD: &str =
-    "echo chatter\nmkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n";
+const GOOD: &str = "echo chatter\nmkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hello\"\n";
 
 fn kiry(args: &[&str]) -> Output {
     Command::new(KIRY).args(args).output().unwrap()
@@ -61,11 +58,8 @@ fn cache(root: &Path, suffix: &str) -> Vec<String> {
     let Ok(rd) = fs::read_dir(root.join("var/kiry/cache")) else {
         return Vec::new();
     };
-    let mut out: Vec<String> = rd
-        .flatten()
-        .filter_map(|e| e.file_name().to_str().map(String::from))
-        .filter(|n| n.ends_with(suffix))
-        .collect();
+    let mut out: Vec<String> =
+        rd.flatten().filter_map(|e| e.file_name().to_str().map(String::from)).filter(|n| n.ends_with(suffix)).collect();
     out.sort();
     out
 }
@@ -90,9 +84,8 @@ fn interp(p: &Path) -> Option<String> {
         }
         v
     };
-    let half = |at: usize| -> usize {
-        (*b.get(at + 1).unwrap_or(&0) as usize) << 8 | *b.get(at).unwrap_or(&0) as usize
-    };
+    let half =
+        |at: usize| -> usize { (*b.get(at + 1).unwrap_or(&0) as usize) << 8 | *b.get(at).unwrap_or(&0) as usize };
     let (off, size, num) = (word(0x20), half(0x36), half(0x38));
     for i in 0..num {
         let h = off + i * size;
@@ -109,10 +102,7 @@ fn interp(p: &Path) -> Option<String> {
 fn bootstrap(root: &Path) -> bool {
     let bb = PathBuf::from("/usr/bin/busybox");
     if !bb.is_file() {
-        assert!(
-            std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-            "no busybox to seed the sandbox toolchain with"
-        );
+        assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "no busybox to seed the sandbox toolchain with");
         return false;
     }
 
@@ -155,14 +145,10 @@ fn bootstrap(root: &Path) -> bool {
     // one rather than left to the standalone shell, which reads /proc/self/exe and so
     // depends on what the sandbox mounted
     let applets = Command::new("busybox").arg("--list").output().unwrap();
-    let applets: Vec<&str> = std::str::from_utf8(&applets.stdout)
-        .unwrap()
-        .lines()
-        .collect();
+    let applets: Vec<&str> = std::str::from_utf8(&applets.stdout).unwrap().lines().collect();
     for a in [
-        "sh", "mkdir", "cp", "ln", "rm", "mv", "cat", "echo", "printf", "chmod", "find",
-        "head", "install", "patch", "tar", "dd", "true", "false", "sed", "touch", "grep",
-        "sort", "wc", "xargs", "nproc", "tr", "sleep",
+        "sh", "mkdir", "cp", "ln", "rm", "mv", "cat", "echo", "printf", "chmod", "find", "head", "install", "patch",
+        "tar", "dd", "true", "false", "sed", "touch", "grep", "sort", "wc", "xargs", "nproc", "tr", "sleep",
     ] {
         let at = format!("usr/bin/{a}");
         // this busybox is built without patch and the closure is the whole of what a
@@ -173,19 +159,13 @@ fn bootstrap(root: &Path) -> bool {
             fs::copy(&real, root.join(&at)).unwrap();
             manifest.push(db::Entry {
                 mode: 0o755,
-                kind: db::Kind::File(
-                    kiry_core::sha256(fs::File::open(root.join(&at)).unwrap()).unwrap(),
-                ),
+                kind: db::Kind::File(kiry_core::sha256(fs::File::open(root.join(&at)).unwrap()).unwrap()),
                 path: at,
             });
             continue;
         }
         std::os::unix::fs::symlink("busybox", root.join(&at)).unwrap();
-        manifest.push(db::Entry {
-            mode: 0o777,
-            kind: db::Kind::Link("busybox".into()),
-            path: at,
-        });
+        manifest.push(db::Entry { mode: 0o777, kind: db::Kind::Link("busybox".into()), path: at });
     }
 
     let provides: Vec<db::Provide> = install::scan(root, &manifest)
@@ -195,16 +175,13 @@ fn bootstrap(root: &Path) -> bool {
             let install::Seen::Elf(o) = s else {
                 return None;
             };
-            Some(db::Provide {
-                soname: o.soname?,
-                versioned: o.versioned,
-                path,
-            })
+            Some(db::Provide { soname: o.soname?, versioned: o.versioned, path })
         })
         .collect();
     // musl only. these are musl binaries and /usr/lib is not on the gnu search path, so
     // a gnu record for them is a claim doctor is right to reject
-    for target in ["x86_64-musl"] {
+    {
+        let target = "x86_64-musl";
         db::write(
             root,
             &db::Installed {
@@ -277,37 +254,22 @@ fn round_trip_through_install() {
     let meta = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst.meta");
     assert_eq!(fs::read_to_string(meta.join("name")).unwrap(), "hello\n");
     assert_eq!(fs::read_to_string(meta.join("version")).unwrap(), "1.0 1\n");
-    assert_eq!(
-        fs::read_to_string(meta.join("targets")).unwrap(),
-        "x86_64-musl\n"
-    );
+    assert_eq!(fs::read_to_string(meta.join("targets")).unwrap(), "x86_64-musl\n");
     assert_eq!(fs::read_to_string(meta.join("hash")).unwrap().len(), 65);
 
     // -n means nothing happens, an archive named by its path as much as a package named.
     // on / the real run takes the fallback snapshot first
-    let o = kiry(&[
-        "i",
-        "-n",
-        "--root",
-        root.to_str().unwrap(),
-        arc.to_str().unwrap(),
-    ]);
+    let o = kiry(&["i", "-n", "--root", root.to_str().unwrap(), arc.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(!root.join("usr/bin/hello").exists(), "-n installed it");
 
     let o = kiry(&["i", "--root", root.to_str().unwrap(), arc.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert_eq!(
-        fs::read_to_string(root.join("usr/bin/hello")).unwrap(),
-        "hi\n"
-    );
+    assert_eq!(fs::read_to_string(root.join("usr/bin/hello")).unwrap(), "hi\n");
 
     let o = kiry(&["l", "--root", root.to_str().unwrap()]);
     let listed = String::from_utf8_lossy(&o.stdout);
-    assert!(
-        listed.lines().any(|l| l == "hello 1.0 x86_64-musl"),
-        "{listed}"
-    );
+    assert!(listed.lines().any(|l| l == "hello 1.0 x86_64-musl"), "{listed}");
 }
 
 #[test]
@@ -330,11 +292,7 @@ fn an_openrc_service_never_reaches_the_artifact() {
     assert!(String::from_utf8_lossy(&o.stdout).contains("dropped etc/init.d etc/conf.d"));
 
     let arc = root.join("var/kiry/cache/hello-1.0-1.x86_64-musl.tar.zst");
-    let o = Command::new("sh")
-        .arg("-c")
-        .arg(format!("zstd -dc {} | tar tf -", arc.display()))
-        .output()
-        .unwrap();
+    let o = Command::new("sh").arg("-c").arg(format!("zstd -dc {} | tar tf -", arc.display())).output().unwrap();
     let listed = String::from_utf8_lossy(&o.stdout);
     assert!(listed.contains("usr/bin/hello"), "{listed}");
     assert!(!listed.contains("etc/init.d") && !listed.contains("etc/conf.d"), "{listed}");
@@ -461,29 +419,13 @@ fn fetches_once_and_keeps_it() {
     let at = scratch("fetch");
     let d = recipe(&at, "x86_64-musl", GOOD);
     let arc = at.join("hello-1.0.tar");
-    fs::write(
-        d.join("sources"),
-        format!("https://example/{}\n", "hello-1.0.tar"),
-    )
-    .unwrap();
+    fs::write(d.join("sources"), format!("https://example/{}\n", "hello-1.0.tar")).unwrap();
 
     // stands in for curl, and counts how often it ran
     let tally = at.join("tally");
     let fetcher = at.join("fetch.sh");
-    fs::write(
-        &fetcher,
-        format!(
-            "#!/bin/sh\necho x >> {}\ncp {} \"$2\"\n",
-            tally.display(),
-            arc.display()
-        ),
-    )
-    .unwrap();
-    Command::new("chmod")
-        .arg("+x")
-        .arg(&fetcher)
-        .status()
-        .unwrap();
+    fs::write(&fetcher, format!("#!/bin/sh\necho x >> {}\ncp {} \"$2\"\n", tally.display(), arc.display())).unwrap();
+    Command::new("chmod").arg("+x").arg(&fetcher).status().unwrap();
 
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -493,11 +435,8 @@ fn fetches_once_and_keeps_it() {
     let args = ["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()];
 
     for _ in 0..2 {
-        let o = Command::new(KIRY)
-            .args(args)
-            .env("KIRY_FETCH", format!("{} %u %o", fetcher.display()))
-            .output()
-            .unwrap();
+        let o =
+            Command::new(KIRY).args(args).env("KIRY_FETCH", format!("{} %u %o", fetcher.display())).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     }
 
@@ -530,46 +469,26 @@ fn a_transitive_dependency_keeps_everything_but_its_headers() {
     fs::write(deep.join("name"), "deep\n").ok();
     let deep2 = deep.parent().unwrap().join("deep");
     let _ = fs::rename(&deep, &deep2);
-    let o = kiry(&[
-        "b",
-        "--root",
-        root.to_str().unwrap(),
-        deep2.to_str().unwrap(),
-    ]);
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), deep2.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let art = cache(&root, ".tar.zst");
     let a = format!("{}/var/kiry/cache/{}", root.display(), art[0]);
-    assert!(kiry(&["i", "--root", root.to_str().unwrap(), &a])
-        .status
-        .success());
+    assert!(kiry(&["i", "--root", root.to_str().unwrap(), &a]).status.success());
 
     // mid depends on deep at runtime; top declares only mid
     let mid = deep2.parent().unwrap().join("mid");
     fs::create_dir_all(&mid).unwrap();
     fs::write(mid.join("version"), "1 0\n").unwrap();
     fs::write(mid.join("targets"), "x86_64-musl\n").unwrap();
-    fs::write(
-        mid.join("depends"),
-        format!("{}\n", deep2.file_name().unwrap().to_str().unwrap()),
-    )
-    .unwrap();
+    fs::write(mid.join("depends"), format!("{}\n", deep2.file_name().unwrap().to_str().unwrap())).unwrap();
     fs::write(mid.join("sources"), "").unwrap();
     fs::write(mid.join("checksums"), "").unwrap();
-    fs::write(
-        mid.join("build"),
-        "mkdir -p \"$DESTDIR/usr/bin\"\necho mid > \"$DESTDIR/usr/bin/midtool\"\n",
-    )
-    .unwrap();
+    fs::write(mid.join("build"), "mkdir -p \"$DESTDIR/usr/bin\"\necho mid > \"$DESTDIR/usr/bin/midtool\"\n").unwrap();
     let o = kiry(&["b", "--root", root.to_str().unwrap(), mid.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let mida = cache(&root, ".tar.zst")
-        .into_iter()
-        .find(|n| n.starts_with("mid-"))
-        .unwrap();
+    let mida = cache(&root, ".tar.zst").into_iter().find(|n| n.starts_with("mid-")).unwrap();
     let a = format!("{}/var/kiry/cache/{mida}", root.display());
-    assert!(kiry(&["i", "--root", root.to_str().unwrap(), &a])
-        .status
-        .success());
+    assert!(kiry(&["i", "--root", root.to_str().unwrap(), &a]).status.success());
 
     let top = mid.parent().unwrap().join("top");
     fs::create_dir_all(&top).unwrap();
@@ -602,21 +521,13 @@ fn writing_to_slash_is_refused() {
 
     // none of these three reach a write: they die on input that is not there. rebuild
     // is deliberately not among them, since on an owned / it would really start building
-    for args in [
-        vec!["b", "/nonexistent"],
-        vec!["i", "/nonexistent.tar.zst"],
-        vec!["r", "nonexistent"],
-    ] {
+    for args in [vec!["b", "/nonexistent"], vec!["i", "/nonexistent.tar.zst"], vec!["r", "nonexistent"]] {
         let mut a = args.clone();
         a.extend(["--root", "/"]);
         let o = kiry(&a);
         assert!(!o.status.success(), "{args:?} was allowed");
         let said = String::from_utf8_lossy(&o.stderr);
-        assert_eq!(
-            said.contains("refusing to write to /"),
-            !owned,
-            "{args:?}: {said}"
-        );
+        assert_eq!(said.contains("refusing to write to /"), !owned, "{args:?}: {said}");
         if !owned {
             assert!(said.contains("KIRY_ROOT_REALLY"), "{args:?}: {said}");
         }
@@ -634,10 +545,7 @@ fn writing_to_slash_is_refused() {
     // reads are not writes: doctor and l still answer for the running system
     for args in [vec!["l", "--root", "/"], vec!["doctor", "--root", "/"]] {
         let o = kiry(&args);
-        assert!(
-            !String::from_utf8_lossy(&o.stderr).contains("refusing"),
-            "{args:?} was refused"
-        );
+        assert!(!String::from_utf8_lossy(&o.stderr).contains("refusing"), "{args:?} was refused");
     }
 }
 
@@ -661,33 +569,17 @@ fn a_patch_named_through_a_url_still_gets_applied() {
     )
     .unwrap();
     let patch = at.join("thepatch");
-    fs::write(
-        &patch,
-        "--- /dev/null\n+++ b/applied\n@@ -0,0 +1 @@\n+yes\n",
-    )
-    .unwrap();
+    fs::write(&patch, "--- /dev/null\n+++ b/applied\n@@ -0,0 +1 @@\n+yes\n").unwrap();
 
     let arc = at.join("hello-1.0.tar");
-    fs::write(
-        d.join("sources"),
-        "../hello-1.0.tar\nfixup.patch::https://example/raw/fixup\n",
-    )
-    .unwrap();
+    fs::write(d.join("sources"), "../hello-1.0.tar\nfixup.patch::https://example/raw/fixup\n").unwrap();
     let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
     let psum = kiry_core::sha256(fs::File::open(&patch).unwrap()).unwrap();
     fs::write(d.join("checksums"), format!("{sum}\n{psum}\n")).unwrap();
 
     let fetcher = at.join("fetch.sh");
-    fs::write(
-        &fetcher,
-        format!("#!/bin/sh\ncp {} \"$2\"\n", patch.display()),
-    )
-    .unwrap();
-    Command::new("chmod")
-        .arg("+x")
-        .arg(&fetcher)
-        .status()
-        .unwrap();
+    fs::write(&fetcher, format!("#!/bin/sh\ncp {} \"$2\"\n", patch.display())).unwrap();
+    Command::new("chmod").arg("+x").arg(&fetcher).status().unwrap();
 
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -702,10 +594,7 @@ fn a_patch_named_through_a_url_still_gets_applied() {
         .unwrap();
     let said = String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success(), "{said}");
-    assert!(
-        !said.contains("PATCH-NOT-APPLIED"),
-        "the patch was never applied: {said}"
-    );
+    assert!(!said.contains("PATCH-NOT-APPLIED"), "the patch was never applied: {said}");
     assert!(root.join("var/kiry/cache/sources/fixup.patch").exists());
 }
 
@@ -768,11 +657,7 @@ fn a_source_tree_is_owned_by_whoever_unpacks_it() {
         .arg(&into)
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "tar rejects --no-same-owner: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "tar rejects --no-same-owner: {}", String::from_utf8_lossy(&out.stderr));
     assert!(into.join("hello-1.0/greeting").is_file());
 }
 
@@ -800,19 +685,11 @@ fn a_cross_build_is_told_the_two_triples_apart() {
     let art = cache(&root, ".tar.zst");
     let out = Command::new("sh")
         .arg("-c")
-        .arg(format!(
-            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/lib64/hello",
-            root.display(),
-            art[0]
-        ))
+        .arg(format!("zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/lib64/hello", root.display(), art[0]))
         .output()
         .unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        said.trim(),
-        "x86_64-unknown-linux-musl x86_64-unknown-linux-gnu",
-        "{said}"
-    );
+    assert_eq!(said.trim(), "x86_64-unknown-linux-musl x86_64-unknown-linux-gnu", "{said}");
 }
 
 // cmake's GNUInstallDirs defaults to lib64 on any 64-bit linux it does not recognise,
@@ -840,18 +717,12 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
         let art = cache(&root, ".tar.zst");
         let out = Command::new("sh")
             .arg("-c")
-            .arg(format!(
-                "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/{want}/hello",
-                root.display(),
-                art[0]
-            ))
+            .arg(format!("zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/{want}/hello", root.display(), art[0]))
             .output()
             .unwrap();
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(
-            said.contains(&format!(
-                "set(CMAKE_INSTALL_LIBDIR \"{want}\" CACHE STRING \"\" FORCE)"
-            )),
+            said.contains(&format!("set(CMAKE_INSTALL_LIBDIR \"{want}\" CACHE STRING \"\" FORCE)")),
             "{target} got {said}"
         );
         // GNUInstallDirs runs set_property(CACHE) over every one of these, so a plain
@@ -881,10 +752,7 @@ fn a_cmake_build_is_told_which_libdir_the_target_uses() {
             "{target} builds an object library without pic: {said}"
         );
         // nothing runs the suite, so compiling it is the whole of what it costs
-        assert!(
-            said.contains("set(BUILD_TESTING OFF CACHE BOOL \"\" FORCE)"),
-            "{target} builds its tests: {said}"
-        );
+        assert!(said.contains("set(BUILD_TESTING OFF CACHE BOOL \"\" FORCE)"), "{target} builds its tests: {said}");
     }
 }
 
@@ -911,11 +779,7 @@ fn a_build_is_told_which_triple_it_is() {
     let art = cache(&root, ".tar.zst");
     let out = Command::new("sh")
         .arg("-c")
-        .arg(format!(
-            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
-            root.display(),
-            art[0]
-        ))
+        .arg(format!("zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello", root.display(), art[0]))
         .output()
         .unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
@@ -933,26 +797,15 @@ fn a_named_source_lands_under_its_name() {
     let at = scratch("named");
     let d = recipe(&at, "x86_64-musl", GOOD);
     let arc = at.join("hello-1.0.tar");
-    fs::write(
-        d.join("sources"),
-        "hello-1.0.tar::https://example/archive/refs/tags/v1.0\n",
-    )
-    .unwrap();
+    fs::write(d.join("sources"), "hello-1.0.tar::https://example/archive/refs/tags/v1.0\n").unwrap();
 
     let fetcher = at.join("fetch.sh");
     fs::write(
         &fetcher,
-        format!(
-            "#!/bin/sh\ntest \"$1\" = https://example/archive/refs/tags/v1.0\ncp {} \"$2\"\n",
-            arc.display()
-        ),
+        format!("#!/bin/sh\ntest \"$1\" = https://example/archive/refs/tags/v1.0\ncp {} \"$2\"\n", arc.display()),
     )
     .unwrap();
-    Command::new("chmod")
-        .arg("+x")
-        .arg(&fetcher)
-        .status()
-        .unwrap();
+    Command::new("chmod").arg("+x").arg(&fetcher).status().unwrap();
 
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -1021,13 +874,7 @@ fn dash_v_streams_it_instead() {
         return;
     }
 
-    let o = kiry(&[
-        "b",
-        "--root",
-        root.to_str().unwrap(),
-        "-v",
-        d.to_str().unwrap(),
-    ]);
+    let o = kiry(&["b", "--root", root.to_str().unwrap(), "-v", d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(String::from_utf8_lossy(&o.stdout).contains("chatter"));
 }
@@ -1066,17 +913,10 @@ fn a_transitive_library_arrives_with_the_link_that_names_it() {
 }
 
 fn have_cc() -> bool {
-    if Command::new("cc")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+    if Command::new("cc").arg("--version").output().is_ok_and(|o| o.status.success()) {
         return true;
     }
-    assert!(
-        std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-        "no cc to build a library with a soname"
-    );
+    assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "no cc to build a library with a soname");
     false
 }
 
@@ -1104,16 +944,10 @@ fn shared(at: &Path, root: &Path, name: &str) {
     let manifest = vec![
         db::Entry {
             mode: 0o755,
-            kind: db::Kind::File(
-                kiry_core::sha256(fs::File::open(root.join(&real)).unwrap()).unwrap(),
-            ),
+            kind: db::Kind::File(kiry_core::sha256(fs::File::open(root.join(&real)).unwrap()).unwrap()),
             path: real,
         },
-        db::Entry {
-            mode: 0o777,
-            kind: db::Kind::Link(format!("lib{name}.so.1.2.3")),
-            path: link,
-        },
+        db::Entry { mode: 0o777, kind: db::Kind::Link(format!("lib{name}.so.1.2.3")), path: link },
     ];
     let provides: Vec<db::Provide> = install::scan(root, &manifest)
         .unwrap()
@@ -1122,11 +956,7 @@ fn shared(at: &Path, root: &Path, name: &str) {
             let install::Seen::Elf(o) = s else {
                 return None;
             };
-            Some(db::Provide {
-                soname: o.soname?,
-                versioned: o.versioned,
-                path,
-            })
+            Some(db::Provide { soname: o.soname?, versioned: o.versioned, path })
         })
         .collect();
     record(root, name, &[], manifest);
@@ -1147,12 +977,7 @@ fn record(root: &Path, name: &str, deps: &[&str], manifest: Vec<db::Entry>) {
             version: Version::parse("1.0 1").unwrap(),
             depends: deps
                 .iter()
-                .map(|d| kiry_core::pkg::Dep {
-                    name: (*d).to_string(),
-                    make: false,
-                    host: false,
-                    only: None,
-                })
+                .map(|d| kiry_core::pkg::Dep { name: (*d).to_string(), make: false, host: false, only: None })
                 .collect(),
             manifest,
             hash: String::new(),
@@ -1275,11 +1100,7 @@ fn place(root: &Path, name: &str, files: &[(&str, &Path)]) {
             let install::Seen::Elf(o) = s else {
                 return None;
             };
-            Some(db::Provide {
-                soname: o.soname?,
-                versioned: o.versioned,
-                path,
-            })
+            Some(db::Provide { soname: o.soname?, versioned: o.versioned, path })
         })
         .collect();
     db::write_provides(root, "x86_64-gnu", name, &provides).unwrap();
@@ -1320,14 +1141,7 @@ fn rebuild_recompiles_what_the_break_names() {
     fs::write(d.join("version"), "1.0 1\n").unwrap();
     fs::write(d.join("targets"), "x86_64-gnu\n").unwrap();
     fs::write(d.join("sources"), "../../app-1.0.tar\n").unwrap();
-    fs::write(
-        d.join("checksums"),
-        format!(
-            "{}\n",
-            kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap()
-        ),
-    )
-    .unwrap();
+    fs::write(d.join("checksums"), format!("{}\n", kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap())).unwrap();
     fs::write(d.join("depends"), "libp\n").unwrap();
     fs::write(
         d.join("build"),
@@ -1345,12 +1159,7 @@ fn rebuild_recompiles_what_the_break_names() {
     fs::create_dir_all(half.join("app")).unwrap();
     fs::write(
         root.join("etc/kiry/repos"),
-        format!(
-            "# where to look\n\n{}\n{}\n{}\n",
-            bare.display(),
-            half.display(),
-            repo.display()
-        ),
+        format!("# where to look\n\n{}\n{}\n{}\n", bare.display(), half.display(), repo.display()),
     )
     .unwrap();
 
@@ -1366,20 +1175,12 @@ fn rebuild_recompiles_what_the_break_names() {
     // the soname moves under it, which is the break the whole engine exists for
     place(&root, "libp", &[("usr/lib64/libp.so.2", &two)]);
     let _ = fs::remove_file(root.join("usr/lib64/libp.so.1"));
-    let out = String::from_utf8_lossy(&kiry(&["doctor", "--root", r]).stdout)
-        .into_owned();
-    assert!(
-        out.contains("usr/lib64/app x86_64-gnu unresolved libp.so.1"),
-        "{out}"
-    );
+    let out = String::from_utf8_lossy(&kiry(&["doctor", "--root", r]).stdout).into_owned();
+    assert!(out.contains("usr/lib64/app x86_64-gnu unresolved libp.so.1"), "{out}");
 
     let o = kiry(&["rebuild", "--root", r]);
     let said = String::from_utf8_lossy(&o.stdout);
-    assert!(
-        said.contains("app 1.0 x86_64-gnu rebuilt"),
-        "out: {said}\nerr: {}",
-        String::from_utf8_lossy(&o.stderr)
-    );
+    assert!(said.contains("app 1.0 x86_64-gnu rebuilt"), "out: {said}\nerr: {}", String::from_utf8_lossy(&o.stderr));
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(!said.contains("same bytes"), "app-2 replaced app-1 and was called the same: {said}");
     let log = fs::read_to_string(root.join("var/kiry/log/rebuilds")).unwrap();
@@ -1671,11 +1472,7 @@ fn a_failure_says_where_and_quotes_the_first_real_error() {
     let block: Vec<&str> = out.lines().skip_while(|l| !l.contains(" failed ")).collect();
     let log = format!("  log    {}", root.join("var/kiry/log/hello-1.0-1.x86_64-musl.log").display());
     let first = "src/a.c:1:1: error: use of undeclared identifier bar";
-    assert_eq!(
-        block[1..],
-        ["  phase  compile", "  rule   none matched", log.as_str(), &format!("  {first}")],
-        "{out}"
-    );
+    assert_eq!(block[1..], ["  phase  compile", "  rule   none matched", log.as_str(), &format!("  {first}")], "{out}");
 
     // cut to the terminal rather than wrapped under the next line
     let tty = on_tty(40, &format!("{KIRY} b --root {} {}", root.display(), d.display()));
@@ -1693,11 +1490,7 @@ fn a_rung_note_quotes_the_first_real_error() {
     if !bootstrap(&root) {
         return;
     }
-    let d = recipe(
-        &at,
-        "x86_64-musl",
-        &format!("case \"$CFLAGS\" in\n*-O3*) {{\n{WRECK}}}; exit 2 ;;\nesac\n{GOOD}"),
-    );
+    let d = recipe(&at, "x86_64-musl", &format!("case \"$CFLAGS\" in\n*-O3*) {{\n{WRECK}}}; exit 2 ;;\nesac\n{GOOD}"));
     config(&root, None, "OPT -O3\nLTO thin\n");
 
     let o = kiry(&["b", "--root", root.to_str().unwrap(), "--recover", d.to_str().unwrap()]);
@@ -1894,11 +1687,8 @@ fn a_failed_rebuild_skips_what_needs_it_and_builds_the_rest() {
         fs::write(d.join("sources"), "../../hello-1.0.tar\n").unwrap();
         fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
         fs::write(d.join("depends"), dep).unwrap();
-        fs::write(
-            d.join("build"),
-            format!("mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/{name}\"\n"),
-        )
-        .unwrap();
+        fs::write(d.join("build"), format!("mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/{name}\"\n"))
+            .unwrap();
         let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let a = root.join(format!("var/kiry/cache/{name}-1.0-1.x86_64-musl.tar.zst"));
@@ -1935,8 +1725,7 @@ fn stats_says_cpu_time_and_how_recoveries_ended() {
         return;
     }
     let d = recipe(&at, "x86_64-musl", &format!("i=0\nwhile [ $i -lt 300000 ]; do i=$((i+1)); done\n{GOOD}"));
-    fs::write(d.join("filter"), "# 2026-09-12 rung 1 after compile failed on x86_64-musl\nfilter-lto\n")
-        .unwrap();
+    fs::write(d.join("filter"), "# 2026-09-12 rung 1 after compile failed on x86_64-musl\nfilter-lto\n").unwrap();
     let r = root.to_str().unwrap();
     let o = kiry(&["b", "--root", r, d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -1945,8 +1734,7 @@ fn stats_says_cpu_time_and_how_recoveries_ended() {
     assert!(cpu.parse::<u64>().is_ok(), "no cpu column: {times}");
 
     fs::create_dir_all(root.join("etc/kiry/pkg")).unwrap();
-    fs::write(root.join("etc/kiry/pkg/other"), "# 2026-09-24 stuck on x86_64-musl: the ladder ran out\n")
-        .unwrap();
+    fs::write(root.join("etc/kiry/pkg/other"), "# 2026-09-24 stuck on x86_64-musl: the ladder ran out\n").unwrap();
     fs::write(root.join("etc/kiry/repos"), format!("{}\n", at.display())).unwrap();
     let o = kiry(&["stats", "-q", "--root", r]);
     let said = String::from_utf8_lossy(&o.stdout);
@@ -1989,16 +1777,8 @@ fn two_consumers(at: &Path, root: &Path, deps: &str) -> PathBuf {
     fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
 
     place(root, "libp", &[("usr/lib64/libp.so.1", &one)]);
-    place(
-        root,
-        "alpha",
-        &[("usr/bin/alpha", &app(&at.join("a"), "alpha", &one))],
-    );
-    place(
-        root,
-        "beta",
-        &[("usr/bin/beta", &app(&at.join("b"), "beta", &one))],
-    );
+    place(root, "alpha", &[("usr/bin/alpha", &app(&at.join("a"), "alpha", &one))]);
+    place(root, "beta", &[("usr/bin/beta", &app(&at.join("b"), "beta", &one))]);
     // the soname moves and both consumers are left naming one that is gone
     place(root, "libp", &[("usr/lib64/libp.so.2", &two)]);
     let _ = fs::remove_file(root.join("usr/lib64/libp.so.1"));
@@ -2068,11 +1848,7 @@ fn lib_with(at: &Path, soname: &str, body: &str) -> PathBuf {
 fn app_calling(at: &Path, name: &str, sym: &str, against: &Path) -> PathBuf {
     fs::create_dir_all(at).unwrap();
     let src = at.join(format!("{name}.c"));
-    fs::write(
-        &src,
-        format!("void {sym}(void);\nvoid _start(void){{{sym}();}}\n"),
-    )
-    .unwrap();
+    fs::write(&src, format!("void {sym}(void);\nvoid _start(void){{{sym}();}}\n")).unwrap();
     let out = at.join(name);
     assert!(Command::new("cc")
         .args(["-nostdlib", "-Wl,-rpath,$ORIGIN/../lib64"])
@@ -2098,11 +1874,7 @@ fn archive(at: &Path, name: &str, files: &[(&str, &Path)]) -> PathBuf {
     let _ = fs::remove_file(&arc);
     assert!(Command::new("sh")
         .arg("-c")
-        .arg(format!(
-            "cd {} && tar cf - . | zstd -q -o {}",
-            src.display(),
-            arc.display()
-        ))
+        .arg(format!("cd {} && tar cf - . | zstd -q -o {}", src.display(), arc.display()))
         .status()
         .unwrap()
         .success());
@@ -2122,11 +1894,7 @@ fn queued_pkg(l: &str) -> &str {
 }
 
 fn queued(root: &Path) -> Vec<String> {
-    fs::read_to_string(root.join("usr/lib/kiry/db/queue"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect()
+    fs::read_to_string(root.join("usr/lib/kiry/db/queue")).unwrap_or_default().lines().map(str::to_string).collect()
 }
 
 // two consumers of one library, one calling p and one calling q. dropping q resolves
@@ -2142,47 +1910,23 @@ fn only_the_consumer_that_used_what_left_is_queued() {
     fs::create_dir_all(&root).unwrap();
     let r = root.to_str().unwrap();
 
-    let both = lib_with(
-        &at.join("v1"),
-        "libp.so.1",
-        "void p(void){}\nvoid q(void){}\n",
-    );
+    let both = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\nvoid q(void){}\n");
     let gone = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
 
     let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &both)]);
     let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
-    place(
-        &root,
-        "usep",
-        &[(
-            "usr/bin/usep",
-            &app_calling(&at.join("a"), "usep", "p", &both),
-        )],
-    );
-    place(
-        &root,
-        "useq",
-        &[(
-            "usr/bin/useq",
-            &app_calling(&at.join("b"), "useq", "q", &both),
-        )],
-    );
+    place(&root, "usep", &[("usr/bin/usep", &app_calling(&at.join("a"), "usep", "p", &both))]);
+    place(&root, "useq", &[("usr/bin/useq", &app_calling(&at.join("b"), "useq", "q", &both))]);
 
     let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &gone)]);
     let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
     let q = queued(&root);
-    assert!(
-        q.iter().any(|l| queued_pkg(l) == "useq"),
-        "useq calls q and is not queued: {q:?}"
-    );
-    assert!(
-        !q.iter().any(|l| queued_pkg(l) == "usep"),
-        "usep never called q and was queued anyway: {q:?}"
-    );
+    assert!(q.iter().any(|l| queued_pkg(l) == "useq"), "useq calls q and is not queued: {q:?}");
+    assert!(!q.iter().any(|l| queued_pkg(l) == "usep"), "usep never called q and was queued anyway: {q:?}");
 }
 
 // plex ships its own libp and finds it through $ORIGIN. the system libp losing q is
@@ -2288,11 +2032,7 @@ fn a_consumer_that_can_dlsym_is_queued_whatever_it_imports() {
         .status()
         .unwrap()
         .success());
-    place(
-        &root,
-        "usedl",
-        &[("usr/bin/usedl", &a.join("usedl")), ("usr/lib64/libdl.so.2", &dl)],
-    );
+    place(&root, "usedl", &[("usr/bin/usedl", &a.join("usedl")), ("usr/lib64/libdl.so.2", &dl)]);
     place(&root, "usep", &[("usr/bin/usep", &app_calling(&at.join("b"), "usep", "p", &both))]);
 
     let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &gone)]);
@@ -2300,14 +2040,8 @@ fn a_consumer_that_can_dlsym_is_queued_whatever_it_imports() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
     let q = queued(&root);
-    assert!(
-        q.iter().any(|l| queued_pkg(l) == "usedl"),
-        "usedl can dlsym and is not queued: {q:?}"
-    );
-    assert!(
-        !q.iter().any(|l| queued_pkg(l) == "usep"),
-        "usep never called q and was queued anyway: {q:?}"
-    );
+    assert!(q.iter().any(|l| queued_pkg(l) == "usedl"), "usedl can dlsym and is not queued: {q:?}");
+    assert!(!q.iter().any(|l| queued_pkg(l) == "usep"), "usep never called q and was queued anyway: {q:?}");
 }
 
 // nobody hands dlsym a mangled name. tomlplusplus stopped exporting three libc++ typeinfos
@@ -2341,11 +2075,7 @@ fn a_mangled_name_leaving_does_not_queue_what_can_dlsym() {
         .status()
         .unwrap()
         .success());
-    place(
-        &root,
-        "usedl",
-        &[("usr/bin/usedl", &a.join("usedl")), ("usr/lib64/libdl.so.2", &dl)],
-    );
+    place(&root, "usedl", &[("usr/bin/usedl", &a.join("usedl")), ("usr/lib64/libdl.so.2", &dl)]);
 
     let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &gone)]);
     let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
@@ -2378,14 +2108,9 @@ fn an_edited_config_survives_and_a_library_does_not() {
     let one = archive(
         &at,
         "cfg-1",
-        &[
-            ("etc/thing.conf", &put("c1", "shipped\n")),
-            ("usr/lib/thing.so", &put("l1", "one\n")),
-        ],
+        &[("etc/thing.conf", &put("c1", "shipped\n")), ("usr/lib/thing.so", &put("l1", "one\n"))],
     );
-    assert!(kiry(&["i", "--root", r, one.to_str().unwrap()])
-        .status
-        .success());
+    assert!(kiry(&["i", "--root", r, one.to_str().unwrap()]).status.success());
 
     fs::write(root.join("etc/thing.conf"), b"mine\n").unwrap();
     fs::write(root.join("usr/lib/thing.so"), b"tampered\n").unwrap();
@@ -2393,24 +2118,13 @@ fn an_edited_config_survives_and_a_library_does_not() {
     let two = archive(
         &at,
         "cfg-2",
-        &[
-            ("etc/thing.conf", &put("c2", "shipped2\n")),
-            ("usr/lib/thing.so", &put("l2", "two\n")),
-        ],
+        &[("etc/thing.conf", &put("c2", "shipped2\n")), ("usr/lib/thing.so", &put("l2", "two\n"))],
     );
     let o = kiry(&["i", "--root", r, "--force", two.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
-    assert_eq!(
-        fs::read(root.join("etc/thing.conf")).unwrap(),
-        b"mine\n",
-        "the edit was overwritten"
-    );
-    assert_eq!(
-        fs::read(root.join("usr/lib/thing.so")).unwrap(),
-        b"two\n",
-        "a library was kept instead of replaced"
-    );
+    assert_eq!(fs::read(root.join("etc/thing.conf")).unwrap(), b"mine\n", "the edit was overwritten");
+    assert_eq!(fs::read(root.join("usr/lib/thing.so")).unwrap(), b"two\n", "a library was kept instead of replaced");
 
     // the config that was not written is the one nobody can see, and a line that only
     // says it was kept leaves you to go and find the artifact yourself
@@ -2430,49 +2144,24 @@ fn a_symbol_that_comes_back_clears_the_entry() {
     fs::create_dir_all(&root).unwrap();
     let r = root.to_str().unwrap();
 
-    let both = lib_with(
-        &at.join("v1"),
-        "libp.so.1",
-        "void p(void){}\nvoid q(void){}\n",
-    );
+    let both = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\nvoid q(void){}\n");
     let gone = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
 
     let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &both)]);
-    assert!(kiry(&["i", "--root", r, first.to_str().unwrap()])
-        .status
-        .success());
+    assert!(kiry(&["i", "--root", r, first.to_str().unwrap()]).status.success());
 
-    place(
-        &root,
-        "useq",
-        &[(
-            "usr/bin/useq",
-            &app_calling(&at.join("b"), "useq", "q", &both),
-        )],
-    );
+    place(&root, "useq", &[("usr/bin/useq", &app_calling(&at.join("b"), "useq", "q", &both))]);
 
     let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &gone)]);
-    assert!(kiry(&["i", "--root", r, "--force", second.to_str().unwrap()])
-        .status
-        .success());
-    assert!(
-        queued(&root).iter().any(|l| queued_pkg(l) == "useq"),
-        "useq was never queued: {:?}",
-        queued(&root)
-    );
+    assert!(kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]).status.success());
+    assert!(queued(&root).iter().any(|l| queued_pkg(l) == "useq"), "useq was never queued: {:?}", queued(&root));
 
     let third = archive(&at, "foo-3", &[("usr/lib64/libp.so.1", &both)]);
-    assert!(kiry(&["i", "--root", r, "--force", third.to_str().unwrap()])
-        .status
-        .success());
+    assert!(kiry(&["i", "--root", r, "--force", third.to_str().unwrap()]).status.success());
 
     let o = kiry(&["rebuild", "--root", r, "-n"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert!(
-        queued(&root).is_empty(),
-        "q came back and useq is still queued: {:?}",
-        queued(&root)
-    );
+    assert!(queued(&root).is_empty(), "q came back and useq is still queued: {:?}", queued(&root));
 }
 
 // a library that only gained a symbol guarantees everything it used to. the queue stays
@@ -2488,23 +2177,12 @@ fn a_library_that_only_grew_queues_nobody() {
     let r = root.to_str().unwrap();
 
     let one = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\n");
-    let two = lib_with(
-        &at.join("v2"),
-        "libp.so.1",
-        "void p(void){}\nvoid q(void){}\n",
-    );
+    let two = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\nvoid q(void){}\n");
 
     let first = archive(&at, "foo-1", &[("usr/lib64/libp.so.1", &one)]);
     let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    place(
-        &root,
-        "usep",
-        &[(
-            "usr/bin/usep",
-            &app_calling(&at.join("a"), "usep", "p", &one),
-        )],
-    );
+    place(&root, "usep", &[("usr/bin/usep", &app_calling(&at.join("a"), "usep", "p", &one))]);
 
     let second = archive(&at, "foo-2", &[("usr/lib64/libp.so.1", &two)]);
     let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
@@ -2555,46 +2233,24 @@ fn a_package_does_not_queue_itself_for_its_own_library() {
         "foo-1",
         &[
             ("usr/lib64/libp.so.1", &small),
-            (
-                "usr/lib64/libtool.so.1",
-                &touching(&at.join("t1"), "libtool.so.1", &small),
-            ),
+            ("usr/lib64/libtool.so.1", &touching(&at.join("t1"), "libtool.so.1", &small)),
         ],
     );
     let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    place(
-        &root,
-        "other",
-        &[(
-            "usr/lib64/libother.so.1",
-            &touching(&at.join("o1"), "libother.so.1", &small),
-        )],
-    );
+    place(&root, "other", &[("usr/lib64/libother.so.1", &touching(&at.join("o1"), "libother.so.1", &small))]);
 
     let second = archive(
         &at,
         "foo-2",
-        &[
-            ("usr/lib64/libp.so.1", &big),
-            (
-                "usr/lib64/libtool.so.1",
-                &touching(&at.join("t2"), "libtool.so.1", &big),
-            ),
-        ],
+        &[("usr/lib64/libp.so.1", &big), ("usr/lib64/libtool.so.1", &touching(&at.join("t2"), "libtool.so.1", &big))],
     );
     let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
     let q = queued(&root);
-    assert!(
-        q.iter().any(|l| queued_pkg(l) == "other"),
-        "other still links the old layout and is not queued: {q:?}"
-    );
-    assert!(
-        !q.iter().any(|l| queued_pkg(l) == "foo"),
-        "foo ships the library and was rebuilt with it: {q:?}"
-    );
+    assert!(q.iter().any(|l| queued_pkg(l) == "other"), "other still links the old layout and is not queued: {q:?}");
+    assert!(!q.iter().any(|l| queued_pkg(l) == "foo"), "foo ships the library and was rebuilt with it: {q:?}");
 }
 
 fn config(root: &Path, name: Option<&str>, body: &str) {
@@ -2635,11 +2291,7 @@ fn a_build_is_handed_the_flags_the_config_resolves() {
     let art = cache(&root, ".tar.zst");
     let out = Command::new("sh")
         .arg("-c")
-        .arg(format!(
-            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
-            root.display(),
-            art[0]
-        ))
+        .arg(format!("zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello", root.display(), art[0]))
         .output()
         .unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
@@ -2653,11 +2305,8 @@ fn a_build_is_handed_the_flags_the_config_resolves() {
 #[test]
 fn a_rust_build_is_handed_the_machine_it_runs_on() {
     let at = scratch("rustflags");
-    let d = recipe(
-        &at,
-        "x86_64-musl",
-        "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$RUSTFLAGS\" > \"$DESTDIR/usr/bin/hello\"\n",
-    );
+    let d =
+        recipe(&at, "x86_64-musl", "mkdir -p \"$DESTDIR/usr/bin\"\necho \"$RUSTFLAGS\" > \"$DESTDIR/usr/bin/hello\"\n");
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
     if !bootstrap(&root) {
@@ -2670,11 +2319,7 @@ fn a_rust_build_is_handed_the_machine_it_runs_on() {
     let art = cache(&root, ".tar.zst");
     let out = Command::new("sh")
         .arg("-c")
-        .arg(format!(
-            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
-            root.display(),
-            art[0]
-        ))
+        .arg(format!("zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello", root.display(), art[0]))
         .output()
         .unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
@@ -2706,10 +2351,7 @@ fn a_package_takes_the_rust_opt_level_back() {
     config(&root, None, "OPT -O2\nCFLAGS_MARCH znver3\n");
     config(&root, Some("hello"), "RUSTFLAGS -C opt-level=3\n");
     let said = resolved(&root, "hello");
-    assert!(
-        said.contains("resolved RUSTFLAGS -C target-cpu=znver3 -C opt-level=2 -C opt-level=3\n"),
-        "{said}"
-    );
+    assert!(said.contains("resolved RUSTFLAGS -C target-cpu=znver3 -C opt-level=2 -C opt-level=3\n"), "{said}");
 }
 
 // what the sidecar carries is what the record ends up holding, which is the only
@@ -2727,10 +2369,7 @@ fn an_artifact_records_what_it_was_built_with() {
 
     let o = kiry(&["b", "--root", root.to_str().unwrap(), d.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let meta = root
-        .join("var/kiry/cache")
-        .join(&sidecars(&root)[0])
-        .join("flags");
+    let meta = root.join("var/kiry/cache").join(&sidecars(&root)[0]).join("flags");
     let said = fs::read_to_string(meta).unwrap();
     assert!(said.contains("CFLAGS -O2 -march=znver3 -g0"), "{said}");
 }
@@ -2744,10 +2383,7 @@ fn a_package_replaces_a_knob_and_appends_to_the_rest() {
     config(&root, Some("glibc"), "OPT -O2\nLTO none\nCFLAGS -fno-lto\n");
 
     let said = resolved(&root, "glibc");
-    assert!(
-        said.contains("resolved CFLAGS -O2 -march=znver3 -g0 -pipe -fno-lto"),
-        "{said}"
-    );
+    assert!(said.contains("resolved CFLAGS -O2 -march=znver3 -g0 -pipe -fno-lto"), "{said}");
     // where each line came from, or a filter that looks wrong in six months has no
     // reason beside it
     assert!(said.contains("/etc/kiry/config OPT -O3"), "{said}");
@@ -2769,11 +2405,7 @@ fn a_later_minus_takes_a_flag_back_off() {
     config(&root, None, "flags x11 wayland vulkan gtk\n");
     config(&root, Some("foot"), "flags -x11\n");
 
-    assert!(
-        resolved(&root, "foot").contains("resolved FLAGS -x11 vulkan wayland\n"),
-        "{}",
-        resolved(&root, "foot")
-    );
+    assert!(resolved(&root, "foot").contains("resolved FLAGS -x11 vulkan wayland\n"), "{}", resolved(&root, "foot"));
 }
 
 // silence on a typo would mean a flag that never applied and nothing saying so
@@ -2940,10 +2572,7 @@ fn a_filter_is_subtractive_and_not_an_override() {
     filtered(&root, &root, "mesa", "filter-lto  # oomed at 16 jobs, 2026-09-09\n");
 
     let said = resolved(&root, "mesa");
-    assert!(
-        said.contains("resolved CFLAGS -O3 -march=znver3 -g0"),
-        "{said}"
-    );
+    assert!(said.contains("resolved CFLAGS -O3 -march=znver3 -g0"), "{said}");
     assert!(said.contains("resolved LDFLAGS -Wl,-O2"), "{said}");
     assert!(!said.contains("flto"), "{said}");
     assert!(!said.contains("thinlto-jobs"), "{said}");
@@ -2967,18 +2596,10 @@ fn a_filter_verb_that_is_not_one_is_refused_by_name() {
 fn the_other_verbs_reach_the_flags_they_name() {
     let root = scratch("filterverbs");
     config(&root, None, "OPT -O3\nCFLAGS_MARCH znver3\nCFLAGS -fomit-frame-pointer\n");
-    filtered(
-        &root,
-        &root,
-        "thing",
-        "replace-flags -O3 -O2\nfilter-flags -march=*\nappend-flags -fPIC\n",
-    );
+    filtered(&root, &root, "thing", "replace-flags -O3 -O2\nfilter-flags -march=*\nappend-flags -fPIC\n");
 
     let said = resolved(&root, "thing");
-    assert!(
-        said.contains("resolved CFLAGS -O2 -g0 -fomit-frame-pointer -fPIC"),
-        "{said}"
-    );
+    assert!(said.contains("resolved CFLAGS -O2 -g0 -fomit-frame-pointer -fPIC"), "{said}");
 }
 
 // only the ones that decide how fast and for what survive
@@ -3018,11 +2639,7 @@ fn a_build_reaches_flag_o_matic_through_lib_sh() {
     let art = cache(&root, ".tar.zst");
     let out = Command::new("sh")
         .arg("-c")
-        .arg(format!(
-            "zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello",
-            root.display(),
-            art[0]
-        ))
+        .arg(format!("zstd -dc {}/var/kiry/cache/{} | tar -xOf - ./usr/bin/hello", root.display(), art[0]))
         .output()
         .unwrap();
     let said = String::from_utf8_lossy(&out.stdout);
@@ -3121,10 +2738,7 @@ fn a_rung_that_changes_no_flag_costs_no_build() {
     assert_eq!(tries, 3, "{said}");
     let f = fs::read_to_string(d.join("filter")).unwrap();
     assert!(f.contains("filter-flags -march=*"), "{f}");
-    assert!(
-        !root.join("etc/kiry/pkg/hello").exists(),
-        "a rung that changed nothing was left behind"
-    );
+    assert!(!root.join("etc/kiry/pkg/hello").exists(), "a rung that changed nothing was left behind");
 }
 
 // every rung and it still fails, so none of them is a fix. left behind they read as one,
@@ -3193,14 +2807,10 @@ fn fake_clang(when: &str, then: &str) -> String {
     )
 }
 
-const CRASH: &str =
-    "echo \"PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/\" >&2; exit 1";
+const CRASH: &str = "echo \"PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/\" >&2; exit 1";
 
 fn tries(o: &Output) -> usize {
-    String::from_utf8_lossy(&o.stdout)
-        .lines()
-        .filter(|l| l.contains(" building "))
-        .count()
+    String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.contains(" building ")).count()
 }
 
 // libtool's c++ link is -nostdlib with the runtime put back as -l flags, and clang's
@@ -3298,10 +2908,7 @@ fn a_compile_fed_on_stdin_gets_one_go() {
     let d = recipe(
         &at,
         "x86_64-musl",
-        &format!(
-            "{}echo 'int x;' | kirycc $CFLAGS -x c -c - -o x.o\n{GOOD}",
-            fake_clang("*-march=*", CRASH)
-        ),
+        &format!("{}echo 'int x;' | kirycc $CFLAGS -x c -c - -o x.o\n{GOOD}", fake_clang("*-march=*", CRASH)),
     );
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -3398,8 +3005,7 @@ fn cargo_fetched_apart(name: &str, head: &str, apart: Option<&str>, own: bool) {
         ),
     )
     .unwrap();
-    fs::set_permissions(bin.join("cargo"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .unwrap();
+    fs::set_permissions(bin.join("cargo"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
     if !bootstrap(&root) {
@@ -3437,11 +3043,8 @@ fn a_patch_that_edits_the_lock_is_fetched_for_and_taken_back_off() {
     );
     fs::write(at.join("src/hello-1.0/Cargo.lock"), "version = 4\n").unwrap();
     let arc = tarball(&at);
-    fs::write(
-        d.join("lock.patch"),
-        "--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1,2 @@\n version = 4\n+# moved\n",
-    )
-    .unwrap();
+    fs::write(d.join("lock.patch"), "--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1,2 @@\n version = 4\n+# moved\n")
+        .unwrap();
     fs::write(d.join("sources"), "../hello-1.0.tar\nlock.patch\n").unwrap();
     let sum = kiry_core::sha256(fs::File::open(&arc).unwrap()).unwrap();
     let psum = kiry_core::sha256(fs::File::open(d.join("lock.patch")).unwrap()).unwrap();
@@ -3454,8 +3057,7 @@ fn a_patch_that_edits_the_lock_is_fetched_for_and_taken_back_off() {
         format!("#!/bin/sh\ncat \"$(dirname \"$4\")/Cargo.lock\" >> {}\n", at.join("args").display()),
     )
     .unwrap();
-    fs::set_permissions(bin.join("cargo"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .unwrap();
+    fs::set_permissions(bin.join("cargo"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
     if !bootstrap(&root) {
@@ -3516,8 +3118,7 @@ fn go_fetched(name: &str, head: &str, fetched: bool) {
         ),
     )
     .unwrap();
-    fs::set_permissions(bin.join("go"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .unwrap();
+    fs::set_permissions(bin.join("go"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
     if !bootstrap(&root) {
@@ -3585,10 +3186,8 @@ fn a_lock_the_recipe_never_fetches_for_runs_no_host_tool() {
     fs::create_dir_all(&bin).unwrap();
     for tool in ["cargo", "go"] {
         let log = at.join("args");
-        fs::write(bin.join(tool), format!("#!/bin/sh\necho {tool} >> {}\nexit 1\n", log.display()))
-            .unwrap();
-        fs::set_permissions(bin.join(tool), std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        fs::write(bin.join(tool), format!("#!/bin/sh\necho {tool} >> {}\nexit 1\n", log.display())).unwrap();
+        fs::set_permissions(bin.join(tool), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     }
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
@@ -3609,8 +3208,7 @@ fn a_lock_the_recipe_never_fetches_for_runs_no_host_tool() {
 // clang gives a language it has no frontend for to gcc, and gcc is a link to clang, so
 // an ada probe forked until something killed the build. this clang hands over the way
 // the real one does, and this gcc only says it ran
-const HANDOFF: &str =
-    "g=gcc; p=; for a do [ \"$p\" = -ccc-gcc-name ] && g=$a; p=$a; done; exec \"$g\" \"$@\"";
+const HANDOFF: &str = "g=gcc; p=; for a do [ \"$p\" = -ccc-gcc-name ] && g=$a; p=$a; done; exec \"$g\" \"$@\"";
 
 #[test]
 fn a_language_clang_hands_to_gcc_does_not_come_back_to_clang() {
@@ -3641,11 +3239,7 @@ fn a_language_clang_hands_to_gcc_does_not_come_back_to_clang() {
 #[test]
 fn a_file_that_crashes_on_every_rung_is_stuck_after_one_build() {
     let at = scratch("inflight-stuck");
-    let d = recipe(
-        &at,
-        "x86_64-musl",
-        &format!("{}kirycc $CFLAGS -c x.c -o x.o\n{GOOD}", fake_clang("*", CRASH)),
-    );
+    let d = recipe(&at, "x86_64-musl", &format!("{}kirycc $CFLAGS -c x.c -o x.o\n{GOOD}", fake_clang("*", CRASH)));
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
     if !bootstrap(&root) {
@@ -3784,8 +3378,7 @@ fn gc_drops_thinlto_caches_nothing_can_read_again() {
 }
 
 const RUNG: &str = "# 2026-09-12 rung 1 after compile failed on x86_64-musl\nfilter-lto\n";
-const TABLE: &str =
-    "# 2026-09-20 link failed, recompile with -fPIC\n#   recompile with -fPIC\nappend-flags -fPIC\n";
+const TABLE: &str = "# 2026-09-20 link failed, recompile with -fPIC\n#   recompile with -fPIC\nappend-flags -fPIC\n";
 
 // a rung nothing needs any more goes, and the fix the table wrote off a line it matched
 // stays where it is
@@ -3865,11 +3458,8 @@ fn a_bisect_that_gets_stuck_leaves_the_package_as_it_was() {
 #[test]
 fn a_failure_no_flag_can_fix_says_so_at_once() {
     let at = scratch("stuck");
-    let d = recipe(
-        &at,
-        "x86_64-musl",
-        "echo \"ld.lld: error: undefined reference to \\`__isoc99_sscanf'\" >&2\nexit 1\n",
-    );
+    let d =
+        recipe(&at, "x86_64-musl", "echo \"ld.lld: error: undefined reference to \\`__isoc99_sscanf'\" >&2\nexit 1\n");
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
     if !bootstrap(&root) {
@@ -4121,12 +3711,7 @@ fn tree(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     fs::create_dir_all(&catalogue).unwrap();
     fs::write(
         root.join("etc/kiry/repos"),
-        format!(
-            "{}\n{}\n{}\n",
-            repo.display(),
-            catalogue.display(),
-            testing.display()
-        ),
+        format!("{}\n{}\n{}\n", repo.display(), catalogue.display(), testing.display()),
     )
     .unwrap();
     (root, repo, testing)
@@ -4174,10 +3759,7 @@ fn ahead_orders_what_it_can_and_says_nothing_where_it_cannot() {
             .unwrap_or_else(|| panic!("no row for {n}: {said}"));
         assert_eq!(line.split_whitespace().nth(3), Some(status), "{line}");
     }
-    assert!(
-        said.contains("8 recipes  2 behind  1 ahead  3 ok  0 untracked  2 unknown"),
-        "{said}"
-    );
+    assert!(said.contains("8 recipes  2 behind  1 ahead  3 ok  0 untracked  2 unknown"), "{said}");
     // the version it could not order is still printed, because that is the thing a
     // scheme has to be written against
     assert!(said.contains("2026d aports/main/letters unordered"), "{said}");
@@ -4289,10 +3871,7 @@ fn sync_names_what_moved_and_where_it_would_land() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(said.contains("moved 1.0 -> 1.1"), "{said}");
-    assert!(
-        said.contains(testing.join("moved").to_str().unwrap()),
-        "{said}"
-    );
+    assert!(said.contains(testing.join("moved").to_str().unwrap()), "{said}");
     assert!(said.contains("aports/main/moved/APKBUILD"), "{said}");
     assert!(!said.contains("level"), "{said}");
     assert!(said.contains("1 would be re-converted"), "{said}");
@@ -4322,10 +3901,7 @@ fn sync_writes_the_bump_and_carries_what_the_tree_added() {
     assert_eq!(fs::read_to_string(at.join("version")).unwrap(), "1.1 0\n");
     // a conversion always says x86_64-musl, so the recipe being bumped is the one that
     // knows what it builds for
-    assert_eq!(
-        fs::read_to_string(at.join("targets")).unwrap(),
-        "x86_64-musl x86_64-gnu\n"
-    );
+    assert_eq!(fs::read_to_string(at.join("targets")).unwrap(), "x86_64-musl x86_64-gnu\n");
     assert_eq!(fs::read_to_string(at.join("filter")).unwrap(), "filter-lto\n");
     assert_eq!(fs::read_to_string(at.join("pin")).unwrap(), "alpine/main\n");
     assert!(said.contains("carried"), "{said}");
@@ -4411,10 +3987,7 @@ fn a_bump_names_the_prepare_step_ours_does_not_do() {
     let o = kiry(&["sync", "--root", root.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
-    assert!(
-        said.contains("alpine's prepare does what ours does not"),
-        "{said}"
-    );
+    assert!(said.contains("alpine's prepare does what ours does not"), "{said}");
     assert!(said.contains("+ autoreconf -fi"), "{said}");
     // it heads every converted prepare there is, so reading it back is noise
     assert!(!said.contains("+ default_prepare"), "{said}");
@@ -4483,10 +4056,7 @@ fn promote_moves_testing_over_the_recipe_it_replaces() {
 
     let o = kiry(&["promote", "--root", root.to_str().unwrap(), "moved"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert_eq!(
-        fs::read_to_string(repo.join("moved/version")).unwrap(),
-        "1.1 1\n"
-    );
+    assert_eq!(fs::read_to_string(repo.join("moved/version")).unwrap(), "1.1 1\n");
     assert!(!testing.join("moved").exists(), "testing kept a copy");
 }
 
@@ -4758,10 +4328,7 @@ fn repos_fall_back_to_the_built_in_place_when_nothing_configured() {
     fs::create_dir_all(&root).unwrap();
     offer(&root.join("var/db/kiry/extra"), "found", "2.0");
 
-    let o = Command::new(KIRY)
-        .args(["--root", root.to_str().unwrap(), "found"])
-        .output()
-        .unwrap();
+    let o = Command::new(KIRY).args(["--root", root.to_str().unwrap(), "found"]).output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert!(String::from_utf8_lossy(&o.stdout).contains("found 2.0 1"));
 }
@@ -4777,10 +4344,7 @@ fn the_built_in_repos_are_in_precedence_order() {
     offer(&base.join("local"), "both", "9.9");
     offer(&base.join("extra"), "both", "1.0");
 
-    let o = Command::new(KIRY)
-        .args(["--root", root.to_str().unwrap(), "both"])
-        .output()
-        .unwrap();
+    let o = Command::new(KIRY).args(["--root", root.to_str().unwrap(), "both"]).output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(said.contains("both 9.9 1"), "{said}");
@@ -4815,11 +4379,8 @@ fn buildable(at: &Path, repo: &Path, name: &str, deps: &str) {
     fs::write(d.join("sources"), format!("{}\n", arc.display())).unwrap();
     fs::write(d.join("checksums"), format!("{sum}\n")).unwrap();
     fs::write(d.join("depends"), deps).unwrap();
-    fs::write(
-        d.join("build"),
-        format!("mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/{name}\"\n"),
-    )
-    .unwrap();
+    fs::write(d.join("build"), format!("mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/{name}\"\n"))
+        .unwrap();
 }
 
 // die prefixes every line it is handed, so an error carrying two findings is two lines
@@ -4845,10 +4406,7 @@ fn a_batch_missing_two_dependencies_prints_both_prefixed() {
     let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
     assert!(!o.status.success(), "it installed with both deps missing");
     let said = String::from_utf8_lossy(&o.stderr);
-    let got: Vec<&str> = said
-        .lines()
-        .filter(|l| l.starts_with("kiry: solo needs"))
-        .collect();
+    let got: Vec<&str> = said.lines().filter(|l| l.starts_with("kiry: solo needs")).collect();
     assert_eq!(got, ["kiry: solo needs alpha", "kiry: solo needs beta"], "{said}");
 }
 
@@ -4871,8 +4429,20 @@ fn an_extra_build_gets_the_dep_its_failure_names_and_nothing_else() {
     let Some((at, root, _)) = workshop("discover") else {
         return;
     };
-    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
-    convert_made(&root, &at, "unused", "", "mkdir -p \"$DESTDIR/usr/bin\"\necho unused > \"$DESTDIR/usr/bin/unused\"\n");
+    convert_made(
+        &root,
+        &at,
+        "hdr",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n",
+    );
+    convert_made(
+        &root,
+        &at,
+        "unused",
+        "",
+        "mkdir -p \"$DESTDIR/usr/bin\"\necho unused > \"$DESTDIR/usr/bin/unused\"\n",
+    );
     convert_made(
         &root,
         &at,
@@ -4901,7 +4471,13 @@ fn a_cmake_name_finds_the_listed_binding_named_for_it() {
     let Some((at, root, _)) = workshop("discover-word") else {
         return;
     };
-    convert_made(&root, &at, "lua-hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "lua-hdr",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n",
+    );
     convert_made(
         &root,
         &at,
@@ -4918,8 +4494,20 @@ fn a_cmake_name_finds_the_listed_binding_named_for_it() {
 
     // libjxl's Could NOT find JPEG is libjpeg-turbo, and the ijg jpeg extra/ also carries
     // is not, which the aliases say
-    convert_made(&root, &at, "libjpg-turbo", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define JPG 1' > \"$DESTDIR/usr/include/jpg.h\"\n");
-    convert_made(&root, &at, "jpg", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define IJG 1' > \"$DESTDIR/usr/include/ijg.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "libjpg-turbo",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define JPG 1' > \"$DESTDIR/usr/include/jpg.h\"\n",
+    );
+    convert_made(
+        &root,
+        &at,
+        "jpg",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define IJG 1' > \"$DESTDIR/usr/include/ijg.h\"\n",
+    );
     fs::write(at.join("extra/aliases"), "jpg\tlibjpg-turbo\n").unwrap();
     convert_made(
         &root,
@@ -4942,7 +4530,13 @@ fn recover_waits_for_a_discovered_dep_instead_of_climbing_the_ladder() {
     let Some((at, root, _)) = workshop("discover-recover") else {
         return;
     };
-    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "hdr",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n",
+    );
     convert_made(
         &root,
         &at,
@@ -4971,8 +4565,20 @@ fn an_ok_build_that_missed_a_listed_dep_gets_it_and_builds_again() {
     let Some((at, root, _)) = workshop("could") else {
         return;
     };
-    convert_made(&root, &at, "opt", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define OPT 1' > \"$DESTDIR/usr/include/opt.h\"\n");
-    convert_made(&root, &at, "never", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define NEVER 1' > \"$DESTDIR/usr/include/never.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "opt",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define OPT 1' > \"$DESTDIR/usr/include/opt.h\"\n",
+    );
+    convert_made(
+        &root,
+        &at,
+        "never",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define NEVER 1' > \"$DESTDIR/usr/include/never.h\"\n",
+    );
     convert_made(
         &root,
         &at,
@@ -5013,7 +4619,13 @@ fn b_brings_back_a_proven_dep_that_left_and_a_flag_still_takes_it_out() {
     let Some((at, root, _)) = workshop("bring") else {
         return;
     };
-    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "hdr",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n",
+    );
     convert_made(
         &root,
         &at,
@@ -5050,7 +4662,8 @@ fn a_proven_line_the_build_did_not_use_goes_once_per_version() {
     let Some((at, root, _)) = workshop("unprove") else {
         return;
     };
-    let header = |n: &str| format!("mkdir -p \"$DESTDIR/usr/include\"\necho '#define X 1' > \"$DESTDIR/usr/include/{n}.h\"\n");
+    let header =
+        |n: &str| format!("mkdir -p \"$DESTDIR/usr/include\"\necho '#define X 1' > \"$DESTDIR/usr/include/{n}.h\"\n");
     convert_made(&root, &at, "hdr", "", &header("hdr"));
     convert_made(&root, &at, "unused", "", &header("unused"));
     let app = |needs: &[&str]| {
@@ -5059,7 +4672,10 @@ fn a_proven_line_the_build_did_not_use_goes_once_per_version() {
             s.push_str(&format!("[ -f /usr/include/{n}.h ] || {{ echo \"app.c:1:10: fatal error: '{n}.h' file not found\"; exit 1; }}\n"));
         }
         let inc: Vec<String> = needs.iter().map(|n| format!("\\\"/usr/include/{n}.h\\\"")).collect();
-        s.push_str(&format!("echo \"{{\\\"source\\\":\\\"/src/app.c\\\",\\\"includes\\\":[{}]}}\" > /src/.kiry-headers\n", inc.join(",")));
+        s.push_str(&format!(
+            "echo \"{{\\\"source\\\":\\\"/src/app.c\\\",\\\"includes\\\":[{}]}}\" > /src/.kiry-headers\n",
+            inc.join(",")
+        ));
         s.push_str("mkdir -p \"$DESTDIR/usr/bin\"\necho app > \"$DESTDIR/usr/bin/app\"\n");
         s
     };
@@ -5097,12 +4713,26 @@ fn a_star_becomes_the_lines_the_build_used() {
     let Some((at, root, _)) = workshop("unstar") else {
         return;
     };
-    let header = |n: &str| format!("mkdir -p \"$DESTDIR/usr/include\" \"$DESTDIR/usr/bin\"\necho '#define X 1' > \"$DESTDIR/usr/include/{n}.h\"\n");
+    let header = |n: &str| {
+        format!("mkdir -p \"$DESTDIR/usr/include\" \"$DESTDIR/usr/bin\"\necho '#define X 1' > \"$DESTDIR/usr/include/{n}.h\"\n")
+    };
     convert_made(&root, &at, "hdr", "", &header("hdr"));
     convert_made(&root, &at, "unused", "", &header("unused"));
-    convert_made(&root, &at, "tool", "", &format!("{}echo x > \"$DESTDIR/usr/bin/tool\"\nchmod +x \"$DESTDIR/usr/bin/tool\"\n", header("tool")));
+    convert_made(
+        &root,
+        &at,
+        "tool",
+        "",
+        &format!("{}echo x > \"$DESTDIR/usr/bin/tool\"\nchmod +x \"$DESTDIR/usr/bin/tool\"\n", header("tool")),
+    );
     // no headers, so nothing here says whether it was used
-    convert_made(&root, &at, "data", "", "mkdir -p \"$DESTDIR/usr/share/data\"\necho x > \"$DESTDIR/usr/share/data/x\"\n");
+    convert_made(
+        &root,
+        &at,
+        "data",
+        "",
+        "mkdir -p \"$DESTDIR/usr/share/data\"\necho x > \"$DESTDIR/usr/share/data/x\"\n",
+    );
     // headers, and a .pc under share: wayland-protocols, used through its xml
     convert_made(&root, &at, "protos", "", &format!("{}mkdir -p \"$DESTDIR/usr/share/pkgconfig\"\necho 'Name: protos' > \"$DESTDIR/usr/share/pkgconfig/protos.pc\"\n", header("protos")));
     convert_made(
@@ -5130,7 +4760,13 @@ fn rebuild_brings_back_a_proven_dep_that_left() {
     let Some((at, root, _)) = workshop("rebring") else {
         return;
     };
-    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
+    convert_made(
+        &root,
+        &at,
+        "hdr",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n",
+    );
     convert_made(
         &root,
         &at,
@@ -5146,7 +4782,12 @@ fn rebuild_brings_back_a_proven_dep_that_left() {
 
     db::write_queue(
         &root,
-        &[db::Queued { target: "x86_64-musl".into(), name: "app".into(), soname: "libgone.so.1".into(), changed: Vec::new() }],
+        &[db::Queued {
+            target: "x86_64-musl".into(),
+            name: "app".into(),
+            soname: "libgone.so.1".into(),
+            changed: Vec::new(),
+        }],
     )
     .unwrap();
     let o = kiry(&["rebuild", "--root", r]);
@@ -5163,8 +4804,20 @@ fn a_flag_named_after_a_listed_dep_puts_it_in_or_keeps_it_out() {
     let Some((at, root, _)) = workshop("flagdep") else {
         return;
     };
-    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
-    convert_made(&root, &at, "unused", "", "mkdir -p \"$DESTDIR/usr/bin\"\necho unused > \"$DESTDIR/usr/bin/unused\"\n");
+    convert_made(
+        &root,
+        &at,
+        "hdr",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n",
+    );
+    convert_made(
+        &root,
+        &at,
+        "unused",
+        "",
+        "mkdir -p \"$DESTDIR/usr/bin\"\necho unused > \"$DESTDIR/usr/bin/unused\"\n",
+    );
     convert_made(
         &root,
         &at,
@@ -5200,8 +4853,20 @@ fn a_dep_that_does_not_move_the_failure_comes_back_out() {
     let Some((at, root, _)) = workshop("undiscover") else {
         return;
     };
-    convert_made(&root, &at, "hdr", "", "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n");
-    convert_made(&root, &at, "app", "hdr build\n", "echo \"app.c:1:10: fatal error: 'hdr.h' file not found\"\nexit 1\n");
+    convert_made(
+        &root,
+        &at,
+        "hdr",
+        "",
+        "mkdir -p \"$DESTDIR/usr/include\"\necho '#define HDR 1' > \"$DESTDIR/usr/include/hdr.h\"\n",
+    );
+    convert_made(
+        &root,
+        &at,
+        "app",
+        "hdr build\n",
+        "echo \"app.c:1:10: fatal error: 'hdr.h' file not found\"\nexit 1\n",
+    );
 
     let o = kiry(&["i", "--root", root.to_str().unwrap(), "app"]);
     let said = String::from_utf8_lossy(&o.stdout);
@@ -5259,10 +4924,7 @@ fn install_by_name_takes_what_is_already_built() {
     let o = kiry(&["i", "--root", r, "base"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
-    assert!(
-        said.contains("base 1.0 x86_64-musl already installed"),
-        "{said}"
-    );
+    assert!(said.contains("base 1.0 x86_64-musl already installed"), "{said}");
 }
 
 // the walk stops at what is in. depends carry no version constraint, so an installed
@@ -5342,11 +5004,7 @@ fn gc_keeps_what_is_installed_the_two_newest_and_both_libcs() {
 fn gc_drops_a_tarball_no_recipe_names() {
     let (root, repo, _) = tree("gcsrc");
     offer(&repo, "foo", "1.0");
-    fs::write(
-        repo.join("foo/sources"),
-        "https://example.invalid/foo-1.0.tar.gz\n",
-    )
-    .unwrap();
+    fs::write(repo.join("foo/sources"), "https://example.invalid/foo-1.0.tar.gz\n").unwrap();
     let src = root.join("var/kiry/cache/sources");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("foo-1.0.tar.gz"), "keep").unwrap();
@@ -5381,7 +5039,7 @@ fn hold(lock: &Path) -> std::process::Child {
     fs::write(lock, "").unwrap();
     let ready = lock.with_extension("ready");
     let _ = fs::remove_file(&ready);
-    let c = Command::new("busybox")
+    let mut c = Command::new("busybox")
         .arg("flock")
         .arg(lock)
         .args(["sh", "-c", &format!("touch {} && sleep 30", ready.display())])
@@ -5393,6 +5051,8 @@ fn hold(lock: &Path) -> std::process::Child {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let _ = c.kill();
+    let _ = c.wait();
     panic!("flock never took {}", lock.display());
 }
 
@@ -5520,10 +5180,7 @@ fn a_batch_says_what_it_will_cost_before_it_starts() {
     let o = kiry(&["i", "--root", root.to_str().unwrap(), "top"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
-    let line = said
-        .lines()
-        .find(|l| l.contains(" builds  ~"))
-        .unwrap_or_else(|| panic!("no forecast: {said}"));
+    let line = said.lines().find(|l| l.contains(" builds  ~")).unwrap_or_else(|| panic!("no forecast: {said}"));
     assert!(line.starts_with("3 builds"), "{line}");
     assert!(line.contains("3 never built here"), "{line}");
     // and before any of them, or it is a report rather than an estimate
@@ -5543,10 +5200,8 @@ fn a_new_package_nothing_has_open_goes_live() {
     let o = kiry(&["i", "--root", root.to_str().unwrap(), "base"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
-    let line = said
-        .lines()
-        .find(|l| l.starts_with("route "))
-        .unwrap_or_else(|| panic!("nothing said which root: {said}"));
+    let line =
+        said.lines().find(|l| l.starts_with("route ")).unwrap_or_else(|| panic!("nothing said which root: {said}"));
     assert!(line.starts_with("route live"), "{line}");
     // a staging root is not the running one, and /proc answers only for /
     assert!(line.contains("not the running root"), "{line}");
@@ -5723,25 +5378,14 @@ fn a_library_whose_file_was_renamed_is_still_compared() {
     fs::create_dir_all(&root).unwrap();
     let r = root.to_str().unwrap();
 
-    let both = lib_with(
-        &at.join("v1"),
-        "libp.so.1",
-        "void p(void){}\nvoid q(void){}\n",
-    );
+    let both = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\nvoid q(void){}\n");
     let gone = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
 
     let first = archive(&at, "ren-1", &[("usr/lib64/libp.so.1.2.3", &both)]);
     let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
-    place(
-        &root,
-        "useq",
-        &[(
-            "usr/bin/useq",
-            &app_calling(&at.join("b"), "useq", "q", &both),
-        )],
-    );
+    place(&root, "useq", &[("usr/bin/useq", &app_calling(&at.join("b"), "useq", "q", &both))]);
 
     let second = archive(&at, "ren-2", &[("usr/lib64/libp.so.1.2.4", &gone)]);
     let o = kiry(&["i", "--root", r, second.to_str().unwrap()]);
@@ -5767,60 +5411,28 @@ fn two_libraries_under_one_soname_are_each_compared_against_themselves() {
     fs::create_dir_all(&root).unwrap();
     let r = root.to_str().unwrap();
 
-    let both = lib_with(
-        &at.join("v1"),
-        "libp.so.1",
-        "void p(void){}\nvoid q(void){}\n",
-    );
+    let both = lib_with(&at.join("v1"), "libp.so.1", "void p(void){}\nvoid q(void){}\n");
     let only = lib_with(&at.join("v2"), "libp.so.1", "void p(void){}\n");
 
-    let first = archive(
-        &at,
-        "two-1",
-        &[
-            ("usr/lib64/a/libp.so.1", &both),
-            ("usr/lib64/b/libp.so.1", &only),
-        ],
-    );
+    let first = archive(&at, "two-1", &[("usr/lib64/a/libp.so.1", &both), ("usr/lib64/b/libp.so.1", &only)]);
     let o = kiry(&["i", "--root", r, first.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
-    place(
-        &root,
-        "useq",
-        &[(
-            "usr/bin/useq",
-            &app_calling(&at.join("c"), "useq", "q", &both),
-        )],
-    );
+    place(&root, "useq", &[("usr/bin/useq", &app_calling(&at.join("c"), "useq", "q", &both))]);
 
     // a loses q, b never had it. only the a comparison can say anything happened
-    let second = archive(
-        &at,
-        "two-2",
-        &[
-            ("usr/lib64/a/libp.so.1", &only),
-            ("usr/lib64/b/libp.so.1", &only),
-        ],
-    );
+    let second = archive(&at, "two-2", &[("usr/lib64/a/libp.so.1", &only), ("usr/lib64/b/libp.so.1", &only)]);
     let o = kiry(&["i", "--root", r, "--force", second.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
     let q = queued(&root);
-    assert!(
-        q.iter().any(|l| queued_pkg(l) == "useq"),
-        "a dropped q and the two sonames were not told apart: {q:?}"
-    );
+    assert!(q.iter().any(|l| queued_pkg(l) == "useq"), "a dropped q and the two sonames were not told apart: {q:?}");
 }
 
 fn lib_versioned(at: &Path, soname: &str, ver: &str) -> PathBuf {
     fs::create_dir_all(at).unwrap();
     let src = at.join(format!("{soname}.c"));
-    fs::write(
-        &src,
-        format!("void p_impl(void){{}}\n__asm__(\".symver p_impl,p@@{ver}\");\n"),
-    )
-    .unwrap();
+    fs::write(&src, format!("void p_impl(void){{}}\n__asm__(\".symver p_impl,p@@{ver}\");\n")).unwrap();
     let map = at.join("v.map");
     fs::write(&map, format!("{ver} {{ global: p; local: *; }};\n")).unwrap();
     let out = at.join(soname);
@@ -5855,11 +5467,7 @@ fn installing_a_binary_that_wants_a_version_nothing_provides_says_so() {
     let app = app_calling(&at.join("app"), "useskew", "p", &two);
 
     // linked against the one that has V2, installed beside the one that has only V1
-    let arc = archive(
-        &at,
-        "skew",
-        &[("usr/lib64/libp.so.1", &one), ("usr/bin/useskew", &app)],
-    );
+    let arc = archive(&at, "skew", &[("usr/lib64/libp.so.1", &one), ("usr/bin/useskew", &app)]);
     let o = kiry(&["i", "--root", r, arc.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
@@ -5919,11 +5527,7 @@ fn an_edited_recipe_takes_the_cached_artifact_out_of_play() {
 
     assert!(kiry(&["b", "--root", r, dir]).status.success());
     let o = kiry(&["i", "--root", r, "-n", dir]);
-    assert!(
-        String::from_utf8_lossy(&o.stdout).contains("cached"),
-        "{}",
-        String::from_utf8_lossy(&o.stdout)
-    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("cached"), "{}", String::from_utf8_lossy(&o.stdout));
 
     fs::write(d.join("build"), format!("{GOOD}echo second thoughts\n")).unwrap();
 
@@ -5980,10 +5584,7 @@ fn a_profile_outlives_its_build_and_removing_it_retrains() {
     let o = kiry(&["b", "--root", r, dir]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let said = String::from_utf8_lossy(&o.stdout);
-    assert!(
-        said.contains("hello x86_64-musl profile out of date for 2 functions"),
-        "{said}"
-    );
+    assert!(said.contains("hello x86_64-musl profile out of date for 2 functions"), "{said}");
 
     fs::remove_dir_all(&kept).unwrap();
     let o = kiry(&["i", "--root", r, "-n", dir]);
@@ -6209,10 +5810,7 @@ fn a_bump_alpine_did_not_touch_promotes_itself() {
     assert!(build.contains("pkgver=\"1.1\""), "{build}");
     assert!(build.contains("builddir=\"/src/quiet-1.1\""), "{build}");
     assert!(!build.contains("make"), "the conversion's body won: {build}");
-    assert_eq!(
-        fs::read_to_string(repo.join("quiet/version")).unwrap(),
-        "1.1 0\n"
-    );
+    assert_eq!(fs::read_to_string(repo.join("quiet/version")).unwrap(), "1.1 0\n");
 }
 
 // and when alpine did move, the bump waits and says which line. the recipe sitting in
@@ -6233,10 +5831,7 @@ fn a_bump_alpine_moved_is_held_and_names_the_line() {
     assert!(said.contains("alpine changed build()"), "{said}");
     assert!(said.contains("+ autoreconf -fi"), "{said}");
     assert!(testing.join("loud").exists(), "{said}");
-    assert_eq!(
-        fs::read_to_string(repo.join("loud/version")).unwrap(),
-        "1.0 0\n"
-    );
+    assert_eq!(fs::read_to_string(repo.join("loud/version")).unwrap(), "1.0 0\n");
     // held is about reading, not about the recipe being unusable. what is waiting is
     // this tree's build with the new version in it
     let waiting = fs::read_to_string(testing.join("loud/build")).unwrap();
@@ -6282,15 +5877,7 @@ fn a_kept_patch_the_new_tarball_already_has_is_dropped() {
     fs::create_dir_all(dist.join("pat-1.1")).unwrap();
     fs::write(dist.join("pat-1.1/a.txt"), "new\n").unwrap();
     let tgz = dist.join("pat-1.1.tar.gz");
-    assert!(Command::new("tar")
-        .arg("czf")
-        .arg(&tgz)
-        .arg("-C")
-        .arg(&dist)
-        .arg("pat-1.1")
-        .status()
-        .unwrap()
-        .success());
+    assert!(Command::new("tar").arg("czf").arg(&tgz).arg("-C").arg(&dist).arg("pat-1.1").status().unwrap().success());
     let sum = kiry_core::sha512(fs::File::open(&tgz).unwrap()).unwrap();
     aport(
         &root,
@@ -6350,10 +5937,7 @@ fn promoting_a_held_bump_stops_it_being_asked_again() {
     let said = sync_at(&root);
     assert!(said.contains("promoted"), "{said}");
     assert!(!said.contains("autoreconf"), "it asked twice: {said}");
-    assert_eq!(
-        fs::read_to_string(repo.join("twice/version")).unwrap(),
-        "1.2 0\n"
-    );
+    assert_eq!(fs::read_to_string(repo.join("twice/version")).unwrap(), "1.2 0\n");
 }
 
 // a bump waiting in testing is the same package at the version alpine has, so a survey
@@ -6373,10 +5957,7 @@ fn a_bump_already_waiting_does_not_become_its_own_measure() {
 
     let said = sync_at(&root);
     assert!(said.contains("held"), "it promoted itself unread: {said}");
-    assert_eq!(
-        fs::read_to_string(repo.join("twin/version")).unwrap(),
-        "1.0 0\n"
-    );
+    assert_eq!(fs::read_to_string(repo.join("twin/version")).unwrap(), "1.0 0\n");
 }
 
 // a recipe's own files live in a subdirectory, a conversion never writes one, and a
@@ -6579,17 +6160,11 @@ fn a_recipe_subdirectory_comes_across_a_bump() {
     // missing from it is a file the promotion deletes
     let landed = testing.join("served/files/nitro-run");
     assert!(landed.exists(), "the subdirectory was dropped");
-    assert_eq!(
-        fs::read_to_string(landed).unwrap(),
-        "#!/bin/sh\nexec served\n"
-    );
+    assert_eq!(fs::read_to_string(landed).unwrap(), "#!/bin/sh\nexec served\n");
 
     let o = kiry(&["promote", "--root", root.to_str().unwrap(), "served"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    assert!(
-        repo.join("served/files/nitro-run").exists(),
-        "the promotion deleted it"
-    );
+    assert!(repo.join("served/files/nitro-run").exists(), "the promotion deleted it");
 }
 
 // the first bump of a package has nothing to measure against, so it wants reading. what
@@ -6639,11 +6214,7 @@ fn with_repo(at: &Path, root: &Path) {
     let repo = at.join("repo");
     recipe(&repo, "x86_64-gnu", GOOD);
     fs::create_dir_all(root.join("etc/kiry")).unwrap();
-    fs::write(
-        root.join("etc/kiry/repos"),
-        format!("{}\n", repo.display()),
-    )
-    .unwrap();
+    fs::write(root.join("etc/kiry/repos"), format!("{}\n", repo.display())).unwrap();
 }
 
 // the whole point of keeping it: the consumer goes on naming the soname that left until
@@ -6669,9 +6240,7 @@ fn a_preserved_library_something_still_links_is_not_released() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains("released"), "{text}");
     assert!(root.join("usr/lib64/libp.so.1").is_file(), "{text}");
-    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp")
-        .unwrap()
-        .is_empty());
+    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp").unwrap().is_empty());
 }
 
 // and once nothing names it, carrying it forever is how a root fills up with libraries
@@ -6699,9 +6268,7 @@ fn a_preserved_library_nothing_links_is_released() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("libp x86_64-gnu libp.so.1 released"), "{text}");
     assert!(!root.join("usr/lib64/libp.so.1").exists(), "{text}");
-    assert!(db::read_preserved(&root, "x86_64-gnu", "libp")
-        .unwrap()
-        .is_empty());
+    assert!(db::read_preserved(&root, "x86_64-gnu", "libp").unwrap().is_empty());
     assert!(root.join("usr/lib64/libp.so.2").is_file());
 }
 
@@ -6723,9 +6290,7 @@ fn gc_dash_n_releases_nothing() {
 
     kiry(&["gc", "-n", "--root", root.to_str().unwrap()]);
     assert!(root.join("usr/lib64/libp.so.1").is_file());
-    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp")
-        .unwrap()
-        .is_empty());
+    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp").unwrap().is_empty());
 }
 
 // same soname, different bytes, so it is still an elf gc can group and still not the
@@ -6773,9 +6338,7 @@ fn a_preserved_library_edited_by_hand_is_left_alone() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(!text.contains("released"), "{text}");
     assert!(root.join("usr/lib64/libp.so.1").is_file());
-    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp")
-        .unwrap()
-        .is_empty());
+    assert!(!db::read_preserved(&root, "x86_64-gnu", "libp").unwrap().is_empty());
 }
 
 // extra carries all of aports. asked about nothing in particular, a bump for a recipe
@@ -6857,21 +6420,13 @@ fn two_packages_in_one_level_build_side_by_side() {
     let b = recipe(&two, "x86_64-musl", GOOD);
     let b2 = two.join("hullo");
     fs::rename(&b, &b2).unwrap();
-    fs::write(
-        b2.join("build"),
-        "mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hullo\"\n",
-    )
-    .unwrap();
+    fs::write(b2.join("build"), "mkdir -p \"$DESTDIR/usr/bin\"\ncp greeting \"$DESTDIR/usr/bin/hullo\"\n").unwrap();
     for d in [&a, &b2] {
         fs::write(d.join("sources"), "hello-1.0.tar::https://example.invalid/hello-1.0.tar\n").unwrap();
     }
     // slow enough that both fetches are in flight before either one renames
     let fetch = one.join("fetch.sh");
-    fs::write(
-        &fetch,
-        format!("#!/bin/sh\nsleep 0.5\ncp {} \"$1\"\n", one.join("hello-1.0.tar").display()),
-    )
-    .unwrap();
+    fs::write(&fetch, format!("#!/bin/sh\nsleep 0.5\ncp {} \"$1\"\n", one.join("hello-1.0.tar").display())).unwrap();
     Command::new("chmod").arg("+x").arg(&fetch).status().unwrap();
 
     let root = one.join("root");
@@ -6992,9 +6547,8 @@ fn a_build_that_stages_under_dest_twice_is_refused() {
 fn the_memory_cap_is_split_between_the_builds_of_a_level() {
     let one = scratch("share-one");
     let two = scratch("share-two");
-    let say = |f: &str| {
-        format!("mkdir -p \"$DESTDIR/usr/bin\"\nprintf %s \"$KIRY_SHARE\" > \"$DESTDIR/usr/bin/{f}\"\n")
-    };
+    let say =
+        |f: &str| format!("mkdir -p \"$DESTDIR/usr/bin\"\nprintf %s \"$KIRY_SHARE\" > \"$DESTDIR/usr/bin/{f}\"\n");
     let a = recipe(&one, "x86_64-musl", &say("hello"));
     let b = recipe(&two, "x86_64-musl", &say("hullo"));
     let b2 = two.join("hullo");
@@ -7037,9 +6591,7 @@ fn the_memory_cap_is_split_between_the_builds_of_a_level() {
 fn make_is_told_the_jobs_of_a_level_and_nothing_gnu_only() {
     let one = scratch("mf-one");
     let two = scratch("mf-two");
-    let say = |f: &str| {
-        format!("mkdir -p \"$DESTDIR/usr/bin\"\nprintf %s \"$MAKEFLAGS\" > \"$DESTDIR/usr/bin/{f}\"\n")
-    };
+    let say = |f: &str| format!("mkdir -p \"$DESTDIR/usr/bin\"\nprintf %s \"$MAKEFLAGS\" > \"$DESTDIR/usr/bin/{f}\"\n");
     let a = recipe(&one, "x86_64-musl", &say("pair"));
     let b = recipe(&two, "x86_64-musl", &say("pear"));
     let b2 = two.join("pear");
@@ -7147,15 +6699,11 @@ fn a_recipe_of_our_own_does_not_go_looking_elsewhere() {
     assert!(!String::from_utf8_lossy(&o.stdout).contains(" from file://"));
 }
 
-
 fn have_rsync() -> bool {
     if Command::new("rsync").arg("--version").output().is_ok_and(|o| o.status.success()) {
         return true;
     }
-    assert!(
-        std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-        "no rsync to mirror a gentoo md5-cache with"
-    );
+    assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "no rsync to mirror a gentoo md5-cache with");
     false
 }
 
@@ -7301,11 +6849,7 @@ fn a_flag_that_links_nothing_says_so() {
         &root,
         "x86_64-musl",
         "libx11",
-        &[db::Provide {
-            soname: "libX11.so.6".into(),
-            versioned: false,
-            path: "usr/lib/libX11.so.6".into(),
-        }],
+        &[db::Provide { soname: "libX11.so.6".into(), versioned: false, path: "usr/lib/libX11.so.6".into() }],
     )
     .unwrap();
     let d = recipe(&at, "x86_64-musl", GOOD);
@@ -7428,11 +6972,7 @@ fn installed_as(root: &Path, name: &str, files: &[(&str, &Path)], sonames: &[&st
     record(root, name, &[], manifest);
     let ps: Vec<db::Provide> = sonames
         .iter()
-        .map(|s| db::Provide {
-            soname: (*s).to_string(),
-            versioned: false,
-            path: format!("usr/lib/{s}"),
-        })
+        .map(|s| db::Provide { soname: (*s).to_string(), versioned: false, path: format!("usr/lib/{s}") })
         .collect();
     db::write_provides(root, "x86_64-musl", name, &ps).unwrap();
 }
@@ -7630,7 +7170,11 @@ fn a_prune_that_cannot_be_decided_leaves_the_library_whole() {
         .success());
     installed_as(&root, "loader", &[("usr/bin/loader", &loader)], &[]);
     let said = build();
-    assert!(said.contains("not pruned: libfoo can dlopen") || said.contains("can dlopen, and libfoo.so.1 is in what it loads"), "{said}");
+    assert!(
+        said.contains("not pruned: libfoo can dlopen")
+            || said.contains("can dlopen, and libfoo.so.1 is in what it loads"),
+        "{said}"
+    );
     db::forget(&root, "x86_64-musl", "loader").unwrap();
 
     // versioned: an anonymous script cannot sit beside named versions
@@ -7638,11 +7182,7 @@ fn a_prune_that_cannot_be_decided_leaves_the_library_whole() {
         &root,
         "x86_64-musl",
         "libfoo",
-        &[db::Provide {
-            soname: "libfoo.so.1".into(),
-            versioned: true,
-            path: "usr/lib/libfoo.so.1".into(),
-        }],
+        &[db::Provide { soname: "libfoo.so.1".into(), versioned: true, path: "usr/lib/libfoo.so.1".into() }],
     )
     .unwrap();
     assert!(build().contains("not pruned: it versions its symbols"));
@@ -7669,9 +7209,7 @@ fn layout_recipe(at: &Path, version: &str, header: &str) -> PathBuf {
     let d = recipe(
         at,
         "x86_64-musl",
-        &format!(
-            "mkdir -p \"$DESTDIR/usr/include\"\ncat > \"$DESTDIR/usr/include/bar.h\" <<'H'\n{header}H\n{GOOD}"
-        ),
+        &format!("mkdir -p \"$DESTDIR/usr/include\"\ncat > \"$DESTDIR/usr/include/bar.h\" <<'H'\n{header}H\n{GOOD}"),
     );
     let bar = at.join("libbar");
     let _ = fs::remove_dir_all(&bar);
@@ -7775,11 +7313,7 @@ fn owns_reads_a_path_the_way_the_root_resolves_it() {
     std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
     fs::write(root.join("usr/bin/hello"), "hi\n").unwrap();
     fs::write(root.join("usr/bin/stray"), "x\n").unwrap();
-    let e = db::Entry {
-        mode: 0o755,
-        kind: db::Kind::File("0".repeat(64)),
-        path: "usr/bin/hello".into(),
-    };
+    let e = db::Entry { mode: 0o755, kind: db::Kind::File("0".repeat(64)), path: "usr/bin/hello".into() };
     record(&root, "hello", &[], vec![e]);
     let r = root.to_str().unwrap();
 
@@ -7916,11 +7450,7 @@ fn gc_counts_what_it_keeps_in_files() {
 #[test]
 fn a_build_dies_with_the_kiry_that_started_it() {
     let at = scratch("orphan");
-    let d = recipe(
-        &at,
-        "x86_64-musl",
-        "while echo x >> \"$DESTDIR/beat\"; do sleep 1; done &\nwait\n",
-    );
+    let d = recipe(&at, "x86_64-musl", "while echo x >> \"$DESTDIR/beat\"; do sleep 1; done &\nwait\n");
     let root = at.join("root");
     fs::create_dir_all(&root).unwrap();
     if !bootstrap(&root) {

@@ -71,11 +71,7 @@ fn bracketed(line: &str) -> Option<String> {
 }
 
 fn readelf(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Dyn> {
-    let out = Command::new("readelf")
-        .arg("-d")
-        .args(paths)
-        .output()
-        .expect("readelf failed to run");
+    let out = Command::new("readelf").arg("-d").args(paths).output().expect("readelf failed to run");
     let text = String::from_utf8_lossy(&out.stdout);
 
     let mut map = BTreeMap::new();
@@ -114,10 +110,7 @@ fn readelf(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Dyn> {
 #[test]
 fn agrees_with_readelf_on_every_library_here() {
     if Command::new("readelf").arg("-v").output().is_err() {
-        assert!(
-            std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-            "readelf is not installed"
-        );
+        assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "readelf is not installed");
         return;
     }
 
@@ -244,19 +237,11 @@ fn maps_a_string_table_that_is_not_where_its_address_says() {
     std::fs::write(&src, "int main(void){return 0;}\n").unwrap();
     let bin = dir.join("t");
 
-    let built = Command::new("cc")
-        .arg("-no-pie")
-        .arg("-o")
-        .arg(&bin)
-        .arg(&src)
-        .status();
+    let built = Command::new("cc").arg("-no-pie").arg("-o").arg(&bin).arg(&src).status();
     match built {
         Ok(s) if s.success() => {}
         _ => {
-            assert!(
-                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-                "cc cannot build a -no-pie binary"
-            );
+            assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "cc cannot build a -no-pie binary");
             return;
         }
     }
@@ -272,14 +257,8 @@ fn maps_a_string_table_that_is_not_where_its_address_says() {
 
     let got = elf::parse(&b).unwrap();
     let want = readelf(&[&bin]);
-    assert_eq!(
-        got.needed, want[&bin].needed,
-        "needed of the -no-pie binary"
-    );
-    assert!(
-        !got.needed.is_empty(),
-        "a dynamic binary with no DT_NEEDED?"
-    );
+    assert_eq!(got.needed, want[&bin].needed, "needed of the -no-pie binary");
+    assert!(!got.needed.is_empty(), "a dynamic binary with no DT_NEEDED?");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -315,11 +294,7 @@ fn st_type(word: &str) -> u8 {
 
 // Num: Value Size Type Bind Vis Ndx Name[@ver|@@ver][ (n)]
 fn dyn_syms(paths: &[&PathBuf]) -> BTreeMap<PathBuf, Vec<RSym>> {
-    let out = Command::new("readelf")
-        .args(["--dyn-syms", "-W"])
-        .args(paths)
-        .output()
-        .expect("readelf failed to run");
+    let out = Command::new("readelf").args(["--dyn-syms", "-W"]).args(paths).output().expect("readelf failed to run");
     read_dyn_syms(&String::from_utf8_lossy(&out.stdout), paths)
 }
 
@@ -405,10 +380,7 @@ fn mine(e: &elf::Elf) -> Vec<RSym> {
     let llvm = readelf_is_llvms();
     let f = |s: &elf::Sym, undefined: bool| RSym {
         name: s.name.clone(),
-        version: s
-            .version
-            .clone()
-            .filter(|v| llvm || *v != s.name),
+        version: s.version.clone().filter(|v| llvm || *v != s.name),
         default: s.default,
         weak: s.weak,
         object: s.object,
@@ -465,9 +437,7 @@ fn agrees_with_readelf_on_dynamic_symbols() {
     let mut selfnamed = 0;
     for (p, bytes) in &sample {
         let got = elf::parse(bytes).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        let want = theirs
-            .get(p)
-            .unwrap_or_else(|| panic!("readelf skipped {}", p.display()));
+        let want = theirs.get(p).unwrap_or_else(|| panic!("readelf skipped {}", p.display()));
 
         let mut a = mine(&got);
         let mut b: Vec<&RSym> = want.iter().collect();
@@ -481,17 +451,10 @@ fn agrees_with_readelf_on_dynamic_symbols() {
 
         compared += a.len();
         versioned += a.iter().filter(|s| s.version.is_some()).count();
-        nondefault += a
-            .iter()
-            .filter(|s| s.version.is_some() && !s.default)
-            .count();
+        nondefault += a.iter().filter(|s| s.version.is_some() && !s.default).count();
         // mine() drops these to match readelf, so count them before it does or
         // the reader could stop resolving them and nothing here would notice
-        selfnamed += got
-            .exports
-            .iter()
-            .filter(|s| s.version.as_deref() == Some(s.name.as_str()))
-            .count();
+        selfnamed += got.exports.iter().filter(|s| s.version.as_deref() == Some(s.name.as_str())).count();
     }
 
     if std::env::var("KIRY_SWEEP").is_ok() {
@@ -499,10 +462,7 @@ fn agrees_with_readelf_on_dynamic_symbols() {
     }
     assert!(compared > 5000, "only compared {compared} symbols");
     assert!(versioned > 100, "only {versioned} versioned symbols");
-    assert!(
-        nondefault > 0,
-        "no non-default versioned symbol in the sample"
-    );
+    assert!(nondefault > 0, "no non-default versioned symbol in the sample");
     assert!(selfnamed > 0, "no version-definition symbol in the sample");
 }
 
@@ -516,18 +476,11 @@ fn reads_a_two_hundred_kilobyte_symbol() {
     std::fs::write(&src, "char big[200000];\n").unwrap();
     let so = dir.join("libt.so");
 
-    let built = Command::new("cc")
-        .args(["-shared", "-fPIC", "-o"])
-        .arg(&so)
-        .arg(&src)
-        .status();
+    let built = Command::new("cc").args(["-shared", "-fPIC", "-o"]).arg(&so).arg(&src).status();
     match built {
         Ok(s) if s.success() => {}
         _ => {
-            assert!(
-                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-                "cc cannot build a shared library"
-            );
+            assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "cc cannot build a shared library");
             return;
         }
     }
@@ -535,10 +488,7 @@ fn reads_a_two_hundred_kilobyte_symbol() {
     let got = mine(&elf::parse(&std::fs::read(&so).unwrap()).unwrap());
     let want = &dyn_syms(&[&so])[&so];
     assert_eq!(got.len(), want.len(), "symbol count for the fixture");
-    let big = got
-        .iter()
-        .find(|s| s.name == "big")
-        .unwrap_or_else(|| panic!("lost the big symbol"));
+    let big = got.iter().find(|s| s.name == "big").unwrap_or_else(|| panic!("lost the big symbol"));
     assert_eq!(big.size, 200_000);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -566,42 +516,26 @@ fn counts_symbols_out_of_the_old_hash_table_too() {
     let dir = std::env::temp_dir().join(format!("kiry-sysv-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("s.c");
-    std::fs::write(
-        &src,
-        "int alpha(int x){return x+1;}\nint beta(int x){return x+2;}\ndouble gamma_data = 3.0;\n",
-    )
-    .unwrap();
+    std::fs::write(&src, "int alpha(int x){return x+1;}\nint beta(int x){return x+2;}\ndouble gamma_data = 3.0;\n")
+        .unwrap();
     let lib = dir.join("libsysv.so");
 
-    let built = Command::new("cc")
-        .args(["-shared", "-fPIC", "-Wl,--hash-style=sysv", "-o"])
-        .arg(&lib)
-        .arg(&src)
-        .status();
+    let built =
+        Command::new("cc").args(["-shared", "-fPIC", "-Wl,--hash-style=sysv", "-o"]).arg(&lib).arg(&src).status();
     match built {
         Ok(s) if s.success() => {}
         _ => {
-            assert!(
-                std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-                "cc cannot build a sysv-hash library"
-            );
+            assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "cc cannot build a sysv-hash library");
             return;
         }
     }
 
     let b = std::fs::read(&lib).unwrap();
     // prove the fixture reaches the branch it exists for
-    let tags = Command::new("readelf")
-        .arg("-d")
-        .arg(&lib)
-        .output()
-        .unwrap();
+    let tags = Command::new("readelf").arg("-d").arg(&lib).output().unwrap();
     let tags = String::from_utf8_lossy(&tags.stdout);
     assert!(tags.contains("(HASH)"), "no DT_HASH, fixture is pointless");
-    assert!(
-        !tags.contains("GNU_HASH"),
-        "GNU_HASH present too, so the gnu branch wins and this proves nothing"
-    );
+    assert!(!tags.contains("GNU_HASH"), "GNU_HASH present too, so the gnu branch wins and this proves nothing");
 
     let got = elf::parse(&b).unwrap();
     let want = dyn_syms(&[&lib]);
@@ -615,10 +549,7 @@ fn counts_symbols_out_of_the_old_hash_table_too() {
             got.exports.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
-    assert!(got
-        .exports
-        .iter()
-        .any(|s| s.name == "gamma_data" && s.object && s.size == 8));
+    assert!(got.exports.iter().any(|s| s.name == "gamma_data" && s.object && s.size == 8));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -626,12 +557,7 @@ fn counts_symbols_out_of_the_old_hash_table_too() {
 // the comparison has no oracle: no tool on the system will say whether two builds of one
 // library broke their consumers. so the compiler makes each change real and the test
 // asserts the verdict
-fn pair(
-    name: &str,
-    before: &str,
-    after: &str,
-    script: Option<&str>,
-) -> Option<(elf::Elf, elf::Elf)> {
+fn pair(name: &str, before: &str, after: &str, script: Option<&str>) -> Option<(elf::Elf, elf::Elf)> {
     let dir = std::env::temp_dir().join(format!("kiry-abi-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -652,10 +578,7 @@ fn pair(
         match ok {
             Ok(st) if st.success() => {}
             _ => {
-                assert!(
-                    std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-                    "cc cannot build a shared library"
-                );
+                assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "cc cannot build a shared library");
                 return None;
             }
         }
@@ -667,12 +590,7 @@ fn pair(
 
 #[test]
 fn a_symbol_that_left_is_gone() {
-    let Some((old, new)) = pair(
-        "gone",
-        "void p(void){}\nvoid q(void){}\n",
-        "void p(void){}\n",
-        None,
-    ) else {
+    let Some((old, new)) = pair("gone", "void p(void){}\nvoid q(void){}\n", "void p(void){}\n", None) else {
         return;
     };
     let seen = elf::compare(&old.exports, &new.exports, false);
@@ -683,19 +601,11 @@ fn a_symbol_that_left_is_gone() {
 // address. no symbol set difference at all
 #[test]
 fn global_to_weak_is_a_change() {
-    let Some((old, new)) = pair(
-        "weak",
-        "void p(void){}\n",
-        "__attribute__((weak)) void p(void){}\n",
-        None,
-    ) else {
+    let Some((old, new)) = pair("weak", "void p(void){}\n", "__attribute__((weak)) void p(void){}\n", None) else {
         return;
     };
     let seen = elf::compare(&old.exports, &new.exports, false);
-    assert!(
-        seen.contains(&elf::Change::Weakened("p".into())),
-        "{seen:?}"
-    );
+    assert!(seen.contains(&elf::Change::Weakened("p".into())), "{seen:?}");
 }
 
 // an exported object's size is the object's size, which is how a c++ vtable growing by
@@ -724,10 +634,7 @@ fn moving_the_default_version_is_a_change_on_gnu_and_not_on_musl() {
     };
 
     let gnu = elf::compare(&old.exports, &new.exports, true);
-    assert!(
-        gnu.contains(&elf::Change::Undefaulted("p@V1".into())),
-        "{gnu:?}"
-    );
+    assert!(gnu.contains(&elf::Change::Undefaulted("p@V1".into())), "{gnu:?}");
 
     // musl's loader ignores versions, so the same two builds changed nothing it can see
     let musl = elf::compare(&old.exports, &new.exports, false);
@@ -749,12 +656,7 @@ fn a_symbol_that_changed_type_is_a_change() {
 // consumer that took sizeof of it baked the old number in
 #[test]
 fn a_thread_local_that_grew_is_a_change() {
-    let Some((old, new)) = pair(
-        "tls",
-        "__thread char t[8];\n",
-        "__thread char t[16];\n",
-        None,
-    ) else {
+    let Some((old, new)) = pair("tls", "__thread char t[8];\n", "__thread char t[16];\n", None) else {
         return;
     };
     let seen = elf::compare(&old.exports, &new.exports, false);
@@ -787,13 +689,7 @@ fn a_definition_versioned_through_verneed_is_not_default() {
 
     std::fs::write(dir.join("v.map"), "V1 { global: d; local: *; };\n").unwrap();
     let lib = build(
-        &[
-            "-shared",
-            "-fPIC",
-            "-nostdlib",
-            "-Wl,-soname,libv.so.1",
-            "-Wl,--version-script,v.map",
-        ],
+        &["-shared", "-fPIC", "-nostdlib", "-Wl,-soname,libv.so.1", "-Wl,--version-script,v.map"],
         "libv.so.1",
         "lib.c",
         "char d[8];\n",
@@ -801,32 +697,18 @@ fn a_definition_versioned_through_verneed_is_not_default() {
     // non-pic is what makes the linker copy the object in rather than point at it
     let app = lib
         && build(
-            &[
-                "-fno-pic",
-                "-fno-pie",
-                "-nostdlib",
-                "-no-pie",
-                "-Wl,-z,notext",
-                "libv.so.1",
-            ],
+            &["-fno-pic", "-fno-pie", "-nostdlib", "-no-pie", "-Wl,-z,notext", "libv.so.1"],
             "app",
             "app.c",
             "extern char d[8];\nvoid _start(void){ d[0]=1; }\n",
         );
     if !app {
-        assert!(
-            std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(),
-            "cc cannot build a copy relocation here"
-        );
+        assert!(std::env::var("KIRY_TEST_ALLOW_SKIP").is_ok(), "cc cannot build a copy relocation here");
         return;
     }
 
     let e = elf::parse(&std::fs::read(dir.join("app")).unwrap()).unwrap();
-    let d = e
-        .exports
-        .iter()
-        .find(|s| s.name == "d")
-        .expect("d is defined in the executable, not undefined");
+    let d = e.exports.iter().find(|s| s.name == "d").expect("d is defined in the executable, not undefined");
     assert_eq!(d.version.as_deref(), Some("V1"));
     assert!(!d.default, "a verneed version is not one this file defaults");
 }

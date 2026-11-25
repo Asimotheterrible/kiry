@@ -1006,7 +1006,10 @@ fn linked_before(root: &Path, p: &Package, t: &str) -> Vec<Dep> {
             && !out.iter().any(|x| x.name == d.name)
             && db::read_provides(root, t, &d.name).is_ok_and(|ps| ps.iter().any(|x| needed.contains(&x.soname)))
         {
-            out.push(d.clone());
+            // build-only like the rest of the closure, so a build that still links it hands it
+            // back as linked. as a runtime line it counts as declared n the sidecar, which
+            // writes only the recipe's runtime lines, drops it
+            out.push(Dep { make: true, ..d.clone() });
         }
     }
     out
@@ -14579,6 +14582,49 @@ mod deps {
         let deps = [dep("carrier", true)];
         let got = undeclared(&root, &members, &deps, T, &dest);
         assert!(got.iter().any(|(s, who, k)| *s == want && who == "carrier" && *k == "build-only"), "{got:?}");
+    }
+
+    // mesa's record had spirv-tools for libgallium's libSPIRV-Tools.so, the next build
+    // started with it as a runtime line, called it declared and wrote a record without it.
+    // the build after that found it again. qt6-qtdeclarative's sandbox got the one without
+    #[test]
+    fn a_runtime_line_the_last_build_linked_comes_back_linked() {
+        let (root, members, dest, want) = fixture("relinked");
+        fs::create_dir_all(root.join("usr/bin")).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), root.join("usr/bin/thing")).unwrap();
+        db::write(
+            &root,
+            &db::Installed {
+                name: "thing".into(),
+                target: T.into(),
+                version: pkg::Version::parse("1.0 1").unwrap(),
+                depends: vec![dep("carrier", false)],
+                manifest: vec![db::Entry {
+                    mode: 0o755,
+                    kind: db::Kind::File("0".repeat(64)),
+                    path: "usr/bin/thing".into(),
+                }],
+                hash: String::new(),
+                users: Vec::new(),
+                flags: Vec::new(),
+            },
+        )
+        .unwrap();
+        let p = Package {
+            name: "thing".into(),
+            dir: root.join("extra/thing"),
+            version: pkg::Version::parse("1.0 1").unwrap(),
+            sources: Vec::new(),
+            checksums: Vec::new(),
+            depends: Vec::new(),
+            targets: vec![T.into()],
+            users: Vec::new(),
+        };
+
+        let deps = linked_before(&root, &p, T);
+        assert!(deps.iter().any(|d| d.name == "carrier" && d.make), "{deps:?}");
+        let got = undeclared(&root, &members, &deps, T, &dest);
+        assert!(got.iter().any(|(s, who, _)| *s == want && who == "carrier"), "{got:?}");
     }
 }
 
